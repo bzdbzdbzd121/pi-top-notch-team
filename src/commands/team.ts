@@ -118,8 +118,13 @@ export function registerTeamCommand(
       const subcommand = parts[0]?.toLowerCase() ?? "";
 
       // --- No subcommand yet: offer all subcommand names ---
+      // For start/show/delete, include trailing space in the value so the cursor
+      // is immediately in team-name position after completion.
       if (parts.length === 1 && !subcommand) {
-        return ALL_SUBCOMMANDS.map((s) => ({ value: s, label: s }));
+        return ALL_SUBCOMMANDS.map((s) => ({
+          value: TEAM_NAME_SUBCOMMANDS.includes(s) ? `${s} ` : s,
+          label: s,
+        }));
       }
 
       // --- Handles both "start" and "start " ---
@@ -145,13 +150,29 @@ export function registerTeamCommand(
         return items.length > 0 ? items : null;
       }
 
-      // --- Partial or fully typed subcommand (non-team-name) ---
+      // --- Partial or fully typed subcommand ---
       if (parts.length === 1 && subcommand) {
         const filtered = ALL_SUBCOMMANDS.filter((s) => s.startsWith(subcommand));
+        // If exactly one match and it's fully typed:
         if (filtered.length === 1 && filtered[0] === subcommand) {
-          return null; // fully typed, nothing to complete
+          // For team-name subcommands, offer teams immediately
+          if (TEAM_NAME_SUBCOMMANDS.includes(subcommand)) {
+            const teams = listTeams(getRootDir());
+            const items = teams.map((t) => ({
+              value: `${subcommand} ${t}`,
+              label: t,
+            }));
+            return items.length > 0 ? items : null;
+          }
+          return null;
         }
-        return filtered.length > 0 ? filtered.map((s) => ({ value: s, label: s })) : null;
+        // Partial match: show subcommands, with trailing space for team-name ones
+        return filtered.length > 0
+          ? filtered.map((s) => ({
+              value: TEAM_NAME_SUBCOMMANDS.includes(s) ? `${s} ` : s,
+              label: s,
+            }))
+          : null;
       }
 
       // Other subcommands (stop, list, status, help) have no further args — return null

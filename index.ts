@@ -196,20 +196,21 @@ export default function (pi: ExtensionAPI) {
 
   registerTlTools(pi, manager, createAndRegisterMember, buildMemberConfig, getMemberLog);
 
-  // ── Custom autocomplete: team names immediately after subcommand ──
+  // ── Custom autocomplete: team names for /team start|show|delete ──
   pi.on("session_start", (_event, ctx) => {
     ctx.ui.addAutocompleteProvider((current) => ({
       async getSuggestions(lines, line, col, options) {
         const beforeCursor = (lines[line] ?? "").slice(0, col);
-        // Match /team start|show|delete followed by space (possibly empty team name)
         const m = beforeCursor.match(/^\/team\s+(start|show|delete)\s+(.*)$/);
         if (m) {
           const partial = m[2];
           const { listTeams } = await import("./src/team/store");
           const { getRootDir } = await import("./src/config");
           const teams = listTeams(getRootDir());
-          const filtered = teams.filter((t: string) => t.startsWith(partial));
-          return { prefix: partial, items: filtered.map((t: string) => ({ value: t, label: t })) };
+          const items = teams
+            .filter((t: string) => !partial || t.startsWith(partial))
+            .map((t: string) => ({ value: t, label: t }));
+          return { prefix: partial, items };
         }
         return current.getSuggestions(lines, line, col, options);
       },
