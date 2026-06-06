@@ -218,8 +218,8 @@ export default function (pi: ExtensionAPI) {
         }
         return current.getSuggestions(lines, line, col, options);
       },
-      applyCompletion(lines, line, col, item, _prefix) {
-        return current.applyCompletion(lines, line, col, item, item.value);
+      applyCompletion(lines, line, col, item, prefix) {
+        return current.applyCompletion(lines, line, col, item, prefix);
       },
       shouldTriggerFileCompletion(lines, line, col) {
         const beforeCursor = (lines[line] ?? "").slice(0, col);
