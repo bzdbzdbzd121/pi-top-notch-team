@@ -3,9 +3,11 @@ import { registerListCommand } from "./src/commands/list";
 import { registerShowCommand } from "./src/commands/show";
 import { registerDeleteCommand } from "./src/commands/delete";
 import { registerStatusCommand } from "./src/commands/status";
-import { startSession as startSessionState, endSession as endSessionState, getSessionState } from "./src/session/state";
-import { readTeam, listTeams } from "./src/team/store";
-import { getRootDir } from "./src/config";
+import { registerCreateCommand } from "./src/commands/create";
+import { registerStartCommand } from "./src/commands/start";
+import { registerStopCommand } from "./src/commands/stop";
+import { getSessionState } from "./src/session/state";
+import type { TeamContext } from "./src/session/context";
 import { registerTlTools } from "./src/tools/tl-tools";
 import { createProcessManager } from "./src/process/manager";
 import { createMemberProcess } from "./src/process/member-process";
@@ -14,140 +16,23 @@ import { createRouter } from "./src/channel/router";
 import type { TeamMessage } from "./src/channel/types";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
+import { getRootDir } from "./src/config";
 
 export default function (pi: ExtensionAPI) {
-  // Track whether the TL has the "create team" mission active
-  let isCreatingTeam = false;
+  // ── Shared mutable state ──────────────────────────────────
+  const teamCtx: TeamContext = {
+    isCreatingTeam: false,
+    processManager: null,
+    memberHandles: new Map(),
+    tlToolNames: ["start_member", "stop_member", "list_members", "get_member_log"],
+    router: null as any,
+    messageQueue: null as any,
+  };
 
-  // ── Register all 7 commands ──────────────────────────────
-  registerListCommand(pi);
-  registerShowCommand(pi);
-  registerDeleteCommand(pi);
-  registerStatusCommand(pi, () => processManager?.listStatus().map((s) => ({
-    name: s.name,
-    status: s.status,
-    pid: s.pid,
-  })) ?? []);
-
-  // ── /team create: natural language team creation ─────────
-  // Uses before_agent_start to inject instructions for the TL
-  // and a custom tool (create_team_definition) to materialize the YAML.
-  (() => {
-    // Register the tool that the TL will call after collecting info
-    pi.registerTool({
-      name: "create_team_definition",
-      label: "Create Team Definition",
-      description:
-        "Call this tool after the user has confirmed the team details. " +
-        "Saves the team YAML to disk and runs validation. " +
-        "Parameters: name (team name), description, members (array of {name, label?, systemPrompt, model?})",
-      parameters: {
-        type: "object",
-        properties: {
-          name: { type: "string", description: "Team name (identifier)" },
-          description: { type: "string", description: "Team description" },
-          defaultModel: {
-            type: "string",
-            description: "Optional default model for all members",
-          },
-          members: {
-            type: "array",
-            items: {
-              type: "object",
-              properties: {
-                name: { type: "string" },
-                label: { type: "string" },
-                systemPrompt: { type: "string" },
-                model: { type: "string" },
-              },
-              required: ["name", "systemPrompt"],
-            },
-            description: "Team members",
-          },
-        },
-        required: ["name", "description", "members"],
-      } as any,
-      async execute(
-        _toolCallId: string,
-        params: {
-          name: string;
-          description: string;
-          defaultModel?: string;
-          members: Array<{
-            name: string;
-            label?: string;
-            systemPrompt: string;
-            model?: string;
-          }>;
-        },
-      ) {
-        const { validateTeamDefinition } = await import("./src/team/schema");
-        const { writeTeam } = await import("./src/team/store");
-        const { getRootDir } = await import("./src/config");
-
-        const teamData = {
-          name: params.name,
-          description: params.description,
-          defaults: params.defaultModel ? { model: params.defaultModel } : undefined,
-          members: params.members.map((m) => ({
-            name: m.name,
-            label: m.label,
-            systemPrompt: m.systemPrompt,
-            model: m.model,
-          })),
-        };
-
-        const validation = validateTeamDefinition(teamData);
-        if (!validation.valid) {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: `团队定义校验失败：\n${validation.errors.join("\n")}\n请修正后重试。`,
-              },
-            ],
-            details: {},
-          };
-        }
-
-        writeTeam(teamData as any, getRootDir());
-        isCreatingTeam = false;
-
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `团队 "${params.name}" 已创建成功！${params.members.length} 个成员已配置。用 /team list 查看，用 /team start ${params.name} 启动。`,
-            },
-          ],
-          details: {},
-        };
-      },
-    });
-
-    // Register the /team create command
-    pi.registerCommand("team-create", {
-      description: "通过自然语言对话创建团队",
-      handler: async (_args: string, ctx) => {
-        // Inject create-team instructions for the TL's next response
-        isCreatingTeam = true;
-        ctx.ui.notify(
-          "团队创建模式已启动。请告诉我你想创建的团队信息，TL 会引导你完成。",
-          "info"
-        );
-      },
-    });
-  })();
-
-  // ── TL tools: registered once, but only activated during team session ──
-  let processManager: ReturnType<typeof createProcessManager> | null = null;
-  // Map of member name → process handle for message channel sendCommand access
-  const memberHandles: Map<string, ReturnType<typeof createMemberProcess>> = new Map();
-
-  // Message channel: queue → router
+  // ── Message channel: queue → router ──────────────────────
   const router = createRouter({
     sendToMember: (memberName: string, msg: TeamMessage) => {
-      const handle = memberHandles.get(memberName);
+      const handle = teamCtx.memberHandles.get(memberName);
       if (!handle) {
         console.warn(`[team] Cannot send to unknown member: ${memberName}`);
         return;
@@ -169,7 +54,7 @@ export default function (pi: ExtensionAPI) {
         details: { msg },
       });
     },
-    memberNames: [], // populated when team starts
+    memberNames: [],
   });
 
   const messageQueue = createMessageQueue(async (msg: TeamMessage) => {
@@ -177,17 +62,27 @@ export default function (pi: ExtensionAPI) {
     router.route(msg);
   });
 
-  /**
-   * Create a member process handle, wire event listeners, and register
-   * with both the processManager (lifecycle) and memberHandles (messaging).
-   */
-  function createAndRegisterMember(config: import("./src/process/member-process").MemberProcessConfig): ReturnType<typeof createMemberProcess> {
+  teamCtx.router = router;
+  teamCtx.messageQueue = messageQueue;
+
+  // ── Create and register member handles ─────────────────────
+  function createAndRegisterMember(
+    config: import("./src/process/member-process").MemberProcessConfig
+  ): ReturnType<typeof createMemberProcess> {
     const handle = createMemberProcess(config, spawn);
-    memberHandles.set(config.name, handle);
-    processManager?.addHandle(handle);
+    teamCtx.memberHandles.set(config.name, handle);
+    teamCtx.processManager?.addHandle(handle);
+
+    // Backup parse: scan text blocks for <team-message> tags
+    function parseTeamMessageTag(text: string): { to: string; subject?: string; content: string } | null {
+      const m = text.match(/<team-message\s+to="([^"]+)"(?:\s+subject="([^"]*)")?>([\s\S]*?)<\/team-message>/);
+      if (!m) return null;
+      return { to: m[1], subject: m[2] || undefined, content: m[3].trim() };
+    }
 
     // Wire message channel: intercept team_send_message tool calls
     handle.onEvent((event: any) => {
+      // Primary: team_send_message tool result
       if (event.type === "tool_execution_end" && event.toolName === "team_send_message") {
         const teamMsg = event.result?.details?.teamMessage;
         if (teamMsg) {
@@ -201,15 +96,61 @@ export default function (pi: ExtensionAPI) {
           });
         }
       }
+
+      // Backup: check assistant text for <team-message> tags
+      if (event.type === "message_end" && event.message?.role === "assistant") {
+        const text = typeof event.message.content === "string"
+          ? event.message.content
+          : event.message.content?.map((c: any) => c.text ?? "").join(" ") ?? "";
+        const parsed = parseTeamMessageTag(text);
+        if (parsed) {
+          messageQueue.enqueue({
+            id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            from: config.name,
+            to: parsed.to,
+            subject: parsed.subject,
+            content: parsed.content,
+            timestamp: Date.now(),
+          });
+        }
+      }
+
+      // Handle process crash: auto-restart + notify TL
+      if (event.type === "process_exit" && event.wasRunning) {
+        const memberName = event.memberName;
+        const exitCode = event.exitCode;
+        console.warn(`[team] Member "${memberName}" exited with code ${exitCode}, auto-restarting...`);
+
+        // Trigger auto-restart via manager
+        teamCtx.processManager?.handleExit(memberName, exitCode);
+
+        // Notify TL via message channel
+        pi.sendMessage({
+          customType: "team-message",
+          content: `Member "${memberName}" 进程异常退出（code: ${exitCode}），已自动重启。`,
+          display: true,
+          details: { crashEvent: event },
+        });
+      }
+
+      if (event.type === "process_error") {
+        const memberName = event.memberName;
+        console.warn(`[team] Member "${memberName}" process error`);
+        teamCtx.processManager?.handleExit(memberName, null);
+        pi.sendMessage({
+          customType: "team-message",
+          content: `Member "${memberName}" 进程异常，已自动重启。`,
+          display: true,
+        });
+      }
     });
 
     return handle;
   }
 
-  /**
-   * Build a MemberProcessConfig from team definition + member name.
-   */
-  function buildMemberConfig(memberName: string): import("./src/process/member-process").MemberProcessConfig | null {
+  function buildMemberConfig(
+    memberName: string
+  ): import("./src/process/member-process").MemberProcessConfig | null {
     const session = getSessionState();
     const team = session.teamDefinition;
     if (!team) return null;
@@ -234,13 +175,12 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
-  // Register TL tools once at startup (inactive by default)
   const manager = createProcessManager([], { autoRestart: true });
-  processManager = manager;
+  teamCtx.processManager = manager;
 
   // getMemberLog: query member session via RPC get_messages
   async function getMemberLog(memberName: string, maxLines: number): Promise<string> {
-    const handle = memberHandles.get(memberName);
+    const handle = teamCtx.memberHandles.get(memberName);
     if (!handle) {
       throw new Error(`Member "${memberName}" not found`);
     }
@@ -262,85 +202,27 @@ export default function (pi: ExtensionAPI) {
 
   registerTlTools(pi, manager, createAndRegisterMember, buildMemberConfig, getMemberLog);
 
-  // ── /team start: activate team session ──────────────────
-  pi.registerCommand("team-start", {
-    description: "启动团队会话",
-    handler: async (args: string, ctx) => {
-      const name = args.trim();
-      if (!name) {
-        ctx.ui.notify("用法：/team start <团队名称>", "warning");
-        return;
-      }
-
-      const team = readTeam(name, getRootDir());
-      if (!team) {
-        ctx.ui.notify(`团队 "${name}" 不存在`, "warning");
-        return;
-      }
-
-      startSessionState(team);
-
-      // Update message channel router with team members
-      router.updateMembers(team.members.map((m) => m.name));
-
-      // Activate TL tools by adding them to the active tool set
-      const allTools = pi.getAllTools();
-      const tlToolNames = ["start_member", "stop_member", "list_members", "get_member_log"];
-      const currentActive = pi.getActiveTools();
-      const newActive = [...new Set([...currentActive, ...tlToolNames])];
-      pi.setActiveTools(newActive);
-
-      ctx.ui.notify(
-        `团队 "${name}" 已就绪。${team.members.length} 个成员待启动。\n` +
-          `TL 已获得进程管理工具（start_member, stop_member, list_members, get_member_log）。\n` +
-          `请告诉 TL 你的任务需求，TL 会引导你完成。`,
-        "info"
-      );
-    },
-  });
-
-  // ── /team stop: end team session ────────────────────────
-  pi.registerCommand("team-stop", {
-    description: "终止当前团队会话",
-    handler: async (_args: string, ctx) => {
-      const session = getSessionState();
-
-      if (!session.active) {
-        ctx.ui.notify("当前无活跃团队会话", "info");
-        return;
-      }
-
-      const teamName = session.teamDefinition?.name ?? "unknown";
-
-      // Stop all member processes
-      if (processManager) {
-        await processManager.stopAll();
-      }
-      memberHandles.clear();
-      router.updateMembers([]);
-
-      // Deactivate TL tools
-      const allTools = pi.getAllTools();
-      const tlToolNames = ["start_member", "stop_member", "list_members", "get_member_log"];
-      const currentActive = pi.getActiveTools();
-      const newActive = currentActive.filter((t: string) => !tlToolNames.includes(t));
-      pi.setActiveTools(newActive);
-
-      endSessionState();
-      ctx.ui.notify(`团队 "${teamName}" 会话已结束`, "info");
-    },
-  });
+  // ── Register all 7 commands ──────────────────────────────
+  registerListCommand(pi);
+  registerShowCommand(pi);
+  registerDeleteCommand(pi);
+  registerStatusCommand(pi, () =>
+    (teamCtx.processManager?.listStatus().map((s) => ({
+      name: s.name,
+      status: s.status,
+      pid: s.pid,
+    })) ?? [])
+  );
+  registerCreateCommand(pi, teamCtx);
+  registerStartCommand(pi, teamCtx);
+  registerStopCommand(pi, teamCtx);
 
   // ── TL system prompt injection ───────────────────────────
-  // When a team session is active, inject TL instructions.
-  // When /team create is active, inject create-team instructions.
   pi.on("before_agent_start", async (event, _ctx) => {
-    const { getSessionState } = await import("./src/session/state");
     const session = getSessionState();
-
     let extraPrompt = "";
 
-    if (isCreatingTeam) {
+    if (teamCtx.isCreatingTeam) {
       extraPrompt = `
 ## 当前任务：创建团队定义
 
@@ -362,10 +244,7 @@ export default function (pi: ExtensionAPI) {
     } else if (session.active && session.teamDefinition) {
       const team = session.teamDefinition;
       const memberLines = team.members
-        .map(
-          (m) =>
-            `  - ${m.name}（${m.label ?? m.name}）— ${m.systemPrompt.slice(0, 80)}`
-        )
+        .map((m) => `  - ${m.name}（${m.label ?? m.name}）— ${m.systemPrompt.slice(0, 80)}`)
         .join("\n");
 
       extraPrompt = `
@@ -393,11 +272,7 @@ ${memberLines}
     }
 
     if (extraPrompt) {
-      return {
-        systemPrompt: event.systemPrompt + extraPrompt,
-      };
+      return { systemPrompt: event.systemPrompt + extraPrompt };
     }
-
-    return;
   });
 }

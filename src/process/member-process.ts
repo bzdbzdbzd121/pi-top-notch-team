@@ -191,14 +191,28 @@ export function createMemberProcess(
         }
       });
 
-      child.on("exit", (_code, _signal) => {
+      child.on("exit", (code, _signal) => {
+        const wasRunning = status === "running";
         status = "stopped";
         pid = null;
+        // Notify handlers so the manager can trigger auto-restart
+        notifyHandlers({
+          type: "process_exit",
+          memberName: name,
+          exitCode: code,
+          wasRunning,
+        });
       });
 
       child.on("error", () => {
+        const wasRunning = status === "running";
         status = "error";
         pid = null;
+        notifyHandlers({
+          type: "process_error",
+          memberName: name,
+          wasRunning,
+        });
       });
     },
 
