@@ -23,7 +23,11 @@ export default function (pi: ExtensionAPI) {
   registerListCommand(pi);
   registerShowCommand(pi);
   registerDeleteCommand(pi);
-  registerStatusCommand(pi);
+  registerStatusCommand(pi, () => processManager?.listStatus().map((s) => ({
+    name: s.name,
+    status: s.status,
+    pid: s.pid,
+  })) ?? []);
 
   // ── /team create: natural language team creation ─────────
   // Uses before_agent_start to inject instructions for the TL
@@ -238,7 +242,29 @@ export default function (pi: ExtensionAPI) {
   const manager = createProcessManager([], { autoRestart: true });
   processManager = manager;
 
-  registerTlTools(pi, manager, createAndRegisterMember, buildMemberConfig);
+  // getMemberLog: query member session via RPC get_messages
+  async function getMemberLog(memberName: string, maxLines: number): Promise<string> {
+    const handle = memberHandles.get(memberName);
+    if (!handle) {
+      throw new Error(`Member "${memberName}" not found`);
+    }
+
+    const response = await handle.sendCommandAndWait(
+      { type: "get_messages" },
+      (event: any) => event.type === "response" && event.command === "get_messages"
+    );
+
+    const messages = response?.data?.messages ?? [];
+    const recent = messages.slice(-maxLines);
+    return recent
+      .map(
+        (m: any) =>
+          `[${m.role}] ${typeof m.content === "string" ? m.content : JSON.stringify(m.content)}`
+      )
+      .join("\n");
+  }
+
+  registerTlTools(pi, manager, createAndRegisterMember, buildMemberConfig, getMemberLog);
 
   // ── /team start: activate team session ──────────────────
   pi.registerCommand("team-start", {

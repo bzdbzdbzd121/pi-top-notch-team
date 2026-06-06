@@ -30,6 +30,12 @@ export interface MemberProcessHandle {
   getState(): MemberState;
   onEvent(handler: (event: any) => void): void;
   sendCommand(command: object): void;
+  /** Send a command and wait for a matching response event. */
+  sendCommandAndWait(
+    command: object,
+    matchFn: (event: any) => boolean,
+    timeoutMs?: number
+  ): Promise<any>;
 }
 
 /**
@@ -86,6 +92,44 @@ export function createMemberProcess(
         throw new Error(`Member "${name}" is not running`);
       }
       child.stdin.write(JSON.stringify(command) + "\n");
+    },
+
+    sendCommandAndWait(
+      command: object,
+      matchFn: (event: any) => boolean,
+      timeoutMs: number = 15000
+    ): Promise<any> {
+      if (!child || status !== "running") {
+        return Promise.reject(new Error(`Member "${name}" is not running`));
+      }
+
+      const id = `req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const cmd = { ...command, id };
+
+      // Write command
+      child.stdin!.write(JSON.stringify(cmd) + "\n");
+
+      return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          cleanup();
+          reject(new Error(`Command to "${name}" timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+
+        function handler(event: any) {
+          if (event.type === "response" && event.id === id && matchFn(event)) {
+            cleanup();
+            resolve(event);
+          }
+        }
+
+        function cleanup() {
+          clearTimeout(timeout);
+          const idx = eventHandlers.indexOf(handler);
+          if (idx >= 0) eventHandlers.splice(idx, 1);
+        }
+
+        eventHandlers.push(handler);
+      });
     },
 
     async start(): Promise<void> {

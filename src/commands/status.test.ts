@@ -72,4 +72,25 @@ describe("team status command", () => {
       "info"
     );
   });
+
+  it("shows member statuses when provider is given", async () => {
+    startSession(testTeam);
+
+    const pi = createMockExtensionAPI();
+    const ctx = createMockContext();
+    let handler: Function = () => {};
+    pi.registerCommand = vi.fn((_name, opts) => {
+      handler = opts.handler;
+    });
+
+    registerStatusCommand(pi, () => [
+      { name: "worker", status: "running", pid: 12345 },
+    ]);
+
+    await handler("", ctx);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("🟢"),
+      "info"
+    );
+  });
 });

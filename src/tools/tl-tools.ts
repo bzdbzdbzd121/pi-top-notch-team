@@ -6,6 +6,7 @@ import { spawn } from "node:child_process";
 
 type CreateMemberFn = (config: MemberProcessConfig) => MemberProcessHandle;
 type BuildConfigFn = (memberName: string) => MemberProcessConfig | null;
+type GetMemberLogFn = (memberName: string, maxLines: number) => Promise<string>;
 
 /**
  * Register the 4 TL process management tools.
@@ -15,7 +16,8 @@ export function registerTlTools(
   pi: ExtensionAPI,
   manager: ProcessManager,
   createMember: CreateMemberFn = (config) => createMemberProcess(config, spawn),
-  buildMemberConfig?: BuildConfigFn
+  buildMemberConfig?: BuildConfigFn,
+  getMemberLog?: GetMemberLogFn
 ): void {
   // ── start_member ────────────────────────────────────────
   pi.registerTool({
@@ -159,6 +161,7 @@ export function registerTlTools(
       required: ["name"],
     } as any,
     async execute(_toolCallId: string, params: { name: string; lines?: number }) {
+      const maxLines = params.lines ?? 10;
       const status = manager.getStatus(params.name);
       if (!status || status.status !== "running") {
         return {
@@ -171,14 +174,37 @@ export function registerTlTools(
         };
       }
 
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Member "${params.name}" 当前状态：${status.status} (PID: ${status.pid})\n\n日志查询功能需在 Phase 4 中通过 RPC get_messages 实现。`,
-          },
-        ],
-      };
+      if (!getMemberLog) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Member "${params.name}" 日志查询功能不可用：未配置日志获取函数。`,
+            },
+          ],
+        };
+      }
+
+      try {
+        const logText = await getMemberLog(params.name, maxLines);
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Member "${params.name}" 最近对话：\n\n${logText}`,
+            },
+          ],
+        };
+      } catch (err) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `读取 Member "${params.name}" 日志失败：${err instanceof Error ? err.message : String(err)}`,
+            },
+          ],
+        };
+      }
     },
   });
 }

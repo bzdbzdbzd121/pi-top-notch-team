@@ -169,4 +169,52 @@ describe("createMemberProcess", () => {
     const member = createMemberProcess(defaultConfig, spawnMock);
     await expect(member.start()).rejects.toThrow();
   });
+
+  describe("sendCommandAndWait", () => {
+    it("sends command and resolves on matching response event", async () => {
+      const { process: mockProcess, stdin, stdout } = createMockSpawn();
+      const spawnMock = vi.fn().mockReturnValue(mockProcess);
+
+      const member = createMemberProcess(defaultConfig, spawnMock);
+      await member.start();
+
+      // Capture what was written to stdin
+      const writeSpy = vi.fn();
+      stdin.write = writeSpy;
+
+      // Initiate the request
+      const resultPromise = member.sendCommandAndWait(
+        { type: "get_messages" },
+        (event) => event.type === "response" && event.command === "get_messages"
+      );
+
+      // Verify command was sent with an id
+      expect(writeSpy).toHaveBeenCalled();
+      const sent = JSON.parse(writeSpy.mock.calls[0][0]);
+      expect(sent.type).toBe("get_messages");
+      expect(sent.id).toBeTruthy();
+
+      // Simulate response on stdout
+      const response = JSON.stringify({
+        type: "response",
+        id: sent.id,
+        command: "get_messages",
+        success: true,
+        data: { messages: [{ role: "user", content: "Hello" }] },
+      });
+      stdout.write(response + "\n");
+
+      const result = await resultPromise;
+      expect(result.success).toBe(true);
+      expect(result.data.messages).toHaveLength(1);
+    });
+
+    it("rejects if member is not running", async () => {
+      const member = createMemberProcess(defaultConfig, vi.fn());
+      // Don't start - status is "stopped"
+      await expect(
+        member.sendCommandAndWait({ type: "get_messages" }, () => true)
+      ).rejects.toThrow();
+    });
+  });
 });
