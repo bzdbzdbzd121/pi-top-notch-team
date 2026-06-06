@@ -590,7 +590,7 @@ TEAM_SHARED_CONTEXT_PATH=~/.pi/top-notch-team/sessions/refactoring/shared-contex
 | Level | What | Mock Strategy | Test Framework |
 |-------|------|---------------|----------------|
 | **Unit** | Pure logic: YAML validation, message queue, routing, session state, env var helpers | None (pure functions) | vitest |
-| **Integration** | pi-dependent: command handlers, tl-tools, member-tool, process manager | Mock `ExtensionAPI`, `ChildProcess`, `WritableStream` via `vi.mock()` or factory injection | vitest + vi |
+| **Integration** | pi-dependent: command handlers, tl-tools, member.ts, process manager | Mock `ExtensionAPI`, `ChildProcess`, `WritableStream` via `vi.mock()` or factory injection | vitest + vi |
 | **E2E** | Real pi RPC: spawn `pi --mode rpc`, send JSONL, verify events | Real pi binary (no mocking) | vitest + exec |
 
 ### Patterns

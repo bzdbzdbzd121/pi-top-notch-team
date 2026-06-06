@@ -2,17 +2,7 @@
 
 Multi-agent team collaboration system for pi agent. Allows users to define teams of agent roles that work together on complex, long-running tasks.
 
-## Architecture decisions
-
-**Member Runtime**: Each Member runs as an independent `pi --mode rpc` subprocess. The Team Lead spawns and manages these processes. Members maintain independent session context.
-
-**TL-Member Communication**: TL communicates with each Member via the Member's RPC stdin/stdout (JSONL protocol). TL sends prompt commands to stdin; TL reads events (tool_execution_end, etc.) from stdout.
-
-**Message Channel**: A global message queue within the TL extension that routes messages between agents. All agents (TL and Members) can use the channel. Messages are processed serially by a router, which writes to each target Member's RPC stdin. No external infrastructure (sockets, files, buses) is required.
-
-**Message Passing Mechanism (Member → TL)**: Member agents register a custom tool (`team_send_message`) exposed via the team extension. When called, the tool returns a structured result. The TL listens for `tool_execution_end` events on the Member's RPC stdout, detects the tool name, extracts the message, and enqueues it for routing.
-
-**Remote Support**: The stream abstraction supports remote Members. Instead of spawning `pi` locally, the TL spawns `ssh remote-host pi --mode rpc`. The event stream and RPC protocol remain unchanged.
+See [DESIGN.md](DESIGN.md) for the full design specification and [docs/adr/](docs/adr/) for architecture decisions.
 
 ## Language
 
