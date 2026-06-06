@@ -291,18 +291,22 @@ export function registerTeamCommand(
           return;
         }
 
+        // ── /team help ────────────────────────────────────
+        case "help":
         default: {
-          ctx.ui.notify(
-            `未知子命令 "${subcommand}"。用法：\n` +
-            `  /team create           创建团队\n` +
-            `  /team start <名称>      启动团队会话\n` +
-            `  /team stop             终止团队会话\n` +
-            `  /team list             列出所有团队\n` +
-            `  /team show <名称>       显示团队详情\n` +
-            `  /team delete <名称>     删除团队\n` +
-            `  /team status           查看会话状态`,
-            "warning"
-          );
+          const usage = [
+            `用法：/team <子命令> [参数]`,
+            `  /team create           创建团队（自然语言对话）`,
+            `  /team start <名称>      启动团队会话`,
+            `  /team stop             终止团队会话`,
+            `  /team list             列出所有已创建的团队`,
+            `  /team show <名称>       显示团队定义详情`,
+            `  /team delete <名称>     删除团队定义`,
+            `  /team status           查看当前团队会话状态`,
+            `  /team help             显示此帮助信息`,
+          ].join("\n");
+
+          ctx.ui.notify(usage, subcommand === "help" ? "info" : "warning");
         }
       }
     },

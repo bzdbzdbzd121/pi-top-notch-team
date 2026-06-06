@@ -129,8 +129,22 @@ describe("/team command", () => {
 
     await handler("unknown-command", ctx);
     expect(ctx.ui.notify).toHaveBeenCalledWith(
-      expect.stringContaining("未知子命令"),
+      expect.stringContaining("用法"),
       "warning"
+    );
+  });
+
+  it("/team help shows usage with info level", async () => {
+    const pi = createMockExtensionAPI();
+    const ctx = createMockContext();
+    let handler: Function = () => {};
+    pi.registerCommand = vi.fn((_name, opts) => { handler = opts.handler; });
+    registerTeamCommand(pi, createTeamContext());
+
+    await handler("help", ctx);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("用法"),
+      "info"
     );
   });
 });
