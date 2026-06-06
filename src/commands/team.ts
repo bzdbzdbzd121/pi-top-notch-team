@@ -111,39 +111,50 @@ export function registerTeamCommand(
   pi.registerCommand("team", {
     description: "管理团队（create / start / stop / list / show / delete / status）",
     getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
+      const ALL_SUBCOMMANDS = ["create", "start", "stop", "list", "show", "delete", "status", "help"];
+      const TEAM_NAME_SUBCOMMANDS = ["start", "show", "delete"];
+
       const parts = prefix.split(/\s+/);
       const subcommand = parts[0]?.toLowerCase() ?? "";
 
-      // No subcommand yet — offer subcommand names
+      // --- No subcommand yet: offer all subcommand names ---
       if (parts.length === 1 && !subcommand) {
-        const subcommands = ["create", "start", "stop", "list", "show", "delete", "status", "help"];
-        const filtered = subcommands.filter((s) => s.startsWith(subcommand));
-        return filtered.map((s) => ({ value: s, label: s }));
+        return ALL_SUBCOMMANDS.map((s) => ({ value: s, label: s }));
       }
 
-      // Partial subcommand — filter subcommand names
-      if (parts.length === 1 && subcommand) {
-        const subcommands = ["create", "start", "stop", "list", "show", "delete", "status", "help"];
-        const filtered = subcommands.filter((s) => s.startsWith(subcommand));
-        if (filtered.length === 1 && filtered[0] === subcommand) {
-          // Fully typed a valid subcommand — no completion needed
-          return null;
+      // --- Handles both "start" and "start " ---
+      if (TEAM_NAME_SUBCOMMANDS.includes(subcommand)) {
+        // After subcommand + space: parts.length >= 2 means there's text (or empty) after it
+        if (parts.length >= 2) {
+          const teamPrefix = parts.slice(1).join(" ");
+          const teams = listTeams(getRootDir());
+          const items = teams.map((t) => ({
+            value: `${subcommand} ${t}`,
+            label: t,
+          }));
+          const filtered = items.filter((i) => i.label.startsWith(teamPrefix));
+          return filtered.length > 0 ? filtered : null;
         }
-        return filtered.length > 0 ? filtered.map((s) => ({ value: s, label: s })) : null;
-      }
-
-      // After subcommand: team name completion for start/show/delete
-      if (["start", "show", "delete"].includes(subcommand) && parts.length >= 2) {
-        const teamPrefix = parts.slice(1).join(" ");
+        // Fully typed subcommand ("start") but no space yet — still show team names
+        // so user sees candidates immediately after the subcommand
         const teams = listTeams(getRootDir());
         const items = teams.map((t) => ({
           value: `${subcommand} ${t}`,
           label: t,
         }));
-        const filtered = items.filter((i) => i.label.startsWith(teamPrefix));
-        return filtered.length > 0 ? filtered : null;
+        return items.length > 0 ? items : null;
       }
 
+      // --- Partial or fully typed subcommand (non-team-name) ---
+      if (parts.length === 1 && subcommand) {
+        const filtered = ALL_SUBCOMMANDS.filter((s) => s.startsWith(subcommand));
+        if (filtered.length === 1 && filtered[0] === subcommand) {
+          return null; // fully typed, nothing to complete
+        }
+        return filtered.length > 0 ? filtered.map((s) => ({ value: s, label: s })) : null;
+      }
+
+      // Other subcommands (stop, list, status, help) have no further args — return null
       return null;
     },
     handler: async (args: string, ctx: ExtensionCommandContext) => {
