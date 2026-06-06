@@ -22,7 +22,7 @@ pi install ./pi-top-notch-team
 
 ```
 User's pi session (TL extension)
-  ├── 7 commands (/team create, start, stop, list, show, delete, status)
+  ├── 8 subcommands (/team create, start, stop, list, show, delete, status, help)
   ├── 4 TL tools (start_member, stop_member, list_members, get_member_log)
   ├── Message channel (queue → router)
   └── Member Process Manager
@@ -35,7 +35,7 @@ User's pi session (TL extension)
 
 | File | Role |
 |------|------|
-| `index.ts` | TL extension entry point. Registers 7 commands, TL tools, message channel, `before_agent_start` injection |
+| `index.ts` | TL extension entry point. Registers `/team` command, TL tools, message channel, `before_agent_start` injection |
 | `member.ts` | Member extension entry point. Registers `team_send_message` tool, injects team awareness via env vars |
 | `package.json` | pi package manifest with `pi.extensions` pointing to `["./index.ts", "./member.ts"]` |
 
@@ -149,7 +149,7 @@ npm run test:watch  # Watch mode
 | `/team show <name>` | Display team definition details |
 | `/team delete <name>` | Delete a team definition (with confirmation) |
 | `/team status` | Show active session + member process statuses |
-| `/team help` | Show usage (unknown subcommand) |
+| `/team help` | Display usage help for all subcommands |
 
 ## TL Tools (active only during team session)
 
@@ -167,4 +167,4 @@ npm run test:watch  # Watch mode
 
 ## Design Document
 
-See [DESIGN.md](../DESIGN.md) for the full design specification (16 sections).
+See [DESIGN.md](./DESIGN.md) for the full design specification (16 sections).

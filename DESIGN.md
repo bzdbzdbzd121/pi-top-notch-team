@@ -17,7 +17,7 @@ The TL clarifies requirements with the user, breaks down tasks into a plan, spaw
 │  │                                                    │    │
 │  │  ┌─────────────┐  ┌──────────────┐  ┌──────────┐  │    │
 │  │  │  Commands   │  │  TL Tools    │  │ Message  │  │    │
-│  │  │  (7 total)  │  │ (process mgt)│  │ Router   │  │    │
+│  │  │  (8 total)  │  │ (process mgt)│  │ Router   │  │    │
 │  │  └─────────────┘  └──────────────┘  └─────┬────┘  │    │
 │  │                                            │       │    │
 │  │  ┌─────────────────────────────────────────┴───┐   │    │
@@ -636,7 +636,7 @@ Every step follows the TDD cycle: **write test → implement → refactor**.
 5. `src/team/schema.ts` — validation schema + TDD
 6. `src/team/store.ts` — file read/write + TDD
 7. `src/test/fixtures/mock-extension-api.ts` — mock factory
-8. All 7 command handlers + TDD
+8. `/team` command with all subcommands + TDD
 9. Manual smoke test: `/team create`, `list`, `show`, `delete` work
 
 ### Phase 2: TL Tools + Member Process (integration tests first)
