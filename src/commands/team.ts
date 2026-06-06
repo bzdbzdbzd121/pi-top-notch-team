@@ -273,11 +273,16 @@ export function registerTeamCommand(
           if (team.defaults?.model) {
             output += `默认模型：${team.defaults.model}\n`;
           }
-          output += `成员（${team.members.length}）：\n`;
+          output += `\n成员（${team.members.length}）：\n\n`;
           for (const m of team.members) {
-            output += `  - ${m.label ?? m.name}`;
-            if (m.model) output += ` [${m.model}]`;
-            output += `\n    提示词：${m.systemPrompt}\n`;
+            output += `  [${m.label ?? m.name}]`;
+            if (m.model) output += ` - 模型: ${m.model}`;
+            output += `\n  职责:\n`;
+            const promptLines = m.systemPrompt.trim().split("\\n");
+            for (const pl of promptLines) {
+              output += `    ${pl}\n`;
+            }
+            output += `\n`;
           }
 
           ctx.ui.notify(output, "info");
