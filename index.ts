@@ -125,10 +125,6 @@ export default function (pi: ExtensionAPI) {
       },
     });
 
-    // Deactivate create_team_definition tool until /team create is used
-    const allTools = pi.getAllTools().map((t) => t.name);
-    pi.setActiveTools(allTools.filter((t) => t !== "create_team_definition"));
-
     // Register the /team create command
     pi.registerCommand("team-create", {
       description: "通过自然语言对话创建团队",

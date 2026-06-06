@@ -61,6 +61,7 @@ describe("registerTlTools", () => {
       stop: vi.fn(),
       onEvent: vi.fn(),
       sendCommand: vi.fn(),
+      sendCommandAndWait: vi.fn(),
     });
     const buildConfig = vi.fn().mockReturnValue({
       name: "analyzer",

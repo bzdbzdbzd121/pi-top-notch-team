@@ -13,6 +13,7 @@ function createMockHandle(
     getState: vi.fn().mockReturnValue({ name, pid: 12345, status: "running" }),
     onEvent: vi.fn(),
     sendCommand: vi.fn(),
+    sendCommandAndWait: vi.fn().mockResolvedValue({ data: { messages: [] } }),
     ...overrides,
   };
 }

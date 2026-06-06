@@ -37,10 +37,10 @@ export function registerTlTools(
       required: ["name"],
     } as any,
     async execute(_toolCallId: string, params: { name: string }) {
-      // Build config from team definition and create the process
       const config = buildMemberConfig?.(params.name);
       if (!config) {
         return {
+          details: {},
           content: [
             {
               type: "text" as const,
@@ -54,6 +54,7 @@ export function registerTlTools(
         const handle = createMember(config);
         await handle.start();
         return {
+          details: {},
           content: [
             {
               type: "text" as const,
@@ -63,6 +64,7 @@ export function registerTlTools(
         };
       } catch (err) {
         return {
+          details: {},
           content: [
             {
               type: "text" as const,
@@ -94,6 +96,7 @@ export function registerTlTools(
     async execute(_toolCallId: string, params: { name: string }) {
       await manager.stop(params.name);
       return {
+        details: {},
         content: [
           {
             type: "text" as const,
@@ -117,6 +120,7 @@ export function registerTlTools(
       const statuses = manager.listStatus();
       if (statuses.length === 0) {
         return {
+          details: {},
           content: [
             {
               type: "text" as const,
@@ -129,6 +133,7 @@ export function registerTlTools(
         (s) => `  - ${s.name}: ${s.status}${s.pid ? ` (PID: ${s.pid})` : ""}`
       );
       return {
+        details: {},
         content: [
           {
             type: "text" as const,
@@ -165,6 +170,7 @@ export function registerTlTools(
       const status = manager.getStatus(params.name);
       if (!status || status.status !== "running") {
         return {
+          details: {},
           content: [
             {
               type: "text" as const,
@@ -176,6 +182,7 @@ export function registerTlTools(
 
       if (!getMemberLog) {
         return {
+          details: {},
           content: [
             {
               type: "text" as const,
@@ -188,6 +195,7 @@ export function registerTlTools(
       try {
         const logText = await getMemberLog(params.name, maxLines);
         return {
+          details: {},
           content: [
             {
               type: "text" as const,
@@ -197,6 +205,7 @@ export function registerTlTools(
         };
       } catch (err) {
         return {
+          details: {},
           content: [
             {
               type: "text" as const,
