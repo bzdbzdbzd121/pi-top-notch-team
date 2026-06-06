@@ -74,7 +74,7 @@ pi-top-notch-team/
 │   │   └── status.ts           ← StatusProvider type export
 │   ├── tools/
 │   │   └── tl-tools.ts         ← TL process management tool registrations
-│   ├── (team_send_message tool is registered in member.ts directly)
+│   │   (team_send_message is in member.ts directly)
 │   ├── channel/
 │   │   ├── message-queue.ts    ← Global serial message queue
 │   │   ├── router.ts           ← Message routing logic
@@ -110,11 +110,18 @@ pi-top-notch-team/
       "./member.ts"
     ]
   },
+  "dependencies": {
+    "yaml": "^2.7.0"
+  },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-tui": "*",
     "typebox": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0"
   }
 }
 ```
@@ -138,8 +145,15 @@ Since TL and Member are declared as two separate extensions, but both are loaded
 **Detection logic in `member.ts`:**
 
 ```typescript
-// Member side: only activates if running as part of a team
-if (ctx.mode === "rpc" && process.env.TEAM_ROLE) {
+export default function (pi: ExtensionAPI) {
+  const role = process.env.TEAM_ROLE;
+  const teamName = process.env.TEAM_NAME;
+
+  // Only activate if this process was launched as a Member
+  if (!role || !teamName) {
+    return; // Early exit — no tools registered
+  }
+
   // Register team_send_message tool
   // Inject team system prompt via before_agent_start
 }
@@ -435,33 +449,30 @@ When `/team start` creates a team session, the extension sets up a `before_agent
 > 8. 任务完成后向用户汇报结果
 > 9. 让用户决定是否 /team stop
 
-This handler is removed when `/team stop` ends the session.
+The handler stays registered for the entire pi session but checks `session.active` to decide whether to inject TL instructions. When `/team stop` ends the session, `session.active` becomes `false` and no extra prompt is injected.
 
 ## 11. Team Session State
 
 ```typescript
+// src/session/state.ts — lightweight session state
 interface TeamSessionState {
   active: boolean;
-  teamName: string;
-  teamDefinition: TeamDefinition;
-  members: Map<string, MemberProcess>;
-  messageQueue: MessageQueue;
-  startedAt: number;
+  teamDefinition: TeamDefinition | null;
+  startedAt: number | null;
 }
 
-interface MemberProcess {
-  name: string;
-  process: ChildProcess | null;
-  pid: number | null;
-  status: "stopped" | "running" | "error";
-  rpcStdin: WritableStream | null;
-  rpcStdoutEventParser: EventEmitter | null;
-  sessionDir: string;
-  startedAt: number | null;
+// src/session/context.ts — shared mutable references for the extension
+interface TeamContext {
+  isCreatingTeam: boolean;
+  processManager: ProcessManager | null;
+  memberHandles: Map<string, MemberProcessHandle>;
+  router: Router;
+  messageQueue: MessageQueue;
+  tlToolNames: string[];
 }
 ```
 
-State is held in memory in the extension closure. On `/team stop`, all processes are terminated and state is cleared.
+Session state (active + team definition) is stored in `session/state.ts` as a module-level variable. Member process handles, message channel, and other runtime objects are in `TeamContext` passed to command handlers. On `/team stop`, all processes are terminated, handles cleared, and state reset.
 
 ## 12. Error Handling
 
