@@ -196,6 +196,37 @@ export default function (pi: ExtensionAPI) {
 
   registerTlTools(pi, manager, createAndRegisterMember, buildMemberConfig, getMemberLog);
 
+  // ── Custom autocomplete: suppress file paths for team name args ──
+  pi.on("session_start", (_event, ctx) => {
+    ctx.ui.addAutocompleteProvider((current) => ({
+      async getSuggestions(lines, line, col, options) {
+        const beforeCursor = (lines[line] ?? "").slice(0, col);
+        const match = beforeCursor.match(/^\/team\s+(start|show|delete)\s+(.*)$/);
+        if (match) {
+          const partial = match[2];
+          const teams = (await import("./src/team/store")).listTeams(
+            (await import("./src/config")).getRootDir()
+          );
+          const items = teams
+            .filter((t: string) => t.startsWith(partial))
+            .map((t: string) => ({ value: t, label: t }));
+          return { prefix: partial, items };
+        }
+        return current.getSuggestions(lines, line, col, options);
+      },
+      applyCompletion(lines, line, col, item, prefix) {
+        return current.applyCompletion(lines, line, col, item, prefix);
+      },
+      shouldTriggerFileCompletion(lines, line, col) {
+        const beforeCursor = (lines[line] ?? "").slice(0, col);
+        if (/^\/team\s+(start|show|delete)/.test(beforeCursor)) {
+          return false;
+        }
+        return current.shouldTriggerFileCompletion?.(lines, line, col) ?? true;
+      },
+    }));
+  });
+
   // ── Register all 7 commands ──────────────────────────────
   registerTeamCommand(pi, teamCtx, () =>
     (teamCtx.processManager?.listStatus().map((s) => ({

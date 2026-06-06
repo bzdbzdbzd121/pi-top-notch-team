@@ -111,16 +111,10 @@ export function registerTeamCommand(
   pi.registerCommand("team", {
     description: "管理团队（create / start / stop / list / show / delete / status）",
     getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
-      // prefix is everything after "/team " — e.g. "start 重" or "start "
       const parts = prefix.split(/\s+/);
       const subcommand = parts[0]?.toLowerCase() ?? "";
-
-      // Only for subcommands that take a team name
       if (!["start", "show", "delete"].includes(subcommand)) return null;
-
-      // Need at least a subcommand + something (trailing space gives empty string)
       if (parts.length < 2) return null;
-
       const teamPrefix = parts.slice(1).join(" ");
       const teams = listTeams(getRootDir());
       const items = teams.map((t) => ({
