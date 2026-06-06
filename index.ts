@@ -219,7 +219,8 @@ export default function (pi: ExtensionAPI) {
       },
       shouldTriggerFileCompletion(lines, line, col) {
         const beforeCursor = (lines[line] ?? "").slice(0, col);
-        if (/^\/team\s+(start|show|delete)/.test(beforeCursor)) {
+        // Suppress file completion for ANY /team input
+        if (/^\/team/.test(beforeCursor)) {
           return false;
         }
         return current.shouldTriggerFileCompletion?.(lines, line, col) ?? true;

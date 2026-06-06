@@ -113,16 +113,38 @@ export function registerTeamCommand(
     getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
       const parts = prefix.split(/\s+/);
       const subcommand = parts[0]?.toLowerCase() ?? "";
-      if (!["start", "show", "delete"].includes(subcommand)) return null;
-      if (parts.length < 2) return null;
-      const teamPrefix = parts.slice(1).join(" ");
-      const teams = listTeams(getRootDir());
-      const items = teams.map((t) => ({
-        value: `${subcommand} ${t}`,
-        label: t,
-      }));
-      const filtered = items.filter((i) => i.label.startsWith(teamPrefix));
-      return filtered.length > 0 ? filtered : null;
+
+      // No subcommand yet — offer subcommand names
+      if (parts.length === 1 && !subcommand) {
+        const subcommands = ["create", "start", "stop", "list", "show", "delete", "status", "help"];
+        const filtered = subcommands.filter((s) => s.startsWith(subcommand));
+        return filtered.map((s) => ({ value: s, label: s }));
+      }
+
+      // Partial subcommand — filter subcommand names
+      if (parts.length === 1 && subcommand) {
+        const subcommands = ["create", "start", "stop", "list", "show", "delete", "status", "help"];
+        const filtered = subcommands.filter((s) => s.startsWith(subcommand));
+        if (filtered.length === 1 && filtered[0] === subcommand) {
+          // Fully typed a valid subcommand — no completion needed
+          return null;
+        }
+        return filtered.length > 0 ? filtered.map((s) => ({ value: s, label: s })) : null;
+      }
+
+      // After subcommand: team name completion for start/show/delete
+      if (["start", "show", "delete"].includes(subcommand) && parts.length >= 2) {
+        const teamPrefix = parts.slice(1).join(" ");
+        const teams = listTeams(getRootDir());
+        const items = teams.map((t) => ({
+          value: `${subcommand} ${t}`,
+          label: t,
+        }));
+        const filtered = items.filter((i) => i.label.startsWith(teamPrefix));
+        return filtered.length > 0 ? filtered : null;
+      }
+
+      return null;
     },
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const parts = args.trim().split(/\s+/);
