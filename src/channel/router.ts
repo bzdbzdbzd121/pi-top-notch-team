@@ -11,6 +11,8 @@ export interface RouterConfig {
 
 export interface Router {
   route(msg: TeamMessage): void;
+  /** Update the list of valid member names (called when a team session starts). */
+  updateMembers(names: string[]): void;
 }
 
 /**
@@ -21,6 +23,15 @@ export function createRouter(config: RouterConfig): Router {
   const memberSet = new Set(memberNames);
 
   return {
+    updateMembers(names: string[]): void {
+      memberNames.length = 0;
+      memberNames.push(...names);
+      memberSet.clear();
+      for (const n of names) {
+        memberSet.add(n);
+      }
+    },
+
     route(msg: TeamMessage): void {
       const { from, to } = msg;
 

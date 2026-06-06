@@ -14,6 +14,39 @@ function makeMsg(overrides?: Partial<TeamMessage>): TeamMessage {
 }
 
 describe("createRouter", () => {
+  it("updateMembers changes valid targets", () => {
+    const sendToMember = vi.fn();
+    const router = createRouter({
+      sendToMember,
+      sendToTl: vi.fn(),
+      memberNames: ["analyzer"],
+    });
+
+    // Add new members
+    router.updateMembers(["analyzer", "mover", "verifier"]);
+
+    router.route(makeMsg({ from: "analyzer", to: "verifier", content: "Hi" }));
+    expect(sendToMember).toHaveBeenCalledWith("verifier", expect.anything());
+  });
+
+  it("updateMembers with empty list clears targets", () => {
+    const sendToMember = vi.fn();
+    const router = createRouter({
+      sendToMember,
+      sendToTl: vi.fn(),
+      memberNames: ["analyzer"],
+    });
+
+    router.updateMembers([]);
+
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    router.route(makeMsg({ from: "analyzer", to: "analyzer" }));
+    // Should skip self and not send
+    expect(sendToMember).not.toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+
+
   it("routes message to a specific member", () => {
     const sendToMember = vi.fn();
     const sendToTl = vi.fn();

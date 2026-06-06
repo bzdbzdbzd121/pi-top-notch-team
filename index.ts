@@ -9,6 +9,9 @@ import { getRootDir } from "./src/config";
 import { registerTlTools } from "./src/tools/tl-tools";
 import { createProcessManager } from "./src/process/manager";
 import { createMemberProcess } from "./src/process/member-process";
+import { createMessageQueue } from "./src/channel/message-queue";
+import { createRouter } from "./src/channel/router";
+import type { TeamMessage } from "./src/channel/types";
 import { spawn } from "node:child_process";
 
 export default function (pi: ExtensionAPI) {
@@ -139,6 +142,40 @@ export default function (pi: ExtensionAPI) {
   let processManager: ReturnType<typeof createProcessManager> | null = null;
   const memberHandles: Map<string, ReturnType<typeof createMemberProcess>> = new Map();
 
+  // Message channel: queue → router
+  const router = createRouter({
+    sendToMember: (memberName: string, msg: TeamMessage) => {
+      const handle = memberHandles.get(memberName);
+      if (!handle) {
+        console.warn(`[team] Cannot send to unknown member: ${memberName}`);
+        return;
+      }
+      try {
+        handle.sendCommand({
+          type: "prompt",
+          message: `[消息通道 - 来自 ${msg.from}]
+${msg.subject ? `主题：${msg.subject}\n` : ""}${msg.content}`,
+        });
+      } catch (err) {
+        console.warn(`[team] Failed to send to ${memberName}:`, err);
+      }
+    },
+    sendToTl: (msg: TeamMessage) => {
+      pi.sendMessage({
+        customType: "team-message",
+        content: `[消息通道 - 来自 ${msg.from}]
+${msg.subject ? `主题：${msg.subject}\n` : ""}${msg.content}`,
+        display: true,
+        details: { msg },
+      });
+    },
+    memberNames: [], // populated when team starts
+  });
+
+  const messageQueue = createMessageQueue(async (msg: TeamMessage) => {
+    router.route(msg);
+  });
+
   // Register TL tools once at startup (inactive by default)
   function setupTlTools() {
     const manager = createProcessManager([], { autoRestart: true });
@@ -151,7 +188,17 @@ export default function (pi: ExtensionAPI) {
       // Wire exit handling for auto-restart
       handle.onEvent((event: any) => {
         if (event.type === "tool_execution_end" && event.toolName === "team_send_message") {
-          // Route message via message channel (Phase 3)
+          const teamMsg = event.result?.details?.teamMessage;
+          if (teamMsg) {
+            messageQueue.enqueue({
+              id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+              from: teamMsg.from,
+              to: teamMsg.to,
+              subject: teamMsg.subject,
+              content: teamMsg.content,
+              timestamp: teamMsg.timestamp ?? Date.now(),
+            });
+          }
         }
       });
 
@@ -178,6 +225,9 @@ export default function (pi: ExtensionAPI) {
       }
 
       startSessionState(team);
+
+      // Update message channel router with team members
+      router.updateMembers(team.members.map((m) => m.name));
 
       // Activate TL tools by adding them to the active tool set
       const allTools = pi.getAllTools();
@@ -214,6 +264,7 @@ export default function (pi: ExtensionAPI) {
         await processManager.stopAll();
       }
       memberHandles.clear();
+      router.updateMembers([]);
 
       // Deactivate TL tools
       const allTools = pi.getAllTools();
