@@ -38,6 +38,7 @@ pi -e ./index.ts
 | Command | Description |
 |---------|-------------|
 | `/team create` | Create a team via natural language dialogue |
+| `/team edit <name>` | Modify an existing team via natural language dialogue |
 | `/team start <name>` | Start a team session |
 | `/team stop` | End the current team session |
 | `/team list` | List all team definitions |
@@ -46,7 +47,7 @@ pi -e ./index.ts
 | `/team status` | Show team session state with member statuses |
 | `/team help` | Show usage help |
 
-Tab completion for team names is supported on `/team start`, `/team show`, `/team delete`.
+Tab completion for team names is supported on `/team start`, `/team show`, `/team delete`, `/team edit`.
 
 ## How It Works
 

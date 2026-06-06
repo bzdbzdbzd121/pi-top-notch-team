@@ -16,6 +16,7 @@ export default function (pi: ExtensionAPI) {
   // ── Shared mutable state ──────────────────────────────────
   const teamCtx: TeamContext = {
     isCreatingTeam: false,
+    editingTeamName: null,
     processManager: null,
     memberHandles: new Map(),
     tlToolNames: ["start_member", "stop_member", "list_members", "get_member_log"],
@@ -196,12 +197,12 @@ export default function (pi: ExtensionAPI) {
 
   registerTlTools(pi, manager, createAndRegisterMember, buildMemberConfig, getMemberLog);
 
-  // ── Custom autocomplete: team names for /team start|show|delete ──
+  // ── Custom autocomplete: team names for /team start|show|delete|edit ──
   pi.on("session_start", (_event, ctx) => {
     ctx.ui.addAutocompleteProvider((current) => ({
       async getSuggestions(lines, line, col, options) {
         const beforeCursor = (lines[line] ?? "").slice(0, col);
-        const m = beforeCursor.match(/^\/team\s+(start|show|delete)(\s+)(.*)$/);
+        const m = beforeCursor.match(/^\/team\s+(start|show|delete|edit)(\s+)(.*)$/);
         if (m) {
           const subCmd = m[1];     // e.g. "show"
           const spacing = m[2];    // e.g. " "
@@ -265,6 +266,24 @@ export default function (pi: ExtensionAPI) {
 3. **默认模型** — 按需指定（可选）
 
 收集完后向用户展示汇总并确认，然后调用 \`create_team_definition\` 工具保存。
+`;
+    } else if (teamCtx.editingTeamName) {
+      const editName = teamCtx.editingTeamName;
+      extraPrompt = `
+## 当前任务：修改团队定义
+
+你正在协助用户修改团队 **${editName}**。请通过自然语言对话了解用户想做的修改。
+
+可能的修改包括：
+- 修改团队名称或描述
+- 添加新成员（name/label/systemPrompt/model）
+- 修改现有成员（名称、提示词、模型）
+- 删除成员
+- 修改默认模型
+
+**不要**追问 name 和 label——从用户的描述中推断。
+
+了解清楚所有修改后，向用户展示修改汇总并确认，然后调用 \`update_team_definition\` 工具保存最终定义。
 `;
     } else if (session.active && session.teamDefinition) {
       const team = session.teamDefinition;

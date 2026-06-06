@@ -45,6 +45,7 @@ _Avoid_: Mission brief, team doc, session context
 | Command | Description |
 |---------|-------------|
 | `/team create` | Interactive team creation via natural language dialog with TL. TL collects info, auto-derives name/label from role descriptions, writes YAML via `create_team_definition` tool. |
+| `/team edit <name>` | Interactive team modification via natural language dialog. TL discusses changes with user, then saves via `update_team_definition` tool. |
 | `/team start <name>` | Start a team session. Activates TL's process management tools, injects TL system prompt via `before_agent_start`. |
 | `/team stop` | Terminate all Member processes and end the current team session. |
 | `/team list` | List all team definitions in `~/.pi/top-notch-team/teams/`. |
@@ -53,7 +54,7 @@ _Avoid_: Mission brief, team doc, session context
 | `/team status` | Show the current team session state with member process statuses (🟢running/⚪stopped/🔴error). |
 | `/team help` | Display usage help for all subcommands. |
 
-Tab completion is supported for team names on `/team start`, `/team show`, `/team delete`.
+Tab completion is supported for team names on `/team start`, `/team show`, `/team delete`, `/team edit`.
 
 ## Example Dialogue
 

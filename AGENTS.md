@@ -22,7 +22,7 @@ pi install ./pi-top-notch-team
 
 ```
 User's pi session (TL extension)
-  ├── 8 subcommands (/team create, start, stop, list, show, delete, status, help)
+  ├── 9 subcommands (/team create, edit, start, stop, list, show, delete, status, help)
   ├── 4 TL tools (start_member, stop_member, list_members, get_member_log)
   ├── Message channel (queue → router)
   └── Member Process Manager
@@ -143,6 +143,7 @@ npm run test:watch  # Watch mode
 | Command | Description |
 |---------|-------------|
 | `/team create` | Natural language team creation via TL dialogue |
+| `/team edit <name>` | Natural language team modification via TL dialogue |
 | `/team start <name>` | Start team session, activate TL tools |
 | `/team stop` | Stop all members, deactivate TL tools |
 | `/team list` | List all team definitions |

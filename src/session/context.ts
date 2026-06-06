@@ -10,6 +10,8 @@ import type { MemberProcessHandle } from "../process/member-process";
  */
 export interface TeamContext {
   isCreatingTeam: boolean;
+  /** When editing, holds the team name. Null otherwise. */
+  editingTeamName: string | null;
   processManager: ProcessManager | null;
   memberHandles: Map<string, MemberProcessHandle>;
   router: Router;

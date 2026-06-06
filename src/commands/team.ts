@@ -108,11 +108,95 @@ export function registerTeamCommand(
     },
   });
 
+  // ── update_team_definition tool ───────────────────────────
+  pi.registerTool({
+    name: "update_team_definition",
+    label: "Update Team Definition",
+    description:
+      "Call this tool after the user has confirmed changes to an existing team. " +
+      "Overwrites the team YAML with the new definition and runs validation.",
+    parameters: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Team name (identifier)" },
+        description: { type: "string", description: "Team description" },
+        defaultModel: { type: "string", description: "Optional default model for all members" },
+        members: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              name: { type: "string" },
+              label: { type: "string" },
+              systemPrompt: { type: "string" },
+              model: { type: "string" },
+            },
+            required: ["name", "systemPrompt"],
+          },
+          description: "Team members",
+        },
+      },
+      required: ["name", "description", "members"],
+    } as any,
+    async execute(
+      _toolCallId: string,
+      params: {
+        name: string;
+        description: string;
+        defaultModel?: string;
+        members: Array<{
+          name: string;
+          label?: string;
+          systemPrompt: string;
+          model?: string;
+        }>;
+      },
+    ) {
+      const { validateTeamDefinition } = await import("../team/schema");
+      const { writeTeam } = await import("../team/store");
+      const { getRootDir } = await import("../config");
+
+      const teamData = {
+        name: params.name,
+        description: params.description,
+        defaults: params.defaultModel ? { model: params.defaultModel } : undefined,
+        members: params.members.map((m) => ({
+          name: m.name,
+          label: m.label,
+          systemPrompt: m.systemPrompt,
+          model: m.model,
+        })),
+      };
+
+      const validation = validateTeamDefinition(teamData);
+      if (!validation.valid) {
+        return {
+          details: {},
+          content: [{
+            type: "text" as const,
+            text: `团队定义校验失败：\n${validation.errors.join("\n")}\n请修正后重试。`,
+          }],
+        };
+      }
+
+      writeTeam(teamData as any, getRootDir());
+      teamCtx.editingTeamName = null;
+
+      return {
+        details: {},
+        content: [{
+          type: "text" as const,
+          text: `团队 "${params.name}" 已更新成功！${params.members.length} 个成员已配置。`,
+        }],
+      };
+    },
+  });
+
   pi.registerCommand("team", {
     description: "管理团队（create / start / stop / list / show / delete / status）",
     getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
-      const ALL_SUBCOMMANDS = ["create", "start", "stop", "list", "show", "delete", "status", "help"];
-      const TEAM_NAME_SUBCOMMANDS = ["start", "show", "delete"];
+      const ALL_SUBCOMMANDS = ["create", "edit", "start", "stop", "list", "show", "delete", "status", "help"];
+      const TEAM_NAME_SUBCOMMANDS = ["start", "show", "delete", "edit"];
 
       const parts = prefix.split(/\s+/);
       const subcommand = parts[0]?.toLowerCase() ?? "";
@@ -181,6 +265,28 @@ export function registerTeamCommand(
           teamCtx.isCreatingTeam = true;
           ctx.ui.notify(
             "团队创建模式已启动。请告诉我你想创建的团队信息，TL 会引导你完成。",
+            "info"
+          );
+          return;
+        }
+
+        // ── /team edit <name> ─────────────────────────────
+        case "edit": {
+          const editName = subargs.trim();
+          if (!editName) {
+            ctx.ui.notify("用法：/team edit <团队名称>，然后通过自然语言描述修改内容", "warning");
+            return;
+          }
+
+          const team = readTeam(editName, getRootDir());
+          if (!team) {
+            ctx.ui.notify(`团队 "${editName}" 不存在`, "warning");
+            return;
+          }
+
+          teamCtx.editingTeamName = editName;
+          ctx.ui.notify(
+            `正在编辑团队 "${editName}"。请告诉 TL 你想做的修改，TL 会引导你完成。`,
             "info"
           );
           return;
@@ -363,6 +469,7 @@ export function registerTeamCommand(
           const usage = [
             `用法：/team <子命令> [参数]`,
             `  /team create           创建团队（自然语言对话）`,
+            `  /team edit <名称>       修改团队定义（自然语言对话）`,
             `  /team start <名称>      启动团队会话`,
             `  /team stop             终止团队会话`,
             `  /team list             列出所有已创建的团队`,

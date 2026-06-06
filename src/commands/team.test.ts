@@ -12,6 +12,7 @@ import type { TeamDefinition } from "../team/definition";
 function createTeamContext(): TeamContext {
   return {
     isCreatingTeam: false,
+    editingTeamName: null,
     processManager: null,
     memberHandles: new Map(),
     router: { route: vi.fn(), updateMembers: vi.fn() } as any,
@@ -117,6 +118,34 @@ describe("/team command", () => {
     expect(ctx.ui.notify).toHaveBeenCalledWith(
       expect.stringContaining("无活跃"),
       "info"
+    );
+  });
+
+  it("/team edit without name shows warning", async () => {
+    const pi = createMockExtensionAPI();
+    const ctx = createMockContext();
+    let handler: Function = () => {};
+    pi.registerCommand = vi.fn((_name, opts) => { handler = opts.handler; });
+    registerTeamCommand(pi, createTeamContext());
+
+    await handler("edit", ctx);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("用法"),
+      "warning"
+    );
+  });
+
+  it("/team edit nonexistent shows warning", async () => {
+    const pi = createMockExtensionAPI();
+    const ctx = createMockContext();
+    let handler: Function = () => {};
+    pi.registerCommand = vi.fn((_name, opts) => { handler = opts.handler; });
+    registerTeamCommand(pi, createTeamContext());
+
+    await handler("edit nonexistent", ctx);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("不存在"),
+      "warning"
     );
   });
 
