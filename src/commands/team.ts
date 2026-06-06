@@ -118,13 +118,8 @@ export function registerTeamCommand(
       const subcommand = parts[0]?.toLowerCase() ?? "";
 
       // --- No subcommand yet: offer all subcommand names ---
-      // For start/show/delete, include trailing space in the value so the cursor
-      // is immediately in team-name position after completion.
       if (parts.length === 1 && !subcommand) {
-        return ALL_SUBCOMMANDS.map((s) => ({
-          value: TEAM_NAME_SUBCOMMANDS.includes(s) ? `${s} ` : s,
-          label: s,
-        }));
+        return ALL_SUBCOMMANDS.map((s) => ({ value: s, label: s }));
       }
 
       // --- Handles both "start" and "start " ---
@@ -168,10 +163,7 @@ export function registerTeamCommand(
         }
         // Partial match: show subcommands, with trailing space for team-name ones
         return filtered.length > 0
-          ? filtered.map((s) => ({
-              value: TEAM_NAME_SUBCOMMANDS.includes(s) ? `${s} ` : s,
-              label: s,
-            }))
+          ? filtered.map((s) => ({ value: s, label: s }))
           : null;
       }
 
