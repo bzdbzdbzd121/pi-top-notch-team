@@ -1,4 +1,5 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import type { TeamContext } from "../session/context";
 import { startSession } from "../session/state";
 import { getSessionState, endSession } from "../session/state";
@@ -109,6 +110,21 @@ export function registerTeamCommand(
 
   pi.registerCommand("team", {
     description: "管理团队（create / start / stop / list / show / delete / status）",
+    getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
+      const parts = prefix.trim().split(/\s+/);
+      const subcommand = parts[0]?.toLowerCase() ?? "";
+
+      // Only provide completions for subcommands that take a team name
+      if (["start", "show", "delete"].includes(subcommand)) {
+        const teamPrefix = parts.slice(1).join(" ");
+        const teams = listTeams(getRootDir());
+        const items = teams.map((t) => ({ value: t, label: t }));
+        const filtered = items.filter((i) => i.value.startsWith(teamPrefix));
+        return filtered.length > 0 ? filtered : null;
+      }
+
+      return null;
+    },
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const parts = args.trim().split(/\s+/);
       const subcommand = parts[0]?.toLowerCase() ?? "";
