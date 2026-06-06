@@ -23,8 +23,8 @@ export function createMessageQueue(
       const msg = queue.shift()!;
       try {
         await handler(msg);
-      } catch {
-        // Handler error — continue with next message
+      } catch (err) {
+        console.warn("[team-queue] Error processing message:", msg.id, err);
       }
     }
   }

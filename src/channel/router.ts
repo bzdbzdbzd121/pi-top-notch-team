@@ -19,7 +19,9 @@ export interface Router {
  * Create a message router that determines where to deliver each message.
  */
 export function createRouter(config: RouterConfig): Router {
-  const { sendToMember, sendToTl, memberNames } = config;
+  const sendToMember = config.sendToMember;
+  const sendToTl = config.sendToTl;
+  const memberNames: string[] = [...config.memberNames];
   const memberSet = new Set(memberNames);
 
   return {

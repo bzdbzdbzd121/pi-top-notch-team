@@ -111,4 +111,26 @@ describe("createProcessManager", () => {
 
     expect(startMock).not.toHaveBeenCalled();
   });
+
+  it("adds a new handle dynamically via addHandle", () => {
+    const manager = createProcessManager([]);
+    expect(manager.listStatus()).toHaveLength(0);
+
+    const handle = createMockHandle("new-member");
+    manager.addHandle(handle);
+
+    expect(manager.listStatus()).toHaveLength(1);
+    expect(manager.getStatus("new-member")?.status).toBe("running");
+  });
+
+  it("stopAll works with dynamically added handles", async () => {
+    const stopMock = vi.fn().mockResolvedValue(undefined);
+    const handle = createMockHandle("dynamic", { stop: stopMock });
+
+    const manager = createProcessManager([]);
+    manager.addHandle(handle);
+    await manager.stopAll();
+
+    expect(stopMock).toHaveBeenCalled();
+  });
 });

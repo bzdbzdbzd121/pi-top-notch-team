@@ -105,16 +105,25 @@ export function createMemberProcess(
         env.TEAM_SHARED_CONTEXT_PATH = sharedContextPath;
       }
 
-      child = spawnFn(piCommand, [
-        "--mode", "rpc",
-        "--session-dir", sessionDir,
-        "-e", memberExtensionPath,
-        "--no-session", "false",
-      ], {
-        cwd,
-        env: { ...process.env, ...env },
-        stdio: ["pipe", "pipe", "pipe"],
-      });
+      try {
+        child = spawnFn(piCommand, [
+          "--mode", "rpc",
+          "--session-dir", sessionDir,
+          "-e", memberExtensionPath,
+          "--no-session", "false",
+        ], {
+          cwd,
+          env: { ...process.env, ...env },
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+      } catch (err) {
+        status = "error";
+        pid = null;
+        child = null;
+        throw new Error(
+          `Failed to spawn pi for member "${name}": ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
 
       pid = child.pid ?? null;
       status = "running";

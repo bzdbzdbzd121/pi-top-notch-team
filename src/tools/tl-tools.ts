@@ -5,6 +5,7 @@ import { createMemberProcess } from "../process/member-process";
 import { spawn } from "node:child_process";
 
 type CreateMemberFn = (config: MemberProcessConfig) => MemberProcessHandle;
+type BuildConfigFn = (memberName: string) => MemberProcessConfig | null;
 
 /**
  * Register the 4 TL process management tools.
@@ -13,7 +14,8 @@ type CreateMemberFn = (config: MemberProcessConfig) => MemberProcessHandle;
 export function registerTlTools(
   pi: ExtensionAPI,
   manager: ProcessManager,
-  createMember: CreateMemberFn = (config) => createMemberProcess(config, spawn)
+  createMember: CreateMemberFn = (config) => createMemberProcess(config, spawn),
+  buildMemberConfig?: BuildConfigFn
 ): void {
   // ── start_member ────────────────────────────────────────
   pi.registerTool({
@@ -33,14 +35,40 @@ export function registerTlTools(
       required: ["name"],
     } as any,
     async execute(_toolCallId: string, params: { name: string }) {
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Member "${params.name}" 启动请求已提交。使用 list_members 查看状态。`,
-          },
-        ],
-      };
+      // Build config from team definition and create the process
+      const config = buildMemberConfig?.(params.name);
+      if (!config) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `无法启动 Member "${params.name}"：未找到该成员定义或无活跃团队会话。`,
+            },
+          ],
+        };
+      }
+
+      try {
+        const handle = createMember(config);
+        await handle.start();
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Member "${params.name}" 已启动 (PID: ${handle.getState().pid})。使用 list_members 查看状态，通过消息通道分配任务。`,
+            },
+          ],
+        };
+      } catch (err) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Member "${params.name}" 启动失败：${err instanceof Error ? err.message : String(err)}`,
+            },
+          ],
+        };
+      }
     },
   });
 
@@ -85,6 +113,16 @@ export function registerTlTools(
     } as any,
     async execute() {
       const statuses = manager.listStatus();
+      if (statuses.length === 0) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: "还没有启动任何团队成员。请先使用 start_member 启动成员。",
+            },
+          ],
+        };
+      }
       const lines = statuses.map(
         (s) => `  - ${s.name}: ${s.status}${s.pid ? ` (PID: ${s.pid})` : ""}`
       );
@@ -92,10 +130,7 @@ export function registerTlTools(
         content: [
           {
             type: "text" as const,
-            text:
-              statuses.length === 0
-                ? "没有活跃的团队成员"
-                : `团队成员状态：\n${lines.join("\n")}`,
+            text: `团队成员状态：\n${lines.join("\n")}`,
           },
         ],
       };
@@ -140,7 +175,7 @@ export function registerTlTools(
         content: [
           {
             type: "text" as const,
-            text: `Member "${params.name}" 的日志查询功能需要在 Phase 4 中通过 RPC 的 get_messages 命令实现。\n当前状态：${status.status} (PID: ${status.pid})`,
+            text: `Member "${params.name}" 当前状态：${status.status} (PID: ${status.pid})\n\n日志查询功能需在 Phase 4 中通过 RPC get_messages 实现。`,
           },
         ],
       };

@@ -3,7 +3,7 @@ import { registerListCommand } from "./src/commands/list";
 import { registerShowCommand } from "./src/commands/show";
 import { registerDeleteCommand } from "./src/commands/delete";
 import { registerStatusCommand } from "./src/commands/status";
-import { startSession as startSessionState, endSession as endSessionState } from "./src/session/state";
+import { startSession as startSessionState, endSession as endSessionState, getSessionState } from "./src/session/state";
 import { readTeam, listTeams } from "./src/team/store";
 import { getRootDir } from "./src/config";
 import { registerTlTools } from "./src/tools/tl-tools";
@@ -13,6 +13,7 @@ import { createMessageQueue } from "./src/channel/message-queue";
 import { createRouter } from "./src/channel/router";
 import type { TeamMessage } from "./src/channel/types";
 import { spawn } from "node:child_process";
+import { join } from "node:path";
 
 export default function (pi: ExtensionAPI) {
   // Track whether the TL has the "create team" mission active
@@ -140,6 +141,7 @@ export default function (pi: ExtensionAPI) {
 
   // ── TL tools: registered once, but only activated during team session ──
   let processManager: ReturnType<typeof createProcessManager> | null = null;
+  // Map of member name → process handle for message channel sendCommand access
   const memberHandles: Map<string, ReturnType<typeof createMemberProcess>> = new Map();
 
   // Message channel: queue → router
@@ -153,8 +155,7 @@ export default function (pi: ExtensionAPI) {
       try {
         handle.sendCommand({
           type: "prompt",
-          message: `[消息通道 - 来自 ${msg.from}]
-${msg.subject ? `主题：${msg.subject}\n` : ""}${msg.content}`,
+          message: `[消息通道 - 来自 ${msg.from}]\n${msg.subject ? `主题：${msg.subject}\n` : ""}${msg.content}`,
         });
       } catch (err) {
         console.warn(`[team] Failed to send to ${memberName}:`, err);
@@ -163,8 +164,7 @@ ${msg.subject ? `主题：${msg.subject}\n` : ""}${msg.content}`,
     sendToTl: (msg: TeamMessage) => {
       pi.sendMessage({
         customType: "team-message",
-        content: `[消息通道 - 来自 ${msg.from}]
-${msg.subject ? `主题：${msg.subject}\n` : ""}${msg.content}`,
+        content: `[消息通道 - 来自 ${msg.from}]\n${msg.subject ? `主题：${msg.subject}\n` : ""}${msg.content}`,
         display: true,
         details: { msg },
       });
@@ -173,40 +173,72 @@ ${msg.subject ? `主题：${msg.subject}\n` : ""}${msg.content}`,
   });
 
   const messageQueue = createMessageQueue(async (msg: TeamMessage) => {
+    console.warn("[team-queue] routing message:", msg.id, msg.from, "→", msg.to);
     router.route(msg);
   });
 
-  // Register TL tools once at startup (inactive by default)
-  function setupTlTools() {
-    const manager = createProcessManager([], { autoRestart: true });
-    processManager = manager;
+  /**
+   * Create a member process handle, wire event listeners, and register
+   * with both the processManager (lifecycle) and memberHandles (messaging).
+   */
+  function createAndRegisterMember(config: import("./src/process/member-process").MemberProcessConfig): ReturnType<typeof createMemberProcess> {
+    const handle = createMemberProcess(config, spawn);
+    memberHandles.set(config.name, handle);
+    processManager?.addHandle(handle);
 
-    registerTlTools(pi, manager, (config) => {
-      const handle = createMemberProcess(config, spawn);
-      memberHandles.set(config.name, handle);
-
-      // Wire exit handling for auto-restart
-      handle.onEvent((event: any) => {
-        if (event.type === "tool_execution_end" && event.toolName === "team_send_message") {
-          const teamMsg = event.result?.details?.teamMessage;
-          if (teamMsg) {
-            messageQueue.enqueue({
-              id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-              from: teamMsg.from,
-              to: teamMsg.to,
-              subject: teamMsg.subject,
-              content: teamMsg.content,
-              timestamp: teamMsg.timestamp ?? Date.now(),
-            });
-          }
+    // Wire message channel: intercept team_send_message tool calls
+    handle.onEvent((event: any) => {
+      if (event.type === "tool_execution_end" && event.toolName === "team_send_message") {
+        const teamMsg = event.result?.details?.teamMessage;
+        if (teamMsg) {
+          messageQueue.enqueue({
+            id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            from: teamMsg.from,
+            to: teamMsg.to,
+            subject: teamMsg.subject,
+            content: teamMsg.content,
+            timestamp: teamMsg.timestamp ?? Date.now(),
+          });
         }
-      });
-
-      return handle;
+      }
     });
+
+    return handle;
   }
 
-  setupTlTools();
+  /**
+   * Build a MemberProcessConfig from team definition + member name.
+   */
+  function buildMemberConfig(memberName: string): import("./src/process/member-process").MemberProcessConfig | null {
+    const session = getSessionState();
+    const team = session.teamDefinition;
+    if (!team) return null;
+
+    const memberDef = team.members.find((m) => m.name === memberName);
+    if (!memberDef) return null;
+
+    const sessionDir = join(getRootDir(), "sessions", team.name, memberName);
+    const sharedContextPath = join(getRootDir(), "sessions", team.name, "shared-context.md");
+
+    return {
+      name: memberName,
+      role: memberName,
+      roleLabel: memberDef.label ?? memberName,
+      teamName: team.name,
+      teamMembers: team.members.map((m) => m.name),
+      memberDescription: memberDef.systemPrompt,
+      sessionDir,
+      sharedContextPath,
+      memberExtensionPath: new URL("./member.ts", import.meta.url).pathname,
+      cwd: process.cwd(),
+    };
+  }
+
+  // Register TL tools once at startup (inactive by default)
+  const manager = createProcessManager([], { autoRestart: true });
+  processManager = manager;
+
+  registerTlTools(pi, manager, createAndRegisterMember, buildMemberConfig);
 
   // ── /team start: activate team session ──────────────────
   pi.registerCommand("team-start", {
@@ -249,7 +281,6 @@ ${msg.subject ? `主题：${msg.subject}\n` : ""}${msg.content}`,
   pi.registerCommand("team-stop", {
     description: "终止当前团队会话",
     handler: async (_args: string, ctx) => {
-      const { getSessionState } = await import("./src/session/state");
       const session = getSessionState();
 
       if (!session.active) {

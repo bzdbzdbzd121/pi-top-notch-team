@@ -12,13 +12,15 @@ export interface ProcessManager {
   stopAll(): Promise<void>;
   /** Called when a member process exits unexpectedly. Triggers auto-restart if enabled. */
   handleExit(name: string, exitCode: number | null): void;
+  /** Dynamically add a new member handle (e.g. from start_member tool). */
+  addHandle(handle: MemberProcessHandle): void;
 }
 
 /**
  * Manages the lifecycle of multiple Member processes.
  */
 export function createProcessManager(
-  handles: MemberProcessHandle[],
+  handles: MemberProcessHandle[] = [],
   options: ProcessManagerOptions = {}
 ): ProcessManager {
   const { autoRestart = true } = options;
@@ -30,7 +32,7 @@ export function createProcessManager(
 
   const manager: ProcessManager = {
     listStatus(): MemberState[] {
-      return handles.map((h) => h.getState());
+      return Array.from(memberMap.values()).map((h) => h.getState());
     },
 
     getStatus(name: string): MemberState | null {
@@ -46,7 +48,9 @@ export function createProcessManager(
     },
 
     async stopAll(): Promise<void> {
-      await Promise.all(handles.map((h) => h.stop()));
+      await Promise.all(
+        Array.from(memberMap.values()).map((h) => h.stop())
+      );
     },
 
     handleExit(name: string, _exitCode: number | null): void {
@@ -56,6 +60,10 @@ export function createProcessManager(
       if (handle && handle.getState().status !== "running") {
         handle.start().catch(() => {});
       }
+    },
+
+    addHandle(handle: MemberProcessHandle): void {
+      memberMap.set(handle.name, handle);
     },
   };
 

@@ -22,6 +22,7 @@ function createMockManager(): ProcessManager {
     stop: vi.fn().mockResolvedValue(undefined),
     stopAll: vi.fn().mockResolvedValue(undefined),
     handleExit: vi.fn(),
+    addHandle: vi.fn(),
   };
 }
 
@@ -48,6 +49,57 @@ describe("registerTlTools", () => {
     expect(pi.registerTool).toHaveBeenCalledWith(
       expect.objectContaining({ name: "start_member" })
     );
+  });
+
+  it("start_member execute calls createMember when buildMemberConfig returns a config", async () => {
+    const pi = createMockPi();
+    const manager = createMockManager();
+    const createMember = vi.fn().mockReturnValue({
+      name: "analyzer",
+      start: vi.fn().mockResolvedValue(undefined),
+      getState: vi.fn().mockReturnValue({ name: "analyzer", pid: 12345, status: "running" }),
+      stop: vi.fn(),
+      onEvent: vi.fn(),
+      sendCommand: vi.fn(),
+    });
+    const buildConfig = vi.fn().mockReturnValue({
+      name: "analyzer",
+      role: "analyzer",
+      teamName: "test",
+    });
+
+    // Capture the registerTool call for start_member
+    let executeFn: Function = () => {};
+    pi.registerTool = vi.fn((def: any) => {
+      if (def.name === "start_member") {
+        executeFn = def.execute;
+      }
+    });
+
+    registerTlTools(pi, manager, createMember, buildConfig);
+
+    const result = await executeFn("call-1", { name: "analyzer" });
+    expect(buildConfig).toHaveBeenCalledWith("analyzer");
+    expect(createMember).toHaveBeenCalled();
+    expect(result.content[0].text).toContain("已启动");
+  });
+
+  it("start_member returns error when buildMemberConfig returns null", async () => {
+    const pi = createMockPi();
+    const manager = createMockManager();
+    const buildConfig = vi.fn().mockReturnValue(null);
+
+    let executeFn: Function = () => {};
+    pi.registerTool = vi.fn((def: any) => {
+      if (def.name === "start_member") {
+        executeFn = def.execute;
+      }
+    });
+
+    registerTlTools(pi, manager, vi.fn(), buildConfig);
+
+    const result = await executeFn("call-2", { name: "nonexistent" });
+    expect(result.content[0].text).toContain("无法启动");
   });
 
   it("registers stop_member tool", () => {
