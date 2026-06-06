@@ -1,0 +1,4 @@
+# invalid-team.yaml — missing required fields for validation tests
+name: ""
+description: ""
+members: []

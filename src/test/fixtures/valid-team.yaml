@@ -1,0 +1,19 @@
+# valid-team.yaml — used by unit tests for parsing/validation
+name: "refactoring"
+description: "负责大型代码重构任务"
+defaults:
+  model: "anthropic/claude-sonnet-4"
+members:
+  - name: "analyzer"
+    label: "代码分析员"
+    systemPrompt: |
+      你是一个代码分析专家。你擅长理解代码结构、识别依赖关系。
+  - name: "mover"
+    label: "代码迁移员"
+    systemPrompt: |
+      你负责执行代码迁移操作。
+    model: "anthropic/claude-sonnet-4"
+  - name: "verifier"
+    label: "验证员"
+    systemPrompt: |
+      你负责验证迁移后的代码是否正确、测试是否通过。
