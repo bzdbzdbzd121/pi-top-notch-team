@@ -277,7 +277,7 @@ export function registerTeamCommand(
           for (const m of team.members) {
             output += `  [${m.label ?? m.name}]`;
             if (m.model) output += ` - 模型: ${m.model}`;
-            output += `\n  职责:\n`;
+            output += `\n  提示词:\n`;
             const promptLines = m.systemPrompt.trim().split("\\n");
             for (const pl of promptLines) {
               output += `    ${pl}\n`;
