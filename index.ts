@@ -201,21 +201,25 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.addAutocompleteProvider((current) => ({
       async getSuggestions(lines, line, col, options) {
         const beforeCursor = (lines[line] ?? "").slice(0, col);
-        const m = beforeCursor.match(/^\/team\s+(start|show|delete)\s+(.*)$/);
+        const m = beforeCursor.match(/^\/team\s+(start|show|delete)(\s+)(.*)$/);
         if (m) {
-          const partial = m[2];
+          const subCmd = m[1];     // e.g. "show"
+          const spacing = m[2];    // e.g. " "
+          const partial = m[3];    // typed team name (or empty)
           const { listTeams } = await import("./src/team/store");
           const { getRootDir } = await import("./src/config");
           const teams = listTeams(getRootDir());
+          // Replace everything from subcommand onward: "show " -> "show teamname"
+          const prefix = subCmd + spacing + partial;
           const items = teams
-            .filter((t: string) => !partial || t.startsWith(partial))
-            .map((t: string) => ({ value: t, label: t }));
-          return { prefix: partial, items };
+            .filter((t: string) => t.startsWith(partial))
+            .map((t: string) => ({ value: `${subCmd} ${t}`, label: t }));
+          return { prefix, items };
         }
         return current.getSuggestions(lines, line, col, options);
       },
-      applyCompletion(lines, line, col, item, prefix) {
-        return current.applyCompletion(lines, line, col, item, prefix);
+      applyCompletion(lines, line, col, item, _prefix) {
+        return current.applyCompletion(lines, line, col, item, item.value);
       },
       shouldTriggerFileCompletion(lines, line, col) {
         const beforeCursor = (lines[line] ?? "").slice(0, col);
