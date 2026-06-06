@@ -1,11 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { registerListCommand } from "./src/commands/list";
-import { registerShowCommand } from "./src/commands/show";
-import { registerDeleteCommand } from "./src/commands/delete";
-import { registerStatusCommand } from "./src/commands/status";
-import { registerCreateCommand } from "./src/commands/create";
-import { registerStartCommand } from "./src/commands/start";
-import { registerStopCommand } from "./src/commands/stop";
+import { registerTeamCommand } from "./src/commands/team";
 import { getSessionState } from "./src/session/state";
 import type { TeamContext } from "./src/session/context";
 import { registerTlTools } from "./src/tools/tl-tools";
@@ -203,19 +197,13 @@ export default function (pi: ExtensionAPI) {
   registerTlTools(pi, manager, createAndRegisterMember, buildMemberConfig, getMemberLog);
 
   // ── Register all 7 commands ──────────────────────────────
-  registerListCommand(pi);
-  registerShowCommand(pi);
-  registerDeleteCommand(pi);
-  registerStatusCommand(pi, () =>
+  registerTeamCommand(pi, teamCtx, () =>
     (teamCtx.processManager?.listStatus().map((s) => ({
       name: s.name,
       status: s.status,
       pid: s.pid,
     })) ?? [])
   );
-  registerCreateCommand(pi, teamCtx);
-  registerStartCommand(pi, teamCtx);
-  registerStopCommand(pi, teamCtx);
 
   // ── TL system prompt injection ───────────────────────────
   pi.on("before_agent_start", async (event, _ctx) => {

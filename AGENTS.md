@@ -43,14 +43,9 @@ User's pi session (TL extension)
 
 ```
 src/
-├── commands/         ← 7 command handlers
-│   ├── create.ts     ← /team create + create_team_definition tool
-│   ├── start.ts      ← /team start (activates TL tools)
-│   ├── stop.ts       ← /team stop (cleans up members)
-│   ├── list.ts       ← /team list
-│   ├── show.ts       ← /team show
-│   ├── delete.ts     ← /team delete
-│   └── status.ts     ← /team status (with StatusProvider)
+├── commands/
+│   ├── team.ts       ← Single /team command (7 subcommands: create/start/stop/list/show/delete/status)
+│   └── team.test.ts
 ├── channel/          ← Real-time message channel
 │   ├── types.ts      ← TeamMessage interface
 │   ├── message-queue.ts  ← Serial FIFO queue
@@ -122,7 +117,7 @@ npm test          # Run all tests (vitest)
 npm run test:watch  # Watch mode
 ```
 
-67 tests across 11 files. Tests live alongside source as `*.test.ts`.
+63 tests across 10 files. Tests live alongside source as `*.test.ts`.
 
 | Test Level | What | How |
 |-----------|------|-----|
@@ -154,6 +149,7 @@ npm run test:watch  # Watch mode
 | `/team show <name>` | Display team definition details |
 | `/team delete <name>` | Delete a team definition (with confirmation) |
 | `/team status` | Show active session + member process statuses |
+| `/team help` | Show usage (unknown subcommand) |
 
 ## TL Tools (active only during team session)
 

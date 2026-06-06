@@ -1,0 +1,136 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { stringify as stringifyYaml } from "yaml";
+import { createMockExtensionAPI, createMockContext } from "../test/fixtures/mock-extension-api";
+import { registerTeamCommand } from "./team";
+import { endSession } from "../session/state";
+import type { TeamContext } from "../session/context";
+import type { TeamDefinition } from "../team/definition";
+
+function createTeamContext(): TeamContext {
+  return {
+    isCreatingTeam: false,
+    processManager: null,
+    memberHandles: new Map(),
+    router: { route: vi.fn(), updateMembers: vi.fn() } as any,
+    messageQueue: { enqueue: vi.fn(), drain: vi.fn(), length: vi.fn(), stop: vi.fn() } as any,
+    tlToolNames: ["start_member", "stop_member", "list_members", "get_member_log"],
+  };
+}
+
+describe("/team command", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "team-command-test-"));
+    process.env.TOP_NOTCH_TEAM_ROOT = tmpDir;
+    endSession();
+  });
+
+  afterEach(() => {
+    delete process.env.TOP_NOTCH_TEAM_ROOT;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("registers a command named 'team'", () => {
+    const pi = createMockExtensionAPI();
+    registerTeamCommand(pi, createTeamContext());
+    expect(pi.registerCommand).toHaveBeenCalledWith(
+      "team",
+      expect.objectContaining({ description: expect.any(String) })
+    );
+  });
+
+  it("/team list shows no teams when none exist", async () => {
+    const pi = createMockExtensionAPI();
+    const ctx = createMockContext();
+    let handler: Function = () => {};
+    pi.registerCommand = vi.fn((_name, opts) => { handler = opts.handler; });
+    registerTeamCommand(pi, createTeamContext());
+
+    await handler("list", ctx);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("还没有创建"),
+      "info"
+    );
+  });
+
+  it("/team list shows team names", async () => {
+    const pi = createMockExtensionAPI();
+    const ctx = createMockContext();
+    let handler: Function = () => {};
+    pi.registerCommand = vi.fn((_name, opts) => { handler = opts.handler; });
+    registerTeamCommand(pi, createTeamContext());
+
+    // Create a team file
+    mkdirSync(join(tmpDir, "teams"), { recursive: true });
+    writeFileSync(join(tmpDir, "teams", "my-team.yaml"), "name: my-team\ndescription: test\nmembers:\n  - name: w\n    systemPrompt: work", "utf-8");
+
+    await handler("list", ctx);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("my-team"),
+      "info"
+    );
+  });
+
+  it("/team show notifies when not found", async () => {
+    const pi = createMockExtensionAPI();
+    const ctx = createMockContext();
+    let handler: Function = () => {};
+    pi.registerCommand = vi.fn((_name, opts) => { handler = opts.handler; });
+    registerTeamCommand(pi, createTeamContext());
+
+    await handler("show nonexistent", ctx);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("不存在"),
+      "warning"
+    );
+  });
+
+  it("/team delete deletes after confirmation", async () => {
+    mkdirSync(join(tmpDir, "teams"), { recursive: true });
+    writeFileSync(join(tmpDir, "teams", "to-delete.yaml"), "name: to-delete\ndescription: test\nmembers:\n  - name: w\n    systemPrompt: work", "utf-8");
+
+    const pi = createMockExtensionAPI();
+    const ctx = createMockContext({
+      cwd: tmpDir,
+      ui: { ...createMockContext().ui, confirm: vi.fn().mockResolvedValue(true) },
+    });
+    let handler: Function = () => {};
+    pi.registerCommand = vi.fn((_name, opts) => { handler = opts.handler; });
+    registerTeamCommand(pi, createTeamContext());
+
+    await handler("delete to-delete", ctx);
+    expect(existsSync(join(tmpDir, "teams", "to-delete.yaml"))).toBe(false);
+  });
+
+  it("/team status shows no active session", async () => {
+    const pi = createMockExtensionAPI();
+    const ctx = createMockContext();
+    let handler: Function = () => {};
+    pi.registerCommand = vi.fn((_name, opts) => { handler = opts.handler; });
+    registerTeamCommand(pi, createTeamContext());
+
+    await handler("status", ctx);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("无活跃"),
+      "info"
+    );
+  });
+
+  it("/team unknown shows usage", async () => {
+    const pi = createMockExtensionAPI();
+    const ctx = createMockContext();
+    let handler: Function = () => {};
+    pi.registerCommand = vi.fn((_name, opts) => { handler = opts.handler; });
+    registerTeamCommand(pi, createTeamContext());
+
+    await handler("unknown-command", ctx);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("未知子命令"),
+      "warning"
+    );
+  });
+});
