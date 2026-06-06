@@ -73,8 +73,8 @@ pi-top-notch-team/
 │   │   ├── team.ts             ← Single /team command (7 subcommands + autocomplete)
 │   │   └── status.ts           ← StatusProvider type export
 │   ├── tools/
-│   │   ├── tl-tools.ts         ← TL process management tool registrations
-│   │   └── member-tool.ts      ← Member team_send_message tool
+│   │   └── tl-tools.ts         ← TL process management tool registrations
+│   ├── (team_send_message tool is registered in member.ts directly)
 │   ├── channel/
 │   │   ├── message-queue.ts    ← Global serial message queue
 │   │   ├── router.ts           ← Message routing logic
@@ -87,10 +87,12 @@ pi-top-notch-team/
 │   │   ├── store.ts            ← Read/write team definition files
 │   │   └── schema.ts           ← YAML schema for validation
 │   ├── session/
-│   │   └── state.ts            ← Team session state tracking
-│   └── prompt/
-│       ├── tl-system-prompt.ts ← TL system prompt template
-│       └── member-env.ts       ← Member env var setup
+│   │   ├── state.ts            ← Team session state tracking
+│   │   └── context.ts          ← TeamContext shared mutable state interface
+│   ├── config.ts               ← getRootDir() env var override
+│   ├── test/
+│   │   └── fixtures/           ← Test YAMLs + mock-extension-api
+│   └── smoke.test.ts           ← Test infrastructure smoke test
 ```
 
 ### package.json
@@ -129,14 +131,9 @@ Since TL and Member are declared as two separate extensions, but both are loaded
 | User's interactive session | `"tui"`, `"rpc"`, `"json"`, `"print"` | **TL** — registers commands (7), waits for `/team start` to activate tools |
 | Member RPC process | `"rpc"` | **Member** — registers `team_send_message` tool, injects team system prompt via env vars |
 
-**Detection logic in `index.ts`:**
-
-```typescript
-// TL side: always registers commands, only activates tools during team session
-if (ctx.mode !== "rpc") {
-  // Register commands: /team create, start, stop, list, show, delete, status
-}
-```
+**Detection logic:**
+- `index.ts` (TL side): always registers commands and tools. TL tools are **deactivated** by default (not in active set) and activated when `/team start` calls `pi.setActiveTools()`. No mode check needed.
+- `member.ts` (Member side): checks `process.env.TEAM_ROLE` at startup. If not set, exits early (no tools registered).
 
 **Detection logic in `member.ts`:**
 
@@ -199,25 +196,22 @@ All subcommands are registered as a single `/team` command via `registerCommand(
 
 **Flow:**
 1. User types `/team create`
-2. Extension injects instructions via `before_agent_start`:
-   - "通过自然语言对话向用户收集团队信息：名称、描述、需要哪些角色、每个角色的职责和系统提示"
-   - "收集完成后展示汇总信息让用户确认"
-   - "用户确认后，调用 `create_team_definition` 工具生成 YAML 文件并校验"
-3. TL has a natural conversation with the user
-4. On confirmation, TL calls `create_team_definition` tool
-5. Tool saves YAML to `~/.pi/top-notch-team/teams/<name>.yaml` and runs validation
-6. On success, TL notifies user
+2. `teamCtx.isCreatingTeam = true`
+3. `before_agent_start` injects creation instructions: TL auto-infers `name`/`label` from user's role description
+4. TL converses with user, collects info, builds team data
+5. TL calls `create_team_definition` tool → validates YAML schema → saves to `~/.pi/top-notch-team/teams/<name>.yaml`
+6. `isCreatingTeam` set to `false`
 7. No team session is started
 
 ### `/team start <name>`
 
 **Flow:**
 1. Read team definition from `~/.pi/top-notch-team/teams/<name>.yaml`
-2. Create team session state object
-3. Register (or activate) TL's 4 process management tools via `pi.registerTool()`
-4. Set up `before_agent_start` to inject TL system prompt (see §10)
-5. Notify user: "团队 'refactoring' 已就绪，请告诉我你想完成什么任务"
-6. Team session is now active
+2. Start session state via `startSession(team)`
+3. Update router's member list: `router.updateMembers(team.members.map(m => m.name))`
+4. Activate TL tools: `pi.setActiveTools([...current, ...tlToolNames])`
+5. `before_agent_start` handler checks `session.active` and injects TL system prompt (see §10)
+6. Notify user that team is ready
 
 **Lifecycle after `/team start`** (see also: CONTEXT.md):
 1. TL clarifies requirements with the user (possibly multiple rounds)
@@ -232,11 +226,12 @@ All subcommands are registered as a single `/team` command via `registerCommand(
 ### `/team stop`
 
 **Flow:**
-1. Iterate over all active Member processes
-2. Call `stop_member` on each
-3. Deactivate TL's process management tools
-4. Clear team session state
-5. Remove `before_agent_start` injection
+1. `processManager.stopAll()` — stops all Member RPC processes (SIGTERM → SIGKILL)
+2. Clear `memberHandles` map
+3. `router.updateMembers([])` — clear message channel targets
+4. `pi.setActiveTools([...filter out tlToolNames])` — deactivate TL tools
+5. `endSession()` — clear session state
+6. `before_agent_start` handler remains registered but checks `session.active` to skip injection
 
 ### `/team list`
 
@@ -303,8 +298,8 @@ list_members()
 - Returns array of all Member process statuses:
 ```json
 [
-  { "name": "analyzer", "pid": 12345, "status": "running", "uptime": 300 },
-  { "name": "mover", "pid": 12346, "status": "running", "uptime": 300 },
+  { "name": "analyzer", "pid": 12345, "status": "running" },
+  { "name": "mover", "pid": 12346, "status": "running" },
   { "name": "verifier", "pid": null, "status": "stopped" }
 ]
 ```
@@ -637,16 +632,16 @@ Every step follows the TDD cycle: **write test → implement → refactor**.
 10. `src/process/member-process.ts` — spawn pi RPC, connect stdin/stdout + TDD
 11. `src/process/manager.ts` — process lifecycle + TDD
 12. `src/tools/tl-tools.ts` — 4 process management tools + TDD
-13. `src/prompt/tl-system-prompt.ts` — system prompt injection + TDD
+13. System prompt injection — inlined in `index.ts` (TL) and `member.ts` (Member)
 14. Manual smoke test: `/team start` and `/team stop` work end-to-end
 
 ### Phase 3: Message Channel + Shared Context (mix of unit + integration)
 15. `src/channel/types.ts` — TeamMessage type (no test needed, just types)
 16. `src/channel/message-queue.ts` — serial FIFO queue + TDD (unit)
 17. `src/channel/router.ts` — routing logic + TDD (unit)
-18. `src/tools/member-tool.ts` — `team_send_message` tool + TDD (integration)
-19. Wire `tool_execution_end` listener in `member-process.ts` + TDD (integration)
-20. `src/prompt/member-env.ts` — Member env var + system prompt injection + TDD (integration)
+18. `member.ts` — `team_send_message` tool (inline in member extension)
+19. Wire `tool_execution_end` listener in `member-process.ts` + `index.ts` + TDD (integration)
+20. Member env var + system prompt injection in `member.ts`
 21. Update TL system prompt (§10) for Shared Context
 22. E2E test: Member-to-Member and Member-to-TL messaging
 

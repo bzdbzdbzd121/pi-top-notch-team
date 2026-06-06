@@ -117,7 +117,7 @@ npm test          # Run all tests (vitest)
 npm run test:watch  # Watch mode
 ```
 
-63 tests across 10 files. Tests live alongside source as `*.test.ts`.
+64 tests across 10 files. Tests live alongside source as `*.test.ts`.
 
 | Test Level | What | How |
 |-----------|------|-----|
