@@ -277,7 +277,7 @@ export function registerTeamCommand(
           for (const m of team.members) {
             output += `  - ${m.label ?? m.name}`;
             if (m.model) output += ` [${m.model}]`;
-            output += `\n    提示词：${m.systemPrompt.slice(0, 60)}...\n`;
+            output += `\n    提示词：${m.systemPrompt}\n`;
           }
 
           ctx.ui.notify(output, "info");
