@@ -23,7 +23,7 @@ pi install ./pi-top-notch-team
 ```
 User's pi session (TL extension)
   ├── 10 subcommands (/team create, edit, cancel, start, stop, list, show, delete, status, help)
-  ├── 4 TL tools (start_member, stop_member, list_members, get_member_log)
+  ├── 5 TL tools (start_member, stop_member, list_members, get_member_log, team_send_and_wait)
   ├── Message channel (queue → router)
   └── Member Process Manager
         ├── Member A (pi --mode rpc, member.ts)
@@ -54,7 +54,7 @@ src/
 │   ├── member-process.ts  ← pi --mode rpc spawn wrapper
 │   └── manager.ts    ← Multi-member lifecycle + auto-restart
 ├── tools/
-│   └── tl-tools.ts   ← 4 TL process management tools
+│   └── tl-tools.ts   ← 5 TL process management tools
 ├── team/
 │   ├── definition.ts ← TeamDefinition / TeamMember types
 │   ├── schema.ts     ← YAML field validation
@@ -161,6 +161,7 @@ npm run test:watch  # Watch mode
 | `stop_member(name)` | Gracefully terminate a Member process |
 | `list_members()` | Show all member statuses |
 | `get_member_log(name, lines?)` | Query Member's recent session via RPC |
+| `team_send_and_wait(to, content, timeout?)` | Send message and wait for response (blocks until reply or timeout) |
 
 ## ADRs
 

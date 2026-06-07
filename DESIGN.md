@@ -351,6 +351,30 @@ get_member_log({ name: "analyzer", lines: 10 })
 - Returns last N messages from that session
 - Useful for TL to check what a Member has been working on
 
+### `team_send_and_wait`
+
+```typescript
+team_send_and_wait({
+  to: "analyzer",             // target member name
+  content: "分析这段代码",     // message body
+  timeout: 120_000            // optional, max wait in ms (default 120000, max 300000)
+})
+```
+
+- **Enqueues** a message to the target member with a correlation ID embedded
+- **Blocks** (returns a Promise that resolves when a matching response arrives)
+- Matching: scans incoming messages for `<corr:...>` tags matching the original correlation ID
+- Supports chain workflows: Member A can forward the `<corr:...>` tag to Member B, and B's reply to TL resolves the original wait
+- **Timeout**: if no response within `timeout` ms, returns `{ status: "timeout" }` — TL should check member status and re-wait if needed
+- **Cancellation**: on `/team stop`, all pending waits are cancelled
+
+**Difference from `team_send_message`:**
+
+| tool | behavior |
+|------|----------|
+| `team_send_message` | Fire-and-forget. Message sent, tool returns immediately. |
+| `team_send_and_wait` | Message sent, tool blocks until response or timeout. Response content is returned as tool result, NOT injected into TL context via `pi.sendMessage()`. |
+
 ## 7. Member Tool: `team_send_message`
 
 Registered by `member.ts` extension loaded in each Member's pi RPC process.
@@ -378,7 +402,7 @@ Member A's RPC stdout
   ▼
 on('tool_execution_end')
   ├── toolName === "team_send_message"?
-  │     YES → extract { from, to, subject, content }
+  │     YES → extract { from, to, subject, content, correlationId }
   │            → enqueue(Message)
   │
   └── NO → ignore (other tools), pass through
@@ -389,7 +413,11 @@ Message Queue (FIFO)
   ▼
 Router (processes one message at a time)
   │
-  ├── to === "tl"           → inject into TL's session
+  ├── to === "tl"
+  │     → ResponseWaiter.check(msg.correlationId or scan content for <corr:...>)
+  │       ├── MATCH → resolve pending wait (skip pi.sendMessage())
+  │       └── NO MATCH → inject into TL's session via pi.sendMessage()
+  │
   ├── to === "<member>"     → write prompt to target Member's RPC stdin
   ├── to === "all"          → write prompt to ALL Members' RPC stdin
   └── to === unknown        → log warning, drop
@@ -405,6 +433,7 @@ interface TeamMessage {
   subject?: string;
   content: string;
   timestamp: number;   // Date.now()
+  correlationId?: string;  // for send_and_wait matching
 }
 ```
 

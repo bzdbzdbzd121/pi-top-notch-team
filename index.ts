@@ -25,7 +25,7 @@ export default function (pi: ExtensionAPI) {
     editingTeamName: null,
     processManager: null,
     memberHandles: new Map(),
-    tlToolNames: ["start_member", "stop_member", "list_members", "get_member_log"],
+    tlToolNames: ["start_member", "stop_member", "list_members", "get_member_log", "team_send_and_wait"],
     router: null as any,
     messageQueue: null as any,
   };
