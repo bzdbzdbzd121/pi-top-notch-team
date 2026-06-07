@@ -119,7 +119,7 @@ export default function (pi: ExtensionAPI) {
         // Notify TL
         pi.sendMessage({
           customType: "team-message",
-          content: `Member "${memberName}" 进程异常退出（code: ${exitCode}），不会自动重启，请使用 start_member 手动启动。`,
+          content: `Member "${memberName}" 进程异常退出（code: ${exitCode}），需检查崩溃原因。`,
           display: true,
           details: { crashEvent: event },
         });
@@ -130,7 +130,7 @@ export default function (pi: ExtensionAPI) {
         console.warn(`[team] Member "${memberName}" process error`);
         pi.sendMessage({
           customType: "team-message",
-          content: `Member "${memberName}" 进程异常，不会自动重启，请使用 start_member 手动启动。`,
+          content: `Member "${memberName}" 进程异常，需检查崩溃原因。`,
           display: true,
         });
       }
