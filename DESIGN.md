@@ -363,8 +363,8 @@ team_send_and_wait({
 
 - **Enqueues** a message to the target member with a correlation ID embedded
 - **Blocks** (returns a Promise that resolves when a matching response arrives)
-- Matching: scans incoming messages for `<corr:...>` tags matching the original correlation ID
-- Supports chain workflows: Member A can forward the `<corr:...>` tag to Member B, and B's reply to TL resolves the original wait
+- **Correlation matching**: scans incoming messages for `<corr:...>` tags matching the original correlation ID. Supports chain workflows: Member A can forward the `<corr:...>` tag to Member B, and B's reply to TL resolves the original wait
+- **Auto-injection**: if a member's reply is directed to `"tl"` but lacks a `<corr:...>` tag, the TL extension automatically appends the most recent pending correlation ID for that member. This ensures responses are matched even if the member AI forgets to include the tag
 - **Timeout**: if no response within `timeout` ms, returns `{ status: "timeout" }` — TL should check member status and re-wait if needed
 - **Cancellation**: on `/team stop`, all pending waits are cancelled
 
