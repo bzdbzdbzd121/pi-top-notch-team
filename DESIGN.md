@@ -503,11 +503,10 @@ Session state (active + team definition) is stored in `session/state.ts` as a mo
 
 1. The Member's `ChildProcess` emits `"exit"` with non-zero code
 2. `MemberProcessManager` detects the unexpected exit
-3. Auto-restart:
-   - Create a new `child_process.spawn` with the same args
-   - The Member's RPC session is loaded from the existing session file (`--session-dir`)
-   - The Member resumes with its previous context intact
-4. TL is notified via a custom message: "Member 'analyzer' 进程异常退出，已自动重启"
+3. Manager logs the crash and notifies TL; no auto-restart (prevents crash loops)
+4. TL is notified via a custom message: "Member 'analyzer' 进程异常退出（code: 1），需检查崩溃原因。"
+   - Exit code 143 (SIGTERM) is treated as normal stop via `stop_member`, no notification sent
+5. TL can use `start_member` to manually restart after investigating
 
 ### Member process stuck / unresponsive
 
@@ -631,7 +630,7 @@ TEAM_SHARED_CONTEXT_PATH=~/.pi/top-notch-team/sessions/refactoring/shared-contex
 **E2E tests** (for critical paths only):
 - Start a Member pi RPC process, send a prompt, assert on events
 - Test that `team_send_message` tool is available to the Member LLM
-- Test process crash + auto-restart
+- Test process crash (TL notified without auto-restart)
 
 ### Fixtures & Factories
 

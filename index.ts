@@ -13,6 +13,12 @@ import { join } from "node:path";
 import { getRootDir } from "./src/config";
 
 export default function (pi: ExtensionAPI) {
+  // If running as a member process (TEAM_ROLE is set), skip TL-only tools
+  // to avoid tool name conflicts with member.ts.
+  if (process.env.TEAM_ROLE) {
+    return;
+  }
+
   // ── Shared mutable state ──────────────────────────────────
   const teamCtx: TeamContext = {
     isCreatingTeam: false,
@@ -110,19 +116,27 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
-      // Handle process crash: auto-restart + notify TL
+      // Handle process exit
       if (event.type === "process_exit" && event.wasRunning) {
         const memberName = event.memberName;
         const exitCode = event.exitCode;
         console.warn(`[team] Member "${memberName}" exited with code ${exitCode}`);
 
-        // Notify TL
-        pi.sendMessage({
-          customType: "team-message",
-          content: `Member "${memberName}" 进程异常退出（code: ${exitCode}），需检查崩溃原因。`,
-          display: true,
-          details: { crashEvent: event },
-        });
+        // Exit code 143 = SIGTERM (128 + 15), which is a normal stop via stop_member
+        // Exit code 0 or null = clean exit
+        const isNormalExit = exitCode === null || exitCode === 0 || exitCode === 143;
+
+        if (!isNormalExit) {
+          // Notify TL only on unexpected crashes
+          pi.sendMessage({
+            customType: "team-message",
+            content: `Member "${memberName}" 进程异常退出（code: ${exitCode}），需检查崩溃原因。`,
+            display: true,
+            details: { crashEvent: event },
+          });
+        } else {
+          console.warn(`[team] Member "${memberName}" stopped normally (code: ${exitCode})`);
+        }
       }
 
       if (event.type === "process_error") {
