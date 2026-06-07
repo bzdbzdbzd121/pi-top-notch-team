@@ -266,6 +266,7 @@ export default function (pi: ExtensionAPI) {
 3. **默认模型** — 按需指定（可选）
 
 收集完后向用户展示汇总并确认，然后调用 \`create_team_definition\` 工具保存。
+如果用户想取消操作，告诉用户输入 \`/team cancel\`。
 `;
     } else if (teamCtx.editingTeamName) {
       const editName = teamCtx.editingTeamName;
@@ -284,6 +285,7 @@ export default function (pi: ExtensionAPI) {
 **不要**追问 name 和 label——从用户的描述中推断。
 
 了解清楚所有修改后，向用户展示修改汇总并确认，然后调用 \`update_team_definition\` 工具保存最终定义。
+如果用户想取消操作，告诉用户输入 \`/team cancel\`。
 `;
     } else if (session.active && session.teamDefinition) {
       const team = session.teamDefinition;

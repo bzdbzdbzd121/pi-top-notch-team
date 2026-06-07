@@ -195,7 +195,7 @@ export function registerTeamCommand(
   pi.registerCommand("team", {
     description: "管理团队（create / start / stop / list / show / delete / status）",
     getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
-      const ALL_SUBCOMMANDS = ["create", "edit", "start", "stop", "list", "show", "delete", "status", "help"];
+      const ALL_SUBCOMMANDS = ["create", "edit", "cancel", "start", "stop", "list", "show", "delete", "status", "help"];
       const TEAM_NAME_SUBCOMMANDS = ["start", "show", "delete", "edit"];
 
       const parts = prefix.split(/\s+/);
@@ -267,6 +267,19 @@ export function registerTeamCommand(
             "团队创建模式已启动。请告诉我你想创建的团队信息，TL 会引导你完成。",
             "info"
           );
+          return;
+        }
+
+        // ── /team cancel ─────────────────────────────────
+        case "cancel": {
+          if (!teamCtx.isCreatingTeam && !teamCtx.editingTeamName) {
+            ctx.ui.notify("当前没有正在进行的创建或编辑操作", "info");
+            return;
+          }
+          const mode = teamCtx.isCreatingTeam ? "创建" : "编辑";
+          teamCtx.isCreatingTeam = false;
+          teamCtx.editingTeamName = null;
+          ctx.ui.notify(`已取消${mode}操作`, "info");
           return;
         }
 
@@ -470,6 +483,7 @@ export function registerTeamCommand(
             `用法：/team <子命令> [参数]`,
             `  /team create           创建团队（自然语言对话）`,
             `  /team edit <名称>       修改团队定义（自然语言对话）`,
+            `  /team cancel           取消当前的创建或编辑操作`,
             `  /team start <名称>      启动团队会话`,
             `  /team stop             终止团队会话`,
             `  /team list             列出所有已创建的团队`,

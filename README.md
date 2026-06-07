@@ -43,6 +43,7 @@ pi -e ./index.ts
 | `/team stop` | End the current team session |
 | `/team list` | List all team definitions |
 | `/team show <name>` | Display team definition details |
+| `/team cancel           | Cancel current create/edit operation |
 | `/team delete <name>` | Delete a team definition |
 | `/team status` | Show team session state with member statuses |
 | `/team help` | Show usage help |

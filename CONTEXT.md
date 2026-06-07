@@ -50,6 +50,7 @@ _Avoid_: Mission brief, team doc, session context
 | `/team stop` | Terminate all Member processes and end the current team session. |
 | `/team list` | List all team definitions in `~/.pi/top-notch-team/teams/`. |
 | `/team show <name>` | Display a formatted view of a team's YAML definition. |
+| `/team cancel           | Cancel current create or edit operation |
 | `/team delete <name>` | Delete a team definition file (with confirmation). |
 | `/team status` | Show the current team session state with member process statuses (🟢running/⚪stopped/🔴error). |
 | `/team help` | Display usage help for all subcommands. |
