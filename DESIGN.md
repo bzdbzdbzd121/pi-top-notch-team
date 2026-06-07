@@ -204,9 +204,32 @@ Validation is run at `/team create` time via a validation script.
 
 ## 5. Commands
 
-All subcommands are registered as a single `/team` command via `registerCommand("team", ...)`. The handler dispatches based on the first argument. Tab completion for team names is supported on `/team start`, `/team show`, and `/team delete` via `getArgumentCompletions` and a custom autocomplete provider that suppresses file path suggestions.
+All subcommands are registered as a single `/team` command via `registerCommand("team", ...)`. The handler dispatches based on the first argument. Tab completion for team names is supported on `/team start`, `/team show`, `/team delete`, and `/team edit` via `getArgumentCompletions` and a custom autocomplete provider that suppresses file path suggestions.
 
 ### `/team create`
+
+**Flow:**
+1. User types `/team create`
+2. Extension injects instructions via `before_agent_start`
+3. TL converses with user, auto-derives name/label
+4. On confirmation, TL calls `create_team_definition` tool
+5. Tool validates and saves YAML
+6. No team session started
+
+### `/team edit <name>`
+
+**Flow:**
+1. User types `/team edit <name>`
+2. Reads existing team definition
+3. Sets `editingTeamName`, injects instructions via `before_agent_start`
+4. TL discusses changes with user
+5. On confirmation, TL calls `update_team_definition` tool
+6. Tool validates and overwrites YAML
+
+### `/team cancel`
+
+- Cancels current create or edit operation
+- Resets `isCreatingTeam` and `editingTeamName` flags
 
 **Flow:**
 1. User types `/team create`

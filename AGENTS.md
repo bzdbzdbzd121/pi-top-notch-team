@@ -148,7 +148,7 @@ npm run test:watch  # Watch mode
 | `/team stop` | Stop all members, deactivate TL tools |
 | `/team list` | List all team definitions |
 | `/team show <name>` | Display team definition details |
-| `/team cancel           | Cancel current create or edit operation |
+| `/team cancel`           | Cancel current create or edit operation |
 | `/team delete <name>` | Delete a team definition (with confirmation) |
 | `/team status` | Show active session + member process statuses |
 | `/team help` | Display usage help for all subcommands |
