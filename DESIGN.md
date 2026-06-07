@@ -70,7 +70,7 @@ pi-top-notch-team/
 ├── member.ts                 ← Extension entry point — Member side (auto-discovered via pi manifest)
 ├── src/
 │   ├── commands/
-│   │   ├── team.ts             ← Single /team command (8 subcommands + autocomplete)
+│   │   ├── team.ts             ← Single /team command (10 subcommands + autocomplete)
 │   │   └── status.ts           ← StatusProvider type export
 │   ├── tools/
 │   │   └── tl-tools.ts         ← TL process management tool registrations
@@ -135,7 +135,7 @@ Since TL and Member are declared as two separate extensions, but both are loaded
 
 | Scenario | `ctx.mode` | Role |
 |----------|-----------|------|
-| User's interactive session | `"tui"`, `"rpc"`, `"json"`, `"print"` | **TL** — registers /team command with 8 subcommands, waits for `/team start` to activate tools |
+| User's interactive session | `"tui"`, `"rpc"`, `"json"`, `"print"` | **TL** — registers /team command with 10 subcommands, waits for `/team start` to activate tools |
 | Member RPC process | `"rpc"` | **Member** — registers `team_send_message` tool, injects team system prompt via env vars |
 
 **Detection logic:**

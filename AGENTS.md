@@ -22,7 +22,7 @@ pi install ./pi-top-notch-team
 
 ```
 User's pi session (TL extension)
-  ├── 9 subcommands (/team create, edit, start, stop, list, show, delete, status, help)
+  ├── 10 subcommands (/team create, edit, cancel, start, stop, list, show, delete, status, help)
   ├── 4 TL tools (start_member, stop_member, list_members, get_member_log)
   ├── Message channel (queue → router)
   └── Member Process Manager
@@ -44,7 +44,7 @@ User's pi session (TL extension)
 ```
 src/
 ├── commands/
-│   ├── team.ts       ← Single /team command (7 subcommands: create/start/stop/list/show/delete/status)
+│   ├── team.ts       ← Single /team command (10 subcommands)
 │   └── team.test.ts
 ├── channel/          ← Real-time message channel
 │   ├── types.ts      ← TeamMessage interface
@@ -117,7 +117,7 @@ npm test          # Run all tests (vitest)
 npm run test:watch  # Watch mode
 ```
 
-64 tests across 10 files. Tests live alongside source as `*.test.ts`.
+66 tests across 10 files. Tests live alongside source as `*.test.ts`.
 
 | Test Level | What | How |
 |-----------|------|-----|
