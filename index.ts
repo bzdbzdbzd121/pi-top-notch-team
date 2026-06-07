@@ -116,13 +116,10 @@ export default function (pi: ExtensionAPI) {
         const exitCode = event.exitCode;
         console.warn(`[team] Member "${memberName}" exited with code ${exitCode}`);
 
-        // Trigger auto-restart via manager (handles backoff + crash loop detection)
-        teamCtx.processManager?.handleExit(memberName, exitCode);
-
-        // Notify TL of the crash (restart status is sent by manager callbacks)
+        // Notify TL
         pi.sendMessage({
           customType: "team-message",
-          content: `Member "${memberName}" 进程异常退出（code: ${exitCode}），正在准备自动重启...`,
+          content: `Member "${memberName}" 进程异常退出（code: ${exitCode}），不会自动重启，请使用 start_member 手动启动。`,
           display: true,
           details: { crashEvent: event },
         });
@@ -131,10 +128,9 @@ export default function (pi: ExtensionAPI) {
       if (event.type === "process_error") {
         const memberName = event.memberName;
         console.warn(`[team] Member "${memberName}" process error`);
-        teamCtx.processManager?.handleExit(memberName, null);
         pi.sendMessage({
           customType: "team-message",
-          content: `Member "${memberName}" 进程异常，已自动重启。`,
+          content: `Member "${memberName}" 进程异常，不会自动重启，请使用 start_member 手动启动。`,
           display: true,
         });
       }
@@ -171,24 +167,9 @@ export default function (pi: ExtensionAPI) {
   }
 
   const manager = createProcessManager([], {
-    autoRestart: true,
+    autoRestart: false,
     onCrashLoopDetected: (name, restarts) => {
-      console.warn(`[team] Member "${name}" crashed ${restarts} times, disabling auto-restart`);
-      pi.sendMessage({
-        customType: "team-message",
-        content: `⚠️ Member "${name}" 已连续崩溃 ${restarts} 次，已停止自动重启。请检查问题后手动使用 start_member 启动。`,
-        display: true,
-        details: { crashLoop: true, memberName: name },
-      });
-    },
-    onRestarting: (name, attempt, delayMs) => {
-      console.warn(`[team] Restarting Member "${name}" (attempt ${attempt}, delay ${delayMs}ms)`);
-      pi.sendMessage({
-        customType: "team-message",
-        content: `Member "${name}" 正在自动重启（第 ${attempt} 次，延迟 ${delayMs}ms）...`,
-        display: true,
-        details: { restarting: true, memberName: name, attempt, delayMs },
-      });
+      console.warn(`[team] Member "${name}" crashed ${restarts} times`);
     },
   });
   teamCtx.processManager = manager;

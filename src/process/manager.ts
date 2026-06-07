@@ -38,7 +38,7 @@ export function createProcessManager(
   options: ProcessManagerOptions = {}
 ): ProcessManager {
   const {
-    autoRestart = true,
+    autoRestart = false,
     maxRestarts = 5,
     restartWindowMs = 60_000,
     initialBackoffMs = 1_000,
