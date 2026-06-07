@@ -2,3 +2,4 @@ node_modules/
 dist/
 shared-context.md
 code_review_*.md
+*.swp
