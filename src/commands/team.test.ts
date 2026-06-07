@@ -17,7 +17,8 @@ function createTeamContext(): TeamContext {
     memberHandles: new Map(),
     router: { route: vi.fn(), updateMembers: vi.fn() } as any,
     messageQueue: { enqueue: vi.fn(), drain: vi.fn(), length: vi.fn(), stop: vi.fn() } as any,
-    tlToolNames: ["start_member", "stop_member", "list_members", "get_member_log"],
+    responseWaiter: { waitForResponse: vi.fn(), resolveIfWaiting: vi.fn(), cancelAll: vi.fn() } as any,
+    tlToolNames: ["start_member", "stop_member", "list_members", "get_member_log", "team_send_and_wait"],
   };
 }
 

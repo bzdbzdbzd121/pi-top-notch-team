@@ -1,5 +1,6 @@
 import type { Router } from "../channel/router";
 import type { MessageQueue } from "../channel/message-queue";
+import type { ResponseWaiter } from "../channel/response-waiter";
 import type { ProcessManager } from "../process/manager";
 import type { MemberProcessHandle } from "../process/member-process";
 
@@ -16,5 +17,6 @@ export interface TeamContext {
   memberHandles: Map<string, MemberProcessHandle>;
   router: Router;
   messageQueue: MessageQueue;
+  responseWaiter: ResponseWaiter;
   tlToolNames: string[];
 }

@@ -12,6 +12,8 @@ export interface TeamMessage {
   content: string;
   /** Unix timestamp in milliseconds. */
   timestamp: number;
+  /** Optional correlation ID for send_and_wait matching. */
+  correlationId?: string;
 }
 
 export type TeamMessageHandler = (msg: TeamMessage) => void;

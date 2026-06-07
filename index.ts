@@ -7,6 +7,7 @@ import { createProcessManager } from "./src/process/manager";
 import { createMemberProcess } from "./src/process/member-process";
 import { createMessageQueue } from "./src/channel/message-queue";
 import { createRouter } from "./src/channel/router";
+import { createResponseWaiter, extractCorrelationId } from "./src/channel/response-waiter";
 import type { TeamMessage } from "./src/channel/types";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
@@ -28,6 +29,7 @@ export default function (pi: ExtensionAPI) {
     tlToolNames: ["start_member", "stop_member", "list_members", "get_member_log", "team_send_and_wait"],
     router: null as any,
     messageQueue: null as any,
+    responseWaiter: null as any,
   };
 
   // ── Message channel: queue → router ──────────────────────
@@ -48,6 +50,14 @@ export default function (pi: ExtensionAPI) {
       }
     },
     sendToTl: (msg: TeamMessage) => {
+      // Check if ResponseWaiter has a pending wait for this message
+      const corrId = msg.correlationId ?? extractCorrelationId(msg.content);
+      if (corrId) {
+        const resolved = responseWaiter.resolveIfWaiting(
+          corrId, msg.from, msg.content, msg.subject
+        );
+        if (resolved) return; // consumed by waiter, skip sendMessage
+      }
       pi.sendMessage({
         customType: "team-message",
         content: `[消息通道 - 来自 ${msg.from}]\n${msg.subject ? `主题：${msg.subject}\n` : ""}${msg.content}`,
@@ -63,8 +73,11 @@ export default function (pi: ExtensionAPI) {
     router.route(msg);
   });
 
+  const responseWaiter = createResponseWaiter();
+
   teamCtx.router = router;
   teamCtx.messageQueue = messageQueue;
+  teamCtx.responseWaiter = responseWaiter;
 
   // ── Create and register member handles ─────────────────────
   function createAndRegisterMember(
@@ -329,14 +342,17 @@ ${team.description}
 ${memberLines}
 
 ### 可用工具
-你拥有 4 个团队管理工具。使用步骤：
+你拥有 5 个团队管理工具：
 
 1. **先写 Shared Context** — 用编辑器的 write 或 edit 工具创建 shared-context.md
-2. **start_member(name)** — 启动一个 Member 进程。启动后 Member 进入待命状态
-3. **team_send_message** — 通过消息通道给 Member 发消息（分配任务、共享上下文、交流等）。使用方式和发送消息一致，设置 to 参数为目标 Member 名称
-4. **list_members** — 随时查看各 Member 的运行状态
-5. **get_member_log(name)** — 查看 Member 最近的对话记录，了解进展
-6. **stop_member(name)** — 任务完成后终止 Member 进程
+2. **start_member(name)** — 启动一个 Member 进程
+3. **team_send_and_wait(to, content, timeout?)** — 给 Member 发任务并等待回复（阻塞）。需要成员的处理结果时使用
+4. **team_send_message(to, subject?, content?)** — 只发消息不等待回复。仅通知或无需结果时使用
+5. **list_members** — 查看各 Member 的运行状态
+6. **get_member_log(name, lines?)** — 查看 Member 最近的对话记录
+7. **stop_member(name)** — 终止 Member 进程
+
+> 提示：team_send_and_wait 发送的消息包含 <corr:...> 标签。其他成员回复时需在内容中包含此标签，这样即使任务经过多次转交（A->B->TL），最终的回复也能正确匹配等待器。消息通道中的 Team Lead 名称是 tl。
 
 ### 流程
 1. 先与用户充分讨论需求，直到和用户对齐细节
