@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, existsSync, unlinkSync, readdirSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, unlinkSync, rmSync, readdirSync, mkdirSync } from "node:fs";
 import { join, basename, extname } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import type { TeamDefinition } from "./definition";
@@ -68,5 +68,12 @@ export function deleteTeam(name: string, rootDir: string): boolean {
   }
 
   unlinkSync(filePath);
+
+  // Clean up session files if any exist
+  const sessionDir = join(rootDir, "sessions", name);
+  if (existsSync(sessionDir)) {
+    rmSync(sessionDir, { recursive: true, force: true });
+  }
+
   return true;
 }
