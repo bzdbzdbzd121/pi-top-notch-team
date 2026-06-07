@@ -462,7 +462,7 @@ TEAM_NAME=refactoring
 TEAM_MEMBERS=analyzer,mover,verifier   # comma-separated list of all member names
 TEAM_MEMBER_DESCRIPTION="你负责分析代码依赖关系..."   # system prompt content
 TEAM_SESSION_DIR=~/.pi/top-notch-team/sessions/refactoring/analyzer/  # session storage
-TEAM_SHARED_CONTEXT_PATH=~/.pi/top-notch-team/sessions/refactoring/shared-context.md  # shared context file path
+TEAM_SHARED_CONTEXT_PATH=~/.pi/top-notch-team/sessions/refactoring/.shared-context.md  # shared context file path
 ```
 
 The `member.ts` extension reads these in `session_start`, then in `before_agent_start` injects a system prompt preamble:
@@ -575,7 +575,7 @@ The Shared Context is a Markdown document maintained by the TL during a team ses
 ### Storage
 
 ```
-~/.pi/top-notch-team/sessions/refactoring/shared-context.md
+~/.pi/top-notch-team/sessions/refactoring/.shared-context.md
 ```
 
 ### Contents
@@ -616,7 +616,7 @@ When creating or updating the Shared Context, the TL includes:
 2. **Initial delivery**: When TL sends the first task to a Member, the Shared Context is included as part of the task message
 3. **Updates**: When TL determines the Shared Context needs updating (e.g., goal refined, glossary term added, progress checkpoint), TL:
    - Rewrites the file
-   - Sends a message to all Members via the message channel: "共享上下文已更新，请重新阅读 shared-context.md"
+   - Sends a message to all Members via the message channel: "共享上下文已更新，请重新阅读 .shared-context.md"
 4. **Member behavior**: Members are instructed via system prompt to read the Shared Context when starting a new task, and to re-read it upon receiving an update notification
 
 ### File path convention
@@ -624,7 +624,7 @@ When creating or updating the Shared Context, the TL includes:
 Members receive the Shared Context file path as an environment variable at startup:
 
 ```bash
-TEAM_SHARED_CONTEXT_PATH=~/.pi/top-notch-team/sessions/refactoring/shared-context.md
+TEAM_SHARED_CONTEXT_PATH=~/.pi/top-notch-team/sessions/refactoring/.shared-context.md
 ```
 
 ## 15. Testing Strategy

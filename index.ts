@@ -457,7 +457,7 @@ ${memberLines}
 ### 可用工具
 你拥有 5 个团队管理工具：
 
-1. **先写 Shared Context** — 用编辑器的 write 或 edit 工具创建 shared-context.md
+1. **先写 Shared Context** — 用编辑器的 write 或 edit 工具创建 .shared-context.md
 2. **start_member(name)** — 启动一个 Member 进程
 3. **team_send_and_wait(to, content, timeout?)** — 给 Member 发任务并等待回复（阻塞）。需要成员的处理结果时使用
 4. **team_send_message(to, subject?, content?)** — 只发消息不等待回复。仅通知或无需结果时使用
