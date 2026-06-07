@@ -26,6 +26,9 @@ export function registerTlTools(
     description:
       "Launch a Member's pi RPC process. The Member will be available for task assignment via the message channel. " +
       "Parameters: name (member identifier from the team definition).",
+    promptGuidelines: [
+      "Use start_member to launch a Member RPC process after writing the Shared Context document.",
+    ],
     parameters: {
       type: "object",
       properties: {
@@ -83,6 +86,9 @@ export function registerTlTools(
     description:
       "Gracefully terminate a Member's pi RPC process. " +
       "Parameters: name (member identifier).",
+    promptGuidelines: [
+      "Use stop_member to terminate a Member process when its task is complete or when ending the team session.",
+    ],
     parameters: {
       type: "object",
       properties: {
@@ -112,6 +118,9 @@ export function registerTlTools(
     name: "list_members",
     label: "List Members",
     description: "Show the current status of all team members.",
+    promptGuidelines: [
+      "Use list_members to check the status of all team members (running/stopped/error) during a team session.",
+    ],
     parameters: {
       type: "object",
       properties: {},
@@ -151,6 +160,9 @@ export function registerTlTools(
     description:
       "Retrieve a Member's recent conversation log to check their progress. " +
       "Parameters: name (member identifier), lines (number of recent lines, default 10).",
+    promptGuidelines: [
+      "Use get_member_log to review a Member's recent conversation and track their progress on assigned tasks.",
+    ],
     parameters: {
       type: "object",
       properties: {

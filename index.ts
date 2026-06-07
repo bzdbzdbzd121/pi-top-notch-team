@@ -304,6 +304,16 @@ ${team.description}
 ### 团队成员
 ${memberLines}
 
+### 可用工具
+你拥有 4 个团队管理工具。使用步骤：
+
+1. **先写 Shared Context** — 用编辑器的 write 或 edit 工具创建 shared-context.md
+2. **start_member(name)** — 启动一个 Member 进程。启动后 Member 进入待命状态
+3. **team_send_message** — 通过消息通道给 Member 发消息（分配任务、共享上下文、交流等）。使用方式和发送消息一致，设置 to 参数为目标 Member 名称
+4. **list_members** — 随时查看各 Member 的运行状态
+5. **get_member_log(name)** — 查看 Member 最近的对话记录，了解进展
+6. **stop_member(name)** — 任务完成后终止 Member 进程
+
 ### 流程
 1. 先与用户充分讨论需求，直到和用户对齐细节
 2. 拆解任务，制定计划
