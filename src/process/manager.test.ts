@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { createProcessManager } from "./manager";
 import type { MemberProcessHandle } from "./member-process";
 
@@ -21,6 +21,11 @@ function createMockHandle(
 describe("createProcessManager", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   it("starts all members", async () => {
@@ -87,7 +92,7 @@ describe("createProcessManager", () => {
     expect(manager.getStatus("nonexistent")).toBeNull();
   });
 
-  it("triggers auto-restart on unexpected exit", async () => {
+  it("triggers auto-restart on unexpected exit with backoff delay", async () => {
     const startMock = vi.fn().mockResolvedValue(undefined);
     // Simulate a crashed member: status is stopped, not running
     const handle = createMockHandle("analyzer", {
@@ -99,6 +104,11 @@ describe("createProcessManager", () => {
 
     // Simulate crash
     manager.handleExit("analyzer", 1);
+    // start should NOT be called immediately — it's delayed
+    expect(startMock).not.toHaveBeenCalled();
+
+    // Advance past the initial backoff (1000ms)
+    await vi.advanceTimersByTimeAsync(1500);
 
     expect(startMock).toHaveBeenCalledTimes(1);
   });
@@ -133,5 +143,80 @@ describe("createProcessManager", () => {
     await manager.stopAll();
 
     expect(stopMock).toHaveBeenCalled();
+  });
+
+  it("applies exponential backoff on repeated crashes", async () => {
+    const startMock = vi.fn().mockResolvedValue(undefined);
+    const handle = createMockHandle("crashy", {
+      start: startMock,
+      getState: vi.fn().mockReturnValue({ name: "crashy", pid: null, status: "stopped" }),
+    });
+
+    const manager = createProcessManager([handle], { autoRestart: true });
+
+    // Crash 3 times — each restart uses increasing backoff
+    manager.handleExit("crashy", 1);
+    await vi.advanceTimersByTimeAsync(1500); // 1st backoff ~1s
+    expect(startMock).toHaveBeenCalledTimes(1);
+
+    manager.handleExit("crashy", 1);
+    await vi.advanceTimersByTimeAsync(2500); // 2nd backoff ~2s
+    expect(startMock).toHaveBeenCalledTimes(2);
+
+    manager.handleExit("crashy", 1);
+    await vi.advanceTimersByTimeAsync(4500); // 3rd backoff ~4s
+    expect(startMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("detects crash loop and stops auto-restart after maxRestarts", async () => {
+    const startMock = vi.fn().mockResolvedValue(undefined);
+    const handle = createMockHandle("loopy", {
+      start: startMock,
+      getState: vi.fn().mockReturnValue({ name: "loopy", pid: null, status: "stopped" }),
+    });
+
+    const crashLoopSpy = vi.fn();
+    const manager = createProcessManager([handle], {
+      autoRestart: true,
+      maxRestarts: 3, // Low threshold for test
+      restartWindowMs: 60_000,
+      initialBackoffMs: 10, // Fast for test
+      onCrashLoopDetected: crashLoopSpy,
+    });
+
+    // Crash 4 times (maxRestarts=3 means the 4th triggers loop detection)
+    for (let i = 0; i < 4; i++) {
+      manager.handleExit("loopy", 1);
+      await vi.advanceTimersByTimeAsync(100);
+    }
+
+    // Only 3 restarts should have happened (the 4th triggers crash loop)
+    expect(startMock).toHaveBeenCalledTimes(3);
+    expect(crashLoopSpy).toHaveBeenCalledWith("loopy", 4);
+  });
+
+  it("shows error status for frozen members via listStatus", async () => {
+    const startMock = vi.fn().mockResolvedValue(undefined);
+    const handle = createMockHandle("loopy", {
+      start: startMock,
+      getState: vi.fn().mockReturnValue({ name: "loopy", pid: null, status: "stopped" }),
+    });
+
+    const manager = createProcessManager([handle], {
+      autoRestart: true,
+      maxRestarts: 2,
+      restartWindowMs: 60_000,
+      initialBackoffMs: 10,
+    });
+
+    // Exceed the crash limit
+    for (let i = 0; i < 3; i++) {
+      manager.handleExit("loopy", 1);
+      await vi.advanceTimersByTimeAsync(100);
+    }
+
+    // Status should show as "error"
+    expect(manager.getStatus("loopy")?.status).toBe("error");
+    expect(manager.listStatus()[0].status).toBe("error");
   });
 });

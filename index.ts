@@ -114,15 +114,15 @@ export default function (pi: ExtensionAPI) {
       if (event.type === "process_exit" && event.wasRunning) {
         const memberName = event.memberName;
         const exitCode = event.exitCode;
-        console.warn(`[team] Member "${memberName}" exited with code ${exitCode}, auto-restarting...`);
+        console.warn(`[team] Member "${memberName}" exited with code ${exitCode}`);
 
-        // Trigger auto-restart via manager
+        // Trigger auto-restart via manager (handles backoff + crash loop detection)
         teamCtx.processManager?.handleExit(memberName, exitCode);
 
-        // Notify TL via message channel
+        // Notify TL of the crash (restart status is sent by manager callbacks)
         pi.sendMessage({
           customType: "team-message",
-          content: `Member "${memberName}" 进程异常退出（code: ${exitCode}），已自动重启。`,
+          content: `Member "${memberName}" 进程异常退出（code: ${exitCode}），正在准备自动重启...`,
           display: true,
           details: { crashEvent: event },
         });
@@ -170,7 +170,27 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
-  const manager = createProcessManager([], { autoRestart: true });
+  const manager = createProcessManager([], {
+    autoRestart: true,
+    onCrashLoopDetected: (name, restarts) => {
+      console.warn(`[team] Member "${name}" crashed ${restarts} times, disabling auto-restart`);
+      pi.sendMessage({
+        customType: "team-message",
+        content: `⚠️ Member "${name}" 已连续崩溃 ${restarts} 次，已停止自动重启。请检查问题后手动使用 start_member 启动。`,
+        display: true,
+        details: { crashLoop: true, memberName: name },
+      });
+    },
+    onRestarting: (name, attempt, delayMs) => {
+      console.warn(`[team] Restarting Member "${name}" (attempt ${attempt}, delay ${delayMs}ms)`);
+      pi.sendMessage({
+        customType: "team-message",
+        content: `Member "${name}" 正在自动重启（第 ${attempt} 次，延迟 ${delayMs}ms）...`,
+        display: true,
+        details: { restarting: true, memberName: name, attempt, delayMs },
+      });
+    },
+  });
   teamCtx.processManager = manager;
 
   // getMemberLog: query member session via RPC get_messages
@@ -195,7 +215,16 @@ export default function (pi: ExtensionAPI) {
       .join("\n");
   }
 
-  registerTlTools(pi, manager, createAndRegisterMember, buildMemberConfig, getMemberLog);
+  registerTlTools(pi, manager, createAndRegisterMember, buildMemberConfig, getMemberLog, (msg) => {
+    messageQueue.enqueue({
+      id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      from: "tl",
+      to: msg.to,
+      subject: msg.subject,
+      content: msg.content,
+      timestamp: Date.now(),
+    });
+  });
 
   // ── Custom autocomplete: team names for /team start|show|delete|edit ──
   pi.on("session_start", (_event, ctx) => {

@@ -9,6 +9,12 @@ type BuildConfigFn = (memberName: string) => MemberProcessConfig | null;
 type GetMemberLogFn = (memberName: string, maxLines: number) => Promise<string>;
 
 /**
+ * Callback to enqueue a message from the TL into the team's message channel.
+ * The message queue and router handle delivery (to member / tl / all).
+ */
+type EnqueueMessageFn = (msg: { to: string; subject?: string; content: string }) => void;
+
+/**
  * Register the 4 TL process management tools.
  * These tools are only active during a team session.
  */
@@ -17,7 +23,8 @@ export function registerTlTools(
   manager: ProcessManager,
   createMember: CreateMemberFn = (config) => createMemberProcess(config, spawn),
   buildMemberConfig?: BuildConfigFn,
-  getMemberLog?: GetMemberLogFn
+  getMemberLog?: GetMemberLogFn,
+  enqueueMessage?: EnqueueMessageFn
 ): void {
   // ── start_member ────────────────────────────────────────
   pi.registerTool({
@@ -228,4 +235,53 @@ export function registerTlTools(
       }
     },
   });
+
+  // ── team_send_message (TL version) ─────────────────────
+  if (enqueueMessage) {
+    pi.registerTool({
+      name: "team_send_message",
+      label: "Team Send Message",
+      description:
+        "Send a message to another team member or all members via the real-time message channel. " +
+        "Use this to assign tasks, share context, or request updates. " +
+        "Parameters: to (target member name or \"all\"), subject (optional), content (message body).",
+      promptGuidelines: [
+        "Use team_send_message to communicate with team members — assign tasks, share updates, or ask questions.",
+        "The message channel delivers to the target member's conversation context.",
+      ],
+      parameters: {
+        type: "object",
+        properties: {
+          to: {
+            type: "string",
+            description: "Target member name, or \"all\" for broadcast",
+          },
+          subject: {
+            type: "string",
+            description: "Optional subject line",
+          },
+          content: {
+            type: "string",
+            description: "Message body",
+          },
+        },
+        required: ["to", "content"],
+      } as any,
+      async execute(
+        _toolCallId: string,
+        params: { to: string; subject?: string; content: string }
+      ) {
+        enqueueMessage({ to: params.to, subject: params.subject, content: params.content });
+        return {
+          details: {},
+          content: [
+            {
+              type: "text" as const,
+              text: `[消息已发送给 ${params.to}]`,
+            },
+          ],
+        };
+      },
+    });
+  }
 }
