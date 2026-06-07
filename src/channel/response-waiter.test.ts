@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { createResponseWaiter } from "./response-waiter";
+import { createResponseWaiter, extractCorrelationId } from "./response-waiter";
 
 describe("createResponseWaiter", () => {
   beforeEach(() => {
@@ -141,5 +141,31 @@ describe("createResponseWaiter", () => {
     waiter.cancelAll();
     // Calling again should not throw
     waiter.cancelAll();
+  });
+});
+
+describe("extractCorrelationId", () => {
+  it("extracts corr tag from content", () => {
+    expect(extractCorrelationId("hello\n\n<corr:req-abc>")).toBe("req-abc");
+  });
+
+  it("extracts from middle of content", () => {
+    expect(extractCorrelationId("prefix <corr:req-abc> suffix")).toBe("req-abc");
+  });
+
+  it("supports underscores and hyphens", () => {
+    expect(extractCorrelationId("<corr:req_abc-xyz_123>")).toBe("req_abc-xyz_123");
+  });
+
+  it("returns null when no tag found", () => {
+    expect(extractCorrelationId("hello world")).toBeNull();
+  });
+
+  it("returns null on empty string", () => {
+    expect(extractCorrelationId("")).toBeNull();
+  });
+
+  it("only matches the first tag", () => {
+    expect(extractCorrelationId("<corr:first> and <corr:second>")).toBe("first");
   });
 });

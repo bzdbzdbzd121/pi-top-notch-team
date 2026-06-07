@@ -234,6 +234,58 @@ export default function (pi: ExtensionAPI) {
     });
   });
 
+  // ── team_send_and_wait tool ─────────────────────────────
+  pi.registerTool({
+    name: "team_send_and_wait",
+    label: "Send Message and Wait",
+    description:
+      "Send a message to a team member and WAIT for their response. "
+      + "Use instead of team_send_message when you need the member result. "
+      + "Params: to (target), content (body), timeout (optional ms, default 120000).",
+    promptGuidelines: [
+      "Use team_send_and_wait when you need a member result before continuing.",
+      "On timeout check via get_member_log and re-wait if still working.",
+    ],
+    parameters: {
+      type: "object",
+      properties: {
+        to: { type: "string", description: "Target member name" },
+        content: { type: "string", description: "Message body" },
+        timeout: { type: "number", description: "Max wait in ms (default 120000, max 300000)" },
+      },
+      required: ["to", "content"],
+    } as any,
+    async execute(_toolCallId: string, params: { to: string; content: string; timeout?: number }) {
+      const corrId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+      messageQueue.enqueue({
+        id: "msg-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8),
+        from: "tl",
+        to: params.to,
+        content: params.content + "\n\n<corr:" + corrId + ">",
+        timestamp: Date.now(),
+        correlationId: corrId,
+      });
+      const result = await responseWaiter.waitForResponse(corrId, params.timeout ?? 120_000);
+      if (result.status === "response") {
+        return {
+          details: {},
+          content: [{ type: "text" as const, text: "[" + params.to + " reply] " + result.content }],
+        };
+      }
+      if (result.status === "cancelled") {
+        return {
+          details: {},
+          content: [{ type: "text" as const, text: "Wait for " + params.to + " was cancelled." }],
+        };
+      }
+      // timeout
+      return {
+        details: { timeout: true } as any,
+        content: [{ type: "text" as const, text: "Timeout waiting for " + params.to + ". Use get_member_log to check, then re-wait if needed." }],
+      };
+    },
+  });
+
   // ── Custom autocomplete: team names for /team start|show|delete|edit ──
   pi.on("session_start", (_event, ctx) => {
     ctx.ui.addAutocompleteProvider((current) => ({

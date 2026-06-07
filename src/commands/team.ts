@@ -349,6 +349,8 @@ export function registerTeamCommand(
           if (teamCtx.processManager) {
             await teamCtx.processManager.stopAll();
           }
+          // Cancel any pending response waiters
+          teamCtx.responseWaiter.cancelAll();
           teamCtx.memberHandles.clear();
           teamCtx.router.updateMembers([]);
 
