@@ -231,7 +231,7 @@ export default function (pi: ExtensionAPI) {
     if (!memberDef) return null;
 
     const sessionDir = join(getRootDir(), "sessions", team.name, memberName);
-    const sharedContextPath = join(getRootDir(), "sessions", team.name, "shared-context.md");
+    const sharedContextPath = join(getRootDir(), "sessions", team.name, ".shared-context.md");
 
     return {
       name: memberName,
