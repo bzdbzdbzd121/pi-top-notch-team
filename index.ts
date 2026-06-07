@@ -37,7 +37,11 @@ export default function (pi: ExtensionAPI) {
     sendToMember: (memberName: string, msg: TeamMessage) => {
       const handle = teamCtx.memberHandles.get(memberName);
       if (!handle) {
-        console.warn(`[team] Cannot send to unknown member: ${memberName}`);
+        pi.sendMessage({
+          customType: "team-route",
+          content: `无法路由消息到未知成员 "${memberName}"（该成员可能未启动）`,
+          display: true,
+        });
         return;
       }
       try {
@@ -46,7 +50,11 @@ export default function (pi: ExtensionAPI) {
           message: `[消息通道 - 来自 ${msg.from}]\n${msg.subject ? `主题：${msg.subject}\n` : ""}${msg.content}`,
         });
       } catch (err) {
-        console.warn(`[team] Failed to send to ${memberName}:`, err);
+        pi.sendMessage({
+          customType: "team-route",
+          content: `发送消息给 "${memberName}" 失败：${err instanceof Error ? err.message : String(err)}`,
+          display: true,
+        });
       }
     },
     sendToTl: (msg: TeamMessage) => {
@@ -69,11 +77,33 @@ export default function (pi: ExtensionAPI) {
       });
     },
     memberNames: [],
+    onUnknownTarget: (from, to) => {
+      pi.sendMessage({
+        customType: "team-route",
+        content: `消息目标 "${to}" 不存在（来自 ${from}）。有效目标：tl、all、团队成员名称。`,
+        display: true,
+      });
+    },
   });
 
   const messageQueue = createMessageQueue(async (msg: TeamMessage) => {
-    console.warn("[team-queue] routing message:", msg.id, msg.from, "→", msg.to);
+    // Show routing notification for messages from TL (so TL knows it was dispatched)
+    if (msg.from === "tl") {
+      pi.sendMessage({
+        customType: "team-route",
+        content: `[消息已路由给 ${msg.to}]`,
+        display: true,
+      });
+    }
     router.route(msg);
+  }, {
+    onHandlerError: (msg, err) => {
+      pi.sendMessage({
+        customType: "team-route",
+        content: `处理消息（${msg.id}）时出错：${err.message}`,
+        display: true,
+      });
+    },
   });
 
   const responseWaiter = createResponseWaiter();
@@ -155,7 +185,6 @@ export default function (pi: ExtensionAPI) {
       if (event.type === "process_exit" && event.wasRunning) {
         const memberName = event.memberName;
         const exitCode = event.exitCode;
-        console.warn(`[team] Member "${memberName}" exited with code ${exitCode}`);
 
         // Exit code 143 = SIGTERM (128 + 15), which is a normal stop via stop_member
         // Exit code 0 or null = clean exit
@@ -170,13 +199,16 @@ export default function (pi: ExtensionAPI) {
             details: { crashEvent: event },
           });
         } else {
-          console.warn(`[team] Member "${memberName}" stopped normally (code: ${exitCode})`);
+          pi.sendMessage({
+            customType: "team-message",
+            content: `Member "${memberName}" 进程已正常停止（code: ${exitCode}）。`,
+            display: true,
+          });
         }
       }
 
       if (event.type === "process_error") {
         const memberName = event.memberName;
-        console.warn(`[team] Member "${memberName}" process error`);
         pi.sendMessage({
           customType: "team-message",
           content: `Member "${memberName}" 进程异常，需检查崩溃原因。`,
@@ -218,7 +250,11 @@ export default function (pi: ExtensionAPI) {
   const manager = createProcessManager([], {
     autoRestart: false,
     onCrashLoopDetected: (name, restarts) => {
-      console.warn(`[team] Member "${name}" crashed ${restarts} times`);
+      pi.sendMessage({
+          customType: "team-message",
+          content: `Member "${name}" 已连续崩溃 ${restarts} 次，已停止自动重启。`,
+          display: true,
+        });
     },
   });
   teamCtx.processManager = manager;

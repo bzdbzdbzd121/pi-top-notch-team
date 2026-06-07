@@ -1,5 +1,10 @@
 import type { TeamMessage, TeamMessageHandler } from "./types";
 
+export interface MessageQueueOptions {
+  /** Called when the message handler throws. Default: console.warn. */
+  onHandlerError?: (msg: TeamMessage, error: Error) => void;
+}
+
 export interface MessageQueue {
   enqueue(msg: TeamMessage): void;
   length(): number;
@@ -12,7 +17,8 @@ export interface MessageQueue {
  * Messages are processed one at a time, in FIFO order.
  */
 export function createMessageQueue(
-  handler: TeamMessageHandler
+  handler: TeamMessageHandler,
+  options?: MessageQueueOptions
 ): MessageQueue {
   const queue: TeamMessage[] = [];
   let processing: Promise<void> | null = null;
@@ -24,7 +30,7 @@ export function createMessageQueue(
       try {
         await handler(msg);
       } catch (err) {
-        console.warn("[team-queue] Error processing message:", msg.id, err);
+        options?.onHandlerError?.(msg, err instanceof Error ? err : new Error(String(err)));
       }
     }
   }

@@ -7,6 +7,8 @@ export interface RouterConfig {
   sendToTl: (msg: TeamMessage) => void;
   /** List of valid member names. */
   memberNames: string[];
+  /** Called when a message targets an unknown recipient. */
+  onUnknownTarget?: (from: string, to: string) => void;
 }
 
 export interface Router {
@@ -51,9 +53,7 @@ export function createRouter(config: RouterConfig): Router {
       } else if (memberSet.has(to)) {
         sendToMember(to, msg);
       } else {
-        console.warn(
-          `[team-router] Unknown target "${to}". Valid targets: tl, all, ${memberNames.join(", ")}`
-        );
+        config.onUnknownTarget?.(msg.from, msg.to);
       }
     },
   };

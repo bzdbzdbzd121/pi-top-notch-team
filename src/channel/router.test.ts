@@ -39,11 +39,9 @@ describe("createRouter", () => {
 
     router.updateMembers([]);
 
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     router.route(makeMsg({ from: "analyzer", to: "analyzer" }));
     // Should skip self and not send
     expect(sendToMember).not.toHaveBeenCalled();
-    warnSpy.mockRestore();
   });
 
 
@@ -87,18 +85,16 @@ describe("createRouter", () => {
     expect(sendToMember).not.toHaveBeenCalled();
   });
 
-  it("logs warning for unknown target", () => {
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+  it("calls onUnknownTarget for unknown target", () => {
+    const onUnknownTarget = vi.fn();
     const router = createRouter({
       sendToMember: vi.fn(),
       sendToTl: vi.fn(),
       memberNames: ["analyzer"],
+      onUnknownTarget,
     });
 
     router.route(makeMsg({ from: "analyzer", to: "nonexistent" }));
-    expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining("nonexistent")
-    );
-    warnSpy.mockRestore();
+    expect(onUnknownTarget).toHaveBeenCalledWith("analyzer", "nonexistent");
   });
 });
