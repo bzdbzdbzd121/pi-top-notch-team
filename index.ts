@@ -56,7 +56,10 @@ export default function (pi: ExtensionAPI) {
         const resolved = responseWaiter.resolveIfWaiting(
           corrId, msg.from, msg.content, msg.subject
         );
-        if (resolved) return; // consumed by waiter, skip sendMessage
+        if (resolved) {
+          lastPendingCorrId.delete(msg.from);
+          return; // consumed by waiter, skip sendMessage
+        }
       }
       pi.sendMessage({
         customType: "team-message",
@@ -74,6 +77,9 @@ export default function (pi: ExtensionAPI) {
   });
 
   const responseWaiter = createResponseWaiter();
+  // Track the most recent correlation ID sent to each member via team_send_and_wait.
+  // Used to auto-inject correlation ID when a member replies without the <corr:...> tag.
+  const lastPendingCorrId = new Map<string, string>();
 
   teamCtx.router = router;
   teamCtx.messageQueue = messageQueue;
@@ -100,12 +106,20 @@ export default function (pi: ExtensionAPI) {
       if (event.type === "tool_execution_end" && event.toolName === "team_send_message") {
         const teamMsg = event.result?.details?.teamMessage;
         if (teamMsg) {
+          // Auto-populate correlation ID (only for TL-directed messages)
+          let content = teamMsg.content;
+          if (teamMsg.to === "tl" && !content.match(/<corr:[a-zA-Z0-9_-]+>/)) {
+            const stored = lastPendingCorrId.get(teamMsg.from);
+            if (stored) {
+              content = content + `\n\n<corr:${stored}>`;
+            }
+          }
           messageQueue.enqueue({
             id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
             from: teamMsg.from,
             to: teamMsg.to,
             subject: teamMsg.subject,
-            content: teamMsg.content,
+            content,
             timestamp: teamMsg.timestamp ?? Date.now(),
           });
         }
@@ -118,12 +132,20 @@ export default function (pi: ExtensionAPI) {
           : event.message.content?.map((c: any) => c.text ?? "").join(" ") ?? "";
         const parsed = parseTeamMessageTag(text);
         if (parsed) {
+          // Auto-populate correlation ID for backup path too
+          let backupContent = parsed.content;
+          if (parsed.to === "tl" && !backupContent.match(/<corr:[a-zA-Z0-9_-]+>/)) {
+            const stored = lastPendingCorrId.get(config.name);
+            if (stored) {
+              backupContent = backupContent + "\n\n<corr:" + stored + ">";
+            }
+          }
           messageQueue.enqueue({
             id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
             from: config.name,
             to: parsed.to,
             subject: parsed.subject,
-            content: parsed.content,
+            content: backupContent,
             timestamp: Date.now(),
           });
         }
@@ -257,6 +279,7 @@ export default function (pi: ExtensionAPI) {
     } as any,
     async execute(_toolCallId: string, params: { to: string; content: string; timeout?: number }) {
       const corrId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+      lastPendingCorrId.set(params.to, corrId);
       messageQueue.enqueue({
         id: "msg-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8),
         from: "tl",
@@ -266,6 +289,8 @@ export default function (pi: ExtensionAPI) {
         correlationId: corrId,
       });
       const result = await responseWaiter.waitForResponse(corrId, params.timeout ?? 120_000);
+      // Clean up the pending corr ID tracker regardless of outcome
+      lastPendingCorrId.delete(params.to);
       if (result.status === "response") {
         return {
           details: {},
