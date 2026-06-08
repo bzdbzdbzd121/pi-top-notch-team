@@ -135,4 +135,66 @@ describe("registerTlTools", () => {
       expect.objectContaining({ name: "get_member_log" })
     );
   });
+
+  it("get_member_log tool parameters include maxContentLength", () => {
+    const pi = createMockPi();
+    const manager = createMockManager();
+
+    let toolDef: any = null;
+    pi.registerTool = vi.fn((def: any) => {
+      if (def.name === "get_member_log") {
+        toolDef = def;
+      }
+    });
+
+    registerTlTools(pi, manager, vi.fn());
+
+    expect(toolDef).not.toBeNull();
+    expect(toolDef.parameters.properties.maxContentLength).toBeDefined();
+    expect(toolDef.parameters.properties.maxContentLength.type).toBe("number");
+  });
+
+  it("get_member_log execute passes maxContentLength to getMemberLog", async () => {
+    const pi = createMockPi();
+    const manager = createMockManager();
+    const getMemberLog = vi.fn().mockResolvedValue("[user] hello\n[assistant] world");
+
+    manager.getStatus = vi.fn().mockReturnValue({ name: "coder", status: "running", pid: 123 });
+
+    let executeFn: Function = () => {};
+    pi.registerTool = vi.fn((def: any) => {
+      if (def.name === "get_member_log") {
+        executeFn = def.execute;
+      }
+    });
+
+    registerTlTools(pi, manager, vi.fn(), undefined, getMemberLog);
+
+    const result = await executeFn("call-1", { name: "coder", lines: 5, maxContentLength: 20 });
+    expect(getMemberLog).toHaveBeenCalledWith("coder", 5, 20);
+    expect(result.content[0].text).toContain("最近对话");
+  });
+
+  it("get_member_log execute defaults maxContentLength when not provided", async () => {
+    const pi = createMockPi();
+    const manager = createMockManager();
+    const getMemberLog = vi.fn().mockResolvedValue("[user] hello");
+
+    manager.getStatus = vi.fn().mockReturnValue({ name: "coder", status: "running", pid: 123 });
+
+    let executeFn: Function = () => {};
+    pi.registerTool = vi.fn((def: any) => {
+      if (def.name === "get_member_log") {
+        executeFn = def.execute;
+      }
+    });
+
+    registerTlTools(pi, manager, vi.fn(), undefined, getMemberLog);
+
+    const result = await executeFn("call-2", { name: "coder", lines: 10 });
+    // Should still call getMemberLog with undefined for maxContentLength
+    // (the default is handled by the getMemberLog function itself)
+    expect(getMemberLog).toHaveBeenCalledWith("coder", 10, undefined);
+    expect(result.content[0].text).toContain("最近对话");
+  });
 });

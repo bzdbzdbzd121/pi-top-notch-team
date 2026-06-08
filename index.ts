@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerTeamCommand } from "./src/commands/team";
 import { getSessionState } from "./src/session/state";
-import type { TeamContext } from "./src/session/context";
+import type { TeamContext, MemberOperationalState } from "./src/session/context";
 import { registerTlTools } from "./src/tools/tl-tools";
 import { createProcessManager } from "./src/process/manager";
 import { createMemberProcess } from "./src/process/member-process";
@@ -12,6 +12,7 @@ import type { TeamMessage } from "./src/channel/types";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { getRootDir } from "./src/config";
+import { createTeamStatusWidget } from "./src/ui/team-status-widget";
 
 export default function (pi: ExtensionAPI) {
   // If running as a member process (TEAM_ROLE is set), skip TL-only tools
@@ -26,10 +27,12 @@ export default function (pi: ExtensionAPI) {
     editingTeamName: null,
     processManager: null,
     memberHandles: new Map(),
-    tlToolNames: ["start_member", "stop_member", "list_members", "get_member_log", "team_send_and_wait"],
+    tlToolNames: ["start_member", "stop_member", "list_members", "get_member_log", "team_send_and_wait", "get_member_status"],
+    blockedToolNames: ["write", "edit"],
     router: null,
     messageQueue: null,
     responseWaiter: null,
+    memberOperationalStates: null,
   };
 
   // ── Message channel: queue → router ──────────────────────
@@ -44,6 +47,9 @@ export default function (pi: ExtensionAPI) {
         });
         return;
       }
+      // Mark member as working when we send a prompt (before sendCommand)
+      memberOpsStates.set(memberName, "working");
+
       try {
         handle.sendCommand({
           type: "prompt",
@@ -107,6 +113,10 @@ export default function (pi: ExtensionAPI) {
   });
 
   const responseWaiter = createResponseWaiter();
+
+  // ── Member operational state tracking ─────────────────────
+  const memberOpsStates = new Map<string, MemberOperationalState>();
+
   // Track the most recent correlation ID sent to each member via team_send_and_wait.
   // Used to auto-inject correlation ID when a member replies without the <corr:...> tag.
   const lastPendingCorrId = new Map<string, string>();
@@ -116,6 +126,7 @@ export default function (pi: ExtensionAPI) {
   teamCtx.router = router;
   teamCtx.messageQueue = messageQueue;
   teamCtx.responseWaiter = responseWaiter;
+  teamCtx.memberOperationalStates = memberOpsStates;
 
   // ── Create and register member handles ─────────────────────
   function createAndRegisterMember(
@@ -134,6 +145,14 @@ export default function (pi: ExtensionAPI) {
 
     // Wire message channel: intercept team_send_message tool calls
     handle.onEvent((event: any) => {
+      // ── Member operational state tracking ─────────────────
+      if (event.type === "agent_start") {
+        memberOpsStates.set(config.name, "working");
+      }
+      if (event.type === "agent_end") {
+        memberOpsStates.set(config.name, "idle");
+      }
+
       // Primary: team_send_message tool result
       if (event.type === "tool_execution_end" && event.toolName === "team_send_message") {
         const teamMsg = event.result?.details?.teamMessage;
@@ -195,13 +214,20 @@ export default function (pi: ExtensionAPI) {
       }
 
       // Handle process exit
-      if (event.type === "process_exit" && event.wasRunning) {
+      if (event.type === "process_exit") {
         const memberName = event.memberName;
         const exitCode = event.exitCode;
 
         // Exit code 143 = SIGTERM (128 + 15), which is a normal stop via stop_member
         // Exit code 0 or null = clean exit
         const isNormalExit = exitCode === null || exitCode === 0 || exitCode === 143;
+
+        // Update operational state
+        memberOpsStates.set(memberName, isNormalExit ? "stopped" : "crashed");
+
+        // Only proceed with further handling if the process was actually running
+        // (wasRunning=true indicates an unexpected exit that needs routing/notification)
+        if (!event.wasRunning) return;
 
         if (!isNormalExit) {
           // Cancel pending team_send_and_wait waits for this member
@@ -233,6 +259,8 @@ export default function (pi: ExtensionAPI) {
 
       if (event.type === "process_error") {
         const memberName = event.memberName;
+        // Update operational state
+        memberOpsStates.set(memberName, "crashed");
         const pendingCorrId = lastPendingCorrId.get(memberName);
         if (pendingCorrId) {
           responseWaiter.resolveIfWaiting(
@@ -248,6 +276,9 @@ export default function (pi: ExtensionAPI) {
         });
       }
     });
+
+    // Initialize member operational state
+    memberOpsStates.set(config.name, "idle");
 
     return handle;
   }
@@ -292,7 +323,7 @@ export default function (pi: ExtensionAPI) {
   teamCtx.processManager = manager;
 
   // getMemberLog: query member session via RPC get_messages
-  async function getMemberLog(memberName: string, maxLines: number): Promise<string> {
+  async function getMemberLog(memberName: string, maxLines: number, maxContentLength?: number): Promise<string> {
     const handle = teamCtx.memberHandles.get(memberName);
     if (!handle) {
       throw new Error(`Member "${memberName}" not found`);
@@ -303,13 +334,22 @@ export default function (pi: ExtensionAPI) {
       (event: any) => event.type === "response" && event.command === "get_messages"
     );
 
+    const effectiveMaxLen = maxContentLength ?? 50;
+
     const messages = response?.data?.messages ?? [];
     const recent = messages.slice(-maxLines);
     return recent
-      .map(
-        (m: any) =>
-          `[${m.role}] ${typeof m.content === "string" ? m.content : JSON.stringify(m.content)}`
-      )
+      .map((m: any) => {
+        let content = typeof m.content === "string"
+          ? m.content
+          : JSON.stringify(m.content);
+
+        if (content.length > effectiveMaxLen) {
+          content = content.slice(0, effectiveMaxLen) + "...";
+        }
+
+        return `[${m.role}] ${content}`;
+      })
       .join("\n");
   }
 
@@ -382,6 +422,37 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // ── get_member_status ─────────────────────────────────────
+  pi.registerTool({
+    name: "get_member_status",
+    label: "Get Member Operational Status",
+    description: "获取所有团队成员的运行状态（idle/working/crashed/stopped）。无参数。",
+    promptGuidelines: [
+      "Use get_member_status to check the operational status of all members before assigning tasks.",
+    ],
+    parameters: { type: "object", properties: {} } as any,
+    async execute() {
+      const entries = Array.from(memberOpsStates.entries());
+      if (entries.length === 0) {
+        return {
+          details: {},
+          content: [{ type: "text" as const, text: "还没有启动任何团队成员。请先使用 start_member 启动成员。" }],
+        };
+      }
+      const lines = entries.map(([name, state]) => {
+        const icon = state === "working" ? "🔧"
+                   : state === "idle" ? "✅"
+                   : state === "crashed" ? "💥"
+                   : "⏹️";
+        return `  ${icon} ${name}: ${state}`;
+      });
+      return {
+        details: {},
+        content: [{ type: "text" as const, text: `团队成员操作状态：\n${lines.join("\n")}` }],
+      };
+    },
+  });
+
   // ── Custom autocomplete: team names for /team start|show|delete|edit ──
   pi.on("session_start", (_event, ctx) => {
     ctx.ui.addAutocompleteProvider((current) => ({
@@ -424,9 +495,30 @@ export default function (pi: ExtensionAPI) {
     })) ?? [])
   );
 
+  // ── Team status widget (team mode visual indicator) ─────
+  let teamStatusWidget: ReturnType<typeof createTeamStatusWidget> | null = null;
+
   // ── TL system prompt injection ───────────────────────────
-  pi.on("before_agent_start", async (event, _ctx) => {
+  pi.on("before_agent_start", async (event, ctx) => {
     const session = getSessionState();
+
+    // Install team status widget when session becomes active
+    if (session.active && session.teamDefinition && !teamStatusWidget) {
+      teamStatusWidget = createTeamStatusWidget({
+        teamName: session.teamDefinition.name,
+        members: session.teamDefinition.members,
+        teamCtx,
+        memberOpsStates,
+      });
+      teamStatusWidget.install(ctx.ui, ctx.ui.theme);
+    }
+
+    // Clean up widget when session ends
+    if (!session.active && teamStatusWidget) {
+      teamStatusWidget.uninstall();
+      teamStatusWidget = null;
+    }
+
     let extraPrompt = "";
 
     if (teamCtx.isCreatingTeam) {

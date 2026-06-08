@@ -289,9 +289,14 @@ export function registerTeamCommand(
           teamCtx.router!.updateMembers(team.members.map((m) => m.name));
 
           const tlToolNames = teamCtx.tlToolNames;
+          const blockedToolNames = teamCtx.blockedToolNames;
           const currentActive = pi.getActiveTools();
-          const newActive = [...new Set([...currentActive, ...tlToolNames])];
+          // Add TL tools and remove blocked tools (code-writing tools TL should not use)
+          const filtered = currentActive.filter((t: string) => !blockedToolNames.includes(t));
+          const newActive = [...new Set([...filtered, ...tlToolNames])];
           pi.setActiveTools(newActive);
+          // Store blocked tools so we know what to restore later
+          teamCtx.blockedToolNames = blockedToolNames;
 
           ctx.ui.notify(
             `团队 "${name}" 已就绪。${team.members.length} 个成员待启动。\n` +
@@ -321,8 +326,11 @@ export function registerTeamCommand(
           teamCtx.router!.updateMembers([]);
 
           const tlToolNames = teamCtx.tlToolNames;
+          const blockedToolNames = teamCtx.blockedToolNames;
           const currentActive = pi.getActiveTools();
-          const newActive = currentActive.filter((t: string) => !tlToolNames.includes(t));
+          // Remove TL tools and restore blocked tools
+          const withoutTlTools = currentActive.filter((t: string) => !tlToolNames.includes(t));
+          const newActive = [...new Set([...withoutTlTools, ...blockedToolNames])];
           pi.setActiveTools(newActive);
 
           endSession();

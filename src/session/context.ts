@@ -4,6 +4,9 @@ import type { ResponseWaiter } from "../channel/response-waiter";
 import type { ProcessManager } from "../process/manager";
 import type { MemberProcessHandle } from "../process/member-process";
 
+/** Member operational state, tracked in TL side. */
+export type MemberOperationalState = "idle" | "working" | "crashed" | "stopped";
+
 /**
  * Shared mutable state for the active team session.
  * Passed to command registration functions so they can
@@ -19,4 +22,8 @@ export interface TeamContext {
   messageQueue: MessageQueue | null;
   responseWaiter: ResponseWaiter | null;
   tlToolNames: string[];
+  /** Tool names to remove from active set during a team session (e.g. code-writing tools). */
+  blockedToolNames: string[];
+  /** Member operational state tracking map (TL side). */
+  memberOperationalStates: Map<string, MemberOperationalState> | null;
 }

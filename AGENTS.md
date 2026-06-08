@@ -117,12 +117,12 @@ npm test          # Run all tests (vitest)
 npm run test:watch  # Watch mode
 ```
 
-87 tests across 11 files. Tests live alongside source as `*.test.ts`.
+121 tests across 12 files. Tests live alongside source as `*.test.ts`.
 
 | Test Level | What | How |
 |-----------|------|-----|
 | Unit | schema, store, message-queue, router, config | Pure functions, no mocking |
-| Integration | commands, tl-tools, member-process, manager | Mock ExtensionAPI / child_process |
+| Integration | commands, tl-tools, index, member-process, manager | Mock ExtensionAPI / child_process |
 | E2E | Manual via `pi --mode json -e ./index.ts` | Real pi binary |
 
 ## Environment Variables
@@ -160,7 +160,8 @@ npm run test:watch  # Watch mode
 | `start_member(name)` | Launch a Member's pi RPC process |
 | `stop_member(name)` | Gracefully terminate a Member process |
 | `list_members()` | Show all member statuses |
-| `get_member_log(name, lines?)` | Query Member's recent session via RPC |
+| `get_member_log(name, lines?, maxContentLength?)` | Query Member's recent session via RPC. `maxContentLength` truncates each message content (default 50 chars). |
+| `get_member_status()` | Get operational status (idle/working/crashed/stopped) for all members. No parameters. |
 | `team_send_and_wait(to, content, timeout?)` | Send message and wait for response (blocks until reply or timeout) |
 
 ## ADRs

@@ -6,7 +6,7 @@ import { spawn } from "node:child_process";
 
 type CreateMemberFn = (config: MemberProcessConfig) => MemberProcessHandle;
 type BuildConfigFn = (memberName: string) => MemberProcessConfig | null;
-type GetMemberLogFn = (memberName: string, maxLines: number) => Promise<string>;
+type GetMemberLogFn = (memberName: string, maxLines: number, maxContentLength?: number) => Promise<string>;
 
 /**
  * Callback to enqueue a message from the TL into the team's message channel.
@@ -181,10 +181,14 @@ export function registerTlTools(
           type: "number",
           description: "Number of recent lines to fetch (default: 10)",
         },
+        maxContentLength: {
+          type: "number",
+          description: "每条消息内容最大字符数（默认 50），超出截断并追加'...'",
+        },
       },
       required: ["name"],
     } as any,
-    async execute(_toolCallId: string, params: { name: string; lines?: number }) {
+    async execute(_toolCallId: string, params: { name: string; lines?: number; maxContentLength?: number }) {
       const maxLines = params.lines ?? 10;
       const status = manager.getStatus(params.name);
       if (!status || status.status !== "running") {
@@ -212,7 +216,7 @@ export function registerTlTools(
       }
 
       try {
-        const logText = await getMemberLog(params.name, maxLines);
+        const logText = await getMemberLog(params.name, maxLines, params.maxContentLength);
         return {
           details: {},
           content: [
