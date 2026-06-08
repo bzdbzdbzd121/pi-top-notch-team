@@ -452,23 +452,23 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // ── Call-level guard: allow write/edit only for .shared-context.md ─
+  // ── Call-level guard: block code-file writes during team session ───
   pi.on("tool_call", (event) => {
     if (!teamCtx.processManager) return; // not in a team session
 
-    // Only intercept write/edit tools
     if (event.toolName !== "write" && event.toolName !== "edit") return;
 
     const input = event.input as { path?: string };
     const filePath = input?.path ?? "";
-    const isSharedContext = filePath.endsWith(".shared-context.md");
 
-    if (!isSharedContext) {
-      return {
-        block: true,
-        reason: `团队会话期间不得使用 ${event.toolName} 修改文件。请委派给 Member 执行。唯一的例外是维护 .shared-context.md。`,
-      };
-    }
+    // Allow .md files (shared context, ADRs, planning docs)
+    if (filePath.endsWith(".md")) return;
+
+    // Block everything else (code, config, etc.)
+    return {
+      block: true,
+      reason: `团队会话期间不得使用 ${event.toolName} 写代码文件。请委派给 Member 执行。你可以编写 .md 文档（如 .shared-context.md、ADR 等）。`,
+    };
   });
 
   // ── Custom autocomplete: team names for /team start|show|delete|edit ──
@@ -624,7 +624,7 @@ ${memberLines}
 - 需要分析代码？委派给分析员。需要修改文件？委派给开发员。需要验证？委派给测试员。
 - 你的职责是：拆解任务、制定计划、分配工作、协调进度、处理异常。
 - 只有以下情况才自己动手：涉及团队管理的决策、成员不可用时的紧急处理、向用户汇报结果。
-- **维护 .shared-context.md 是唯一的写文件例外**。你可以使用 write/edit 工具修改 .shared-context.md，除此之外不得使用 write/edit 写任何其他文件——代码、配置、文档等一律委派给 Member。
+- **你可以编写 .md 文档**（如 .shared-context.md、ADR 等），但**不得使用 write/edit 写代码文件**（.ts/.js/.py/.json 等）——这些工作一律委派给 Member。
 - **成员完成任务后不要主动停止其进程。** Member 进程保持运行以便继续接收新任务。仅当成员进程异常时（崩溃、无响应），才使用 stop_member 终止后重新启动。
 
 ### 与用户讨论需求的方式
