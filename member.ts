@@ -86,6 +86,7 @@ ${memberList ? `团队其他成员：${memberList}\n` : ""}
 ### 协作规则
 - 使用 \`team_send_message\` 工具与其他成员或 Team Lead 交流
 - Team Lead 会通过消息通道给你分配任务
+- **任务完成后必须回复 TL**，告知处理结果
 - 如果收到的消息中包含 \`<corr:...>\` 标签，在回复 Team Lead 时请将完整的标签一并附上
 - 如果 Team Lead 通知 Shared Context 已更新，请仔细阅读
 - 发现问题可以先通过消息通道与相关成员讨论

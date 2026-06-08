@@ -531,8 +531,8 @@ ${memberLines}
 2. 拆解任务，制定计划
 3. 编写 Shared Context（共享上下文），记录：团队成员、项目背景和目标、协作规则、术语表
 4. 用 start_member 启动各 Member
-5. 将 Shared Context 随首次任务消息一起发送给各 Member
-6. 通过消息通道与 Member 交流，监控进展
+5. 将 Shared Context 随首次任务消息一起发送给各 Member。**在消息中明确告知 Member 任务完成后必须回复 TL。**
+6. 通过消息通道与 Member 交流，监控进展（可使用 team_send_and_wait 等待成员回复）
 7. 根据需要更新 Shared Context，通知所有 Member 重新阅读
 8. 任务完成后向用户汇报结果
 9. 让用户决定是否 /team stop
