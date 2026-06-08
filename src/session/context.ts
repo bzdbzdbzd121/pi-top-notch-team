@@ -22,8 +22,16 @@ export interface TeamContext {
   messageQueue: MessageQueue | null;
   responseWaiter: ResponseWaiter | null;
   tlToolNames: string[];
-  /** Tool names to remove from active set during a team session (e.g. code-writing tools). */
-  blockedToolNames: string[];
   /** Member operational state tracking map (TL side). */
   memberOperationalStates: Map<string, MemberOperationalState> | null;
+
+  // ── UI lifecycle hooks (set by index.ts, called by commands/team.ts) ──
+  /** Called immediately when /team start runs. Installs team status widget. */
+  onSessionStart?: (ui: {
+    setWidget: Function;
+    setStatus: Function;
+    theme: { fg: Function };
+  }) => void;
+  /** Called immediately when /team stop runs. Removes team status widget. */
+  onSessionEnd?: () => void;
 }

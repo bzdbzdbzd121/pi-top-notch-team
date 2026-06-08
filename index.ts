@@ -28,7 +28,6 @@ export default function (pi: ExtensionAPI) {
     processManager: null,
     memberHandles: new Map(),
     tlToolNames: ["start_member", "stop_member", "list_members", "get_member_log", "team_send_and_wait", "get_member_status"],
-    blockedToolNames: ["write", "edit"],
     router: null,
     messageQueue: null,
     responseWaiter: null,
@@ -453,6 +452,25 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // ── Call-level guard: allow write/edit only for .shared-context.md ─
+  pi.on("tool_call", (event) => {
+    if (!teamCtx.processManager) return; // not in a team session
+
+    // Only intercept write/edit tools
+    if (event.toolName !== "write" && event.toolName !== "edit") return;
+
+    const input = event.input as { path?: string };
+    const filePath = input?.path ?? "";
+    const isSharedContext = filePath.endsWith(".shared-context.md");
+
+    if (!isSharedContext) {
+      return {
+        block: true,
+        reason: `团队会话期间不得使用 ${event.toolName} 修改文件。请委派给 Member 执行。唯一的例外是维护 .shared-context.md。`,
+      };
+    }
+  });
+
   // ── Custom autocomplete: team names for /team start|show|delete|edit ──
   pi.on("session_start", (_event, ctx) => {
     ctx.ui.addAutocompleteProvider((current) => ({
@@ -498,11 +516,33 @@ export default function (pi: ExtensionAPI) {
   // ── Team status widget (team mode visual indicator) ─────
   let teamStatusWidget: ReturnType<typeof createTeamStatusWidget> | null = null;
 
+  // Wire UI lifecycle hooks so commands/team.ts can install/uninstall immediately
+  teamCtx.onSessionStart = (ui) => {
+    // If already installed, skip
+    if (teamStatusWidget) return;
+    const session = getSessionState();
+    if (!session.teamDefinition) return;
+    teamStatusWidget = createTeamStatusWidget({
+      teamName: session.teamDefinition.name,
+      members: session.teamDefinition.members,
+      teamCtx,
+      memberOpsStates,
+    });
+    teamStatusWidget.install(ui, ui.theme);
+  };
+  teamCtx.onSessionEnd = () => {
+    if (teamStatusWidget) {
+      teamStatusWidget.uninstall();
+      teamStatusWidget = null;
+    }
+  };
+
   // ── TL system prompt injection ───────────────────────────
-  pi.on("before_agent_start", async (event, ctx) => {
+  pi.on("before_agent_start", async (event, _ctx) => {
     const session = getSessionState();
 
-    // Install team status widget when session becomes active
+    // Safety net: if widget wasn't installed by /team start (e.g., session resume),
+    // install it here. Also clean up if session ended without /team stop.
     if (session.active && session.teamDefinition && !teamStatusWidget) {
       teamStatusWidget = createTeamStatusWidget({
         teamName: session.teamDefinition.name,
@@ -510,10 +550,8 @@ export default function (pi: ExtensionAPI) {
         teamCtx,
         memberOpsStates,
       });
-      teamStatusWidget.install(ctx.ui, ctx.ui.theme);
+      teamStatusWidget.install(_ctx.ui, _ctx.ui.theme);
     }
-
-    // Clean up widget when session ends
     if (!session.active && teamStatusWidget) {
       teamStatusWidget.uninstall();
       teamStatusWidget = null;
@@ -586,6 +624,7 @@ ${memberLines}
 - 需要分析代码？委派给分析员。需要修改文件？委派给开发员。需要验证？委派给测试员。
 - 你的职责是：拆解任务、制定计划、分配工作、协调进度、处理异常。
 - 只有以下情况才自己动手：涉及团队管理的决策、成员不可用时的紧急处理、向用户汇报结果。
+- **维护 .shared-context.md 是唯一的写文件例外**。你可以使用 write/edit 工具修改 .shared-context.md，除此之外不得使用 write/edit 写任何其他文件——代码、配置、文档等一律委派给 Member。
 - **成员完成任务后不要主动停止其进程。** Member 进程保持运行以便继续接收新任务。仅当成员进程异常时（崩溃、无响应），才使用 stop_member 终止后重新启动。
 
 ### 与用户讨论需求的方式
