@@ -51,6 +51,8 @@ export function createProcessManager(
   const crashTimestamps = new Map<string, number[]>();
   // Members that exceeded the crash limit and are frozen (no restart)
   const frozenMembers = new Set<string>();
+  // Pending restart timers keyed by member name (for cancellation on stop)
+  const pendingRestartTimers = new Map<string, NodeJS.Timeout>();
 
   /**
    * Prune crash timestamps older than the tracking window,
@@ -117,6 +119,12 @@ export function createProcessManager(
     },
 
     async stop(name: string): Promise<void> {
+      // Cancel any pending restart timer for this member
+      const timer = pendingRestartTimers.get(name);
+      if (timer) {
+        clearTimeout(timer);
+        pendingRestartTimers.delete(name);
+      }
       const handle = memberMap.get(name);
       if (handle) {
         // Clear crash history on intentional stop
@@ -127,6 +135,11 @@ export function createProcessManager(
     },
 
     async stopAll(): Promise<void> {
+      // Cancel all pending restart timers
+      for (const [, timer] of pendingRestartTimers) {
+        clearTimeout(timer);
+      }
+      pendingRestartTimers.clear();
       crashTimestamps.clear();
       frozenMembers.clear();
       await Promise.all(
@@ -158,12 +171,14 @@ export function createProcessManager(
 
       onRestarting?.(name, attempt, delayMs);
 
-      setTimeout(() => {
+      const timer = setTimeout(() => {
+        pendingRestartTimers.delete(name);
         // Re-check: might have been stopped/frozen intentionally while waiting
         if (!frozenMembers.has(name) && handle.getState().status !== "running") {
           handle.start().catch(() => {});
         }
       }, delayMs);
+      pendingRestartTimers.set(name, timer);
     },
 
     addHandle(handle: MemberProcessHandle): void {

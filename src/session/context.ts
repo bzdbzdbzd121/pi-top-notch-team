@@ -15,8 +15,8 @@ export interface TeamContext {
   editingTeamName: string | null;
   processManager: ProcessManager | null;
   memberHandles: Map<string, MemberProcessHandle>;
-  router: Router;
-  messageQueue: MessageQueue;
-  responseWaiter: ResponseWaiter;
+  router: Router | null;
+  messageQueue: MessageQueue | null;
+  responseWaiter: ResponseWaiter | null;
   tlToolNames: string[];
 }

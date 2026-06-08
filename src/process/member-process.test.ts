@@ -21,6 +21,12 @@ function createMockSpawn() {
   return { stdin, stdout, stderr, process };
 }
 
+/** Emit a dummy JSON event on stdout to resolve the start() ready promise. */
+function emitReadyStdout(stdout: any) {
+  stdout.write(JSON.stringify({ type: "ready" }) + "\n");
+}
+
+
 describe("createMemberProcess", () => {
   const defaultConfig: MemberProcessConfig = {
     name: "analyzer",
@@ -41,11 +47,13 @@ describe("createMemberProcess", () => {
   });
 
   it("spawns pi with correct args", async () => {
-    const { process: mockProcess } = createMockSpawn();
+    const { process: mockProcess, stdout } = createMockSpawn();
     const spawnMock = vi.fn().mockReturnValue(mockProcess);
 
     const member = createMemberProcess(defaultConfig, spawnMock);
-    await member.start();
+    const startPromise = member.start();
+    emitReadyStdout(stdout);
+    await startPromise;
 
     expect(spawnMock).toHaveBeenCalledWith(
       "pi",
@@ -70,16 +78,13 @@ describe("createMemberProcess", () => {
   });
 
   it("resolves when started (process ready event)", async () => {
-    const { process: mockProcess } = createMockSpawn();
+    const { process: mockProcess, stdout } = createMockSpawn();
     const spawnMock = vi.fn().mockReturnValue(mockProcess);
 
     const member = createMemberProcess(defaultConfig, spawnMock);
     const startPromise = member.start();
-
-    // Simulate pi RPC starting up: emits agent_start after initial prompt
-    // Actually, pi RPC doesn't emit agent_start until a prompt is sent.
-    // For start(), we just need the process to be spawned.
-    // The start() resolves after spawn succeeds (immediately since spawn is sync-ish)
+    // Simulate pi RPC starting up: emit a JSON line on stdout
+    emitReadyStdout(stdout);
     await startPromise;
 
     expect(member.getState().status).toBe("running");
@@ -87,11 +92,13 @@ describe("createMemberProcess", () => {
   });
 
   it("tracks process exit", async () => {
-    const { process: mockProcess } = createMockSpawn();
+    const { process: mockProcess, stdout } = createMockSpawn();
     const spawnMock = vi.fn().mockReturnValue(mockProcess);
 
     const member = createMemberProcess(defaultConfig, spawnMock);
-    await member.start();
+    const startPromise = member.start();
+    emitReadyStdout(stdout);
+    await startPromise;
     expect(member.getState().status).toBe("running");
 
     // Simulate process exit
@@ -101,13 +108,15 @@ describe("createMemberProcess", () => {
   });
 
   it("stops process gracefully (SIGTERM then SIGKILL)", async () => {
-    const { process: mockProcess } = createMockSpawn();
+    const { process: mockProcess, stdout } = createMockSpawn();
     const spawnMock = vi.fn().mockReturnValue(mockProcess);
     const killMock = vi.fn();
     mockProcess.kill = killMock;
 
     const member = createMemberProcess(defaultConfig, spawnMock);
-    await member.start();
+    const startPromise = member.start();
+    emitReadyStdout(stdout);
+    await startPromise;
 
     const stopPromise = member.stop();
     // First SIGTERM
@@ -126,7 +135,9 @@ describe("createMemberProcess", () => {
     const spawnMock = vi.fn().mockReturnValue(mockProcess);
 
     const member = createMemberProcess(defaultConfig, spawnMock);
-    await member.start();
+    const startPromise = member.start();
+    emitReadyStdout(stdout);
+    await startPromise;
 
     const onUpdate = vi.fn();
     member.onEvent(onUpdate);
@@ -176,7 +187,9 @@ describe("createMemberProcess", () => {
       const spawnMock = vi.fn().mockReturnValue(mockProcess);
 
       const member = createMemberProcess(defaultConfig, spawnMock);
-      await member.start();
+      const startPromise = member.start();
+      emitReadyStdout(stdout);
+      await startPromise;
 
       // Capture what was written to stdin
       const writeSpy = vi.fn();

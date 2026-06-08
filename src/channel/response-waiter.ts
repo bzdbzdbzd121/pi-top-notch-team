@@ -45,6 +45,7 @@ export interface ResponseWaiter {
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_TIMEOUT_MS = 300_000;
+const MAX_PENDING_LIMIT = 100;
 
 /**
  * Create a ResponseWaiter that manages pending "send and wait" requests,
@@ -64,6 +65,17 @@ export function createResponseWaiter(): ResponseWaiter {
       );
 
       return new Promise<WaitResult>((resolve) => {
+        // Enforce max pending limit: if exceeded, resolve oldest wait immediately as timeout
+        if (pending.size >= MAX_PENDING_LIMIT) {
+          const oldestKey = pending.keys().next().value;
+          if (oldestKey) {
+            const oldest = pending.get(oldestKey)!;
+            clearTimeout(oldest.timeout);
+            pending.delete(oldestKey);
+            oldest.resolve({ status: "timeout" });
+          }
+        }
+
         const timeout = setTimeout(() => {
           pending.delete(correlationId);
           resolve({ status: "timeout" });

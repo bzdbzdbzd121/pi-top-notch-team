@@ -91,6 +91,44 @@ describe("/team command", () => {
     );
   });
 
+  it("/team show displays multi-line systemPrompt correctly", async () => {
+    const pi = createMockExtensionAPI();
+    const ctx = createMockContext();
+    let handler: Function = () => {};
+    pi.registerCommand = vi.fn((_name, opts) => { handler = opts.handler; });
+    registerTeamCommand(pi, createTeamContext());
+
+    // 创建包含多行 systemPrompt 的团队 YAML
+    mkdirSync(join(tmpDir, "teams"), { recursive: true });
+    writeFileSync(join(tmpDir, "teams", "multi-line.yaml"),
+      `name: multi-line
+description: test
+members:
+  - name: analyzer
+    label: 分析员
+    systemPrompt: |
+      第一行提示词
+      第二行提示词
+      第三行提示词
+`, "utf-8");
+
+    await handler("show multi-line", ctx);
+
+    // 验证输出包含三行提示词
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("第一行提示词"),
+      "info"
+    );
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("第二行提示词"),
+      "info"
+    );
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("第三行提示词"),
+      "info"
+    );
+  });
+
   it("/team delete deletes after confirmation", async () => {
     mkdirSync(join(tmpDir, "teams"), { recursive: true });
     writeFileSync(join(tmpDir, "teams", "to-delete.yaml"), "name: to-delete\ndescription: test\nmembers:\n  - name: w\n    systemPrompt: work", "utf-8");

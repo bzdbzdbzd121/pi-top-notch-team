@@ -25,7 +25,7 @@ export function writeTeam(team: TeamDefinition, rootDir: string): void {
   writeFileSync(filePath, yaml, "utf-8");
 }
 
-/** Read a team definition from a YAML file. Returns null if not found. */
+/** Read a team definition from a YAML file. Returns null if not found or invalid. */
 export function readTeam(name: string, rootDir: string): TeamDefinition | null {
   const filePath = join(getTeamsDir(rootDir), `${name}.yaml`);
 
@@ -33,17 +33,21 @@ export function readTeam(name: string, rootDir: string): TeamDefinition | null {
     return null;
   }
 
-  const raw = readFileSync(filePath, "utf-8");
-  const data = parseYaml(raw);
-  const validation = validateTeamDefinition(data);
+  try {
+    const raw = readFileSync(filePath, "utf-8");
+    const data = parseYaml(raw);
+    const validation = validateTeamDefinition(data);
 
-  if (!validation.valid) {
-    throw new Error(
-      `Invalid team definition in ${filePath}:\n${validation.errors.join("\n")}`
-    );
+    if (!validation.valid) {
+      console.warn(`Invalid team definition in ${filePath}:\n${validation.errors.join("\n")}`);
+      return null;
+    }
+
+    return data as TeamDefinition;
+  } catch (err) {
+    console.warn(`Failed to read team "${name}": ${err instanceof Error ? err.message : String(err)}`);
+    return null;
   }
-
-  return data as TeamDefinition;
 }
 
 /** List all team names (without .yaml extension). Returns empty array if no teams directory. */

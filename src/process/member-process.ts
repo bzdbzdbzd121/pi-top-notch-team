@@ -110,13 +110,19 @@ export function createMemberProcess(
       child.stdin!.write(JSON.stringify(cmd) + "\n");
 
       return new Promise((resolve, reject) => {
+        let settled = false;
+
         const timeout = setTimeout(() => {
+          if (settled) return;
+          settled = true;
           cleanup();
           reject(new Error(`Command to "${name}" timed out after ${timeoutMs}ms`));
         }, timeoutMs);
 
         function handler(event: any) {
+          if (settled) return;
           if (event.type === "response" && event.id === id && matchFn(event)) {
+            settled = true;
             cleanup();
             resolve(event);
           }
@@ -149,6 +155,13 @@ export function createMemberProcess(
         env.TEAM_SHARED_CONTEXT_PATH = sharedContextPath;
       }
 
+      let resolveReady: () => void;
+      let rejectReady: (err: Error) => void;
+      const readyPromise = new Promise<void>((resolve, reject) => {
+        resolveReady = resolve;
+        rejectReady = reject;
+      });
+
       try {
         child = spawnFn(piCommand, [
           "--mode", "rpc",
@@ -174,6 +187,8 @@ export function createMemberProcess(
 
       // Parse JSONL from stdout
       let buffer = "";
+      let readyResolved = false;
+
       child.stdout?.on("data", (chunk: Buffer) => {
         buffer += chunk.toString("utf-8");
         const lines = buffer.split("\n");
@@ -184,9 +199,17 @@ export function createMemberProcess(
           if (!trimmed) continue;
           try {
             const event = JSON.parse(trimmed);
+            // Resolve ready promise on first valid JSON event (indicates RPC is up)
+            if (!readyResolved) {
+              readyResolved = true;
+              resolveReady();
+            }
             notifyHandlers(event);
           } catch {
-            // Not valid JSON, skip
+            // Not valid JSON, skip (only log first few for debugging)
+            if (trimmed.length < 200 && !trimmed.startsWith("{")) {
+              console.warn(`[member:${name}] Non-JSON output from pi RPC: ${trimmed.slice(0, 100)}`);
+            }
           }
         }
       });
@@ -195,6 +218,11 @@ export function createMemberProcess(
         const wasRunning = status === "running";
         status = "stopped";
         pid = null;
+        // Reject ready promise if process exited before becoming ready
+        if (!readyResolved) {
+          readyResolved = true;
+          rejectReady(new Error(`Member "${name}" process exited (code: ${code}) before RPC was ready`));
+        }
         // Notify handlers so the manager can trigger auto-restart
         notifyHandlers({
           type: "process_exit",
@@ -208,12 +236,19 @@ export function createMemberProcess(
         const wasRunning = status === "running";
         status = "error";
         pid = null;
+        if (!readyResolved) {
+          readyResolved = true;
+          rejectReady(new Error(`Failed to start member "${name}"`));
+        }
         notifyHandlers({
           type: "process_error",
           memberName: name,
           wasRunning,
         });
       });
+
+      // Wait for RPC process to be ready (first JSON line on stdout)
+      await readyPromise;
     },
 
     async stop(): Promise<void> {

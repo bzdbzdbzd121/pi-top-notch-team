@@ -27,9 +27,9 @@ export default function (pi: ExtensionAPI) {
     processManager: null,
     memberHandles: new Map(),
     tlToolNames: ["start_member", "stop_member", "list_members", "get_member_log", "team_send_and_wait"],
-    router: null as any,
-    messageQueue: null as any,
-    responseWaiter: null as any,
+    router: null,
+    messageQueue: null,
+    responseWaiter: null,
   };
 
   // ── Message channel: queue → router ──────────────────────
@@ -110,6 +110,8 @@ export default function (pi: ExtensionAPI) {
   // Track the most recent correlation ID sent to each member via team_send_and_wait.
   // Used to auto-inject correlation ID when a member replies without the <corr:...> tag.
   const lastPendingCorrId = new Map<string, string>();
+  // Track recently processed tool_execution_end message fingerprints for de-duplication
+  const recentlyProcessedMessages = new Set<string>();
 
   teamCtx.router = router;
   teamCtx.messageQueue = messageQueue;
@@ -136,6 +138,11 @@ export default function (pi: ExtensionAPI) {
       if (event.type === "tool_execution_end" && event.toolName === "team_send_message") {
         const teamMsg = event.result?.details?.teamMessage;
         if (teamMsg) {
+          // Record fingerprint for de-duplication: sender + content prefix (both paths can compute the same key)
+          const dedupKey = `${teamMsg.from}:${teamMsg.content?.slice(0, 80) ?? ""}`;
+          recentlyProcessedMessages.add(dedupKey);
+          setTimeout(() => recentlyProcessedMessages.delete(dedupKey), 60_000);
+
           // Auto-populate correlation ID (only for TL-directed messages)
           let content = teamMsg.content;
           if (teamMsg.to === "tl" && !content.match(/<corr:[a-zA-Z0-9_-]+>/)) {
@@ -162,6 +169,12 @@ export default function (pi: ExtensionAPI) {
           : event.message.content?.map((c: any) => c.text ?? "").join(" ") ?? "";
         const parsed = parseTeamMessageTag(text);
         if (parsed) {
+          // De-duplication: compute same key as primary path (sender + content prefix)
+          const dedupKey = `${config.name}:${parsed.content?.slice(0, 80) ?? ""}`;
+          if (recentlyProcessedMessages.has(dedupKey)) {
+            return;
+          }
+
           // Auto-populate correlation ID for backup path too
           let backupContent = parsed.content;
           if (parsed.to === "tl" && !backupContent.match(/<corr:[a-zA-Z0-9_-]+>/)) {
@@ -191,6 +204,17 @@ export default function (pi: ExtensionAPI) {
         const isNormalExit = exitCode === null || exitCode === 0 || exitCode === 143;
 
         if (!isNormalExit) {
+          // Cancel pending team_send_and_wait waits for this member
+          // to avoid TL waiting 120s for a crashed member to reply
+          const pendingCorrId = lastPendingCorrId.get(memberName);
+          if (pendingCorrId) {
+            responseWaiter.resolveIfWaiting(
+              pendingCorrId, memberName,
+              "[成员进程已崩溃，消息无法送达]"
+            );
+            lastPendingCorrId.delete(memberName);
+          }
+
           // Notify TL only on unexpected crashes
           pi.sendMessage({
             customType: "team-message",
@@ -209,6 +233,14 @@ export default function (pi: ExtensionAPI) {
 
       if (event.type === "process_error") {
         const memberName = event.memberName;
+        const pendingCorrId = lastPendingCorrId.get(memberName);
+        if (pendingCorrId) {
+          responseWaiter.resolveIfWaiting(
+            pendingCorrId, memberName,
+            "[成员进程错误，消息无法送达]"
+          );
+          lastPendingCorrId.delete(memberName);
+        }
         pi.sendMessage({
           customType: "team-message",
           content: `Member "${memberName}" 进程异常，需检查崩溃原因。`,
@@ -316,34 +348,37 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId: string, params: { to: string; content: string; timeout?: number }) {
       const corrId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
       lastPendingCorrId.set(params.to, corrId);
-      messageQueue.enqueue({
-        id: "msg-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8),
-        from: "tl",
-        to: params.to,
-        content: params.content + "\n\n<corr:" + corrId + ">",
-        timestamp: Date.now(),
-        correlationId: corrId,
-      });
-      const result = await responseWaiter.waitForResponse(corrId, params.timeout ?? 120_000);
-      // Clean up the pending corr ID tracker regardless of outcome
-      lastPendingCorrId.delete(params.to);
-      if (result.status === "response") {
+      try {
+        messageQueue.enqueue({
+          id: "msg-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8),
+          from: "tl",
+          to: params.to,
+          content: params.content + "\n\n<corr:" + corrId + ">",
+          timestamp: Date.now(),
+          correlationId: corrId,
+        });
+        const result = await responseWaiter.waitForResponse(corrId, params.timeout ?? 120_000);
+        if (result.status === "response") {
+          return {
+            details: {},
+            content: [{ type: "text" as const, text: "[" + params.to + " reply] " + result.content }],
+          };
+        }
+        if (result.status === "cancelled") {
+          return {
+            details: {},
+            content: [{ type: "text" as const, text: "Wait for " + params.to + " was cancelled." }],
+          };
+        }
+        // timeout
         return {
-          details: {},
-          content: [{ type: "text" as const, text: "[" + params.to + " reply] " + result.content }],
+          details: { timeout: true } as any,
+          content: [{ type: "text" as const, text: "Timeout waiting for " + params.to + ". Use get_member_log to check, then re-wait if needed." }],
         };
+      } finally {
+        // Clean up the pending corr ID tracker in all paths (including exceptions)
+        lastPendingCorrId.delete(params.to);
       }
-      if (result.status === "cancelled") {
-        return {
-          details: {},
-          content: [{ type: "text" as const, text: "Wait for " + params.to + " was cancelled." }],
-        };
-      }
-      // timeout
-      return {
-        details: { timeout: true } as any,
-        content: [{ type: "text" as const, text: "Timeout waiting for " + params.to + ". Use get_member_log to check, then re-wait if needed." }],
-      };
     },
   });
 

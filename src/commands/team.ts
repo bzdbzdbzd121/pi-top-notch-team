@@ -24,6 +24,46 @@ export function registerTeamCommand(
   teamCtx: TeamContext,
   getMemberStatuses?: StatusProvider
 ): void {
+  // Shared type for save/update tool params
+  interface TeamSaveParams {
+    name: string;
+    description: string;
+    defaultModel?: string;
+    members: Array<{ name: string; label?: string; systemPrompt: string; model?: string }>;
+  }
+
+  /** Validate and persist a team definition. Returns an error result if invalid, null if saved. */
+  async function saveTeamDefinition(params: TeamSaveParams, rootDir: string): Promise<any> {
+    const { validateTeamDefinition } = await import("../team/schema");
+    const { writeTeam } = await import("../team/store");
+
+    const teamData = {
+      name: params.name,
+      description: params.description,
+      defaults: params.defaultModel ? { model: params.defaultModel } : undefined,
+      members: params.members.map((m) => ({
+        name: m.name,
+        label: m.label,
+        systemPrompt: m.systemPrompt,
+        model: m.model,
+      })),
+    };
+
+    const validation = validateTeamDefinition(teamData);
+    if (!validation.valid) {
+      return {
+        details: {},
+        content: [{
+          type: "text" as const,
+          text: `团队定义校验失败：\n${validation.errors.join("\n")}\n请修正后重试。`,
+        }],
+      };
+    }
+
+    writeTeam(teamData as any, rootDir);
+    return null;
+  }
+
   // Register the create_team_definition tool (used by TL during /team create)
   pi.registerTool({
     name: "create_team_definition",
@@ -56,48 +96,11 @@ export function registerTeamCommand(
     } as any,
     async execute(
       _toolCallId: string,
-      params: {
-        name: string;
-        description: string;
-        defaultModel?: string;
-        members: Array<{
-          name: string;
-          label?: string;
-          systemPrompt: string;
-          model?: string;
-        }>;
-      },
+      params: TeamSaveParams,
     ) {
-      const { validateTeamDefinition } = await import("../team/schema");
-      const { writeTeam } = await import("../team/store");
-      const { getRootDir } = await import("../config");
-
-      const teamData = {
-        name: params.name,
-        description: params.description,
-        defaults: params.defaultModel ? { model: params.defaultModel } : undefined,
-        members: params.members.map((m) => ({
-          name: m.name,
-          label: m.label,
-          systemPrompt: m.systemPrompt,
-          model: m.model,
-        })),
-      };
-
-      const validation = validateTeamDefinition(teamData);
-      if (!validation.valid) {
-        return {
-          details: {},
-          content: [{
-            type: "text" as const,
-            text: `团队定义校验失败：\n${validation.errors.join("\n")}\n请修正后重试。`,
-          }],
-        };
-      }
-
-      writeTeam(teamData as any, getRootDir());
+      const result = await saveTeamDefinition(params, getRootDir());
+      if (result) return result;
       teamCtx.isCreatingTeam = false;
-
       return {
         details: {},
         content: [{
@@ -140,48 +143,11 @@ export function registerTeamCommand(
     } as any,
     async execute(
       _toolCallId: string,
-      params: {
-        name: string;
-        description: string;
-        defaultModel?: string;
-        members: Array<{
-          name: string;
-          label?: string;
-          systemPrompt: string;
-          model?: string;
-        }>;
-      },
+      params: TeamSaveParams,
     ) {
-      const { validateTeamDefinition } = await import("../team/schema");
-      const { writeTeam } = await import("../team/store");
-      const { getRootDir } = await import("../config");
-
-      const teamData = {
-        name: params.name,
-        description: params.description,
-        defaults: params.defaultModel ? { model: params.defaultModel } : undefined,
-        members: params.members.map((m) => ({
-          name: m.name,
-          label: m.label,
-          systemPrompt: m.systemPrompt,
-          model: m.model,
-        })),
-      };
-
-      const validation = validateTeamDefinition(teamData);
-      if (!validation.valid) {
-        return {
-          details: {},
-          content: [{
-            type: "text" as const,
-            text: `团队定义校验失败：\n${validation.errors.join("\n")}\n请修正后重试。`,
-          }],
-        };
-      }
-
-      writeTeam(teamData as any, getRootDir());
+      const result = await saveTeamDefinition(params, getRootDir());
+      if (result) return result;
       teamCtx.editingTeamName = null;
-
       return {
         details: {},
         content: [{
@@ -320,7 +286,7 @@ export function registerTeamCommand(
           }
 
           startSession(team);
-          teamCtx.router.updateMembers(team.members.map((m) => m.name));
+          teamCtx.router!.updateMembers(team.members.map((m) => m.name));
 
           const tlToolNames = teamCtx.tlToolNames;
           const currentActive = pi.getActiveTools();
@@ -350,9 +316,9 @@ export function registerTeamCommand(
             await teamCtx.processManager.stopAll();
           }
           // Cancel any pending response waiters
-          teamCtx.responseWaiter.cancelAll();
+          teamCtx.responseWaiter!.cancelAll();
           teamCtx.memberHandles.clear();
-          teamCtx.router.updateMembers([]);
+          teamCtx.router!.updateMembers([]);
 
           const tlToolNames = teamCtx.tlToolNames;
           const currentActive = pi.getActiveTools();
@@ -399,7 +365,7 @@ export function registerTeamCommand(
             output += `  [${m.label ?? m.name}]`;
             if (m.model) output += ` - 模型: ${m.model}`;
             output += `\n  提示词:\n`;
-            const promptLines = m.systemPrompt.trim().split("\\n");
+            const promptLines = m.systemPrompt.trim().split("\n");
             for (const pl of promptLines) {
               output += `    ${pl}\n`;
             }
