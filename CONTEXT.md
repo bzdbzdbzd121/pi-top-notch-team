@@ -25,7 +25,7 @@ A set of four tools registered only during an active Team Session: `start_member
 The communication medium through which agents (Team Lead and Members) exchange information during a Team Session. Implementation is separate from the team orchestration logic.
 
 **Shared Context**:
-A Markdown document maintained by the TL during a team session. Contains project background, goals, team member overview, terminology glossary, collaboration rules, and current progress. Created by the TL before spawning Members, and updated as needed. Members receive the Shared Context via the message channel on their first task assignment, and are notified of updates thereafter.
+A Markdown document (`.shared-context.md`) maintained by the TL during a team session. Contains project background, goals, team member overview, terminology glossary, collaboration rules, and current progress. Created by the TL before spawning Members, and updated as needed. Members receive the Shared Context via the message channel on their first task assignment, and are notified of updates thereafter.
 _Avoid_: Mission brief, team doc, session context
 
 **Team Session Lifecycle**:
