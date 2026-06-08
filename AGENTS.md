@@ -120,7 +120,7 @@ npm test          # Run all tests (vitest)
 npm run test:watch  # Watch mode
 ```
 
-121 tests across 12 files (plus 1 UI module without dedicated tests — TUI‑dependent). Tests live alongside source as `*.test.ts`.
+124 tests across 12 files (plus 1 UI module without dedicated tests — TUI‑dependent). Tests live alongside source as `*.test.ts`.
 
 | Test Level | What | How |
 |-----------|------|-----|

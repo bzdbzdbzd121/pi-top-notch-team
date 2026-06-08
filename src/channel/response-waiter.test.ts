@@ -142,6 +142,60 @@ describe("createResponseWaiter", () => {
     // Calling again should not throw
     waiter.cancelAll();
   });
+
+  // ── Response buffer (re-wait after timeout) ────────────
+
+  it("buffers orphaned response for re-wait after timeout", async () => {
+    const waiter = createResponseWaiter();
+
+    // First wait times out
+    const wait1 = waiter.waitForResponse("req-abc", 10_000);
+    vi.advanceTimersByTime(10_001);
+    expect((await wait1).status).toBe("timeout");
+
+    // Member replies during the gap (no waiter active → buffered)
+    const resolved = waiter.resolveIfWaiting("req-abc", "analyzer", "done", undefined);
+    expect(resolved).toBe(false); // no active waiter
+
+    // TL re-waits with same corrId → should pick up buffered response immediately
+    const wait2 = waiter.waitForResponse("req-abc", 60_000);
+    const result = await wait2;
+    expect(result).toMatchObject({ status: "response", from: "analyzer", content: "done" });
+  });
+
+  it("buffered responses survive cancelAll", async () => {
+    const waiter = createResponseWaiter();
+
+    // Member replies during gap
+    const wait1 = waiter.waitForResponse("req-abc", 10_000);
+    vi.advanceTimersByTime(10_001);
+    await wait1;
+
+    waiter.resolveIfWaiting("req-abc", "a", "buffered", undefined);
+
+    // Cancel clears everything, including buffer
+    waiter.cancelAll();
+
+    // Re-wait after cancel → should NOT get buffered response (buffer cleared)
+    const wait2 = waiter.waitForResponse("req-abc", 1);
+    vi.advanceTimersByTime(2);
+    expect((await wait2).status).toBe("timeout");
+  });
+
+  it("does not buffer when waiter is active", async () => {
+    const waiter = createResponseWaiter();
+
+    const waitPromise = waiter.waitForResponse("req-abc", 60_000);
+    // Resolve while waiter active → normal path
+    waiter.resolveIfWaiting("req-abc", "a", "normal", undefined);
+    expect(await waitPromise).toMatchObject({ status: "response", content: "normal" });
+
+    // Buffer should be empty
+    vi.advanceTimersByTime(60_001);
+    const wait2 = waiter.waitForResponse("req-abc", 1);
+    vi.advanceTimersByTime(2);
+    expect((await wait2).status).toBe("timeout");
+  });
 });
 
 describe("extractCorrelationId", () => {

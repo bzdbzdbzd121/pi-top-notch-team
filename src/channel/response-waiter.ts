@@ -49,16 +49,27 @@ const MAX_PENDING_LIMIT = 100;
 
 /**
  * Create a ResponseWaiter that manages pending "send and wait" requests,
- * keyed by correlation ID.
+ * keyed by correlation ID. Also buffers orphaned responses for re-wait.
  */
 export function createResponseWaiter(): ResponseWaiter {
   const pending = new Map<string, PendingEntry>();
+  // Buffer for responses that arrived after a wait timed out but before re-wait.
+  // When a new waitForResponse registers for the same corrId, the buffered
+  // response is delivered immediately instead of waiting for a new timeout.
+  const responseBuffer = new Map<string, WaitResult>();
 
   return {
     waitForResponse(
       correlationId: string,
       timeoutMs?: number
     ): Promise<WaitResult> {
+      // Check buffer first: a response for this corrId arrived during the gap
+      const buffered = responseBuffer.get(correlationId);
+      if (buffered) {
+        responseBuffer.delete(correlationId);
+        return Promise.resolve(buffered);
+      }
+
       const effectiveTimeout = Math.min(
         timeoutMs ?? DEFAULT_TIMEOUT_MS,
         MAX_TIMEOUT_MS
@@ -92,17 +103,21 @@ export function createResponseWaiter(): ResponseWaiter {
       subject?: string
     ): boolean {
       const entry = pending.get(correlationId);
-      if (!entry) return false;
+      if (entry) {
+        clearTimeout(entry.timeout);
+        pending.delete(correlationId);
+        entry.resolve({
+          status: "response",
+          from,
+          content,
+          subject,
+        });
+        return true;
+      }
 
-      clearTimeout(entry.timeout);
-      pending.delete(correlationId);
-      entry.resolve({
-        status: "response",
-        from,
-        content,
-        subject,
-      });
-      return true;
+      // No active waiter — buffer the response for a possible re-wait
+      responseBuffer.set(correlationId, { status: "response", from, content, subject });
+      return false;
     },
 
     cancelAll(): void {
@@ -111,6 +126,7 @@ export function createResponseWaiter(): ResponseWaiter {
         entry.resolve({ status: "cancelled" });
       }
       pending.clear();
+      responseBuffer.clear();
     },
   };
 }
