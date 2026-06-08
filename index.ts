@@ -373,7 +373,7 @@ export default function (pi: ExtensionAPI) {
       + "Params: to (target), content (body), timeout (optional ms, default 120000).",
     promptGuidelines: [
       "Use team_send_and_wait when you need a member result before continuing.",
-      "On timeout check via get_member_log and re-wait if still working.",
+      "On timeout check via get_member_status and re-wait if still working.",
     ],
     parameters: {
       type: "object",
@@ -412,7 +412,7 @@ export default function (pi: ExtensionAPI) {
         // timeout
         return {
           details: { timeout: true } as any,
-          content: [{ type: "text" as const, text: "Timeout waiting for " + params.to + ". Use get_member_log to check, then re-wait if needed." }],
+          content: [{ type: "text" as const, text: "Timeout waiting for " + params.to + ". Use get_member_status to check, then re-wait if needed." }],
         };
       } finally {
         // Clean up the pending corr ID tracker in all paths (including exceptions)
@@ -425,9 +425,12 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "get_member_status",
     label: "Get Member Operational Status",
-    description: "获取所有团队成员的运行状态（idle/working/crashed/stopped）。无参数。",
+    description:
+      "Quick lightweight check of all members' operational status (idle/working/crashed/stopped). " +
+      "No parameters. Use this instead of get_member_log when you just need to know if a member is available.",
     promptGuidelines: [
-      "Use get_member_status to check the operational status of all members before assigning tasks.",
+      "Use get_member_status FIRST to quickly check if members are idle, working, or crashed.",
+      "Only use get_member_log when you need detailed conversation content.",
     ],
     parameters: { type: "object", properties: {} } as any,
     async execute() {
@@ -645,15 +648,16 @@ ${memberLines}
 讨论达成共识后，拆解任务并委派给各 Member。
 
 ### 可用工具
-你拥有 5 个团队管理工具：
+你拥有 7 个团队管理工具：
 
 1. **先写 Shared Context** — 用编辑器的 write 或 edit 工具创建 .shared-context.md
 2. **start_member(name)** — 启动一个 Member 进程
 3. **team_send_and_wait(to, content, timeout?)** — 给 Member 发任务并等待回复（阻塞）。需要成员的处理结果时使用
 4. **team_send_message(to, subject?, content?)** — 只发消息不等待回复。仅通知或无需结果时使用
 5. **list_members** — 查看各 Member 的运行状态
-6. **get_member_log(name, lines?)** — 查看 Member 最近的对话记录
-7. **stop_member(name)** — 终止 Member 进程
+6. **get_member_status()** — **优先使用**。快速查看所有成员当前操作状态（idle/working/crashed/stopped），负担轻
+7. **get_member_log(name, lines?)** — 查看 Member 最近的详细对话记录，负担较重，仅当需要了解具体内容时才使用
+8. **stop_member(name)** — 终止 Member 进程
 
 > 提示：team_send_and_wait 发送的消息包含 <corr:...> 标签。其他成员回复时需在内容中包含此标签，这样即使任务经过多次转交（A->B->TL），最终的回复也能正确匹配等待器。消息通道中的 Team Lead 名称是 tl。
 

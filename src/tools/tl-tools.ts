@@ -168,7 +168,8 @@ export function registerTlTools(
       "Retrieve a Member's recent conversation log to check their progress. " +
       "Parameters: name (member identifier), lines (number of recent lines, default 10).",
     promptGuidelines: [
-      "Use get_member_log to review a Member's recent conversation and track their progress on assigned tasks.",
+      "Use get_member_status FIRST for a quick status check (idle/working/crashed/stopped).",
+      "Only use get_member_log when you need the detailed conversation content — it is heavier than get_member_status.",
     ],
     parameters: {
       type: "object",
