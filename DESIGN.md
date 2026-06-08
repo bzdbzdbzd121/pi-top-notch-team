@@ -352,18 +352,22 @@ get_member_log({ name: "analyzer", lines: 10 })
 ### `team_send_and_wait`
 
 ```typescript
+// First-time wait
 team_send_and_wait({
   to: "analyzer",             // target member name
-  content: "分析这段代码",     // message body
-  timeout: 120_000            // optional, max wait in ms (default 120000, max 300000)
+  content: "分析这段代码",     // message body (optional for re-wait)
+  timeout: 120_000,           // optional, max wait in ms (default 120000, max 300000)
+  correlationId: "corr-abc"   // optional, reuse from timeout details for re-wait
 })
 ```
 
-- **Enqueues** a message to the target member with a correlation ID embedded
-- **Blocks** (returns a Promise that resolves when a matching response arrives)
-- **Correlation matching**: scans incoming messages for `<corr:...>` tags matching the original correlation ID. Supports chain workflows: Member A can forward the `<corr:...>` tag to Member B, and B's reply to TL resolves the original wait
+- **First call**: enqueues a message with a correlation ID (`<corr:...>`) embedded in the content
+- **Re-wait after timeout**: pass the `correlationId` from the timeout details to re-register the wait. No new message is sent — the existing correlation tag in the member's context is reused
+- **Blocks** the tool until a matching response arrives or timeout expires
+- **Correlation matching**: scans incoming messages for `<corr:...>` tags matching the original correlation ID. Supports chain workflows: Member A can forward the tag to Member B
 - **Auto-injection**: if a member's reply is directed to `"tl"` but lacks a `<corr:...>` tag, the TL extension automatically appends the most recent pending correlation ID for that member. This ensures responses are matched even if the member AI forgets to include the tag
-- **Timeout**: if no response within `timeout` ms, returns `{ status: "timeout" }` — TL should check member status and re-wait if needed
+- **Response buffer**: if a member replies between timeout and re-wait, the response is buffered. The subsequent re-wait picks it up immediately instead of timing out again
+- **Timeout**: returns `{ status: "timeout", correlationId }` — check status and re-wait with the same correlationId if still working
 - **Cancellation**: on `/team stop`, all pending waits are cancelled
 
 **Difference from `team_send_message`:**

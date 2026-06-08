@@ -165,7 +165,7 @@ npm run test:watch  # Watch mode
 | `list_members()` | Show all member statuses |
 | `get_member_log(name, lines?, maxContentLength?)` | Query Member's recent session via RPC. `maxContentLength` truncates each message content (default 50 chars). |
 | `get_member_status()` | Get operational status (idle/working/crashed/stopped) for all members. No parameters. |
-| `team_send_and_wait(to, content, timeout?)` | Send message and wait for response (blocks until reply or timeout) |
+| `team_send_and_wait(to, content?, timeout?, correlationId?)` | Send message and wait for response. On timeout, re-wait with same `correlationId` (no new message sent). Response content returned as tool result. |
 
 ### Team Session Guards
 
