@@ -370,54 +370,75 @@ export default function (pi: ExtensionAPI) {
     description:
       "Send a message to a team member and WAIT for their response. "
       + "Use instead of team_send_message when you need the member result. "
-      + "Params: to (target), content (body), timeout (optional ms, default 120000).",
+      + "On timeout: check get_member_status, if still working call team_send_and_wait again "
+      + "with the same correlationId to re-wait (no new message sent). "
+      + "Params: to (target), content (body, optional for re-wait), "
+      + "timeout (optional ms, default 120000), "
+      + "correlationId (optional, reuse from timeout for re-wait).",
     promptGuidelines: [
       "Use team_send_and_wait when you need a member result before continuing.",
-      "On timeout check via get_member_status and re-wait if still working.",
+      "On timeout: check get_member_status; if still working, call team_send_and_wait again with the same correlationId (from timeout details) to re-wait without sending a new message.",
     ],
     parameters: {
       type: "object",
       properties: {
         to: { type: "string", description: "Target member name" },
-        content: { type: "string", description: "Message body" },
+        content: { type: "string", description: "Message body (omit for re-wait after timeout)" },
         timeout: { type: "number", description: "Max wait in ms (default 120000, max 300000)" },
+        correlationId: { type: "string", description: "Reuse this correlation ID to re-wait after a timeout (no new message sent)" },
       },
-      required: ["to", "content"],
+      required: ["to"],
     } as any,
-    async execute(_toolCallId: string, params: { to: string; content: string; timeout?: number }) {
-      const corrId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-      lastPendingCorrId.set(params.to, corrId);
-      try {
-        messageQueue.enqueue({
-          id: "msg-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8),
-          from: "tl",
-          to: params.to,
-          content: params.content + "\n\n<corr:" + corrId + ">",
-          timestamp: Date.now(),
-          correlationId: corrId,
-        });
-        const result = await responseWaiter.waitForResponse(corrId, params.timeout ?? 120_000);
+    async execute(_toolCallId: string, params: { to: string; content?: string; timeout?: number; correlationId?: string }) {
+      // Re-wait: reuse existing correlation ID, no new message sent
+      if (params.correlationId) {
+        const result = await responseWaiter.waitForResponse(params.correlationId, params.timeout ?? 120_000);
         if (result.status === "response") {
-          return {
-            details: {},
-            content: [{ type: "text" as const, text: "[" + params.to + " reply] " + result.content }],
-          };
+          lastPendingCorrId.delete(params.to);
+          return { details: {}, content: [{ type: "text" as const, text: "[" + params.to + " reply] " + result.content }] };
         }
         if (result.status === "cancelled") {
-          return {
-            details: {},
-            content: [{ type: "text" as const, text: "Wait for " + params.to + " was cancelled." }],
-          };
+          lastPendingCorrId.delete(params.to);
+          return { details: {}, content: [{ type: "text" as const, text: "Wait for " + params.to + " was cancelled." }] };
         }
-        // timeout
         return {
-          details: { timeout: true } as any,
-          content: [{ type: "text" as const, text: "Timeout waiting for " + params.to + ". Use get_member_status to check, then re-wait if needed." }],
+          details: { timeout: true, correlationId: params.correlationId } as any,
+          content: [{ type: "text" as const, text: "Timeout waiting for " + params.to + ". Use get_member_status to check, then re-wait if still working." }],
         };
-      } finally {
-        // Clean up the pending corr ID tracker in all paths (including exceptions)
-        lastPendingCorrId.delete(params.to);
       }
+
+      // First-time wait: generate corr ID, send message, register waiter
+      const corrId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+      lastPendingCorrId.set(params.to, corrId);
+      messageQueue.enqueue({
+        id: "msg-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8),
+        from: "tl",
+        to: params.to,
+        content: (params.content ?? "") + "\n\n<corr:" + corrId + ">",
+        timestamp: Date.now(),
+        correlationId: corrId,
+      });
+      const result = await responseWaiter.waitForResponse(corrId, params.timeout ?? 120_000);
+      // On success or cancel, clean up the tracker; on timeout, leave it for potential re-wait
+      if (result.status === "response") {
+        lastPendingCorrId.delete(params.to);
+        return {
+          details: {},
+          content: [{ type: "text" as const, text: "[" + params.to + " reply] " + result.content }],
+        };
+      }
+      if (result.status === "cancelled") {
+        lastPendingCorrId.delete(params.to);
+        return {
+          details: {},
+          content: [{ type: "text" as const, text: "Wait for " + params.to + " was cancelled." }],
+        };
+      }
+      // timeout — keep lastPendingCorrId entry for potential re-wait
+      return {
+        details: { timeout: true, correlationId: corrId } as any,
+        content: [{ type: "text" as const, text: "Timeout waiting for " + params.to + ". Use get_member_status to check. If still working, call team_send_and_wait again with the same correlationId to re-wait." }],
+      };
     },
   });
 
@@ -652,7 +673,7 @@ ${memberLines}
 
 1. **先写 Shared Context** — 用编辑器的 write 或 edit 工具创建 .shared-context.md
 2. **start_member(name)** — 启动一个 Member 进程
-3. **team_send_and_wait(to, content, timeout?)** — 给 Member 发任务并等待回复（阻塞）。需要成员的处理结果时使用
+3. **team_send_and_wait(to, content?, timeout?, correlationId?)** — 给 Member 发任务并等待回复（阻塞）。超时后如需续等，用相同的 correlationId 重新调用（不发新消息，只续等）
 4. **team_send_message(to, subject?, content?)** — 只发消息不等待回复。仅通知或无需结果时使用
 5. **list_members** — 查看各 Member 的运行状态
 6. **get_member_status()** — **优先使用**。快速查看所有成员当前操作状态（idle/working/crashed/stopped），负担轻
