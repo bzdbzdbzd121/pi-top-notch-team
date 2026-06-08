@@ -474,32 +474,16 @@ The `member.ts` extension reads these in `session_start`, then in `before_agent_
 
 ## 10. TL System Prompt Injection
 
-When `/team start` creates a team session, the extension sets up a `before_agent_start` handler that injects:
+When `/team start` creates a team session, the extension sets up a `before_agent_start` handler that injects a structured prompt with the following sections:
 
-> 你现在是一个 Team Lead。团队名称：refactoring。
-> 团队成员：
->   - analyzer（代码分析员）—— 负责分析代码依赖
->   - mover（代码迁移员） —— 负责执行代码迁移
->   - verifier（验证员） ———— 负责验证和测试
->
-> 你拥有 4 个新工具：
-> - `start_member` —— 启动一个 Member 进程
-> - `stop_member` —— 终止一个 Member 进程
-> - `list_members` —— 查看所有 Member 状态
-> - `get_member_log` —— 查看 Member 最近的对话
->
-> 你也拥有消息通道。你可以通过和 Member 一样的 `team_send_message` 工具（以 "tl" 为发送者）向 Member 发消息。
->
-> 流程：
-> 1. 先与用户充分讨论需求，直到和用户对齐细节
-> 2. 拆解任务，制定计划
-> 3. 编写 Shared Context（共享上下文），记录：团队成员、项目背景和目标、协作规则、术语表
-> 4. 用 start_member 启动 Member
-> 5. 将 Shared Context 随首次任务消息一起发送给各 Member
-> 6. 通过消息通道与 Member 交流，监控进展
-> 7. 根据需要更新 Shared Context，并通过消息通道通知所有 Member 重新阅读
-> 8. 任务完成后向用户汇报结果
-> 9. 让用户决定是否 /team stop
+- **角色定义**: "你现在是一个 Team Lead"
+- **团队信息**: 名称、描述、成员列表
+- **核心原则：委派优先**: 明确 TL 的职责是委派而非执行，能交给 Member 做的事绝不自己做
+- **需求讨论方式**: 参考 `/grill-with-docs` 方法——逐问确认、挑战模糊语言、用场景验证、对照代码验证、实时更新共享上下文
+- **可用工具**: 5 个团队管理工具的介绍和使用指引
+- **工作流程**: 从需求讨论到任务委派到结果汇报的 9 个步骤
+
+完整的注入提示词代码见 `index.ts` 中的 `before_agent_start` 处理器。
 
 The handler stays registered for the entire pi session but checks `session.active` to decide whether to inject TL instructions. When `/team stop` ends the session, `session.active` becomes `false` and no extra prompt is injected.
 
