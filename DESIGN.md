@@ -463,12 +463,9 @@ TEAM_SESSION_DIR=~/.pi/top-notch-team/sessions/refactoring/analyzer/  # session 
 TEAM_SHARED_CONTEXT_PATH=~/.pi/top-notch-team/sessions/refactoring/.shared-context.md  # shared context file path
 ```
 
-The `member.ts` extension reads these in `session_start`, then in `before_agent_start` injects a system prompt preamble:
+The `member.ts` extension reads these in `session_start`, then in `before_agent_start` injects a system prompt preamble that covers: team identity, member role description, team member list, collaboration rules (including `team_send_message` usage, task completion reply requirement, and file-based deliverable output for reports/plans/designs). Members are also instructed to preserve `<corr:...>` tags when replying to TL, and are given the Shared Context file path when available.
 
-> 你是重构团队（refactoring）的 analyzer（代码分析员）。
-> 团队其他成员：analyzer、mover、verifier。
-> 你可以使用 `team_send_message` 工具与其他成员或 Team Lead 交流。
-> Team Lead 会通过消息通道给你分配任务。
+完整的注入提示词代码见 `member.ts` 中的 `before_agent_start` 处理器。
 
 ## 10. TL System Prompt Injection
 
