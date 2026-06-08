@@ -25,17 +25,18 @@ User's pi session (TL extension)
   ├── 10 subcommands (/team create, edit, cancel, start, stop, list, show, delete, status, help)
   ├── 5 TL tools (start_member, stop_member, list_members, get_member_log, team_send_and_wait)
   ├── Message channel (queue → router)
-  └── Member Process Manager
-        ├── Member A (pi --mode rpc, member.ts)
-        ├── Member B (pi --mode rpc, member.ts)
-        └── Member C (pi --mode rpc, member.ts)
+  ├── Member Process Manager
+  │     ├── Member A (pi --mode rpc, member.ts)
+  │     ├── Member B (pi --mode rpc, member.ts)
+  │     └── Member C (pi --mode rpc, member.ts)
+  └── Team mode UI widget (live member status + context usage %, above editor)
 ```
 
 **Key files:**
 
 | File | Role |
 |------|------|
-| `index.ts` | TL extension entry point. Registers `/team` command, TL tools, message channel, `before_agent_start` injection |
+| `index.ts` | TL extension entry point. Registers `/team` command, TL tools, message channel, `before_agent_start` injection, wires team‑status widget lifecycle |
 | `member.ts` | Member extension entry point. Registers `team_send_message` tool, injects team awareness via env vars |
 | `package.json` | pi package manifest with `pi.extensions` pointing to `["./index.ts", "./member.ts"]` |
 
@@ -62,6 +63,8 @@ src/
 ├── session/
 │   ├── state.ts      ← TeamSessionState (active, teamDefinition, startedAt)
 │   └── context.ts    ← TeamContext shared mutable state interface
+├── ui/               ← TUI components for team mode
+│   └── team-status-widget.ts  ← Bordered widget: live member status + context %
 ├── config.ts         ← getRootDir() via env var or ~/.pi/top-notch-team
 └── test/fixtures/    ← Test YAML files + mock-extension-api.ts
 ```
@@ -117,7 +120,7 @@ npm test          # Run all tests (vitest)
 npm run test:watch  # Watch mode
 ```
 
-121 tests across 12 files. Tests live alongside source as `*.test.ts`.
+121 tests across 12 files (plus 1 UI module without dedicated tests — TUI‑dependent). Tests live alongside source as `*.test.ts`.
 
 | Test Level | What | How |
 |-----------|------|-----|
@@ -163,6 +166,12 @@ npm run test:watch  # Watch mode
 | `get_member_log(name, lines?, maxContentLength?)` | Query Member's recent session via RPC. `maxContentLength` truncates each message content (default 50 chars). |
 | `get_member_status()` | Get operational status (idle/working/crashed/stopped) for all members. No parameters. |
 | `team_send_and_wait(to, content, timeout?)` | Send message and wait for response (blocks until reply or timeout) |
+
+### Team Session Guards
+
+During an active team session, a `tool_call` event handler intercepts `write`/`edit` tools:
+- `.md` files (`.shared-context.md`, ADRs, planning docs) — allowed
+- Code files (`.ts`, `.js`, `.py`, etc.) — blocked with reason "请委派给 Member"
 
 ## ADRs
 

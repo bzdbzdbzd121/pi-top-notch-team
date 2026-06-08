@@ -86,32 +86,31 @@ export function createTeamStatusWidget(options: {
     }
 
     // Build the full raw status line for width calculation
-    const rawStatus = segments
-      .map((s: any) => s.raw)
-      .join(" | ");
-    const styledStatus = segments
-      .map((s: any) => s.styled)
-      .join(" | ");
+    const sepRaw = "  │  ";
+    const sepStyled = theme.fg("dim", sepRaw);
+    const rawStatus = segments.map((s: any) => s.raw).join(sepRaw);
+    const styledStatus = segments.map((s: any) => s.styled).join(sepStyled);
 
     // Title text
     const title = `● TEAM MODE — ${teamName}`;
 
-    // Compute content box width (inner width excluding borders).
-    // visibleWidth from @earendil-works/pi-tui correctly handles
-    // CJK characters (2 columns) and ASCII (1 column).
-    const contentWidth = Math.max(
-      visibleWidth(title) + 4,        // 2 padding on each side
-      visibleWidth(rawStatus) + 4
-    );
+    // Compute total visible width for all lines.
+    // Each line has different left-border prefix width:
+    //   top:   ┌─   (3 cols) + content + filler
+    //   mid:   │    (2 cols) + content + padding
+    //   bot:   └    (1 col)  + filler
+    // We choose lineWidth so that ALL three lines land at the same column.
+    const titleVw = visibleWidth(title);
+    const statusVw = visibleWidth(rawStatus);
+    const lineWidth = Math.max(titleVw + 4, statusVw + 2) + 4;
 
-    // Gap fillers
-    const titleFill = repeat("─", Math.max(0, contentWidth - visibleWidth(title) - 4));
-    const statusPadding = repeat(" ", Math.max(0, contentWidth - visibleWidth(rawStatus) - 4));
-    const bottomFill = repeat("─", contentWidth);
+    const titleFill = repeat("─", Math.max(0, lineWidth - titleVw - 4));
+    const statusPad  = repeat(" ", Math.max(0, lineWidth - statusVw - 2));
+    const bottomFill = repeat("─", Math.max(0, lineWidth - 1));
 
-    // Build lines with left-only border (no right border)
-    const topBorder = `┌─ ${theme.fg("accent", title)} ${titleFill}`;
-    const middleLine = `│ ${styledStatus}${statusPadding}`;
+    // Build lines with left-only border (no right-side vertical bar)
+    const topBorder    = `┌─ ${theme.fg("accent", title)} ${titleFill}`;
+    const middleLine   = `│ ${styledStatus}${statusPad}`;
     const bottomBorder = `└${theme.fg("dim", bottomFill)}`;
 
     return [topBorder, middleLine, bottomBorder];

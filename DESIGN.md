@@ -476,12 +476,14 @@ When `/team start` creates a team session, the extension sets up a `before_agent
 
 - **角色定义**: "你现在是一个 Team Lead"
 - **团队信息**: 名称、描述、成员列表
-- **核心原则：委派优先**: 明确 TL 的职责是委派而非执行，能交给 Member 做的事绝不自己做
-- **需求讨论方式**: 参考 `/grill-with-docs` 方法——逐问确认、挑战模糊语言、用场景验证、对照代码验证、实时更新共享上下文
-- **可用工具**: 5 个团队管理工具的介绍和使用指引
-- **工作流程**: 从需求讨论到任务委派到结果汇报的 9 个步骤
+- **核心原则：委派优先**: 明确 TL 的职责是委派而非执行，能交给 Member 做的事绝不自己做。成员完成任务后不得主动停止其进程。TL 可以编写 .md 文档（共享上下文、ADR 等）但不得直接写代码文件
+- **需求讨论方式**: 逐问确认、挑战模糊语言、用场景检验边界、对照实际代码、术语和决策立即固化到 `.shared-context.md`
+- **可用工具**: 5 个团队管理工具（start_member、stop_member、list_members、get_member_log、team_send_and_wait）和消息通道（team_send_message）的介绍和使用指引
+- **工作流程**: 从需求讨论→拆解任务→编写共享上下文→启动 Member→分配任务（注明完成后必须回复TL）→监控进展→汇报结果的 9 个步骤
 
 完整的注入提示词代码见 `index.ts` 中的 `before_agent_start` 处理器。
+
+此外，扩展注册了一个 `tool_call` 事件拦截器：团队会话期间，TL 的 `write`/`edit` 工具调用会被检查目标文件路径。仅 `.md` 文件允许直接写入，代码文件（`.ts`、`.js`、`.py` 等）会被拦截并提示委派给 Member。
 
 The handler stays registered for the entire pi session but checks `session.active` to decide whether to inject TL instructions. When `/team stop` ends the session, `session.active` becomes `false` and no extra prompt is injected.
 
@@ -498,11 +500,16 @@ interface TeamSessionState {
 // src/session/context.ts — shared mutable references for the extension
 interface TeamContext {
   isCreatingTeam: boolean;
+  editingTeamName: string | null;
   processManager: ProcessManager | null;
   memberHandles: Map<string, MemberProcessHandle>;
   router: Router;
   messageQueue: MessageQueue;
+  responseWaiter: ResponseWaiter;
   tlToolNames: string[];
+  memberOperationalStates: Map<string, MemberOperationalState> | null;
+  onSessionStart?: (ui: any) => void;
+  onSessionEnd?: () => void;
 }
 ```
 
