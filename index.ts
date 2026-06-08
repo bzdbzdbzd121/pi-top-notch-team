@@ -4,16 +4,15 @@ import { getSessionState } from "./src/session/state";
 import type { TeamContext, MemberOperationalState } from "./src/session/context";
 import { registerTlTools } from "./src/tools/tl-tools";
 import { createProcessManager } from "./src/process/manager";
+import { createMemberProcess } from "./src/process/member-process";
 import { createMessageQueue } from "./src/channel/message-queue";
 import { createRouter } from "./src/channel/router";
 import { createResponseWaiter, extractCorrelationId } from "./src/channel/response-waiter";
 import type { TeamMessage } from "./src/channel/types";
+import { spawn } from "node:child_process";
+import { join } from "node:path";
+import { getRootDir } from "./src/config";
 import { createTeamStatusWidget } from "./src/ui/team-status-widget";
-import {
-  createAndRegisterMember,
-  buildMemberConfig,
-  getMemberLog,
-} from "./src/setup/member-lifecycle";
 
 export default function (pi: ExtensionAPI) {
   // If running as a member process (TEAM_ROLE is set), skip TL-only tools
@@ -128,7 +127,6 @@ export default function (pi: ExtensionAPI) {
   ) {
     const waitPromise = responseWaiter.waitForResponse(corrId, timeoutMs);
 
-    // Periodically check if all members are idle — if so, stop waiting early
     let pollTimer: ReturnType<typeof setInterval> | null = null;
     const allIdlePromise = new Promise<any>((resolve) => {
       pollTimer = setInterval(() => {
@@ -140,7 +138,6 @@ export default function (pi: ExtensionAPI) {
       }, 3000);
     });
 
-    // Clean up poll timer when waitPromise completes
     waitPromise.finally(() => {
       if (pollTimer) clearInterval(pollTimer);
     });
@@ -157,14 +154,12 @@ export default function (pi: ExtensionAPI) {
     }
     if (result.status === "all_idle") {
       lastPendingCorrId.delete(memberName);
-      // Cancel all pending waiters since work appears done
       responseWaiter.cancelAll();
       return {
         details: { allIdle: true } as any,
         content: [{ type: "text" as const, text: "所有团队成员均处于空闲状态，" + memberName + " 可能已完成任务。请检查工作成果。" }],
       };
     }
-    // timeout — keep lastPendingCorrId entry for potential re-wait
     return {
       details: { timeout: true, correlationId: corrId } as any,
       content: [{ type: "text" as const, text: "Timeout waiting for " + memberName + ". Use get_member_status to check. If still working, call team_send_and_wait again with the same correlationId to re-wait." }],
@@ -183,9 +178,186 @@ export default function (pi: ExtensionAPI) {
   teamCtx.memberOperationalStates = memberOpsStates;
 
   // ── Create and register member handles ─────────────────────
-  // (delegated to src/setup/member-lifecycle.ts via registerTlTools below)
+  function createAndRegisterMember(
+    config: import("./src/process/member-process").MemberProcessConfig
+  ): ReturnType<typeof createMemberProcess> {
+    const handle = createMemberProcess(config, spawn);
+    teamCtx.memberHandles.set(config.name, handle);
+    teamCtx.processManager?.addHandle(handle);
 
-  // (delegated to src/setup/member-lifecycle.ts via registerTlTools below)
+    // Backup parse: scan text blocks for <team-message> tags
+    function parseTeamMessageTag(text: string): { to: string; subject?: string; content: string } | null {
+      const m = text.match(/<team-message\s+to="([^"]+)"(?:\s+subject="([^"]*)")?>([\s\S]*?)<\/team-message>/);
+      if (!m) return null;
+      return { to: m[1], subject: m[2] || undefined, content: m[3].trim() };
+    }
+
+    // Wire message channel: intercept team_send_message tool calls
+    handle.onEvent((event: any) => {
+      // ── Member operational state tracking ─────────────────
+      if (event.type === "agent_start") {
+        memberOpsStates.set(config.name, "working");
+      }
+      if (event.type === "agent_end") {
+        memberOpsStates.set(config.name, "idle");
+      }
+
+      // Primary: team_send_message tool result
+      if (event.type === "tool_execution_end" && event.toolName === "team_send_message") {
+        const teamMsg = event.result?.details?.teamMessage;
+        if (teamMsg) {
+          // Record fingerprint for de-duplication: sender + content prefix (both paths can compute the same key)
+          const dedupKey = `${teamMsg.from}:${teamMsg.content?.slice(0, 80) ?? ""}`;
+          recentlyProcessedMessages.add(dedupKey);
+          setTimeout(() => recentlyProcessedMessages.delete(dedupKey), 60_000);
+
+          // Auto-populate correlation ID (only for TL-directed messages)
+          let content = teamMsg.content;
+          if (teamMsg.to === "tl" && !content.match(/<corr:[a-zA-Z0-9_-]+>/)) {
+            const stored = lastPendingCorrId.get(teamMsg.from);
+            if (stored) {
+              content = content + `\n\n<corr:${stored}>`;
+            }
+          }
+          messageQueue.enqueue({
+            id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            from: teamMsg.from,
+            to: teamMsg.to,
+            subject: teamMsg.subject,
+            content,
+            timestamp: teamMsg.timestamp ?? Date.now(),
+          });
+        }
+      }
+
+      // Backup: check assistant text for <team-message> tags
+      if (event.type === "message_end" && event.message?.role === "assistant") {
+        const text = typeof event.message.content === "string"
+          ? event.message.content
+          : event.message.content?.map((c: any) => c.text ?? "").join(" ") ?? "";
+        const parsed = parseTeamMessageTag(text);
+        if (parsed) {
+          // De-duplication: compute same key as primary path (sender + content prefix)
+          const dedupKey = `${config.name}:${parsed.content?.slice(0, 80) ?? ""}`;
+          if (recentlyProcessedMessages.has(dedupKey)) {
+            return;
+          }
+
+          // Auto-populate correlation ID for backup path too
+          let backupContent = parsed.content;
+          if (parsed.to === "tl" && !backupContent.match(/<corr:[a-zA-Z0-9_-]+>/)) {
+            const stored = lastPendingCorrId.get(config.name);
+            if (stored) {
+              backupContent = backupContent + "\n\n<corr:" + stored + ">";
+            }
+          }
+          messageQueue.enqueue({
+            id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            from: config.name,
+            to: parsed.to,
+            subject: parsed.subject,
+            content: backupContent,
+            timestamp: Date.now(),
+          });
+        }
+      }
+
+      // Handle process exit
+      if (event.type === "process_exit") {
+        const memberName = event.memberName;
+        const exitCode = event.exitCode;
+
+        // Exit code 143 = SIGTERM (128 + 15), which is a normal stop via stop_member
+        // Exit code 0 or null = clean exit
+        const isNormalExit = exitCode === null || exitCode === 0 || exitCode === 143;
+
+        // Update operational state
+        memberOpsStates.set(memberName, isNormalExit ? "stopped" : "crashed");
+
+        // Only proceed with further handling if the process was actually running
+        // (wasRunning=true indicates an unexpected exit that needs routing/notification)
+        if (!event.wasRunning) return;
+
+        if (!isNormalExit) {
+          // Cancel pending team_send_and_wait waits for this member
+          // to avoid TL waiting 120s for a crashed member to reply
+          const pendingCorrId = lastPendingCorrId.get(memberName);
+          if (pendingCorrId) {
+            responseWaiter.resolveIfWaiting(
+              pendingCorrId, memberName,
+              "[成员进程已崩溃，消息无法送达]"
+            );
+            lastPendingCorrId.delete(memberName);
+          }
+
+          // Notify TL only on unexpected crashes
+          pi.sendMessage({
+            customType: "team-message",
+            content: `Member "${memberName}" 进程异常退出（code: ${exitCode}），需检查崩溃原因。`,
+            display: true,
+            details: { crashEvent: event },
+          });
+        } else {
+          pi.sendMessage({
+            customType: "team-message",
+            content: `Member "${memberName}" 进程已正常停止（code: ${exitCode}）。`,
+            display: true,
+          });
+        }
+      }
+
+      if (event.type === "process_error") {
+        const memberName = event.memberName;
+        // Update operational state
+        memberOpsStates.set(memberName, "crashed");
+        const pendingCorrId = lastPendingCorrId.get(memberName);
+        if (pendingCorrId) {
+          responseWaiter.resolveIfWaiting(
+            pendingCorrId, memberName,
+            "[成员进程错误，消息无法送达]"
+          );
+          lastPendingCorrId.delete(memberName);
+        }
+        pi.sendMessage({
+          customType: "team-message",
+          content: `Member "${memberName}" 进程异常，需检查崩溃原因。`,
+          display: true,
+        });
+      }
+    });
+
+    // Initialize member operational state
+    memberOpsStates.set(config.name, "idle");
+
+    return handle;
+  }
+
+  function buildMemberConfig(
+    memberName: string
+  ): import("./src/process/member-process").MemberProcessConfig | null {
+    const session = getSessionState();
+    const team = session.teamDefinition;
+    if (!team) return null;
+
+    const memberDef = team.members.find((m) => m.name === memberName);
+    if (!memberDef) return null;
+
+    const sessionDir = join(getRootDir(), "sessions", team.name, memberName);
+    const sharedContextPath = join(getRootDir(), "sessions", team.name, ".shared-context.md");
+
+    return {
+      name: memberName,
+      role: memberName,
+      roleLabel: memberDef.label ?? memberName,
+      teamName: team.name,
+      teamMembers: team.members.map((m) => m.name),
+      memberDescription: memberDef.systemPrompt,
+      sessionDir,
+      sharedContextPath,
+      memberExtensionPath: new URL("./member.ts", import.meta.url).pathname,
+      cwd: process.cwd(),
+    };
+  }
 
   const manager = createProcessManager([], {
     autoRestart: false,
@@ -199,45 +371,47 @@ export default function (pi: ExtensionAPI) {
   });
   teamCtx.processManager = manager;
 
-  // (delegated to src/setup/member-lifecycle.ts via registerTlTools below)
-
-  const memberLifecycleDeps = {
-    pi,
-    memberOpsStates,
-    messageQueue,
-    responseWaiter,
-    lastPendingCorrId,
-    recentlyProcessedMessages,
-    processManager: manager,
-  };
-
-  registerTlTools(
-    pi,
-    manager,
-    (config) => {
-      const handle = createAndRegisterMember(pi, config, memberLifecycleDeps);
-      teamCtx.memberHandles.set(config.name, handle);
-      return handle;
-    },
-    (memberName) => buildMemberConfig(memberName, getSessionState()),
-    async (memberName, maxLines, maxContentLength) => {
-      const handle = teamCtx.memberHandles.get(memberName);
-      if (!handle) {
-        throw new Error(`Member "${memberName}" not found`);
-      }
-      return getMemberLog(handle, maxLines, maxContentLength);
-    },
-    (msg) => {
-      messageQueue.enqueue({
-        id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        from: "tl",
-        to: msg.to,
-        subject: msg.subject,
-        content: msg.content,
-        timestamp: Date.now(),
-      });
+  // getMemberLog: query member session via RPC get_messages
+  async function getMemberLog(memberName: string, maxLines: number, maxContentLength?: number): Promise<string> {
+    const handle = teamCtx.memberHandles.get(memberName);
+    if (!handle) {
+      throw new Error(`Member "${memberName}" not found`);
     }
-  );
+
+    const response = await handle.sendCommandAndWait(
+      { type: "get_messages" },
+      (event: any) => event.type === "response" && event.command === "get_messages"
+    );
+
+    const effectiveMaxLen = maxContentLength ?? 50;
+
+    const messages = response?.data?.messages ?? [];
+    const recent = messages.slice(-maxLines);
+    return recent
+      .map((m: any) => {
+        let content = typeof m.content === "string"
+          ? m.content
+          : JSON.stringify(m.content);
+
+        if (content.length > effectiveMaxLen) {
+          content = content.slice(0, effectiveMaxLen) + "...";
+        }
+
+        return `[${m.role}] ${content}`;
+      })
+      .join("\n");
+  }
+
+  registerTlTools(pi, manager, createAndRegisterMember, buildMemberConfig, getMemberLog, (msg) => {
+    messageQueue.enqueue({
+      id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      from: "tl",
+      to: msg.to,
+      subject: msg.subject,
+      content: msg.content,
+      timestamp: Date.now(),
+    });
+  });
 
   // ── team_send_and_wait tool ─────────────────────────────
   pi.registerTool({
@@ -246,16 +420,14 @@ export default function (pi: ExtensionAPI) {
     description:
       "Send a message to a team member and WAIT for their response. "
       + "Use instead of team_send_message when you need the member result. "
-      + "On timeout: check get_member_status, if still working call team_send_and_wait again "
-      + "with the same correlationId to re-wait (no new message sent). "
-      + "Automatically stops waiting if all members become idle (work appears done). "
       + "Params: to (target), content (body, optional for re-wait), "
+      + "Automatically stops waiting if all members become idle. "
       + "timeout (optional ms, default 120000), "
       + "correlationId (optional, reuse from timeout for re-wait).",
     promptGuidelines: [
       "Use team_send_and_wait when you need a member result before continuing.",
       "On timeout: check get_member_status; if still working, call team_send_and_wait again with the same correlationId (from timeout details) to re-wait without sending a new message.",
-      "team_send_and_wait also returns early with allIdle status when all members become idle — check the work results.",
+      "team_send_and_wait returns early with allIdle status when all members become idle.",
     ],
     parameters: {
       type: "object",
@@ -521,7 +693,7 @@ ${memberLines}
 
 1. **先写 Shared Context** — 用编辑器的 write 或 edit 工具创建 .shared-context.md
 2. **start_member(name)** — 启动一个 Member 进程
-3. **team_send_and_wait(to, content?, timeout?, correlationId?)** — 给 Member 发任务并等待回复（阻塞）。超时后如需续等，用相同的 correlationId 重新调用（不发新消息，只续等）。若所有成员均变为空闲状态，自动停止等待。
+3. **team_send_and_wait(to, content?, timeout?, correlationId?)** — 给 Member 发任务并等待回复（阻塞）。超时后如需续等，用相同的 correlationId 重新调用（不发新消息，只续等）
 4. **team_send_message(to, subject?, content?)** — 只发消息不等待回复。仅通知或无需结果时使用
 5. **list_members** — 查看各 Member 的运行状态
 6. **get_member_status()** — **优先使用**。快速查看所有成员当前操作状态（idle/working/crashed/stopped），负担轻
