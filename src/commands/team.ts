@@ -6,6 +6,7 @@ import { getSessionState, endSession } from "../session/state";
 import { readTeam, listTeams, deleteTeam, deleteTeamSessions } from "../team/store";
 import { getRootDir } from "../config";
 import type { StatusProvider } from "./status";
+import type { TeamWorkflow } from "../team/definition";
 
 interface ToolInputSchema {
   type: "object";
@@ -36,6 +37,7 @@ export function registerTeamCommand(
     description: string;
     defaultModel?: string;
     members: Array<{ name: string; label?: string; systemPrompt: string; model?: string }>;
+    workflow?: TeamWorkflow;
   }
 
   /** Validate and persist a team definition. Returns an error result if invalid, null if saved. */
@@ -43,7 +45,7 @@ export function registerTeamCommand(
     const { validateTeamDefinition } = await import("../team/schema");
     const { writeTeam } = await import("../team/store");
 
-    const teamData = {
+    const teamData: Record<string, unknown> = {
       name: params.name,
       description: params.description,
       defaults: params.defaultModel ? { model: params.defaultModel } : undefined,
@@ -54,6 +56,10 @@ export function registerTeamCommand(
         model: m.model,
       })),
     };
+
+    if (params.workflow) {
+      teamData.workflow = params.workflow;
+    }
 
     const validation = validateTeamDefinition(teamData);
     if (!validation.valid) {
@@ -69,6 +75,63 @@ export function registerTeamCommand(
     writeTeam(teamData, rootDir);
     return null;
   }
+
+  // ── workflow parameter schema (shared between create and update) ──
+  const workflowStageSchema = {
+    type: "object",
+    properties: {
+      member: { type: "string", description: "执行此步骤的成员 name" },
+      name: { type: "string", description: "步骤标识符" },
+      description: { type: "string", description: "步骤描述" },
+      input: { type: "string", description: "步骤输入描述（可选）" },
+      output: { type: "string", description: "步骤输出描述（可选）" },
+      constraints: { type: "string", description: "约束条件（可选）" },
+      onFailure: {
+        type: "object",
+        description: "失败处理策略（可选）：回退到指定 stage",
+        properties: {
+          returnToStage: { type: "string", description: "回退到的 stage name" },
+          condition: { type: "string", description: "触发回退的条件" },
+        },
+        required: ["returnToStage", "condition"],
+      },
+    },
+    required: ["member", "name", "description"],
+  };
+
+  const workflowSchema = {
+    type: "object",
+    description: "可选：定义团队的默认工作流。TL 按照此工作流拆解任务。",
+    properties: {
+      strictness: {
+        type: "string",
+        enum: ["strict", "reference"],
+        description: "strict = 强制顺序执行, reference = 参考指南（默认）",
+      },
+      description: { type: "string", description: "工作流描述" },
+      stages: {
+        type: "array",
+        items: workflowStageSchema,
+        description: "工作流步骤序列（至少一个）",
+      },
+      loops: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            condition: { type: "string", description: "循环条件（自然语言描述）" },
+            stages: {
+              type: "array",
+              items: { type: "string" },
+              description: "循环体内的步骤名称序列（引用主流程 stage names）",
+            },
+          },
+          required: ["condition", "stages"],
+        },
+        description: "可选：工作流中的循环段",
+      },
+    },
+  };
 
   // Register the create_team_definition tool (used by TL during /team create)
   pi.registerTool({
@@ -97,6 +160,7 @@ export function registerTeamCommand(
           },
           description: "Team members",
         },
+        workflow: workflowSchema,
       },
       required: ["name", "description", "members"],
     } as ToolInputSchema,
@@ -144,6 +208,7 @@ export function registerTeamCommand(
           },
           description: "Team members",
         },
+        workflow: workflowSchema,
       },
       required: ["name", "description", "members"],
     } as ToolInputSchema,
@@ -381,6 +446,28 @@ export function registerTeamCommand(
               output += `    ${pl}\n`;
             }
             output += `\n`;
+          }
+
+          // Workflow display
+          if (team.workflow) {
+            const wf = team.workflow;
+            output += `工作流：\n`;
+            output += `  模式：${wf.strictness === "strict" ? "严格模式 ⚡" : "参考模式 📋"}\n`;
+            if (wf.description) output += `  描述：${wf.description}\n`;
+            output += `  步骤（${wf.stages.length}）：\n`;
+            for (const s of wf.stages) {
+              output += `    - 【${s.name}】${s.description} (${s.member})\n`;
+              if (s.input) output += `      输入：${s.input}\n`;
+              if (s.output) output += `      输出：${s.output}\n`;
+              if (s.constraints) output += `      约束：${s.constraints}\n`;
+              if (s.onFailure) output += `      失败处理：如「${s.onFailure.condition}」→ 回退至「${s.onFailure.returnToStage}」\n`;
+            }
+            if (wf.loops && wf.loops.length > 0) {
+              output += `  循环段（${wf.loops.length}）：\n`;
+              for (const loop of wf.loops) {
+                output += `    🔁 条件「${loop.condition}」→ 重复步骤：${loop.stages.join("、")}\n`;
+              }
+            }
           }
 
           ctx.ui.notify(output, "info");

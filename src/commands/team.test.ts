@@ -99,7 +99,6 @@ describe("/team command", () => {
     pi.registerCommand = vi.fn((_name, opts) => { handler = opts.handler; });
     registerTeamCommand(pi, createTeamContext());
 
-    // 创建包含多行 systemPrompt 的团队 YAML
     mkdirSync(join(tmpDir, "teams"), { recursive: true });
     writeFileSync(join(tmpDir, "teams", "multi-line.yaml"),
       `name: multi-line
@@ -114,8 +113,6 @@ members:
 `, "utf-8");
 
     await handler("show multi-line", ctx);
-
-    // 验证输出包含三行提示词
     expect(ctx.ui.notify).toHaveBeenCalledWith(
       expect.stringContaining("第一行提示词"),
       "info"
@@ -126,6 +123,43 @@ members:
     );
     expect(ctx.ui.notify).toHaveBeenCalledWith(
       expect.stringContaining("第三行提示词"),
+      "info"
+    );
+  });
+
+  it("/team show displays workflow when present", async () => {
+    const pi = createMockExtensionAPI();
+    const ctx = createMockContext();
+    let handler: Function = () => {};
+    pi.registerCommand = vi.fn((_name, opts) => { handler = opts.handler; });
+    registerTeamCommand(pi, createTeamContext());
+
+    mkdirSync(join(tmpDir, "teams"), { recursive: true });
+    const yaml = [
+      "name: wf-team",
+      "description: Team with workflow",
+      "members:",
+      "  - name: architect",
+      "    label: 分析员",
+      "    systemPrompt: design",
+      "  - name: coder",
+      "    systemPrompt: code",
+      "workflow:",
+      "  strictness: reference",
+      "  description: Dev workflow",
+      "  stages:",
+      "    - member: architect",
+      "      name: analyze",
+      "      description: Analyze requirements",
+      "    - member: coder",
+      "      name: implement",
+      "      description: Write code",
+    ].join("\n");
+    writeFileSync(join(tmpDir, "teams", "wf-team.yaml"), yaml, "utf-8");
+
+    await handler("show wf-team", ctx);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("分析员"),
       "info"
     );
   });
@@ -215,5 +249,103 @@ members:
       expect.stringContaining("用法"),
       "info"
     );
+  });
+
+  // ── create_team_definition tool with workflow tests ──
+
+  describe("create_team_definition tool with workflow", () => {
+    it("persists workflow to YAML", async () => {
+      const pi = createMockExtensionAPI();
+      const registeredTools: any[] = [];
+      pi.registerTool = vi.fn((def: any) => { registeredTools.push(def); });
+      registerTeamCommand(pi, createTeamContext());
+
+      const createTool = registeredTools.find((t) => t.name === "create_team_definition");
+      expect(createTool).toBeDefined();
+
+      const result = await createTool!.execute("id", {
+        name: "test-wf",
+        description: "Test with workflow",
+        members: [
+          { name: "architect", systemPrompt: "design" },
+          { name: "coder", systemPrompt: "code" },
+        ],
+        workflow: {
+          strictness: "strict",
+          description: "Test workflow",
+          stages: [
+            { member: "architect", name: "design", description: "Design" },
+            { member: "coder", name: "build", description: "Build" },
+          ],
+          loops: [{ condition: "Retry", stages: ["build"] }],
+        },
+      });
+
+      expect(result.content[0].text).toContain("已创建成功");
+
+      const { parse: parseYaml } = await import("yaml");
+      const { readFileSync } = await import("node:fs");
+      const raw = readFileSync(join(tmpDir, "teams", "test-wf.yaml"), "utf-8");
+      const parsed = parseYaml(raw);
+      expect(parsed.workflow).toBeDefined();
+      expect(parsed.workflow.strictness).toBe("strict");
+      expect(parsed.workflow.stages).toHaveLength(2);
+      expect(parsed.workflow.loops).toHaveLength(1);
+      expect(parsed.workflow.loops[0].condition).toBe("Retry");
+    });
+
+    it("persists workflow with onFailure object", async () => {
+      const pi = createMockExtensionAPI();
+      const registeredTools: any[] = [];
+      pi.registerTool = vi.fn((def: any) => { registeredTools.push(def); });
+      registerTeamCommand(pi, createTeamContext());
+
+      const createTool = registeredTools.find((t) => t.name === "create_team_definition");
+      expect(createTool).toBeDefined();
+
+      await createTool!.execute("id", {
+        name: "test-onfail",
+        description: "Test onfailure",
+        members: [{ name: "w", systemPrompt: "work" }],
+        workflow: {
+          strictness: "reference",
+          stages: [{
+            member: "w",
+            name: "code",
+            description: "Write code",
+            onFailure: { returnToStage: "code", condition: "tests fail" },
+          }],
+        },
+      });
+
+      const { parse: parseYaml } = await import("yaml");
+      const { readFileSync } = await import("node:fs");
+      const raw = readFileSync(join(tmpDir, "teams", "test-onfail.yaml"), "utf-8");
+      const parsed = parseYaml(raw);
+      expect(parsed.workflow.stages[0].onFailure.returnToStage).toBe("code");
+      expect(parsed.workflow.stages[0].onFailure.condition).toBe("tests fail");
+    });
+
+    it("validates workflow and rejects bad input", async () => {
+      const pi = createMockExtensionAPI();
+      const registeredTools: any[] = [];
+      pi.registerTool = vi.fn((def: any) => { registeredTools.push(def); });
+      registerTeamCommand(pi, createTeamContext());
+
+      const createTool = registeredTools.find((t) => t.name === "create_team_definition");
+      expect(createTool).toBeDefined();
+
+      const result = await createTool!.execute("id", {
+        name: "bad-wf",
+        description: "Bad workflow",
+        members: [{ name: "w", systemPrompt: "work" }],
+        workflow: {
+          strictness: "reference",
+          stages: [{ member: "nonexistent", name: "s1", description: "task" }],
+        },
+      });
+
+      expect(result.content[0].text).toContain("校验失败");
+    });
   });
 });
