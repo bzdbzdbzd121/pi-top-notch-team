@@ -489,7 +489,7 @@ TEAM_SHARED_CONTEXT_PATH=~/.pi/top-notch-team/sessions/refactoring/.shared-conte
 
 The `member.ts` extension reads these in `session_start`, then in `before_agent_start` injects a system prompt preamble that covers: team identity, member role description, team member list, collaboration rules (including `team_send_message` usage, task completion reply requirement, and file-based deliverable output for reports/plans/designs). Members are also instructed to preserve `<corr:...>` tags when replying to TL, and are given the Shared Context file path when available.
 
-完整的注入提示词代码见 `member.ts` 中的 `before_agent_start` 处理器。
+完整的注入提示词代码见 `member.ts` 中的 `before_agent_start` 处理器。提示词涵盖：团队身份、角色描述、成员列表、协作规则（消息通道使用、完成后回复TL、文件式产出物传递、corr 标签保留），以及**沟通风格要求**（简洁精炼、剔除客套、保留术语原样）。
 
 ## 10. TL System Prompt Injection
 
@@ -499,6 +499,7 @@ When `/team start` creates a team session, the extension sets up a `before_agent
 - **团队信息**: 名称、描述、成员列表
 - **核心原则：委派优先**: 明确 TL 的职责是委派而非执行，能交给 Member 做的事绝不自己做。成员完成任务后不得主动停止其进程。TL 可以编写 .md 文档（共享上下文、ADR 等）但不得直接写代码文件
 - **需求讨论方式**: 逐问确认、挑战模糊语言、用场景检验边界、对照实际代码、术语和决策立即固化到 `.shared-context.md`
+- **沟通风格**: 与用户交流简洁精炼，剔除客套话、语气词、多余铺垫
 - **可用工具**: 5 个团队管理工具（start_member、stop_member、list_members、get_member_log、team_send_and_wait）和消息通道（team_send_message）的介绍和使用指引
 - **工作流程**: 从需求讨论→拆解任务→编写共享上下文→启动 Member→分配任务（注明完成后必须回复TL）→监控进展→汇报结果的 9 个步骤
 
