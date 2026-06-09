@@ -5,6 +5,16 @@ import type { MemberOperationalState } from "./session/state-machine";
 
 // ── Helpers ────────────────────────────────────────────────
 
+function createMockUi() {
+  return {
+    theme: {
+      fg: (_style: string, text: string) => text,
+    },
+    setWidget: vi.fn(),
+    requestRender: vi.fn(),
+  };
+}
+
 function createMockPi(): ExtensionAPI {
   const tools: any[] = [];
   return {
@@ -114,6 +124,168 @@ describe("index.ts default export (integration)", () => {
     // The handler should be an async function
     const handler = beforeAgentStart![1];
     expect(typeof handler).toBe("function");
+  });
+
+  // ── Workflow prompt injection tests ───────────────────
+
+  describe("workflow prompt injection in before_agent_start", () => {
+    beforeEach(async () => {
+      vi.resetModules();
+      delete process.env.TEAM_ROLE;
+      pi = createMockPi();
+      const mod = await import("../index");
+      mod.default(pi);
+    });
+
+    function getBeforeAgentStartHandler(): Function {
+      const onCalls = (pi.on as ReturnType<typeof vi.fn>).mock.calls;
+      const entry = onCalls.find((c: any) => c[0] === "before_agent_start");
+      return entry![1];
+    }
+
+    it("injects strict workflow prompt when workflow.strictness is strict", async () => {
+      const { startSession, endSession } = await import("./session/state");
+      endSession();
+      startSession({
+        name: "test-team",
+        description: "Test",
+        members: [{ name: "worker", systemPrompt: "do work" }],
+        workflow: {
+          strictness: "strict",
+          stages: [{ member: "worker", name: "build", description: "Build the thing" }],
+        },
+      });
+
+      const handler = getBeforeAgentStartHandler();
+      const result = await handler({ systemPrompt: "BASE" }, { ui: createMockUi() });
+      expect(result.systemPrompt).toContain("严格按照以下步骤执行");
+      expect(result.systemPrompt).toContain("【build】");
+      expect(result.systemPrompt).toContain("Build the thing");
+    });
+
+    it("injects reference workflow prompt when workflow.strictness is reference", async () => {
+      const { startSession, endSession } = await import("./session/state");
+      endSession();
+      startSession({
+        name: "test-team",
+        description: "Test",
+        members: [{ name: "worker", systemPrompt: "do work" }],
+        workflow: {
+          strictness: "reference",
+          stages: [{ member: "worker", name: "build", description: "Build the thing" }],
+        },
+      });
+
+      const handler = getBeforeAgentStartHandler();
+      const result = await handler({ systemPrompt: "BASE" }, { ui: createMockUi() });
+      expect(result.systemPrompt).toContain("不必严格遵循");
+      expect(result.systemPrompt).toContain("【build】");
+    });
+
+    it("does not inject workflow prompt when team has no workflow", async () => {
+      const { startSession, endSession } = await import("./session/state");
+      endSession();
+      startSession({
+        name: "test-team",
+        description: "Test",
+        members: [{ name: "worker", systemPrompt: "do work" }],
+      });
+
+      const handler = getBeforeAgentStartHandler();
+      const result = await handler({ systemPrompt: "BASE" }, { ui: createMockUi() });
+      expect(result.systemPrompt).not.toContain("严格");
+      expect(result.systemPrompt).not.toContain("参考");
+      expect(result.systemPrompt).not.toContain("工作流");
+      expect(result.systemPrompt).toContain("Team Lead");
+    });
+
+    it("does not inject workflow prompt when session is not active", async () => {
+      const { endSession } = await import("./session/state");
+      endSession();
+
+      const handler = getBeforeAgentStartHandler();
+      const result = await handler({ systemPrompt: "BASE" }, { ui: createMockUi() });
+      expect(result).toBeUndefined();
+    });
+
+    it("injects workflow prompt with loops", async () => {
+      const { startSession, endSession } = await import("./session/state");
+      endSession();
+      startSession({
+        name: "test-team",
+        description: "Test",
+        members: [{ name: "worker", systemPrompt: "do work" }, { name: "reviewer", systemPrompt: "review" }],
+        workflow: {
+          strictness: "reference",
+          description: "Dev workflow",
+          stages: [
+            { member: "worker", name: "code", description: "Write code" },
+            { member: "reviewer", name: "review", description: "Review code" },
+          ],
+          loops: [{ condition: "Review failed", stages: ["code", "review"] }],
+        },
+      });
+
+      const handler = getBeforeAgentStartHandler();
+      const result = await handler({ systemPrompt: "BASE" }, { ui: createMockUi() });
+      expect(result.systemPrompt).toContain("Review failed");
+      expect(result.systemPrompt).toContain("code");
+      expect(result.systemPrompt).toContain("review");
+    });
+
+    it("injects workflow prompt with onFailure", async () => {
+      const { startSession, endSession } = await import("./session/state");
+      endSession();
+      startSession({
+        name: "test-team",
+        description: "Test",
+        members: [{ name: "worker", systemPrompt: "do work" }],
+        workflow: {
+          strictness: "strict",
+          stages: [{
+            member: "worker",
+            name: "code",
+            description: "Write code",
+            onFailure: { returnToStage: "code", condition: "tests fail" },
+          }],
+        },
+      });
+
+      const handler = getBeforeAgentStartHandler();
+      const result = await handler({ systemPrompt: "BASE" }, { ui: createMockUi() });
+      expect(result.systemPrompt).toContain("tests fail");
+      expect(result.systemPrompt).toContain("code");
+    });
+
+    it("injects workflow prompt with all optional fields", async () => {
+      const { startSession, endSession } = await import("./session/state");
+      endSession();
+      startSession({
+        name: "test-team",
+        description: "Test",
+        members: [{ name: "architect", systemPrompt: "design" }],
+        workflow: {
+          strictness: "reference",
+          description: "Full workflow",
+          stages: [{
+            member: "architect",
+            name: "design",
+            description: "Create design",
+            input: "Requirements",
+            output: "Design doc",
+            constraints: "Use approved patterns",
+          }],
+        },
+      });
+
+      const handler = getBeforeAgentStartHandler();
+      const result = await handler({ systemPrompt: "BASE" }, { ui: createMockUi() });
+      expect(result.systemPrompt).toContain("【design】");
+      expect(result.systemPrompt).toContain("Create design");
+      expect(result.systemPrompt).toContain("Requirements");
+      expect(result.systemPrompt).toContain("Design doc");
+      expect(result.systemPrompt).toContain("Use approved patterns");
+    });
   });
 });
 

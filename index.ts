@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerTeamCommand } from "./src/commands/team";
-import { getSessionState } from "./src/session/state";
+import { TeamModeEditor } from "./src/ui/team-mode-editor";
+import { getSessionState, endSession } from "./src/session/state";
 import type { TeamContext } from "./src/session/context";
 import { registerTlTools } from "./src/tools/tl-tools";
 import { createProcessManager } from "./src/process/manager";
@@ -18,6 +19,10 @@ export default function (pi: ExtensionAPI) {
   if (process.env.TEAM_ROLE) {
     return;
   }
+
+  // ── Team mode editor (border color change) ────────────────
+  let teamModeEditorInstance: TeamModeEditor | null = null;
+  let sessionUiRef: any = null;
 
   // ── Shared mutable state ──────────────────────────────────
   const teamCtx: TeamContext = {
@@ -117,7 +122,7 @@ export default function (pi: ExtensionAPI) {
 
   // ── Call-level guard: block code-file writes during team session ───
   pi.on("tool_call", (event) => {
-    if (!teamCtx.processManager) return; // not in a team session
+    if (!getSessionState().active) return; // only block during active team session
 
     if (event.toolName !== "write" && event.toolName !== "edit") return;
 
@@ -134,8 +139,36 @@ export default function (pi: ExtensionAPI) {
     };
   });
 
+  // ── session_shutdown: clean up team state on /new, /resume, /fork ──
+  pi.on("session_shutdown", () => {
+    const _session = getSessionState();
+    if (_session.active) {
+      endSession();
+      if (teamCtx.onSessionEnd) {
+        teamCtx.onSessionEnd();
+      }
+    }
+  });
+
+  // ── session_start: reset stale team state when fresh session detected ──
+  pi.on("session_start", (_event, ctx) => {
+    if (ctx.sessionManager) {
+      const entries = ctx.sessionManager.getEntries() ?? [];
+      const isFresh = entries.length <= 1;
+      if (isFresh && getSessionState().active) {
+        endSession();
+        if (teamCtx.onSessionEnd) {
+          teamCtx.onSessionEnd();
+        }
+      }
+    }
+  });
+
   // ── Custom autocomplete: team names for /team start|show|delete|edit ──
   pi.on("session_start", (_event, ctx) => {
+    // Store UI ref for session end cleanup
+    sessionUiRef = ctx.ui;
+
     ctx.ui.addAutocompleteProvider((current) => ({
       async getSuggestions(lines, line, col, options) {
         const beforeCursor = (lines[line] ?? "").slice(0, col);
@@ -165,6 +198,15 @@ export default function (pi: ExtensionAPI) {
         return current.shouldTriggerFileCompletion?.(lines, line, col) ?? true;
       },
     }));
+
+    // Register team mode editor factory (border color change)
+    ctx.ui.setEditorComponent((tui: any, theme: any, kb: any) => {
+      teamModeEditorInstance = new TeamModeEditor(tui, theme, kb, ctx.ui.theme);
+      if (getSessionState().active) {
+        teamModeEditorInstance.setTeamMode(true);
+      }
+      return teamModeEditorInstance;
+    });
   });
 
   // ── Register the /team command ────────────────────────────
@@ -192,11 +234,25 @@ export default function (pi: ExtensionAPI) {
       memberOpsStates,
     });
     teamStatusWidget.install(ui, ui.theme);
+
+    // Activate team mode editor border
+    if (teamModeEditorInstance) {
+      teamModeEditorInstance.setTeamMode(true);
+      try { (ui as any).requestRender?.(); } catch {}
+    }
   };
   teamCtx.onSessionEnd = () => {
     if (teamStatusWidget) {
       teamStatusWidget.uninstall();
       teamStatusWidget = null;
+    }
+
+    // Restore default editor border
+    if (teamModeEditorInstance) {
+      teamModeEditorInstance.setTeamMode(false);
+    }
+    if (sessionUiRef) {
+      sessionUiRef.setEditorComponent(undefined);
     }
   };
 
@@ -271,6 +327,38 @@ export default function (pi: ExtensionAPI) {
         .map((m) => `  - ${m.name}（${m.label ?? m.name}）— ${m.systemPrompt.slice(0, 80)}`)
         .join("\n");
 
+      // Workflow prompt injection
+      let workflowText = "";
+      if (team.workflow) {
+        const wf = team.workflow;
+        const fmtStage = (s: (typeof wf.stages)[number]): string => {
+          let t = `  【${s.name}】${s.description} (${s.member})`;
+          if (s.input) t += `\n    输入：${s.input}`;
+          if (s.output) t += `\n    输出：${s.output}`;
+          if (s.constraints) t += `\n    约束：${s.constraints}`;
+          if (s.onFailure) t += `\n    失败处理：如「${s.onFailure.condition}」→ 回退至「${s.onFailure.returnToStage}」`;
+          return t;
+        };
+        if (wf.strictness === "strict") {
+          workflowText += `\n### 默认工作流（严格模式 ⚡）\n严格按照以下步骤执行，不得跳过或调序。\n\n`;
+        } else {
+          workflowText += `\n### 默认工作流（参考模式 📋）\n作为工作参考，不必严格遵循步骤顺序，可根据实际情况灵活调整。\n\n`;
+        }
+        if (wf.description) workflowText += `**描述：** ${wf.description}\n\n`;
+        workflowText += `**步骤序列：**\n`;
+        for (const s of wf.stages) workflowText += fmtStage(s) + "\n\n";
+        if (wf.loops && wf.loops.length > 0) {
+          workflowText += `**循环段：**\n`;
+          for (const loop of wf.loops) {
+            workflowText += `  🔁 条件「${loop.condition}」→ 重复步骤：${loop.stages.join("、")}\n`;
+          }
+          workflowText += "\n";
+        }
+        if (wf.strictness === "strict") {
+          workflowText += `> 规则：完成上一个 stage 前不得开始下一个。Stage 失败时按 onFailure 策略处理。\n`;
+        }
+      }
+
       extraPrompt = `
 ## 当前任务：Team Lead
 
@@ -281,7 +369,7 @@ ${team.description}
 
 ### 团队成员
 ${memberLines}
-
+${workflowText}
 ### 核心原则：委派优先
 - **能交给 Member 做的事，绝不自己做。** 你是 Team Lead 不是执行者。
 - 需要分析代码？委派给分析员。需要修改文件？委派给开发员。需要验证？委派给测试员。
