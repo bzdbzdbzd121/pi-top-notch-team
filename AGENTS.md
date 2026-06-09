@@ -23,7 +23,7 @@ pi install ./pi-top-notch-team
 ```
 User's pi session (TL extension)
   ├── 10 subcommands (/team create, edit, cancel, start, stop, list, show, delete, status, help)
-  ├── 7 TL tools (start_member, stop_member, list_members, get_member_log, get_member_status, team_send_message, team_send_and_wait)
+  ├── 6 TL tools (start_member, stop_member, list_members, get_member_log, get_member_status, team_send_and_wait)
   ├── Message channel (queue → router → responseWaiter)
   ├── Member Process Manager
   │     ├── Member A (pi --mode rpc, member.ts)

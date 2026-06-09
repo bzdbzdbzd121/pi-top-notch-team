@@ -204,7 +204,61 @@ members:
 - `members[].systemPrompt`: required, non-empty
 - `members[].model`: optional, overrides `defaults.model`
 
-Validation is run at `/team create` time via a validation script.
+Validation is run at `/team create` time via a validation script (`src/team/schema.ts`).
+
+### Workflow (optional)
+
+Teams may define a **default workflow** that the TL references when coordinating members:
+
+```yaml
+workflow:
+  # Execution mode: "strict" (must follow order) or "reference" (flexible guide)
+  strictness: "reference"
+  # Optional description
+  description: "标准开发流程：设计 → 编码 → 审查 → 循环"
+  # Ordered list of stages
+  stages:
+    - member: "tl"                    # "tl" for TL-operated stages
+      name: "需求对齐"
+      description: "与用户对齐需求和方案"
+      output: "需求文档"
+    - member: "architect"
+      name: "架构设计"
+      description: "架构方案细化设计"
+      input: "需求文档"
+      output: "详细设计文档"
+      constraints: "考虑可扩展性和技术选型"
+    - member: "coder"
+      name: "编码开发"
+      input: "单个任务"
+      output: "代码 + 测试"
+      constraints: "TDD，单步提交"
+      onFailure:
+        returnToStage: "编码开发"     # Stage to return to on failure
+        condition: "审查不通过"       # Condition that triggers the fallback
+    - member: "reviewer"
+      name: "代码审查"
+      input: "代码实现"
+      output: "审查报告"
+  # Optional while-loop sections: repeat stages while condition is true
+  loops:
+    - condition: "还有未完成的任务"
+      stages: ["编码开发", "代码审查"]
+```
+
+### Workflow Validation Rules
+
+- `workflow`: optional object
+- `strictness`: required, one of `"strict"` | `"reference"`
+- `stages`: required, non-empty array
+- `stages[].member`: required, must match a `TeamMember.name` (or `"tl"`)
+- `stages[].name`: required, unique within main flow
+- `stages[].description`: required, non-empty
+- `stages[].input` / `stages[].output` / `stages[].constraints`: optional strings
+- `stages[].onFailure`: optional object with `returnToStage` (string) and `condition` (non-empty string)
+- `loops`: optional array
+- `loops[].condition`: required, non-empty (natural language while-condition)
+- `loops[].stages`: required, string array — each entry must reference a main-flow stage name
 
 ## 5. Commands
 
@@ -214,21 +268,24 @@ All subcommands are registered as a single `/team` command via `registerCommand(
 
 **Flow:**
 1. User types `/team create`
-2. Extension injects instructions via `before_agent_start`
+2. Extension injects instructions via `before_agent_start` — includes workflow configuration dialogue prompts
 3. TL converses with user, auto-derives name/label
-4. On confirmation, TL calls `create_team_definition` tool
-5. Tool validates and saves YAML
-6. No team session started
+4. After member collection, TL asks if user wants a default workflow
+5. If yes: TL asks strictness → collects stages (member/name/description/input/output/constraints/onFailure) → asks about loops → confirms
+6. On confirmation, TL calls `create_team_definition` tool with optional `workflow` field
+7. Tool validates and saves YAML
+8. No team session started
 
 ### `/team edit <name>`
 
 **Flow:**
 1. User types `/team edit <name>`
 2. Reads existing team definition
-3. Sets `editingTeamName`, injects instructions via `before_agent_start`
-4. TL discusses changes with user
-5. On confirmation, TL calls `update_team_definition` tool
+3. Sets `editingTeamName`, injects instructions via `before_agent_start` — includes workflow modification prompts
+4. TL discusses changes with user (member changes, workflow changes: add/remove/modify stages, loops, strictness)
+5. On confirmation, TL calls `update_team_definition` tool with optional `workflow` field
 6. Tool validates and overwrites YAML
+7. If workflow was removed, the field is simply omitted from the YAML
 
 ### `/team cancel`
 
@@ -500,10 +557,46 @@ When `/team start` creates a team session, the extension sets up a `before_agent
 - **核心原则：委派优先**: 明确 TL 的职责是委派而非执行，能交给 Member 做的事绝不自己做。成员完成任务后不得主动停止其进程。TL 可以编写 .md 文档（共享上下文、ADR 等）但不得直接写代码文件
 - **需求讨论方式**: 逐问确认、挑战模糊语言、用场景检验边界、对照实际代码、术语和决策立即固化到 `.shared-context.md`
 - **沟通风格**: 与用户交流简洁精炼，剔除客套话、语气词、多余铺垫
-- **可用工具**: 5 个团队管理工具（start_member、stop_member、list_members、get_member_log、team_send_and_wait）和消息通道（team_send_message）的介绍和使用指引
+- **可用工具**: 6 个团队管理工具（start_member、stop_member、list_members、get_member_log、get_member_status、team_send_and_wait）的介绍和使用指引
 - **工作流程**: 从需求讨论→拆解任务→编写共享上下文→启动 Member→分配任务（注明完成后必须回复TL）→监控进展→汇报结果的 9 个步骤
+- **默认工作流（可选）**: 如果团队配置了 `workflow` 字段，注入工作流阶段序列和循环段。Strict 模式注入强制顺序执行规则（"严格按照以下步骤执行，不得跳过或调序"），Reference 模式注入灵活参考指引（"不必严格遵循，可根据实际情况灵活调整"）
 
 完整的注入提示词代码见 `index.ts` 中的 `before_agent_start` 处理器。
+
+### 工作流注入示例（Reference 模式）
+
+当团队配置了 workflow 时，`before_agent_start` 会在团队信息之后注入如下内容：
+
+```markdown
+### 默认工作流（参考模式 📋）
+作为工作参考，不必严格遵循步骤顺序，可根据实际情况灵活调整。
+
+**描述：** 标准开发流程：设计 → 编码 → 审查 → 循环
+
+**步骤序列：**
+  【需求对齐】与用户对齐需求和方案 (tl)
+    输出：需求文档
+
+  【架构设计】架构方案细化设计 (architect)
+    输入：需求文档
+    输出：详细设计文档
+    约束：考虑可扩展性和技术选型
+
+  【编码开发】实现功能模块 (coder)
+    输入：设计文档
+    输出：代码 + 测试
+    约束：TDD，单步提交
+    失败处理：如「审查不通过」→ 回退至「编码开发」
+
+  【代码审查】审查代码实现 (reviewer)
+    输入：代码实现
+    输出：审查报告
+
+**循环段：**
+  🔁 条件「还有未完成的任务」→ 重复步骤：编码开发、代码审查
+```
+
+Strict 模式的注入类似，但文案强调"严格按照以下步骤执行，不得跳过或调序"，并在末尾追加规则："完成上一个 stage 前不得开始下一个。Stage 失败时按 onFailure 策略处理。"
 
 此外，扩展注册了一个 `tool_call` 事件拦截器：团队会话期间，TL 的 `write`/`edit` 工具调用会被检查目标文件路径。仅 `.md` 文件允许直接写入，代码文件（`.ts`、`.js`、`.py` 等）会被拦截并提示委派给 Member。
 

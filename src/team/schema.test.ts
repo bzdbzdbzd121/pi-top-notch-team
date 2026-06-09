@@ -319,3 +319,22 @@ describe("validateTeamDefinition", () => {
     });
   });
 });
+
+  it("accepts workflow stage with member \"tl\"", () => {
+    const result = validateTeamDefinition({
+      name: "test",
+      description: "test",
+      members: [{ name: "coder", systemPrompt: "write code" }],
+      workflow: {
+        strictness: "reference",
+        stages: [
+          { member: "tl", name: "plan", description: "plan the work" },
+          { member: "coder", name: "code", description: "write the code" },
+        ],
+      },
+    });
+    expect(result.valid).toBe(true);
+    expect(result.errors).toEqual([]);
+  });
+
+

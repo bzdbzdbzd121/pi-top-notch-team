@@ -13,8 +13,6 @@ import { spawn } from "node:child_process";
 type CreateMemberFn = (config: MemberProcessConfig) => MemberProcessHandle;
 type BuildConfigFn = (memberName: string) => MemberProcessConfig | null;
 type GetMemberLogFn = (memberName: string, maxLines: number, maxContentLength?: number) => Promise<string>;
-type EnqueueMessageFn = (msg: { to: string; subject?: string; content: string }) => void;
-
 // ── TlToolsDeps ────────────────────────────────────────────
 
 export interface TlToolsDeps {
@@ -27,7 +25,6 @@ export interface TlToolsDeps {
   createMember?: CreateMemberFn;
   buildMemberConfig?: BuildConfigFn;
   getMemberLog?: GetMemberLogFn;
-  enqueueMessage?: EnqueueMessageFn;
 }
 
 // ── Tool result types ──────────────────────────────────────
@@ -57,7 +54,6 @@ export function registerTlTools(deps: TlToolsDeps): void {
     createMember = (config) => createMemberProcess(config, spawn),
     buildMemberConfig,
     getMemberLog,
-    enqueueMessage,
   } = deps;
 
   // ── start_member ────────────────────────────────────────
@@ -200,7 +196,7 @@ export function registerTlTools(deps: TlToolsDeps): void {
     label: "Get Member Log",
     description:
       "Retrieve a Member's recent conversation log to check their progress. " +
-      "Parameters: name (member identifier), lines (number of recent lines, default 10).",
+      "Parameters: name (member identifier), lines (number of recent lines, default 3).",
     promptGuidelines: [
       "Use get_member_status FIRST for a quick status check (idle/working/crashed/stopped).",
       "Only use get_member_log when you need the detailed conversation content — it is heavier than get_member_status.",
@@ -214,7 +210,7 @@ export function registerTlTools(deps: TlToolsDeps): void {
         },
         lines: {
           type: "number",
-          description: "Number of recent lines to fetch (default: 10)",
+          description: "Number of recent lines to fetch (default: 3)",
         },
         maxContentLength: {
           type: "number",
@@ -227,7 +223,7 @@ export function registerTlTools(deps: TlToolsDeps): void {
       _toolCallId: string,
       params: { name: string; lines?: number; maxContentLength?: number }
     ): Promise<ToolResult> {
-      const maxLines = params.lines ?? 10;
+      const maxLines = params.lines ?? 3;
       const status = manager.getStatus(params.name);
       if (!status || status.status !== "running") {
         return {
@@ -278,55 +274,6 @@ export function registerTlTools(deps: TlToolsDeps): void {
     },
   });
 
-  // ── team_send_message (TL version) ─────────────────────
-  if (enqueueMessage) {
-    pi.registerTool({
-      name: "team_send_message",
-      label: "Team Send Message",
-      description:
-        "Send a message to another team member or all members via the real-time message channel. " +
-        "Use this to assign tasks, share context, or request updates. " +
-        "Parameters: to (target member name or \"all\"), subject (optional), content (message body).",
-      promptGuidelines: [
-        "Use team_send_message to communicate with team members — assign tasks, share updates, or ask questions.",
-        "The message channel delivers to the target member's conversation context.",
-      ],
-      parameters: {
-        type: "object",
-        properties: {
-          to: {
-            type: "string",
-            description: "Target member name, or \"all\" for broadcast",
-          },
-          subject: {
-            type: "string",
-            description: "Optional subject line",
-          },
-          content: {
-            type: "string",
-            description: "Message body",
-          },
-        },
-        required: ["to", "content"],
-      } as ToolInputSchema,
-      async execute(
-        _toolCallId: string,
-        params: { to: string; subject?: string; content: string }
-      ): Promise<ToolResult> {
-        enqueueMessage({ to: params.to, subject: params.subject, content: params.content });
-        return {
-          details: {},
-          content: [
-            {
-              type: "text" as const,
-              text: `[消息已发送给 ${params.to}]`,
-            },
-          ],
-        };
-      },
-    });
-  }
-
   // ── team_send_and_wait ─────────────────────────────────
   pi.registerTool({
     name: "team_send_and_wait",
@@ -365,7 +312,6 @@ export function registerTlTools(deps: TlToolsDeps): void {
         memberOpsStates,
         lastPendingCorrId,
         messageQueue,
-        enqueueMessage,
       });
     },
   });
@@ -412,7 +358,6 @@ interface SendAndWaitCtx {
   memberOpsStates: Map<string, MemberOperationalState>;
   lastPendingCorrId: Map<string, string>;
   messageQueue: MessageQueue;
-  enqueueMessage?: EnqueueMessageFn;
 }
 
 async function waitWithAllIdleCheck(
@@ -477,7 +422,7 @@ async function sendAndWaitExecute(
   params: { to: string; content?: string; timeout?: number; correlationId?: string },
   ctx: SendAndWaitCtx
 ): Promise<ToolResult> {
-  const { responseWaiter, lastPendingCorrId, messageQueue, enqueueMessage } = ctx;
+  const { responseWaiter, lastPendingCorrId, messageQueue } = ctx;
   const effectiveTimeout = params.timeout ?? 120_000;
 
   // Re-wait: reuse existing correlation ID, no new message sent
@@ -489,7 +434,6 @@ async function sendAndWaitExecute(
   const corrId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
   lastPendingCorrId.set(params.to, corrId);
 
-  // Use enqueueMessage if available, otherwise fallback to messageQueue.enqueue
   const messagePayload = {
     id: "msg-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8),
     from: "tl" as const,
@@ -499,11 +443,7 @@ async function sendAndWaitExecute(
     correlationId: corrId,
   };
 
-  if (enqueueMessage) {
-    enqueueMessage({ to: params.to, content: messagePayload.content });
-  } else {
-    messageQueue.enqueue(messagePayload as TeamMessage);
-  }
+  messageQueue.enqueue(messagePayload as TeamMessage);
 
   return waitWithAllIdleCheck(corrId, effectiveTimeout, params.to, ctx);
 }

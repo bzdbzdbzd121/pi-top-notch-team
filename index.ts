@@ -106,16 +106,6 @@ export default function (pi: ExtensionAPI) {
       }
       return getMemberLog(handle, maxLines, maxContentLength);
     },
-    enqueueMessage: (msg) => {
-      messageQueue.enqueue({
-        id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        from: "tl",
-        to: msg.to,
-        subject: msg.subject,
-        content: msg.content,
-        timestamp: Date.now(),
-      });
-    },
   });
 
   // team_send_and_wait and get_member_status are registered in src/tools/tl-tools.ts
@@ -423,11 +413,10 @@ ${workflowText}
 1. **先写 Shared Context** — 用编辑器的 write 或 edit 工具创建 .shared-context.md
 2. **start_member(name)** — 启动一个 Member 进程
 3. **team_send_and_wait(to, content?, timeout?, correlationId?)** — 给 Member 发任务并等待回复（阻塞）。超时后如需续等，用相同的 correlationId 重新调用（不发新消息，只续等）
-4. **team_send_message(to, subject?, content?)** — 只发消息不等待回复。仅通知或无需结果时使用
-5. **list_members** — 查看各 Member 的运行状态
-6. **get_member_status()** — **优先使用**。快速查看所有成员当前操作状态（idle/working/crashed/stopped），负担轻
-7. **get_member_log(name, lines?)** — 查看 Member 最近的详细对话记录，负担较重，仅当需要了解具体内容时才使用
-8. **stop_member(name)** — 终止 Member 进程
+4. **list_members** — 查看各 Member 的运行状态
+5. **get_member_status()** — **优先使用**。快速查看所有成员当前操作状态（idle/working/crashed/stopped），负担轻
+6. **get_member_log(name, lines?)** — 查看 Member 最近的详细对话记录，负担较重，仅当需要了解具体内容时才使用
+7. **stop_member(name)** — 终止 Member 进程
 
 > 提示：team_send_and_wait 发送的消息包含 <corr:...> 标签。其他成员回复时需在内容中包含此标签，这样即使任务经过多次转交（A->B->TL），最终的回复也能正确匹配等待器。消息通道中的 Team Lead 名称是 tl。
 

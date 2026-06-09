@@ -141,8 +141,8 @@ export function validateWorkflow(
     // stage.member
     if (!stage.member || typeof stage.member !== "string") {
       errors.push(`workflow.stages[${i}]: member is required and must be a string`);
-    } else if (memberNames.length > 0 && !memberNames.includes(stage.member)) {
-      errors.push(`workflow.stages[${i}].member "${stage.member}": does not match any team member name`);
+    } else if (stage.member !== "tl" && memberNames.length > 0 && !memberNames.includes(stage.member)) {
+      errors.push(`workflow.stages[${i}].member "${stage.member}": does not match any team member name (use a member name or "tl")`);
     }
 
     // stage.name

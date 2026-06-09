@@ -73,7 +73,6 @@ describe("registerTlTools", () => {
     createMember?: any;
     buildMemberConfig?: any;
     getMemberLog?: any;
-    enqueueMessage?: any;
   }) {
     registerTlTools({
       pi,
@@ -85,18 +84,12 @@ describe("registerTlTools", () => {
       createMember: overrides?.createMember,
       buildMemberConfig: overrides?.buildMemberConfig,
       getMemberLog: overrides?.getMemberLog,
-      enqueueMessage: overrides?.enqueueMessage,
     });
   }
 
-  it("registers 6 tools (without enqueueMessage)", () => {
+  it("registers 6 tools", () => {
     callRegisterTlTools();
     expect(pi.registerTool).toHaveBeenCalledTimes(6);
-  });
-
-  it("registers 7 tools (with enqueueMessage)", () => {
-    callRegisterTlTools({ enqueueMessage: vi.fn() });
-    expect(pi.registerTool).toHaveBeenCalledTimes(7);
   });
 
   it("registers start_member tool", () => {
@@ -263,7 +256,6 @@ describe("registerTlTools", () => {
         from: "worker",
         content: "Task done",
       });
-      const enqueueMessage = vi.fn();
 
       let executeFn: Function = () => {};
       pi.registerTool = vi.fn((def: any) => {
@@ -279,12 +271,11 @@ describe("registerTlTools", () => {
         memberOpsStates,
         lastPendingCorrId,
         messageQueue,
-        enqueueMessage,
       });
 
       const result = await executeFn("call-1", { to: "worker", content: "Do the task" });
 
-      expect(enqueueMessage).toHaveBeenCalledWith(
+      expect(messageQueue.enqueue).toHaveBeenCalledWith(
         expect.objectContaining({ to: "worker" })
       );
       expect(result.content[0].text).toContain("worker");
@@ -297,7 +288,6 @@ describe("registerTlTools", () => {
       mockResponseWaiter.waitForResponse = vi.fn().mockResolvedValue({
         status: "timeout",
       });
-      const enqueueMessage = vi.fn();
 
       let executeFn: Function = () => {};
       pi.registerTool = vi.fn((def: any) => {
@@ -313,7 +303,6 @@ describe("registerTlTools", () => {
         memberOpsStates,
         lastPendingCorrId,
         messageQueue,
-        enqueueMessage,
       });
 
       const result = await executeFn("call-2", { to: "worker", content: "Hello" });
@@ -573,89 +562,4 @@ describe("start_member error injection", () => {
   });
 });
 
-describe("team_send_message (TL version)", () => {
-  let pi: ExtensionAPI;
-  let manager: ProcessManager;
 
-  beforeEach(() => {
-    pi = createMockPi();
-    manager = createMockManager();
-  });
-
-  it("is not registered when enqueueMessage is not provided", () => {
-    let registeredNames: string[] = [];
-    pi.registerTool = vi.fn((def: any) => { registeredNames.push(def.name); });
-
-    registerTlTools({
-      pi,
-      manager,
-      responseWaiter: createMockResponseWaiter(),
-      memberOpsStates: new Map(),
-      lastPendingCorrId: new Map(),
-      messageQueue: createMockMessageQueue(),
-    });
-
-    expect(registeredNames).not.toContain("team_send_message");
-  });
-
-  it("is registered when enqueueMessage is provided", () => {
-    let registeredNames: string[] = [];
-    pi.registerTool = vi.fn((def: any) => { registeredNames.push(def.name); });
-
-    registerTlTools({
-      pi,
-      manager,
-      responseWaiter: createMockResponseWaiter(),
-      memberOpsStates: new Map(),
-      lastPendingCorrId: new Map(),
-      messageQueue: createMockMessageQueue(),
-      enqueueMessage: vi.fn(),
-    });
-
-    expect(registeredNames).toContain("team_send_message");
-  });
-
-  it("execute calls enqueueMessage", async () => {
-    const enqueueMessage = vi.fn();
-    let executeFn: Function = () => {};
-    pi.registerTool = vi.fn((def: any) => {
-      if (def.name === "team_send_message") executeFn = def.execute;
-    });
-
-    registerTlTools({
-      pi,
-      manager,
-      responseWaiter: createMockResponseWaiter(),
-      memberOpsStates: new Map(),
-      lastPendingCorrId: new Map(),
-      messageQueue: createMockMessageQueue(),
-      enqueueMessage,
-    });
-
-    const result = await executeFn("call-1", { to: "worker", subject: "Task", content: "Do the work" });
-    expect(enqueueMessage).toHaveBeenCalledWith({ to: "worker", subject: "Task", content: "Do the work" });
-    expect(result.content[0].text).toContain("已发送");
-  });
-
-  it("execute works without subject", async () => {
-    const enqueueMessage = vi.fn();
-    let executeFn: Function = () => {};
-    pi.registerTool = vi.fn((def: any) => {
-      if (def.name === "team_send_message") executeFn = def.execute;
-    });
-
-    registerTlTools({
-      pi,
-      manager,
-      responseWaiter: createMockResponseWaiter(),
-      memberOpsStates: new Map(),
-      lastPendingCorrId: new Map(),
-      messageQueue: createMockMessageQueue(),
-      enqueueMessage,
-    });
-
-    const result = await executeFn("call-2", { to: "all", content: "Broadcast" });
-    expect(enqueueMessage).toHaveBeenCalledWith({ to: "all", subject: undefined, content: "Broadcast" });
-    expect(result.content[0].text).toContain("已发送");
-  });
-});
