@@ -23,6 +23,16 @@ export function createMessageQueue(
   const queue: TeamMessage[] = [];
   let processing: Promise<void> | null = null;
   let stopped = false;
+  let drainResolve: (() => void) | null = null;
+
+  /** Notify any waiting drain() that processing finished or queue changed. */
+  function notifyDrain(): void {
+    if (drainResolve) {
+      const r = drainResolve;
+      drainResolve = null;
+      r();
+    }
+  }
 
   async function processAll(): Promise<void> {
     while (queue.length > 0 && !stopped) {
@@ -35,13 +45,23 @@ export function createMessageQueue(
     }
   }
 
+  function finalizeProcessing(): void {
+    processing = null;
+    // Notify drain that a processing round completed
+    notifyDrain();
+    // If more items were queued during processing, restart automatically
+    if (queue.length > 0 && !stopped) {
+      ensureProcessing();
+    }
+  }
+
   function ensureProcessing(): void {
     if (processing || stopped) return;
     // Use queueMicrotask to defer processing so enqueue returns first
     queueMicrotask(() => {
       if (processing || stopped) return;
       processing = processAll().finally(() => {
-        processing = null;
+        finalizeProcessing();
       });
     });
   }
@@ -57,14 +77,26 @@ export function createMessageQueue(
     },
 
     drain(): Promise<void> {
+      if (stopped) return Promise.resolve();
+
       const drainLoop = async (): Promise<void> => {
         // Wait for any in-flight processing
         if (processing) {
           await processing;
         }
-        // If more items were added during processing, drain again
-        if (queue.length > 0 && !stopped) {
-          await new Promise((r) => setTimeout(r, 5));
+        if (stopped) return;
+
+        // If more items were added during or after processing, wait
+        // for them to be processed without polling
+        if (queue.length > 0) {
+          await new Promise<void>((resolve) => {
+            drainResolve = resolve;
+            // Re-check: queue may have been drained since our last check
+            if (queue.length === 0 || stopped) {
+              drainResolve = null;
+              resolve();
+            }
+          });
           return drainLoop();
         }
       };
@@ -73,6 +105,8 @@ export function createMessageQueue(
 
     stop(): void {
       stopped = true;
+      // Wake up any waiting drain() so it can return
+      notifyDrain();
     },
   };
 }

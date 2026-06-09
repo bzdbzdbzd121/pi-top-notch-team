@@ -23,8 +23,8 @@ pi install ./pi-top-notch-team
 ```
 User's pi session (TL extension)
   ├── 10 subcommands (/team create, edit, cancel, start, stop, list, show, delete, status, help)
-  ├── 5 TL tools (start_member, stop_member, list_members, get_member_log, team_send_and_wait)
-  ├── Message channel (queue → router)
+  ├── 7 TL tools (start_member, stop_member, list_members, get_member_log, get_member_status, team_send_message, team_send_and_wait)
+  ├── Message channel (queue → router → responseWaiter)
   ├── Member Process Manager
   │     ├── Member A (pi --mode rpc, member.ts)
   │     ├── Member B (pi --mode rpc, member.ts)
@@ -36,8 +36,8 @@ User's pi session (TL extension)
 
 | File | Role |
 |------|------|
-| `index.ts` | TL extension entry point. Registers `/team` command, TL tools, message channel, `before_agent_start` injection, wires team‑status widget lifecycle |
-| `member.ts` | Member extension entry point. Registers `team_send_message` tool, injects team awareness via env vars |
+| `index.ts` (~341 lines) | TL extension entry point. Registers `/team` command, wires DI dependencies, `before_agent_start` injection, team-status widget lifecycle, autocomplete provider. Refactored from ~800 lines via modular extraction. |
+| `member.ts` | Member extension entry point. Registers `team_send_message` tool, injects team awareness via env vars. Uses `JSON.parse` for TEAM_MEMBERS (no longer comma-delimited). |
 | `package.json` | pi package manifest with `pi.extensions` pointing to `["./index.ts", "./member.ts"]` |
 
 ## Source Map
@@ -46,23 +46,30 @@ User's pi session (TL extension)
 src/
 ├── commands/
 │   ├── team.ts       ← Single /team command (10 subcommands)
+│   ├── status.ts     ← StatusProvider type for getMemberStatuses
 │   └── team.test.ts
 ├── channel/          ← Real-time message channel
 │   ├── types.ts      ← TeamMessage interface
-│   ├── message-queue.ts  ← Serial FIFO queue
-│   └── router.ts     ← Routes to member / tl / all / self-skip
+│   ├── message-queue.ts  ← Serial FIFO queue (event-driven drain, no polling)
+│   ├── router.ts     ← Routes to member / tl / all / self-skip
+│   ├── response-waiter.ts  ← team_send_and_wait correlation matching + response buffer
+│   └── event-handler.ts    ← Member RPC event handler (state machine, dedup, routing)
 ├── process/          ← Member process lifecycle
-│   ├── member-process.ts  ← pi --mode rpc spawn wrapper
-│   └── manager.ts    ← Multi-member lifecycle + auto-restart
+│   ├── member-process.ts  ← pi --mode rpc spawn wrapper (write queue, size guard)
+│   └── manager.ts    ← Multi-member lifecycle + operational state + auto-restart
 ├── tools/
-│   └── tl-tools.ts   ← 5 TL process management tools
+│   └── tl-tools.ts   ← 7 TL process management tools (Deps-based DI)
 ├── team/
 │   ├── definition.ts ← TeamDefinition / TeamMember types
 │   ├── schema.ts     ← YAML field validation
 │   └── store.ts      ← Read/write/delete team YAML files
 ├── session/
-│   ├── state.ts      ← TeamSessionState (active, teamDefinition, startedAt)
-│   └── context.ts    ← TeamContext shared mutable state interface
+│   ├── state.ts      ← TeamSessionState (structuredClone deep copy)
+│   ├── context.ts    ← TeamContext shared mutable state interface
+│   └── state-machine.ts  ← Pure function state machine: MemberOperationalState transitions
+├── setup/            ← Modular extracted setup modules
+│   ├── member-lifecycle.ts  ← createAndRegisterMember, buildMemberConfig, getMemberLog
+│   └── message-channel.ts   ← createMessageChannel factory (queue+router+waiter wiring)
 ├── ui/               ← TUI components for team mode
 │   └── team-status-widget.ts  ← Bordered widget: live member status + context %
 ├── config.ts         ← getRootDir() via env var or ~/.pi/top-notch-team
@@ -75,25 +82,67 @@ src/
 
 2. **TL as central message router** — Member messages detected via `tool_execution_end` RPC events, enqueued in serial FIFO queue, routed via `router.ts`. See ADR-0002.
 
-3. **Environment variables for Member awareness** — `TEAM_ROLE`, `TEAM_NAME`, `TEAM_MEMBERS`, `TEAM_MEMBER_DESCRIPTION` are set on spawn. No YAML file reading in member.ts.
+3. **Environment variables for Member awareness** — `TEAM_ROLE`, `TEAM_NAME`, `TEAM_MEMBERS`, `TEAM_MEMBER_DESCRIPTION` are set on spawn. No YAML file reading in member.ts. `TEAM_MEMBERS` uses `JSON.stringify`/`JSON.parse` (not comma-delimited) for member names that may contain special characters.
 
 4. **Two separate extensions** — `index.ts` (TL) and `member.ts` (Member) are both declared in `pi.extensions`. Mode detection: `index.ts` returns early if `TEAM_ROLE` is set (to avoid tool name conflicts with `member.ts`); `member.ts` checks `process.env.TEAM_ROLE`.
+
+5. **Dependency Injection for testability** — five DI interfaces (`TlToolsDeps`, `MemberLifecycleDeps`, `MessageChannelDeps`, `EventHandlerDeps`, `SendToMemberDeps`) explicitly document each module's dependencies, enabling isolated testing with mocked dependencies. See the Dependency Injection Pattern section below.
+
+6. **Pure function state machine** — `src/session/state-machine.ts` implements `transitionState(current, event)` as a pure function with no side effects. Member operational states (`idle`/`working`/`crashed`/`stopped`) are derived deterministically from events (`task_started`/`task_completed`/`process_exit`/`started`/`stopped`).
+
+7. **Modular extraction** — `index.ts` was reduced from ~800 to ~341 lines by extracting:
+   - `setup/member-lifecycle.ts` — member creation, config building, log querying
+   - `setup/message-channel.ts` — message channel wiring (queue+router+waiter)
+   - `channel/event-handler.ts` — member RPC event processing with dedup
+   - `channel/response-waiter.ts` — correlation matching with response buffering
+   - `session/state-machine.ts` — pure state transitions
+
+## Dependency Injection Pattern
+
+The codebase uses an explicit Dependency Injection (DI) pattern to decouple modules and enable testability. Every subsystem receives its dependencies through a typed interface, rather than importing them directly.
+
+| DI Interface | Module | Dependencies |
+|-------------|--------|-------------|
+| `TlToolsDeps` | `tools/tl-tools.ts` | `pi`, `manager`, `responseWaiter`, `memberOpsStates`, `lastPendingCorrId`, `messageQueue`, `createMember?`, `buildMemberConfig?`, `getMemberLog?`, `enqueueMessage?` |
+| `MemberLifecycleDeps` | `setup/member-lifecycle.ts` | `pi`, `memberOpsStates`, `messageQueue`, `responseWaiter`, `lastPendingCorrId`, `recentlyProcessedMessages`, `processManager?` |
+| `MessageChannelDeps` | `setup/message-channel.ts` | `pi`, `memberOpsStates`, `lastPendingCorrId`, `memberHandles` |
+| `EventHandlerDeps` | `channel/event-handler.ts` | `pi`, `memberOpsStates`, `messageQueue`, `responseWaiter`, `lastPendingCorrId`, `recentlyProcessedMessages` |
+| `SendToMemberDeps` | `channel/event-handler.ts` | `pi`, `memberOpsStates`, `memberHandles` |
+
+Benefits:
+- **Testability**: each module can be tested with mocked dependencies
+- **Isolation**: modules don't reach into other modules' internals via global imports
+- **Clarity**: the DI interfaces document exactly what each subsystem needs
 
 ## Message Channel Flow
 
 ```
 Member A calls team_send_message({to: "mover", content: "..."})
   → RPC stdout emits tool_execution_end
-  → index.ts createAndRegisterMember onEvent handler
-  → messageQueue.enqueue(TeamMessage)
-  → router.route(msg)
-    ├── to="mover"  → handle.sendCommand({type:"prompt", message:"..."}) on Member B's stdin
-    ├── to="tl"     → pi.sendMessage({customType:"team-message", ...})
-    ├── to="all"    → broadcast to all (skip self)
-    └── unknown     → console.warn
-```
+  → event-handler.ts (createMemberEventHandler)
+    → Dedup check (Map-based, auto-pruning)
+    → Auto-populate <corr:...> for TL-directed messages
+    → messageQueue.enqueue(TeamMessage)
+  → messageQueue (serial FIFO, event-driven drain)
+    → router.route(msg)
+      ├── to="mover"  → handle.sendCommand({type:"prompt",...}) on Member B's stdin
+      ├── to="tl"     → responseWaiter.resolveIfWaiting(corrId, ...) OR buffer
+                          → pi.sendMessage({customType:"team-message", ...})
+      ├── to="all"    → broadcast to all (skip self)
+      └── unknown     → pi.sendMessage ("无法路由消息到未知成员")
 
-Backup: assistant text outputs matching `<team-message to="..." subject="...">...</team-message>` are also parsed and enqueued.
+Backup path: assistant text outputs matching
+  `<team-message to="..." subject="...">...</team-message>`
+are also parsed via parseTeamMessageTag() (non-greedy regex, length guard) and enqueued.
+
+team_send_and_wait flow:
+  TL calls team_send_and_wait(to, content) →
+    → responseWaiter.waitForResponse(corrId, timeout)
+    → Message enqueued with <corr:...> tag
+    → Member replies → responseWaiter.resolveIfWaiting(corrId, ...) → TL continues
+    → On timeout: TL can re-wait with same correlationId (no duplicate message sent)
+    → All-idle detection: returns early when all members are idle
+```
 
 ## Team Definition Format
 
@@ -120,12 +169,12 @@ npm test          # Run all tests (vitest)
 npm run test:watch  # Watch mode
 ```
 
-209 tests across 16 files (plus 1 UI module without dedicated tests — TUI‑dependent). Tests live alongside source as `*.test.ts`.
+215 tests across 16 files (state-machine, member-process, event-handler, response-waiter, message-channel tests included). Tests live alongside source as `*.test.ts`.
 
 | Test Level | What | How |
 |-----------|------|-----|
-| Unit | schema, store, message-queue, router, config | Pure functions, no mocking |
-| Integration | commands, tl-tools, index, member-process, manager | Mock ExtensionAPI / child_process |
+| Unit | schema, store, message-queue, router, config, state-machine, response-waiter | Pure functions, no mocking |
+| Integration | commands, tl-tools, index, member-process, manager, event-handler, member-lifecycle, message-channel | Mock ExtensionAPI / child_process |
 | E2E | Manual via `pi --mode json -e ./index.ts` | Real pi binary |
 
 ## Environment Variables
@@ -136,7 +185,7 @@ npm run test:watch  # Watch mode
 | `TEAM_ROLE` | Member process | Member identifier |
 | `TEAM_ROLE_LABEL` | Member process | Human-readable role name |
 | `TEAM_NAME` | Member process | Team name |
-| `TEAM_MEMBERS` | Member process | Comma-separated member list |
+| `TEAM_MEMBERS` | Member process | JSON-serialized member name array (e.g. `'["analyzer","mover"]'`). Parsed via `JSON.parse` with comma-delimited fallback for backward compatibility. |
 | `TEAM_MEMBER_DESCRIPTION` | Member process | System prompt for role |
 | `TEAM_SESSION_DIR` | Member process | Session file storage path |
 | `TEAM_SHARED_CONTEXT_PATH` | Member process | Shared context file path |
@@ -163,7 +212,7 @@ npm run test:watch  # Watch mode
 | `start_member(name)` | Launch a Member's pi RPC process |
 | `stop_member(name)` | Gracefully terminate a Member process |
 | `list_members()` | Show all member statuses |
-| `get_member_log(name, lines?, maxContentLength?)` | Query Member's recent session via RPC. `maxContentLength` truncates each message content (default 50 chars). |
+| `get_member_log(name, lines?, maxContentLength?)` | Query Member's recent session via RPC. `maxContentLength` truncates each message content (default 200 chars). Truncation uses `slice(0, max-3) + "..."` so total length = maxContentLength. |
 | `get_member_status()` | Get operational status (idle/working/crashed/stopped) for all members. No parameters. |
 | `team_send_and_wait(to, content?, timeout?, correlationId?)` | Send message and wait for response. On timeout, re-wait with same `correlationId` (no new message sent). Response content returned as tool result. |
 
@@ -172,6 +221,7 @@ npm run test:watch  # Watch mode
 During an active team session, a `tool_call` event handler intercepts `write`/`edit` tools:
 - `.md` files (`.shared-context.md`, ADRs, planning docs) — allowed
 - Code files (`.ts`, `.js`, `.py`, etc.) — blocked with reason "请委派给 Member"
+
 
 ## ADRs
 

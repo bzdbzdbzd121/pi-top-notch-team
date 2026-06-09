@@ -1,4 +1,4 @@
-import type { TeamDefinition } from "../team/definition";
+import type { TeamDefinition, TeamMember } from "../team/definition";
 
 export interface TeamSessionState {
   active: boolean;
@@ -13,7 +13,12 @@ let currentSession: TeamSessionState = {
 };
 
 export function getSessionState(): TeamSessionState {
-  return { ...currentSession };
+  return structuredClone(currentSession);
+}
+
+/** Return a frozen read-only snapshot of the current team members. */
+export function getFrozenMembers(): readonly TeamMember[] {
+  return Object.freeze([...currentSession.teamDefinition?.members ?? []]);
 }
 
 export function startSession(team: TeamDefinition): void {

@@ -1,11 +1,17 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
-import type { TeamContext } from "../session/context";
+import type { TeamContext, SessionUI } from "../session/context";
 import { startSession } from "../session/state";
 import { getSessionState, endSession } from "../session/state";
 import { readTeam, listTeams, deleteTeam, deleteTeamSessions } from "../team/store";
 import { getRootDir } from "../config";
 import type { StatusProvider } from "./status";
+
+interface ToolInputSchema {
+  type: "object";
+  properties: Record<string, unknown>;
+  required?: readonly string[];
+}
 
 /**
  * Register a single /team command that dispatches to subcommands.
@@ -60,7 +66,7 @@ export function registerTeamCommand(
       };
     }
 
-    writeTeam(teamData as any, rootDir);
+    writeTeam(teamData, rootDir);
     return null;
   }
 
@@ -93,7 +99,7 @@ export function registerTeamCommand(
         },
       },
       required: ["name", "description", "members"],
-    } as any,
+    } as ToolInputSchema,
     async execute(
       _toolCallId: string,
       params: TeamSaveParams,
@@ -140,7 +146,7 @@ export function registerTeamCommand(
         },
       },
       required: ["name", "description", "members"],
-    } as any,
+    } as ToolInputSchema,
     async execute(
       _toolCallId: string,
       params: TeamSaveParams,
@@ -287,7 +293,7 @@ export function registerTeamCommand(
 
           startSession(team);
           // Install team status widget immediately
-          teamCtx.onSessionStart?.(ctx.ui);
+          teamCtx.onSessionStart?.(ctx.ui as unknown as SessionUI);
           teamCtx.router!.updateMembers(team.members.map((m) => m.name));
 
           const tlToolNames = teamCtx.tlToolNames;

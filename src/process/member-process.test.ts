@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
-import { createMemberProcess, type MemberProcessConfig } from "./member-process";
+import { createMemberProcess, MAX_COMMAND_SIZE, type MemberProcessConfig } from "./member-process";
 
 function createMockSpawn() {
   const stdin = new PassThrough();
@@ -69,7 +69,7 @@ describe("createMemberProcess", () => {
           TEAM_ROLE: "analyzer",
           TEAM_ROLE_LABEL: "分析员",
           TEAM_NAME: "refactoring",
-          TEAM_MEMBERS: "analyzer,mover",
+          TEAM_MEMBERS: '["analyzer","mover"]',
           TEAM_MEMBER_DESCRIPTION: "分析代码",
           TEAM_SHARED_CONTEXT_PATH: "/tmp/sessions/refactoring/shared-context.md",
         }),
@@ -222,12 +222,98 @@ describe("createMemberProcess", () => {
       expect(result.data.messages).toHaveLength(1);
     });
 
+    it("rejects on oversized command", async () => {
+      const { process: mockProcess, stdout } = createMockSpawn();
+      const spawnMock = vi.fn().mockReturnValue(mockProcess);
+
+      const member = createMemberProcess(defaultConfig, spawnMock);
+      const startPromise = member.start();
+      emitReadyStdout(stdout);
+      await startPromise;
+
+      const largeObj = { data: "x".repeat(2 * 1024 * 1024) };
+      await expect(
+        member.sendCommandAndWait(largeObj, () => true)
+      ).rejects.toThrow(/exceeds MAX_COMMAND_SIZE/);
+    });
+
     it("rejects if member is not running", async () => {
       const member = createMemberProcess(defaultConfig, vi.fn());
       // Don't start - status is "stopped"
       await expect(
         member.sendCommandAndWait({ type: "get_messages" }, () => true)
       ).rejects.toThrow();
+    });
+  });
+
+  describe("sendCommand", () => {
+    it("sends command JSON to stdin", async () => {
+      const { process: mockProcess, stdin, stdout } = createMockSpawn();
+      const spawnMock = vi.fn().mockReturnValue(mockProcess);
+
+      const member = createMemberProcess(defaultConfig, spawnMock);
+      const startPromise = member.start();
+      emitReadyStdout(stdout);
+      await startPromise;
+
+      const writeSpy = vi.spyOn(stdin, "write");
+      member.sendCommand({ type: "prompt", message: "hello" });
+
+      const sent = JSON.parse(writeSpy.mock.calls[0][0] as string);
+      expect(sent.type).toBe("prompt");
+      expect(sent.message).toBe("hello");
+    });
+
+    it("throws on oversized command", async () => {
+      const { process: mockProcess, stdout } = createMockSpawn();
+      const spawnMock = vi.fn().mockReturnValue(mockProcess);
+
+      const member = createMemberProcess(defaultConfig, spawnMock);
+      const startPromise = member.start();
+      emitReadyStdout(stdout);
+      await startPromise;
+
+      const largeObj = { data: "x".repeat(2 * 1024 * 1024) };
+      expect(() => member.sendCommand(largeObj)).toThrow(/exceeds MAX_COMMAND_SIZE/);
+    });
+
+    it("handles drain event when stdin buffer is full", async () => {
+      const { process: mockProcess, stdin, stdout } = createMockSpawn();
+      const spawnMock = vi.fn().mockReturnValue(mockProcess);
+
+      const member = createMemberProcess(defaultConfig, spawnMock);
+      const startPromise = member.start();
+      emitReadyStdout(stdout);
+      await startPromise;
+
+      // Spy on stdin.write — first call returns false to simulate full buffer
+      const writeSpy = vi.spyOn(stdin, "write");
+      writeSpy.mockImplementationOnce(() => false);
+
+      member.sendCommand({ type: "test", data: "hello" });
+
+      // First call returned false, data should be queued
+      expect(writeSpy).toHaveBeenCalledTimes(1);
+
+      // Manually emit drain to trigger flush
+      stdin.emit("drain");
+
+      // Wait for microtasks
+      await new Promise((r) => setTimeout(r, 10));
+
+      // The write should have been retried (second call through original impl)
+      expect(writeSpy).toHaveBeenCalledTimes(2);
+    });
+
+    it("throws if member is not running", () => {
+      const member = createMemberProcess(defaultConfig, vi.fn());
+      expect(() => member.sendCommand({ type: "test" })).toThrow(/not running/);
+    });
+  });
+
+  describe("MAX_COMMAND_SIZE", () => {
+    it("is exported and equals 1MB", () => {
+      expect(MAX_COMMAND_SIZE).toBe(1024 * 1024);
     });
   });
 });

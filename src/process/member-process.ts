@@ -1,5 +1,13 @@
 import { spawn, type ChildProcess } from "node:child_process";
 
+/** Maximum allowed serialized command size in bytes (1 MB). */
+export const MAX_COMMAND_SIZE = 1024 * 1024;
+
+/** Compute the UTF-8 byte length of a string. */
+function utf8ByteLength(str: string): number {
+  return Buffer.byteLength(str, "utf-8");
+}
+
 export interface MemberProcessConfig {
   name: string;
   role: string;
@@ -64,6 +72,61 @@ export function createMemberProcess(
   let pid: number | null = null;
   const eventHandlers: Array<(event: any) => void> = [];
 
+  // Write queue for handling backpressure (drain event)
+  let pendingWrites: string[] = [];
+  let drainPending = false;
+
+  function writeOrQueue(data: string): void {
+    if (!child || !child.stdin || child.stdin.destroyed) {
+      throw new Error(`Member "${name}" is not running`);
+    }
+
+    const ok = child.stdin.write(data);
+    if (!ok) {
+      pendingWrites.push(data);
+      if (!drainPending) {
+        drainPending = true;
+        child.stdin.once("drain", () => {
+          drainPending = false;
+          flushPendingWrites();
+        });
+      }
+    }
+  }
+
+  function flushPendingWrites(): void {
+    if (!child || !child.stdin || child.stdin.destroyed) {
+      pendingWrites = [];
+      drainPending = false;
+      return;
+    }
+
+    while (pendingWrites.length > 0) {
+      const data = pendingWrites[0];
+      const ok = child.stdin.write(data);
+      if (ok) {
+        pendingWrites.shift();
+      } else {
+        drainPending = true;
+        child.stdin.once("drain", () => {
+          drainPending = false;
+          flushPendingWrites();
+        });
+        break;
+      }
+    }
+  }
+
+  function assertCommandSize(command: object): void {
+    const json = JSON.stringify(command);
+    const byteLen = utf8ByteLength(json);
+    if (byteLen > MAX_COMMAND_SIZE) {
+      throw new Error(
+        `Command to member "${name}" exceeds MAX_COMMAND_SIZE (${byteLen} > ${MAX_COMMAND_SIZE} bytes)`
+      );
+    }
+  }
+
   function notifyHandlers(event: any) {
     for (const handler of eventHandlers) {
       try {
@@ -91,7 +154,8 @@ export function createMemberProcess(
       if (!child || !child.stdin || child.stdin.destroyed) {
         throw new Error(`Member "${name}" is not running`);
       }
-      child.stdin.write(JSON.stringify(command) + "\n");
+      assertCommandSize(command);
+      writeOrQueue(JSON.stringify(command) + "\n");
     },
 
     sendCommandAndWait(
@@ -106,8 +170,14 @@ export function createMemberProcess(
       const id = `req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const cmd = { ...command, id };
 
-      // Write command
-      child.stdin!.write(JSON.stringify(cmd) + "\n");
+      // Validate command size
+      try {
+        assertCommandSize(cmd);
+      } catch (err) {
+        return Promise.reject(err);
+      }
+
+      const data = JSON.stringify(cmd) + "\n";
 
       return new Promise((resolve, reject) => {
         let settled = false;
@@ -141,6 +211,17 @@ export function createMemberProcess(
         }
 
         eventHandlers.push(handler);
+
+        // Write command (with drain handling)
+        try {
+          writeOrQueue(data);
+        } catch (err) {
+          if (!settled) {
+            settled = true;
+            cleanup();
+            reject(err);
+          }
+        }
       });
     },
 
@@ -149,11 +230,15 @@ export function createMemberProcess(
         return;
       }
 
+      // Reset write queue from any previous session
+      pendingWrites = [];
+      drainPending = false;
+
       const env: Record<string, string> = {
         TEAM_ROLE: role,
         TEAM_ROLE_LABEL: roleLabel,
         TEAM_NAME: teamName,
-        TEAM_MEMBERS: teamMembers.join(","),
+        TEAM_MEMBERS: JSON.stringify(teamMembers),
         TEAM_MEMBER_DESCRIPTION: memberDescription,
       };
 
@@ -263,6 +348,11 @@ export function createMemberProcess(
         return;
       }
 
+      // Mark as stopped BEFORE sending the signal, so the exit handler
+      // sees wasRunning=false and correctly distinguishes intentional
+      // stop from a crash.
+      status = "stopped";
+
       // 1. Register exit listener BEFORE sending the signal
       const exitPromise = new Promise<void>((resolve) => {
         child!.on("exit", () => resolve());
@@ -284,7 +374,6 @@ export function createMemberProcess(
         }),
       ]);
 
-      status = "stopped";
       pid = null;
       child = null;
     },

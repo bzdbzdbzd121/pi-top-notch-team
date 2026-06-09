@@ -1,5 +1,5 @@
 import { vi } from "vitest";
-import type { ExtensionAPI, ExtensionContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent";
 
 /**
  * Create a mock ExtensionContext for testing command handlers and tools.
@@ -31,7 +31,20 @@ export function createMockContext(overrides?: Partial<ExtensionContext>): Extens
     onTerminalInput: vi.fn(),
     setHiddenThinkingLabel: vi.fn(),
     setHeader: vi.fn(),
-    theme: undefined!,
+    theme: {
+      fg: vi.fn((_color: string, text: string) => text),
+      bg: vi.fn((_color: string, text: string) => text),
+      bold: vi.fn((text: string) => text),
+      italic: vi.fn((text: string) => text),
+      underline: vi.fn((text: string) => text),
+      inverse: vi.fn((text: string) => text),
+      strikethrough: vi.fn((text: string) => text),
+      getFgAnsi: vi.fn(() => ""),
+      getBgAnsi: vi.fn(() => ""),
+      getColorMode: vi.fn(() => "truecolor" as const),
+      getThinkingBorderColor: vi.fn(() => vi.fn((s: string) => s)),
+      getBashModeBorderColor: vi.fn(() => vi.fn((s: string) => s)),
+    } as unknown as Theme,
     getToolsExpanded: vi.fn().mockReturnValue(false),
     setToolsExpanded: vi.fn(),
   };
@@ -48,7 +61,7 @@ export function createMockContext(overrides?: Partial<ExtensionContext>): Extens
     } as unknown as ExtensionContext["sessionManager"],
     modelRegistry: {} as any,
     model: undefined,
-    signal: undefined as any,
+    signal: undefined,
     isIdle: vi.fn().mockReturnValue(true),
     abort: vi.fn(),
     hasPendingMessages: vi.fn().mockReturnValue(false),
@@ -93,7 +106,7 @@ export function createMockExtensionAPI(
     getThinkingLevel: vi.fn().mockReturnValue("off"),
     setThinkingLevel: vi.fn(),
     exec: vi.fn().mockResolvedValue({ stdout: "", stderr: "", code: 0 }),
-    events: { on: vi.fn(), emit: vi.fn() } as any,
+    events: { on: vi.fn().mockReturnValue(vi.fn()), emit: vi.fn() },
     registerProvider: vi.fn(),
     unregisterProvider: vi.fn(),
     registerMessageRenderer: vi.fn(),

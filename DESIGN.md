@@ -73,25 +73,31 @@ pi-top-notch-team/
 │   │   ├── team.ts             ← Single /team command (10 subcommands + autocomplete)
 │   │   └── status.ts           ← StatusProvider type export
 │   ├── tools/
-│   │   └── tl-tools.ts         ← TL process management tool registrations
+│   │   └── tl-tools.ts         ← 7 TL process management tools (DI-based dependencies)
 │   │   (team_send_message is in member.ts directly)
 │   ├── channel/
-│   │   ├── message-queue.ts    ← Global serial message queue
+│   │   ├── message-queue.ts    ← Serial FIFO message queue (event-driven drain)
 │   │   ├── router.ts           ← Message routing logic
-│   │   └── types.ts            ← Message types
+│   │   ├── types.ts            ← Message types
+│   │   ├── event-handler.ts    ← Member RPC event processing (dedup, state machine, routing)
+│   │   └── response-waiter.ts  ← team_send_and_wait correlation matching + response buffer
 │   ├── process/
-│   │   ├── manager.ts          ← Member process lifecycle management
-│   │   └── member-process.ts   ← Wrapper around child_process for a single Member
+│   │   ├── manager.ts          ← Member process lifecycle management + operational state
+│   │   └── member-process.ts   ← Wrapper around child_process (write queue, size guard)
+│   ├── setup/
+│   │   ├── member-lifecycle.ts ← Member creation, config building, log querying
+│   │   └── message-channel.ts  ← Message channel factory (queue+router+waiter wiring)
 │   ├── team/
 │   │   ├── definition.ts       ← Team definition YAML types & validation
 │   │   ├── store.ts            ← Read/write team definition files
 │   │   └── schema.ts           ← YAML schema for validation
 │   ├── session/
-│   │   ├── state.ts            ← Team session state tracking
-│   │   └── context.ts          ← TeamContext shared mutable state interface
+│   │   ├── state.ts            ← Team session state tracking (structuredClone deep copy)
+│   │   ├── context.ts          ← TeamContext shared mutable state interface
+│   │   └── state-machine.ts    ← Pure function: MemberOperationalState transitions
 │   ├── config.ts               ← getRootDir() env var override
 │   ├── test/
-│   │   └── fixtures/           ← Test YAMLs + mock-extension-api
+│   │   └── fixtures/           ← Test YAMLs + mock-extension-api (with mock Theme)
 │   └── smoke.test.ts           ← Test infrastructure smoke test
 ```
 
@@ -296,7 +302,7 @@ All subcommands are registered as a single `/team` command via `registerCommand(
 
 ## 6. TL Process Management Tools
 
-Four tools are registered when a team session is active. They are **not** available outside a team session.
+Seven tools are registered when a team session is active. They are **not** available outside a team session.
 
 ### `start_member`
 
@@ -342,12 +348,23 @@ list_members()
 ### `get_member_log`
 
 ```typescript
-get_member_log({ name: "analyzer", lines: 10 })
+get_member_log({ name: "analyzer", lines: 10, maxContentLength: 200 })
 ```
 
 - Reads the Member's session file via `get_messages` RPC command
 - Returns last N messages from that session
+- `maxContentLength` truncates each message (default 200 chars) using `slice(0, max-3) + "..."` so total length = maxContentLength
 - Useful for TL to check what a Member has been working on
+
+### `get_member_status`
+
+```typescript
+get_member_status()
+```
+
+- Returns the operational status (idle/working/crashed/stopped) of all members
+- Quick lightweight check (no RPC to members, purely TL-side state)
+- Use before `get_member_log` to determine if a member is busy or crashed
 
 ### `team_send_and_wait`
 
@@ -402,13 +419,16 @@ team_send_message({
 Member A's RPC stdout
   │
   ▼
-on('tool_execution_end')
-  ├── toolName === "team_send_message"?
-  │     YES → extract { from, to, subject, content, correlationId }
-  │            → enqueue(Message)
-  │
-  └── NO → ignore (other tools), pass through
-         → also check for <team-message> in text content (backup parse)
+event-handler.ts (createMemberEventHandler)
+  ├── agent_start → transitionState("working")
+  ├── agent_end   → transitionState("idle")
+  ├── tool_execution_end (team_send_message)
+  │     → extract msg → dedup (recentlyProcessedMessages)
+  │     → auto-populate correlationId → enqueue
+  ├── process_exit / process_error
+  │     → transitionState("crashed" / "stopped")
+  │     → notify TL
+  └── backup: parse <team-message> tags from assistant text
 
 Message Queue (FIFO)
   │

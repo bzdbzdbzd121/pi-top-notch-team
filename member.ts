@@ -13,9 +13,18 @@ export default function (pi: ExtensionAPI) {
     return;
   }
 
-  const memberNames = teamMembers ? teamMembers.split(",") : [];
+  let memberNames: string[] = [];
+  if (teamMembers) {
+    try {
+      memberNames = JSON.parse(teamMembers);
+      if (!Array.isArray(memberNames)) memberNames = [];
+    } catch {
+      // Fallback: compatible with old comma-separated format
+      memberNames = teamMembers.split(",");
+    }
+  }
   const validTargets = new Set(["tl", "all", ...memberNames]);
-  const memberList = teamMembers ? teamMembers.split(",").join("、") : "";
+  const memberList = memberNames.join("、");
 
   // ── team_send_message tool ───────────────────────────────
   pi.registerTool({
@@ -107,6 +116,11 @@ ${memberList ? `团队其他成员：${memberList}\n` : ""}
 - 如果 Team Lead 通知 Shared Context 已更新，请仔细阅读
 - 发现问题可以先通过消息通道与相关成员讨论
 - 重大变更需先向 Team Lead 汇报
+
+### 沟通风格
+- **简洁精炼**：剔除客套话、语气词、多余铺垫与模棱两可的表述
+- **保持完整句式与语法**，专业术语、代码内容、报错信息原样不变
+- **只输出核心内容**，全程保持精简风格，不添加冗余文字
 `;
 
     if (sharedContextPath) {

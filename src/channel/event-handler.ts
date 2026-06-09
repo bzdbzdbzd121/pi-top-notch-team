@@ -296,7 +296,7 @@ export function createSendToMember(
     } catch (err) {
       pi.sendMessage({
         customType: "team-route",
-        content: `发送消息给 "${memberName}" 失败：${err instanceof Error ? err.message : String(err)}`,
+        content: `发送消息给成员 "${memberName}" 失败：${err instanceof Error ? err.message : String(err)}`,
         display: true,
       });
     }

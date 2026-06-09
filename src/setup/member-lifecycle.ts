@@ -126,8 +126,10 @@ export async function getMemberLog(
           ? m.content
           : JSON.stringify(m.content);
 
+      // Truncate at character level (UTF-16 code units), reserving 3 chars for "..."
       if (content.length > effectiveMaxLen) {
-        content = content.slice(0, effectiveMaxLen) + "...";
+        const truncatedLen = Math.max(0, effectiveMaxLen - 3);
+        content = content.slice(0, truncatedLen) + "...";
       }
 
       return `[${m.role}] ${content}`;

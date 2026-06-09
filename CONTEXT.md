@@ -19,7 +19,7 @@ A YAML file at `~/.pi/top-notch-team/teams/<team-name>.yaml` describing a team's
 _Avoid_: Hardcoded team config, JSON config
 
 **Process Management Tools**:
-A set of four tools registered only during an active Team Session: `start_member`, `stop_member`, `list_members`, `get_member_log`. These tools manage the lifecycle of Member `pi --mode rpc` processes. Not available outside a Team Session.
+A set of six tools registered only during an active Team Session: `start_member`, `stop_member`, `list_members`, `get_member_log`, `get_member_status`, `team_send_and_wait`. These tools manage the lifecycle of Member `pi --mode rpc` processes and enable TL-to-Member communication and status checks. Not available outside a Team Session.
 
 **Real-time Message Channel**:
 The communication medium through which agents (Team Lead and Members) exchange information during a Team Session. Implementation is separate from the team orchestration logic.

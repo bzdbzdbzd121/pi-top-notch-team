@@ -22,7 +22,7 @@ function repeat(ch: string, n: number): string {
 
 export interface TeamStatusWidget {
   /** Install the widget. Call once when session starts. */
-  install(ui: { setWidget: Function }, theme: { fg: Function }): void;
+  install(ui: { setWidget: (key: string, content: any) => void }, theme: { fg: (...args: any[]) => string }): void;
   /** Uninstall the widget. Call when session ends. */
   uninstall(): void;
   /** Manually refresh display. */
@@ -39,13 +39,18 @@ export function createTeamStatusWidget(options: {
   const contextUsageMap = new Map<string, MemberContextInfo | null>();
 
   let pollingTimer: ReturnType<typeof setInterval> | null = null;
-  let currentUi: { setWidget: Function } | null = null;
-  let currentTheme: { fg: Function } | null = null;
+  let currentUi: { setWidget: (key: string, content: any) => void } | null = null;
+  let currentTheme: { fg: (...args: any[]) => string } | null = null;
 
   // ── Build display lines (with border) ──────────────────
-  function buildLines(theme: { fg: Function }): string[] {
+  function buildLines(theme: { fg: (...args: any[]) => string }): string[] {
     // Build status segments (raw for width, styled for display)
-    type Segment = { raw: string; styled: string };
+    interface Segment {
+      raw: string;
+      styled: string;
+      separatorRaw: string;
+      separatorStyled: string;
+    }
     const segments: Segment[] = [];
 
     for (const m of members) {
@@ -82,14 +87,14 @@ export function createTeamStatusWidget(options: {
         styled += theme.fg("muted", " —");
       }
 
-      segments.push({ raw, styled, separatorRaw, separatorStyled } as any);
+      segments.push({ raw, styled, separatorRaw, separatorStyled });
     }
 
     // Build the full raw status line for width calculation
     const sepRaw = "  │  ";
     const sepStyled = theme.fg("dim", sepRaw);
-    const rawStatus = segments.map((s: any) => s.raw).join(sepRaw);
-    const styledStatus = segments.map((s: any) => s.styled).join(sepStyled);
+    const rawStatus = segments.map((s) => s.raw).join(sepRaw);
+    const styledStatus = segments.map((s) => s.styled).join(sepStyled);
 
     // Title text
     const title = `● TEAM MODE — ${teamName}`;
@@ -157,7 +162,7 @@ export function createTeamStatusWidget(options: {
 
   // ── Public API ──────────────────────────────────────────
   return {
-    install(ui: { setWidget: Function }, theme: { fg: Function }) {
+    install(ui: { setWidget: (key: string, content: any) => void }, theme: { fg: (...args: any[]) => string }) {
       currentUi = ui;
       currentTheme = theme;
 

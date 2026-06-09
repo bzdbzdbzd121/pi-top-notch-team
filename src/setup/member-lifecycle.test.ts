@@ -482,7 +482,7 @@ describe("getMemberLog", () => {
     });
 
     const result = await getMemberLog(handle, 10);
-    expect(result).toBe("[user] " + "A".repeat(200) + "...");
+    expect(result).toBe("[user] " + "A".repeat(197) + "...");
   });
 
   it("should respect custom maxContentLength", async () => {
@@ -494,7 +494,7 @@ describe("getMemberLog", () => {
     });
 
     const result = await getMemberLog(handle, 10, 10);
-    expect(result).toBe("[user] " + "A".repeat(10) + "...");
+    expect(result).toBe("[user] " + "A".repeat(7) + "...");
   });
 
   it("should not truncate content shorter than maxContentLength", async () => {

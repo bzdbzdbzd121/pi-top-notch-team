@@ -54,9 +54,9 @@ Tab completion for team names is supported on `/team start`, `/team show`, `/tea
 
 ```
 Your pi session (TL extension)
-  ├── /team command (8 subcommands)
-  ├── 4 process management tools
-  ├── Message channel (queue → router)
+  ├── /team command (10 subcommands)
+  ├── 7 process management tools
+  ├── Message channel (event-handler → queue → router → response-waiter)
   └── Member Process Manager
         ├── Member A (pi --mode rpc)
         ├── Member B (pi --mode rpc)
@@ -67,7 +67,7 @@ Your pi session (TL extension)
 
 1. **Define a team** — Use `/team create` to describe your team. The TL collects details and saves a YAML definition to `~/.pi/top-notch-team/teams/`.
 
-2. **Start a session** — `/team start <name>` activates TL tools (`start_member`, `stop_member`, `list_members`, `get_member_log`) and injects team awareness into the TL's system prompt.
+2. **Start a session** — `/team start <name>` activates TL tools (`start_member`, `stop_member`, `list_members`, `get_member_log`, `get_member_status`, `team_send_message`, `team_send_and_wait`) and injects team awareness into the TL's system prompt.
 
 3. **TL works with you** — The TL clarifies requirements, writes a Shared Context document, and spawns Members via `start_member`.
 
@@ -104,13 +104,15 @@ members:
 ```
 Member A calls team_send_message({to: "mover", content: "..."})
   → RPC stdout emits tool_execution_end event
-  → TL extension intercepts the event
-  → Message enqueued in serial FIFO queue
+  → event-handler.ts catches, deduplicates via Map-based cache,
+    auto-populates <corr:...> for TL-directed messages
+  → Message enqueued in serial FIFO queue (event-driven drain, no polling)
   → Router dispatches:
     ├── to="mover"  → writes prompt to Member B's RPC stdin
-    ├── to="tl"     → injects into TL's session via pi.sendMessage()
+    ├── to="tl"     → responseWaiter.resolveIfWaiting() or buffer
+                         → pi.sendMessage({customType:"team-message",...})
     ├── to="all"    → broadcasts to all Members
-    └── unknown     → logged as warning
+    └── unknown     → notify via pi.sendMessage
 ```
 
 A text-based fallback also parses `<team-message to="..." subject="...">...</team-message>` tags in assistant output, so messages work even when the LLM writes them as text instead of calling the tool.
@@ -122,7 +124,10 @@ A text-based fallback also parses `<team-message to="..." subject="...">...</tea
 | `start_member(name)` | Launch a Member's pi RPC process |
 | `stop_member(name)` | Gracefully terminate a Member process |
 | `list_members()` | Show all member statuses |
-| `get_member_log(name, lines?)` | Fetch recent member session messages via RPC |
+| `get_member_log(name, lines?, maxContentLength?)` | Fetch recent member session via RPC. `maxContentLength` truncates each message (default 200 chars). |
+| `get_member_status()` | Quick status check: idle/working/crashed/stopped. No parameters. |
+| `team_send_message(to, subject?, content?)` | Fire-and-forget message to another member or all members |
+| `team_send_and_wait(to, content?, timeout?, correlationId?)` | Send message and block until response, timeout, or all-idle. Re-wait with same correlationId. |
 
 These tools are only available while a team session is active.
 
@@ -156,7 +161,7 @@ npm test           # Run all tests
 npm run test:watch # Watch mode
 ```
 
-64 tests across 10 files.
+215 tests across 16 files.
 
 ### Project Structure
 
@@ -169,12 +174,14 @@ pi-top-notch-team/
 ├── DESIGN.md             ← Full design specification
 ├── docs/adr/             ← Architecture Decision Records
 └── src/
-    ├── commands/team.ts  ← Unified /team command
-    ├── channel/          ← Message queue + router
-    ├── process/          ← Member process lifecycle
-    ├── tools/tl-tools.ts ← TL process management tools
+    ├── commands/team.ts  ← Unified /team command (10 subcommands)
+    ├── commands/status.ts← StatusProvider type
+    ├── channel/          ← Message queue + router + response-waiter + event-handler
+    ├── process/          ← Member process lifecycle (write queue, size guard)
+    ├── tools/tl-tools.ts ← 7 TL process management tools (DI-based)
     ├── team/             ← Definition types, store, schema
-    └── session/          ← Session state + context
+    ├── session/          ← Session state + context + state-machine
+    └── setup/            ← Member lifecycle + message channel wiring
 ```
 
 ## Design Decisions

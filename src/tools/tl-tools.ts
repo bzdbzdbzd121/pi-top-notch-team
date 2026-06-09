@@ -3,6 +3,7 @@ import type { ProcessManager } from "../process/manager";
 import type { MemberProcessHandle, MemberProcessConfig } from "../process/member-process";
 import type { ResponseWaiter } from "../channel/response-waiter";
 import type { MessageQueue } from "../channel/message-queue";
+import type { TeamMessage } from "../channel/types";
 import type { MemberOperationalState } from "../session/context";
 import { createMemberProcess } from "../process/member-process";
 import { spawn } from "node:child_process";
@@ -29,7 +30,14 @@ export interface TlToolsDeps {
   enqueueMessage?: EnqueueMessageFn;
 }
 
-// ── Tool result types (replaces `as any`) ──────────────────
+// ── Tool result types ──────────────────────────────────────
+
+/** JSON Schema for tool parameters (passed to LLM). */
+export interface ToolInputSchema {
+  type: "object";
+  properties: Record<string, unknown>;
+  required?: readonly string[];
+}
 
 export interface ToolResult {
   details: Record<string, unknown>;
@@ -71,7 +79,7 @@ export function registerTlTools(deps: TlToolsDeps): void {
         },
       },
       required: ["name"],
-    } as any,
+    } as ToolInputSchema,
     async execute(_toolCallId: string, params: { name: string }): Promise<ToolResult> {
       const config = buildMemberConfig?.(params.name);
       if (!config) {
@@ -80,7 +88,7 @@ export function registerTlTools(deps: TlToolsDeps): void {
           content: [
             {
               type: "text" as const,
-              text: `无法启动 Member "${params.name}"：未找到该成员定义或无活跃团队会话。`,
+              text: `无法启动成员 "${params.name}"：未找到该成员定义或无活跃团队会话。`,
             },
           ],
         };
@@ -94,7 +102,7 @@ export function registerTlTools(deps: TlToolsDeps): void {
           content: [
             {
               type: "text" as const,
-              text: `Member "${params.name}" 已启动 (PID: ${handle.getState().pid})。使用 list_members 查看状态，通过消息通道分配任务。`,
+              text: `成员 "${params.name}" 已启动 (PID: ${handle.getState().pid})。使用 list_members 查看状态，通过消息通道分配任务。`,
             },
           ],
         };
@@ -104,7 +112,7 @@ export function registerTlTools(deps: TlToolsDeps): void {
           content: [
             {
               type: "text" as const,
-              text: `Member "${params.name}" 启动失败：${err instanceof Error ? err.message : String(err)}`,
+              text: `成员 "${params.name}" 启动失败：${err instanceof Error ? err.message : String(err)}`,
             },
           ],
         };
@@ -131,7 +139,7 @@ export function registerTlTools(deps: TlToolsDeps): void {
         },
       },
       required: ["name"],
-    } as any,
+    } as ToolInputSchema,
     async execute(_toolCallId: string, params: { name: string }): Promise<ToolResult> {
       await manager.stop(params.name);
       return {
@@ -139,7 +147,7 @@ export function registerTlTools(deps: TlToolsDeps): void {
         content: [
           {
             type: "text" as const,
-            text: `Member "${params.name}" 已停止。`,
+            text: `成员 "${params.name}" 已停止。`,
           },
         ],
       };
@@ -157,7 +165,7 @@ export function registerTlTools(deps: TlToolsDeps): void {
     parameters: {
       type: "object",
       properties: {},
-    } as any,
+    } as ToolInputSchema,
     async execute(): Promise<ToolResult> {
       const statuses = manager.listStatus();
       if (statuses.length === 0) {
@@ -210,11 +218,11 @@ export function registerTlTools(deps: TlToolsDeps): void {
         },
         maxContentLength: {
           type: "number",
-          description: "每条消息内容最大字符数（默认 200），超出截断并追加'...'",
+          description: "每条消息内容最大字符数（UTF-16 code units，默认 200），超出截断保留 effectiveMaxLen-3 字符 + '...'",
         },
       },
       required: ["name"],
-    } as any,
+    } as ToolInputSchema,
     async execute(
       _toolCallId: string,
       params: { name: string; lines?: number; maxContentLength?: number }
@@ -227,7 +235,7 @@ export function registerTlTools(deps: TlToolsDeps): void {
           content: [
             {
               type: "text" as const,
-              text: `Member "${params.name}" 未在运行中，无法获取日志。`,
+              text: `成员 "${params.name}" 未在运行中，无法获取日志。`,
             },
           ],
         };
@@ -239,7 +247,7 @@ export function registerTlTools(deps: TlToolsDeps): void {
           content: [
             {
               type: "text" as const,
-              text: `Member "${params.name}" 日志查询功能不可用：未配置日志获取函数。`,
+              text: `成员 "${params.name}" 日志查询功能不可用：未配置日志获取函数。`,
             },
           ],
         };
@@ -252,7 +260,7 @@ export function registerTlTools(deps: TlToolsDeps): void {
           content: [
             {
               type: "text" as const,
-              text: `Member "${params.name}" 最近对话：\n\n${logText}`,
+              text: `成员 "${params.name}" 最近对话：\n\n${logText}`,
             },
           ],
         };
@@ -262,7 +270,7 @@ export function registerTlTools(deps: TlToolsDeps): void {
           content: [
             {
               type: "text" as const,
-              text: `读取 Member "${params.name}" 日志失败：${err instanceof Error ? err.message : String(err)}`,
+              text: `读取成员 "${params.name}" 日志失败：${err instanceof Error ? err.message : String(err)}`,
             },
           ],
         };
@@ -300,7 +308,7 @@ export function registerTlTools(deps: TlToolsDeps): void {
           },
         },
         required: ["to", "content"],
-      } as any,
+      } as ToolInputSchema,
       async execute(
         _toolCallId: string,
         params: { to: string; subject?: string; content: string }
@@ -347,7 +355,7 @@ export function registerTlTools(deps: TlToolsDeps): void {
         correlationId: { type: "string", description: "Reuse this correlation ID to re-wait after a timeout (no new message sent)" },
       },
       required: ["to", "content"],
-    } as any,
+    } as ToolInputSchema,
     async execute(
       _toolCallId: string,
       params: { to: string; content?: string; timeout?: number; correlationId?: string }
@@ -373,7 +381,7 @@ export function registerTlTools(deps: TlToolsDeps): void {
       "Use get_member_status FIRST to quickly check if members are idle, working, or crashed.",
       "Only use get_member_log when you need detailed conversation content.",
     ],
-    parameters: { type: "object", properties: {} } as any,
+    parameters: { type: "object", properties: {} } as ToolInputSchema,
     async execute(): Promise<ToolResult> {
       const entries = Array.from(memberOpsStates.entries());
       if (entries.length === 0) {
@@ -494,7 +502,7 @@ async function sendAndWaitExecute(
   if (enqueueMessage) {
     enqueueMessage({ to: params.to, content: messagePayload.content });
   } else {
-    messageQueue.enqueue(messagePayload as any);
+    messageQueue.enqueue(messagePayload as TeamMessage);
   }
 
   return waitWithAllIdleCheck(corrId, effectiveTimeout, params.to, ctx);
