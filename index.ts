@@ -1,18 +1,16 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerTeamCommand } from "./src/commands/team";
 import { getSessionState } from "./src/session/state";
-import type { TeamContext, MemberOperationalState } from "./src/session/context";
+import type { TeamContext } from "./src/session/context";
 import { registerTlTools } from "./src/tools/tl-tools";
 import { createProcessManager } from "./src/process/manager";
-import { createMemberProcess } from "./src/process/member-process";
-import { createMessageQueue } from "./src/channel/message-queue";
-import { createRouter } from "./src/channel/router";
-import { createResponseWaiter, extractCorrelationId } from "./src/channel/response-waiter";
-import type { TeamMessage } from "./src/channel/types";
-import { spawn } from "node:child_process";
-import { join } from "node:path";
-import { getRootDir } from "./src/config";
 import { createTeamStatusWidget } from "./src/ui/team-status-widget";
+import {
+  createAndRegisterMember,
+  buildMemberConfig,
+  getMemberLog,
+} from "./src/setup/member-lifecycle";
+import { createMessageChannel } from "./src/setup/message-channel";
 
 export default function (pi: ExtensionAPI) {
   // If running as a member process (TEAM_ROLE is set), skip TL-only tools
@@ -34,331 +32,7 @@ export default function (pi: ExtensionAPI) {
     memberOperationalStates: null,
   };
 
-  // ── Message channel: queue → router ──────────────────────
-  const router = createRouter({
-    sendToMember: (memberName: string, msg: TeamMessage) => {
-      const handle = teamCtx.memberHandles.get(memberName);
-      if (!handle) {
-        pi.sendMessage({
-          customType: "team-route",
-          content: `无法路由消息到未知成员 "${memberName}"（该成员可能未启动）`,
-          display: true,
-        });
-        return;
-      }
-      // Mark member as working when we send a prompt (before sendCommand)
-      memberOpsStates.set(memberName, "working");
-
-      try {
-        handle.sendCommand({
-          type: "prompt",
-          message: `[消息通道 - 来自 ${msg.from}]\n${msg.subject ? `主题：${msg.subject}\n` : ""}${msg.content}`,
-        });
-      } catch (err) {
-        pi.sendMessage({
-          customType: "team-route",
-          content: `发送消息给 "${memberName}" 失败：${err instanceof Error ? err.message : String(err)}`,
-          display: true,
-        });
-      }
-    },
-    sendToTl: (msg: TeamMessage) => {
-      // Check if ResponseWaiter has a pending wait for this message
-      const corrId = msg.correlationId ?? extractCorrelationId(msg.content);
-      if (corrId) {
-        const resolved = responseWaiter.resolveIfWaiting(
-          corrId, msg.from, msg.content, msg.subject
-        );
-        if (resolved) {
-          lastPendingCorrId.delete(msg.from);
-          return; // consumed by waiter, skip sendMessage
-        }
-      }
-      pi.sendMessage({
-        customType: "team-message",
-        content: `[消息通道 - 来自 ${msg.from}]\n${msg.subject ? `主题：${msg.subject}\n` : ""}${msg.content}`,
-        display: true,
-        details: { msg },
-      });
-    },
-    memberNames: [],
-    onUnknownTarget: (from, to) => {
-      pi.sendMessage({
-        customType: "team-route",
-        content: `消息目标 "${to}" 不存在（来自 ${from}）。有效目标：tl、all、团队成员名称。`,
-        display: true,
-      });
-    },
-  });
-
-  const messageQueue = createMessageQueue(async (msg: TeamMessage) => {
-    // Show routing notification for messages from TL (so TL knows it was dispatched)
-    if (msg.from === "tl") {
-      pi.sendMessage({
-        customType: "team-route",
-        content: `[消息已路由给 ${msg.to}]`,
-        display: true,
-      });
-    }
-    router.route(msg);
-  }, {
-    onHandlerError: (msg, err) => {
-      pi.sendMessage({
-        customType: "team-route",
-        content: `处理消息（${msg.id}）时出错：${err.message}`,
-        display: true,
-      });
-    },
-  });
-
-  const responseWaiter = createResponseWaiter();
-
-  // ── Member operational state tracking ─────────────────────
-  const memberOpsStates = new Map<string, MemberOperationalState>();
-
-  /**
-   * Wait for a response with early detection: if all members become idle,
-   * stop waiting and return all_idle status.
-   */
-  async function waitWithAllIdleCheck(
-    corrId: string,
-    timeoutMs: number,
-    memberName: string
-  ) {
-    const waitPromise = responseWaiter.waitForResponse(corrId, timeoutMs);
-
-    let pollTimer: ReturnType<typeof setInterval> | null = null;
-    const allIdlePromise = new Promise<any>((resolve) => {
-      pollTimer = setInterval(() => {
-        const entries = Array.from(memberOpsStates.entries());
-        if (entries.length > 0 && entries.every(([, s]) => s === "idle")) {
-          clearInterval(pollTimer!);
-          resolve({ status: "all_idle" });
-        }
-      }, 3000);
-    });
-
-    waitPromise.finally(() => {
-      if (pollTimer) clearInterval(pollTimer);
-    });
-
-    const result = await Promise.race([waitPromise, allIdlePromise]);
-
-    if (result.status === "response") {
-      lastPendingCorrId.delete(memberName);
-      return { details: {}, content: [{ type: "text" as const, text: "[" + memberName + " reply] " + result.content }] };
-    }
-    if (result.status === "cancelled") {
-      lastPendingCorrId.delete(memberName);
-      return { details: {}, content: [{ type: "text" as const, text: "Wait for " + memberName + " was cancelled." }] };
-    }
-    if (result.status === "all_idle") {
-      lastPendingCorrId.delete(memberName);
-      responseWaiter.cancelAll();
-      return {
-        details: { allIdle: true } as any,
-        content: [{ type: "text" as const, text: "所有团队成员均处于空闲状态，" + memberName + " 可能已完成任务。请检查工作成果。" }],
-      };
-    }
-    return {
-      details: { timeout: true, correlationId: corrId } as any,
-      content: [{ type: "text" as const, text: "Timeout waiting for " + memberName + ". Use get_member_status to check. If still working, call team_send_and_wait again with the same correlationId to re-wait." }],
-    };
-  }
-
-  // Track the most recent correlation ID sent to each member via team_send_and_wait.
-  // Used to auto-inject correlation ID when a member replies without the <corr:...> tag.
-  const lastPendingCorrId = new Map<string, string>();
-  // Track recently processed tool_execution_end message fingerprints for de-duplication
-  const recentlyProcessedMessages = new Set<string>();
-
-  teamCtx.router = router;
-  teamCtx.messageQueue = messageQueue;
-  teamCtx.responseWaiter = responseWaiter;
-  teamCtx.memberOperationalStates = memberOpsStates;
-
-  // ── Create and register member handles ─────────────────────
-  function createAndRegisterMember(
-    config: import("./src/process/member-process").MemberProcessConfig
-  ): ReturnType<typeof createMemberProcess> {
-    const handle = createMemberProcess(config, spawn);
-    teamCtx.memberHandles.set(config.name, handle);
-    teamCtx.processManager?.addHandle(handle);
-
-    // Backup parse: scan text blocks for <team-message> tags
-    function parseTeamMessageTag(text: string): { to: string; subject?: string; content: string } | null {
-      const m = text.match(/<team-message\s+to="([^"]+)"(?:\s+subject="([^"]*)")?>([\s\S]*?)<\/team-message>/);
-      if (!m) return null;
-      return { to: m[1], subject: m[2] || undefined, content: m[3].trim() };
-    }
-
-    // Wire message channel: intercept team_send_message tool calls
-    handle.onEvent((event: any) => {
-      // ── Member operational state tracking ─────────────────
-      if (event.type === "agent_start") {
-        memberOpsStates.set(config.name, "working");
-      }
-      if (event.type === "agent_end") {
-        memberOpsStates.set(config.name, "idle");
-      }
-
-      // Primary: team_send_message tool result
-      if (event.type === "tool_execution_end" && event.toolName === "team_send_message") {
-        const teamMsg = event.result?.details?.teamMessage;
-        if (teamMsg) {
-          // Record fingerprint for de-duplication: sender + content prefix (both paths can compute the same key)
-          const dedupKey = `${teamMsg.from}:${teamMsg.content?.slice(0, 80) ?? ""}`;
-          recentlyProcessedMessages.add(dedupKey);
-          setTimeout(() => recentlyProcessedMessages.delete(dedupKey), 60_000);
-
-          // Auto-populate correlation ID (only for TL-directed messages)
-          let content = teamMsg.content;
-          if (teamMsg.to === "tl" && !content.match(/<corr:[a-zA-Z0-9_-]+>/)) {
-            const stored = lastPendingCorrId.get(teamMsg.from);
-            if (stored) {
-              content = content + `\n\n<corr:${stored}>`;
-            }
-          }
-          messageQueue.enqueue({
-            id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-            from: teamMsg.from,
-            to: teamMsg.to,
-            subject: teamMsg.subject,
-            content,
-            timestamp: teamMsg.timestamp ?? Date.now(),
-          });
-        }
-      }
-
-      // Backup: check assistant text for <team-message> tags
-      if (event.type === "message_end" && event.message?.role === "assistant") {
-        const text = typeof event.message.content === "string"
-          ? event.message.content
-          : event.message.content?.map((c: any) => c.text ?? "").join(" ") ?? "";
-        const parsed = parseTeamMessageTag(text);
-        if (parsed) {
-          // De-duplication: compute same key as primary path (sender + content prefix)
-          const dedupKey = `${config.name}:${parsed.content?.slice(0, 80) ?? ""}`;
-          if (recentlyProcessedMessages.has(dedupKey)) {
-            return;
-          }
-
-          // Auto-populate correlation ID for backup path too
-          let backupContent = parsed.content;
-          if (parsed.to === "tl" && !backupContent.match(/<corr:[a-zA-Z0-9_-]+>/)) {
-            const stored = lastPendingCorrId.get(config.name);
-            if (stored) {
-              backupContent = backupContent + "\n\n<corr:" + stored + ">";
-            }
-          }
-          messageQueue.enqueue({
-            id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-            from: config.name,
-            to: parsed.to,
-            subject: parsed.subject,
-            content: backupContent,
-            timestamp: Date.now(),
-          });
-        }
-      }
-
-      // Handle process exit
-      if (event.type === "process_exit") {
-        const memberName = event.memberName;
-        const exitCode = event.exitCode;
-
-        // Exit code 143 = SIGTERM (128 + 15), which is a normal stop via stop_member
-        // Exit code 0 or null = clean exit
-        const isNormalExit = exitCode === null || exitCode === 0 || exitCode === 143;
-
-        // Update operational state
-        memberOpsStates.set(memberName, isNormalExit ? "stopped" : "crashed");
-
-        // Only proceed with further handling if the process was actually running
-        // (wasRunning=true indicates an unexpected exit that needs routing/notification)
-        if (!event.wasRunning) return;
-
-        if (!isNormalExit) {
-          // Cancel pending team_send_and_wait waits for this member
-          // to avoid TL waiting 120s for a crashed member to reply
-          const pendingCorrId = lastPendingCorrId.get(memberName);
-          if (pendingCorrId) {
-            responseWaiter.resolveIfWaiting(
-              pendingCorrId, memberName,
-              "[成员进程已崩溃，消息无法送达]"
-            );
-            lastPendingCorrId.delete(memberName);
-          }
-
-          // Notify TL only on unexpected crashes
-          pi.sendMessage({
-            customType: "team-message",
-            content: `Member "${memberName}" 进程异常退出（code: ${exitCode}），需检查崩溃原因。`,
-            display: true,
-            details: { crashEvent: event },
-          });
-        } else {
-          pi.sendMessage({
-            customType: "team-message",
-            content: `Member "${memberName}" 进程已正常停止（code: ${exitCode}）。`,
-            display: true,
-          });
-        }
-      }
-
-      if (event.type === "process_error") {
-        const memberName = event.memberName;
-        // Update operational state
-        memberOpsStates.set(memberName, "crashed");
-        const pendingCorrId = lastPendingCorrId.get(memberName);
-        if (pendingCorrId) {
-          responseWaiter.resolveIfWaiting(
-            pendingCorrId, memberName,
-            "[成员进程错误，消息无法送达]"
-          );
-          lastPendingCorrId.delete(memberName);
-        }
-        pi.sendMessage({
-          customType: "team-message",
-          content: `Member "${memberName}" 进程异常，需检查崩溃原因。`,
-          display: true,
-        });
-      }
-    });
-
-    // Initialize member operational state
-    memberOpsStates.set(config.name, "idle");
-
-    return handle;
-  }
-
-  function buildMemberConfig(
-    memberName: string
-  ): import("./src/process/member-process").MemberProcessConfig | null {
-    const session = getSessionState();
-    const team = session.teamDefinition;
-    if (!team) return null;
-
-    const memberDef = team.members.find((m) => m.name === memberName);
-    if (!memberDef) return null;
-
-    const sessionDir = join(getRootDir(), "sessions", team.name, memberName);
-    const sharedContextPath = join(getRootDir(), "sessions", team.name, ".shared-context.md");
-
-    return {
-      name: memberName,
-      role: memberName,
-      roleLabel: memberDef.label ?? memberName,
-      teamName: team.name,
-      teamMembers: team.members.map((m) => m.name),
-      memberDescription: memberDef.systemPrompt,
-      sessionDir,
-      sharedContextPath,
-      memberExtensionPath: new URL("./member.ts", import.meta.url).pathname,
-      cwd: process.cwd(),
-    };
-  }
-
+  // ── Manager (includes unified operational state) ────────────
   const manager = createProcessManager([], {
     autoRestart: false,
     onCrashLoopDetected: (name, restarts) => {
@@ -371,130 +45,75 @@ export default function (pi: ExtensionAPI) {
   });
   teamCtx.processManager = manager;
 
-  // getMemberLog: query member session via RPC get_messages
-  async function getMemberLog(memberName: string, maxLines: number, maxContentLength?: number): Promise<string> {
-    const handle = teamCtx.memberHandles.get(memberName);
-    if (!handle) {
-      throw new Error(`Member "${memberName}" not found`);
-    }
+  // Get the unified operational state map from the manager
+  const memberOpsStates = manager.getOperationalStateMap();
 
-    const response = await handle.sendCommandAndWait(
-      { type: "get_messages" },
-      (event: any) => event.type === "response" && event.command === "get_messages"
-    );
+  // Track the most recent correlation ID sent to each member via team_send_and_wait.
+  // Used to auto-inject correlation ID when a member replies without the <corr:...> tag.
+  const lastPendingCorrId = new Map<string, string>();
+  // Track recently processed tool_execution_end message fingerprints for de-duplication
+  const recentlyProcessedMessages = new Map<string, number>();
 
-    const effectiveMaxLen = maxContentLength ?? 50;
+  // waitWithAllIdleCheck is defined in src/tools/tl-tools.ts
 
-    const messages = response?.data?.messages ?? [];
-    const recent = messages.slice(-maxLines);
-    return recent
-      .map((m: any) => {
-        let content = typeof m.content === "string"
-          ? m.content
-          : JSON.stringify(m.content);
-
-        if (content.length > effectiveMaxLen) {
-          content = content.slice(0, effectiveMaxLen) + "...";
-        }
-
-        return `[${m.role}] ${content}`;
-      })
-      .join("\n");
-  }
-
-  registerTlTools(pi, manager, createAndRegisterMember, buildMemberConfig, getMemberLog, (msg) => {
-    messageQueue.enqueue({
-      id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      from: "tl",
-      to: msg.to,
-      subject: msg.subject,
-      content: msg.content,
-      timestamp: Date.now(),
-    });
+  // ── Message channel: queue → router (extracted to src/setup/message-channel.ts) ──
+  const { router, messageQueue, responseWaiter } = createMessageChannel({
+    pi,
+    memberOpsStates,
+    lastPendingCorrId,
+    memberHandles: teamCtx.memberHandles,
   });
 
-  // ── team_send_and_wait tool ─────────────────────────────
-  pi.registerTool({
-    name: "team_send_and_wait",
-    label: "Send Message and Wait",
-    description:
-      "Send a message to a team member and WAIT for their response. "
-      + "Use instead of team_send_message when you need the member result. "
-      + "Params: to (target), content (body, optional for re-wait), "
-      + "Automatically stops waiting if all members become idle. "
-      + "timeout (optional ms, default 120000), "
-      + "correlationId (optional, reuse from timeout for re-wait).",
-    promptGuidelines: [
-      "Use team_send_and_wait when you need a member result before continuing.",
-      "On timeout: check get_member_status; if still working, call team_send_and_wait again with the same correlationId (from timeout details) to re-wait without sending a new message.",
-      "team_send_and_wait returns early with allIdle status when all members become idle.",
-    ],
-    parameters: {
-      type: "object",
-      properties: {
-        to: { type: "string", description: "Target member name" },
-        content: { type: "string", description: "Message body (omit for re-wait after timeout)" },
-        timeout: { type: "number", description: "Max wait in ms (default 120000, max 300000)" },
-        correlationId: { type: "string", description: "Reuse this correlation ID to re-wait after a timeout (no new message sent)" },
-      },
-      required: ["to"],
-    } as any,
-    async execute(_toolCallId: string, params: { to: string; content?: string; timeout?: number; correlationId?: string }) {
-      const effectiveTimeout = params.timeout ?? 120_000;
+  teamCtx.router = router;
+  teamCtx.messageQueue = messageQueue;
+  teamCtx.responseWaiter = responseWaiter;
+  teamCtx.memberOperationalStates = memberOpsStates;
 
-      // Re-wait: reuse existing correlation ID, no new message sent
-      if (params.correlationId) {
-        return waitWithAllIdleCheck(params.correlationId, effectiveTimeout, params.to);
+  // (delegated to src/setup/member-lifecycle.ts via registerTlTools below)
+
+  const memberLifecycleDeps = {
+    pi,
+    memberOpsStates,
+    messageQueue,
+    responseWaiter,
+    lastPendingCorrId,
+    recentlyProcessedMessages,
+    processManager: manager,
+  };
+
+  registerTlTools({
+    pi,
+    manager,
+    responseWaiter,
+    memberOpsStates,
+    lastPendingCorrId,
+    messageQueue,
+    createMember: (config) => {
+      const handle = createAndRegisterMember(pi, config, memberLifecycleDeps);
+      teamCtx.memberHandles.set(config.name, handle);
+      return handle;
+    },
+    buildMemberConfig: (memberName) => buildMemberConfig(memberName, getSessionState()),
+    getMemberLog: async (memberName, maxLines, maxContentLength) => {
+      const handle = teamCtx.memberHandles.get(memberName);
+      if (!handle) {
+        throw new Error(`Member "${memberName}" not found`);
       }
-
-      // First-time wait: generate corr ID, send message, register waiter
-      const corrId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-      lastPendingCorrId.set(params.to, corrId);
+      return getMemberLog(handle, maxLines, maxContentLength);
+    },
+    enqueueMessage: (msg) => {
       messageQueue.enqueue({
-        id: "msg-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8),
+        id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         from: "tl",
-        to: params.to,
-        content: (params.content ?? "") + "\n\n<corr:" + corrId + ">",
+        to: msg.to,
+        subject: msg.subject,
+        content: msg.content,
         timestamp: Date.now(),
-        correlationId: corrId,
       });
-      return waitWithAllIdleCheck(corrId, effectiveTimeout, params.to);
     },
   });
 
-  // ── get_member_status ─────────────────────────────────────
-  pi.registerTool({
-    name: "get_member_status",
-    label: "Get Member Operational Status",
-    description:
-      "Quick lightweight check of all members' operational status (idle/working/crashed/stopped). " +
-      "No parameters. Use this instead of get_member_log when you just need to know if a member is available.",
-    promptGuidelines: [
-      "Use get_member_status FIRST to quickly check if members are idle, working, or crashed.",
-      "Only use get_member_log when you need detailed conversation content.",
-    ],
-    parameters: { type: "object", properties: {} } as any,
-    async execute() {
-      const entries = Array.from(memberOpsStates.entries());
-      if (entries.length === 0) {
-        return {
-          details: {},
-          content: [{ type: "text" as const, text: "还没有启动任何团队成员。请先使用 start_member 启动成员。" }],
-        };
-      }
-      const lines = entries.map(([name, state]) => {
-        const icon = state === "working" ? "🔧"
-                   : state === "idle" ? "✅"
-                   : state === "crashed" ? "💥"
-                   : "⏹️";
-        return `  ${icon} ${name}: ${state}`;
-      });
-      return {
-        details: {},
-        content: [{ type: "text" as const, text: `团队成员操作状态：\n${lines.join("\n")}` }],
-      };
-    },
-  });
+  // team_send_and_wait and get_member_status are registered in src/tools/tl-tools.ts
 
   // ── Call-level guard: block code-file writes during team session ───
   pi.on("tool_call", (event) => {

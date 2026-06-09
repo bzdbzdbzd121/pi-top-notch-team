@@ -39,6 +39,9 @@ export interface ResponseWaiter {
     subject?: string
   ): boolean;
 
+  /** Cancel a single pending wait by correlation ID. */
+  cancelByCorrId(correlationId: string): void;
+
   /** Cancel all pending waits (e.g. on /team stop). */
   cancelAll(): void;
 }
@@ -46,6 +49,9 @@ export interface ResponseWaiter {
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_TIMEOUT_MS = 300_000;
 const MAX_PENDING_LIMIT = 100;
+
+/** TTL for orphaned response buffer entries (5 minutes). */
+const BUFFER_TTL_MS = 300_000;
 
 /**
  * Create a ResponseWaiter that manages pending "send and wait" requests,
@@ -56,7 +62,10 @@ export function createResponseWaiter(): ResponseWaiter {
   // Buffer for responses that arrived after a wait timed out but before re-wait.
   // When a new waitForResponse registers for the same corrId, the buffered
   // response is delivered immediately instead of waiting for a new timeout.
-  const responseBuffer = new Map<string, WaitResult>();
+  const responseBuffer = new Map<
+    string,
+    { result: WaitResult; timer: NodeJS.Timeout }
+  >();
 
   return {
     waitForResponse(
@@ -66,8 +75,9 @@ export function createResponseWaiter(): ResponseWaiter {
       // Check buffer first: a response for this corrId arrived during the gap
       const buffered = responseBuffer.get(correlationId);
       if (buffered) {
+        clearTimeout(buffered.timer);
         responseBuffer.delete(correlationId);
-        return Promise.resolve(buffered);
+        return Promise.resolve(buffered.result);
       }
 
       const effectiveTimeout = Math.min(
@@ -116,8 +126,22 @@ export function createResponseWaiter(): ResponseWaiter {
       }
 
       // No active waiter — buffer the response for a possible re-wait
-      responseBuffer.set(correlationId, { status: "response", from, content, subject });
+      const timer = setTimeout(() => {
+        responseBuffer.delete(correlationId);
+      }, BUFFER_TTL_MS);
+      responseBuffer.set(correlationId, {
+        result: { status: "response", from, content, subject },
+        timer,
+      });
       return false;
+    },
+
+    cancelByCorrId(correlationId: string): void {
+      const entry = pending.get(correlationId);
+      if (!entry) return;
+      clearTimeout(entry.timeout);
+      pending.delete(correlationId);
+      entry.resolve({ status: "cancelled" });
     },
 
     cancelAll(): void {
@@ -126,6 +150,10 @@ export function createResponseWaiter(): ResponseWaiter {
         entry.resolve({ status: "cancelled" });
       }
       pending.clear();
+      // Clear all buffer TTL timers
+      for (const [, bufferEntry] of responseBuffer) {
+        clearTimeout(bufferEntry.timer);
+      }
       responseBuffer.clear();
     },
   };

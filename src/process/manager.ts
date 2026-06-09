@@ -1,4 +1,6 @@
 import type { MemberProcessHandle, MemberState } from "./member-process";
+import { transitionState } from "../session/state-machine";
+import type { MemberOperationalState } from "../session/state-machine";
 
 export interface ProcessManagerOptions {
   /** Whether to automatically restart crashed members. Default: true */
@@ -24,6 +26,14 @@ export interface ProcessManager {
   handleExit(name: string, exitCode: number | null): void;
   /** Dynamically add a new member handle (e.g. from start_member tool). */
   addHandle(handle: MemberProcessHandle): void;
+
+  // ── Operational state (unified with memberOpsStates) ──
+  /** Set the operational state for a member. */
+  setOperationalState(name: string, state: MemberOperationalState): void;
+  /** Get the operational state for a member. */
+  getOperationalState(name: string): MemberOperationalState | undefined;
+  /** Get the internal operational state map (for consumers that need direct map access). */
+  getOperationalStateMap(): Map<string, MemberOperationalState>;
 }
 
 /**
@@ -53,6 +63,8 @@ export function createProcessManager(
   const frozenMembers = new Set<string>();
   // Pending restart timers keyed by member name (for cancellation on stop)
   const pendingRestartTimers = new Map<string, NodeJS.Timeout>();
+  // Unified operational state tracking (replaces standalone memberOpsStates map)
+  const operationalStates = new Map<string, MemberOperationalState>();
 
   /**
    * Prune crash timestamps older than the tracking window,
@@ -80,12 +92,12 @@ export function createProcessManager(
   }
 
   /**
-   * Calculate exponential backoff delay for the nth restart (1-indexed).
+   * Calculate exponential backoff delay given a crash count.
+   * Pure function — no side effects.
+   * The count is crashes *in the window including current*, so the delay
+   * for the *next* start attempt uses (count - 1) as the exponent.
    */
-  function getBackoffDelay(name: string): number {
-    const count = pruneCrashCount(name);
-    // count is crashes *in the window including current*, so the delay
-    // for the *next* start attempt uses (count - 1) as the exponent.
+  function getBackoffDelay(count: number): number {
     const exponent = Math.max(0, count - 1);
     const delay = initialBackoffMs * Math.pow(2, exponent);
     // Cap at 30 seconds
@@ -130,6 +142,7 @@ export function createProcessManager(
         // Clear crash history on intentional stop
         crashTimestamps.delete(name);
         frozenMembers.delete(name);
+        operationalStates.set(name, transitionState(operationalStates.get(name) ?? "idle", { type: "stopped" }));
         await handle.stop();
       }
     },
@@ -147,7 +160,7 @@ export function createProcessManager(
       );
     },
 
-    handleExit(name: string, _exitCode: number | null): void {
+    handleExit(name: string, exitCode: number | null): void {
       if (!autoRestart) return;
 
       const handle = memberMap.get(name);
@@ -156,18 +169,25 @@ export function createProcessManager(
       // Don't restart frozen members
       if (frozenMembers.has(name)) return;
 
+      // Severe signals (SIGSEGV=11, SIGABRT=6) → freeze immediately
+      // Normal exit (code=0, null) and SIGTERM (code=143) are not crash-worthy
+      // Regular error codes (code=1, etc.) go through the normal crash loop
+      const isSevere = exitCode === 6 || exitCode === 11;
+
       // Check crash loop
       const exceeded = recordCrash(name);
-      if (exceeded) {
+      if (exceeded || isSevere) {
         frozenMembers.add(name);
+        operationalStates.set(name, transitionState(operationalStates.get(name) ?? "idle", { type: "process_exit", isCrashLoop: true }));
         crashTimestamps.delete(name); // Reset so next manual start works
         onCrashLoopDetected?.(name, maxRestarts + 1);
         return;
       }
 
-      // Compute backoff delay with exponential backoff
-      const delayMs = getBackoffDelay(name);
-      const attempt = pruneCrashCount(name);
+      // Prune crash count and compute backoff delay separately
+      const count = pruneCrashCount(name);
+      const delayMs = getBackoffDelay(count);
+      const attempt = count;
 
       onRestarting?.(name, attempt, delayMs);
 
@@ -183,6 +203,22 @@ export function createProcessManager(
 
     addHandle(handle: MemberProcessHandle): void {
       memberMap.set(handle.name, handle);
+      // Initialize operational state via started event
+      if (!operationalStates.has(handle.name)) {
+        operationalStates.set(handle.name, transitionState("idle", { type: "started" }));
+      }
+    },
+
+    setOperationalState(name: string, state: MemberOperationalState): void {
+      operationalStates.set(name, state);
+    },
+
+    getOperationalState(name: string): MemberOperationalState | undefined {
+      return operationalStates.get(name);
+    },
+
+    getOperationalStateMap(): Map<string, MemberOperationalState> {
+      return operationalStates;
     },
   };
 

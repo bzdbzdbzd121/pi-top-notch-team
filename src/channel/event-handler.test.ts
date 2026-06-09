@@ -1,0 +1,407 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import type { MemberOperationalState } from "../session/context";
+import type { MemberProcessHandle } from "../process/member-process";
+
+// ── Test helpers ────────────────────────────────────────────
+
+function createMockDeps() {
+  return {
+    pi: { sendMessage: vi.fn() },
+    memberOpsStates: new Map<string, MemberOperationalState>(),
+    messageQueue: { enqueue: vi.fn() },
+    responseWaiter: { resolveIfWaiting: vi.fn().mockReturnValue(false), cancelAll: vi.fn() },
+    lastPendingCorrId: new Map<string, string>(),
+    recentlyProcessedMessages: new Map<string, number>(),
+    memberHandles: new Map<string, MemberProcessHandle>(),
+  };
+}
+
+async function loadModule() {
+  return await import("./event-handler");
+}
+
+describe("parseTeamMessageTag", () => {
+  it("should parse a valid team-message tag with to, subject, content", async () => {
+    const { parseTeamMessageTag } = await loadModule();
+    const result = parseTeamMessageTag(
+      '<team-message to="worker" subject="Task">Do the work</team-message>'
+    );
+    expect(result).toEqual({
+      to: "worker",
+      subject: "Task",
+      content: "Do the work",
+    });
+  });
+
+  it("should parse a valid tag without subject", async () => {
+    const { parseTeamMessageTag } = await loadModule();
+    const result = parseTeamMessageTag(
+      '<team-message to="worker">Just do it</team-message>'
+    );
+    expect(result).toEqual({
+      to: "worker",
+      subject: undefined,
+      content: "Just do it",
+    });
+  });
+
+  it("should parse a valid tag with empty subject", async () => {
+    const { parseTeamMessageTag } = await loadModule();
+    const result = parseTeamMessageTag(
+      '<team-message to="worker" subject="">Just do it</team-message>'
+    );
+    expect(result).toEqual({
+      to: "worker",
+      subject: undefined,
+      content: "Just do it",
+    });
+  });
+
+  it("should trim content", async () => {
+    const { parseTeamMessageTag } = await loadModule();
+    const result = parseTeamMessageTag(
+      '<team-message to="worker">  Hello world  </team-message>'
+    );
+    expect(result!.content).toBe("Hello world");
+  });
+
+  it("should return null for malformed tag", async () => {
+    const { parseTeamMessageTag } = await loadModule();
+    const result = parseTeamMessageTag("this is not a team-message");
+    expect(result).toBeNull();
+  });
+
+  it("should return null for tag with missing to attribute", async () => {
+    const { parseTeamMessageTag } = await loadModule();
+    const result = parseTeamMessageTag("<team-message>content</team-message>");
+    expect(result).toBeNull();
+  });
+
+  it("should return null when text is extremely long (exceeds max length)", async () => {
+    const { parseTeamMessageTag } = await loadModule();
+    const longText = "A".repeat(200_000) + "</team-message>";
+    const result = parseTeamMessageTag(longText);
+    expect(result).toBeNull();
+  });
+
+  it("should handle content with nested angle brackets", async () => {
+    const { parseTeamMessageTag } = await loadModule();
+    const result = parseTeamMessageTag(
+      '<team-message to="worker">Use <template> tag</team-message>'
+    );
+    expect(result).toEqual({
+      to: "worker",
+      subject: undefined,
+      content: "Use <template> tag",
+    });
+  });
+
+  it("should handle content with embedded corr tag", async () => {
+    const { parseTeamMessageTag } = await loadModule();
+    const result = parseTeamMessageTag(
+      '<team-message to="tl" subject="Reply">Done\n\n<corr:abc123></team-message>'
+    );
+    expect(result).toEqual({
+      to: "tl",
+      subject: "Reply",
+      content: "Done\n\n<corr:abc123>",
+    });
+  });
+});
+
+describe("createMemberEventHandler", () => {
+  it("should return a function", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const deps = createMockDeps();
+    const handler = createMemberEventHandler("worker", deps as any);
+    expect(typeof handler).toBe("function");
+  });
+
+  it("should set state to working on agent_start", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const deps = createMockDeps();
+    const handler = createMemberEventHandler("worker", deps as any);
+    handler({ type: "agent_start" });
+    expect(deps.memberOpsStates.get("worker")).toBe("working");
+  });
+
+  it("should set state to idle on agent_end", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const deps = createMockDeps();
+    const handler = createMemberEventHandler("worker", deps as any);
+    deps.memberOpsStates.set("worker", "working");
+    handler({ type: "agent_end" });
+    expect(deps.memberOpsStates.get("worker")).toBe("idle");
+  });
+
+  it("should enqueue message on tool_execution_end for team_send_message", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const deps = createMockDeps();
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    handler({
+      type: "tool_execution_end",
+      toolName: "team_send_message",
+      result: {
+        details: {
+          teamMessage: {
+            from: "worker",
+            to: "tl",
+            content: "Task done",
+            subject: "Report",
+            timestamp: 1234567890,
+          },
+        },
+      },
+    });
+
+    expect(deps.messageQueue.enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        from: "worker",
+        to: "tl",
+        content: "Task done",
+        subject: "Report",
+        timestamp: 1234567890,
+      })
+    );
+  });
+
+  it("should auto-populate correlation ID for TL-directed messages", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const deps = createMockDeps();
+    deps.lastPendingCorrId.set("worker", "corr-abc");
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    handler({
+      type: "tool_execution_end",
+      toolName: "team_send_message",
+      result: {
+        details: {
+          teamMessage: {
+            from: "worker",
+            to: "tl",
+            content: "Done",
+            timestamp: Date.now(),
+          },
+        },
+      },
+    });
+
+    const enqueued = deps.messageQueue.enqueue.mock.calls[0][0];
+    expect(enqueued.content).toContain("<corr:corr-abc>");
+  });
+
+  it("should parse backup team-message tag in message_end assistant text", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const deps = createMockDeps();
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    handler({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: 'Some text <team-message to="analyzer">Please help</team-message> more text',
+      },
+    });
+
+    expect(deps.messageQueue.enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        from: "worker",
+        to: "analyzer",
+        content: "Please help",
+      })
+    );
+  });
+
+  it("should skip de-duplicated messages", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const deps = createMockDeps();
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    // First call: add to recentlyProcessedMessages (as Map<string, number>)
+    deps.recentlyProcessedMessages.set("worker:Please help", Date.now());
+
+    // Second call: should be skipped due to dedup
+    handler({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: 'Some text <team-message to="analyzer">Please help</team-message> more text',
+      },
+    });
+
+    expect(deps.messageQueue.enqueue).not.toHaveBeenCalled();
+  });
+
+  it("should set state to stopped on normal process_exit", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const deps = createMockDeps();
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    handler({
+      type: "process_exit",
+      memberName: "worker",
+      exitCode: 0,
+      wasRunning: false,
+    });
+
+    expect(deps.memberOpsStates.get("worker")).toBe("stopped");
+  });
+
+  it("should set state to crashed on abnormal process_exit", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const deps = createMockDeps();
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    handler({
+      type: "process_exit",
+      memberName: "worker",
+      exitCode: 1,
+      wasRunning: false,
+    });
+
+    expect(deps.memberOpsStates.get("worker")).toBe("crashed");
+  });
+
+  it("should notify TL on abnormal process_exit with wasRunning=true", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const deps = createMockDeps();
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    handler({
+      type: "process_exit",
+      memberName: "worker",
+      exitCode: 1,
+      wasRunning: true,
+    });
+
+    expect(deps.pi.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customType: "team-message",
+        display: true,
+      })
+    );
+  });
+
+  it("should resolve pending wait on abnormal process_exit", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const deps = createMockDeps();
+    deps.lastPendingCorrId.set("worker", "corr-123");
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    handler({
+      type: "process_exit",
+      memberName: "worker",
+      exitCode: 1,
+      wasRunning: true,
+    });
+
+    expect(deps.responseWaiter.resolveIfWaiting).toHaveBeenCalledWith(
+      "corr-123",
+      "worker",
+      expect.stringContaining("崩溃")
+    );
+  });
+
+  it("should set state to crashed on process_error", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const deps = createMockDeps();
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    handler({ type: "process_error", memberName: "worker" });
+
+    expect(deps.memberOpsStates.get("worker")).toBe("crashed");
+  });
+
+  it("should ignore unhandled event types", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const deps = createMockDeps();
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    handler({ type: "unknown_event", data: "whatever" });
+
+    expect(deps.messageQueue.enqueue).not.toHaveBeenCalled();
+    expect(deps.pi.sendMessage).not.toHaveBeenCalled();
+  });
+});
+
+describe("createSendToMember", () => {
+  it("should return a function", async () => {
+    const { createSendToMember } = await loadModule();
+    const deps = createMockDeps() as any;
+    const fn = createSendToMember(deps);
+    expect(typeof fn).toBe("function");
+  });
+
+  it("should send command to a known member handle", async () => {
+    const { createSendToMember } = await loadModule();
+    const deps = createMockDeps() as any;
+    const mockHandle = {
+      sendCommand: vi.fn(),
+    };
+    deps.memberHandles.set("worker", mockHandle);
+
+    const fn = createSendToMember(deps);
+    fn("worker", {
+      id: "msg-1",
+      from: "tl",
+      to: "worker",
+      content: "Hello",
+      timestamp: Date.now(),
+    });
+
+    expect(deps.memberOpsStates.get("worker")).toBe("working");
+    expect(mockHandle.sendCommand).toHaveBeenCalledWith({
+      type: "prompt",
+      message: expect.stringContaining("Hello"),
+    });
+  });
+
+  it("should warn when member handle not found", async () => {
+    const { createSendToMember } = await loadModule();
+    const deps = createMockDeps() as any;
+    const fn = createSendToMember(deps);
+
+    fn("nonexistent", {
+      id: "msg-2",
+      from: "tl",
+      to: "nonexistent",
+      content: "Hello",
+      timestamp: Date.now(),
+    });
+
+    expect(deps.pi.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customType: "team-route",
+        display: true,
+      })
+    );
+  });
+
+  it("should handle sendCommand exception gracefully", async () => {
+    const { createSendToMember } = await loadModule();
+    const deps = createMockDeps() as any;
+    const mockHandle = {
+      sendCommand: vi.fn().mockImplementation(() => {
+        throw new Error("Connection lost");
+      }),
+    };
+    deps.memberHandles.set("worker", mockHandle);
+
+    const fn = createSendToMember(deps);
+    fn("worker", {
+      id: "msg-3",
+      from: "tl",
+      to: "worker",
+      content: "Hello",
+      timestamp: Date.now(),
+    });
+
+    expect(deps.pi.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customType: "team-route",
+        display: true,
+      })
+    );
+  });
+});

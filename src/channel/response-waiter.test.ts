@@ -143,6 +143,26 @@ describe("createResponseWaiter", () => {
     waiter.cancelAll();
   });
 
+  it("cancelByCorrId cancels a single waiter", async () => {
+    const waiter = createResponseWaiter();
+    const wait1 = waiter.waitForResponse("req-001", 60_000);
+    const wait2 = waiter.waitForResponse("req-002", 60_000);
+
+    waiter.cancelByCorrId("req-001");
+
+    // Only the cancelled waiter should have cancelled status
+    expect(await wait1).toEqual({ status: "cancelled", from: undefined, content: undefined, subject: undefined });
+    // The other waiter should still be alive (timeout)
+    vi.advanceTimersByTime(60_001);
+    expect((await wait2).status).toBe("timeout");
+  });
+
+  it("cancelByCorrId does nothing for non-existent correlationId", () => {
+    const waiter = createResponseWaiter();
+    // Should not throw
+    waiter.cancelByCorrId("nonexistent");
+  });
+
   // ── Response buffer (re-wait after timeout) ────────────
 
   it("buffers orphaned response for re-wait after timeout", async () => {
@@ -180,6 +200,46 @@ describe("createResponseWaiter", () => {
     const wait2 = waiter.waitForResponse("req-abc", 1);
     vi.advanceTimersByTime(2);
     expect((await wait2).status).toBe("timeout");
+  });
+
+  it("buffered response auto-expires after TTL", async () => {
+    const waiter = createResponseWaiter();
+
+    // First wait times out
+    const wait1 = waiter.waitForResponse("req-abc", 10_000);
+    vi.advanceTimersByTime(10_001);
+    await wait1;
+
+    // Buffer a response
+    waiter.resolveIfWaiting("req-abc", "a", "delayed", undefined);
+
+    // Advance past the 5-min TTL
+    vi.advanceTimersByTime(300_001);
+
+    // Re-wait after TTL expired → should NOT get buffered response
+    const wait2 = waiter.waitForResponse("req-abc", 1);
+    vi.advanceTimersByTime(2);
+    expect((await wait2).status).toBe("timeout");
+  });
+
+  it("buffer entry consumed by re-wait has its TTL timer cleared", async () => {
+    const waiter = createResponseWaiter();
+
+    // First wait times out
+    const wait1 = waiter.waitForResponse("req-abc", 10_000);
+    vi.advanceTimersByTime(10_001);
+    await wait1;
+
+    // Buffer a response
+    waiter.resolveIfWaiting("req-abc", "a", "delayed", undefined);
+
+    // Consume via re-wait
+    const wait2 = waiter.waitForResponse("req-abc", 60_000);
+    const result = await wait2;
+    expect(result.status).toBe("response");
+
+    // After consumption, advance past TTL — should not crash (timer was cleared)
+    expect(() => vi.advanceTimersByTime(300_001)).not.toThrow();
   });
 
   it("does not buffer when waiter is active", async () => {

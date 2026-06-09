@@ -29,21 +29,40 @@ describe("createMessageQueue", () => {
   });
 
   it("processes one message at a time (serial)", async () => {
-    const inFlight: number[] = [];
+    const processedOrder: string[] = [];
+    let releaseNext: (() => void) | null = null;
+
     const queue = createMessageQueue(async (msg) => {
-      const idx = parseInt(msg.id.replace("msg-", ""));
-      inFlight.push(idx);
-      expect(inFlight).toHaveLength(1); // no concurrent processing
-      await new Promise((r) => setTimeout(r, 10));
-      inFlight.pop();
+      processedOrder.push(msg.id);
+      // Block until the test explicitly releases this handler
+      await new Promise<void>((resolve) => {
+        releaseNext = resolve;
+      });
     });
 
     queue.enqueue(makeMsg({ id: "msg-1" }));
     queue.enqueue(makeMsg({ id: "msg-2" }));
     queue.enqueue(makeMsg({ id: "msg-3" }));
-    await queue.drain();
 
-    expect(inFlight).toHaveLength(0);
+    // Give microtask a chance to start processing msg-1
+    await new Promise((r) => setTimeout(r, 1));
+    expect(processedOrder).toEqual(["msg-1"]);
+
+    // Release msg-1, msg-2 should start
+    releaseNext!();
+    await new Promise((r) => setTimeout(r, 1));
+    expect(processedOrder).toEqual(["msg-1", "msg-2"]);
+
+    // Release msg-2, msg-3 should start
+    releaseNext!();
+    await new Promise((r) => setTimeout(r, 1));
+    expect(processedOrder).toEqual(["msg-1", "msg-2", "msg-3"]);
+
+    // Release msg-3
+    releaseNext!();
+
+    await queue.drain();
+    expect(processedOrder).toEqual(["msg-1", "msg-2", "msg-3"]);
   });
 
   it("reports queue length", () => {

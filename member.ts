@@ -13,6 +13,8 @@ export default function (pi: ExtensionAPI) {
     return;
   }
 
+  const memberNames = teamMembers ? teamMembers.split(",") : [];
+  const validTargets = new Set(["tl", "all", ...memberNames]);
   const memberList = teamMembers ? teamMembers.split(",").join("、") : "";
 
   // ── team_send_message tool ───────────────────────────────
@@ -43,11 +45,24 @@ export default function (pi: ExtensionAPI) {
     async execute(
       _toolCallId: string,
       params: { to: string; subject?: string; content: string }
-    ) {
+    ): Promise<any> {
       const from = role;
       const to = params.to;
       const subject = params.subject ?? "";
       const content = params.content;
+
+      // Validate target
+      if (!validTargets.has(to)) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Invalid target: ${to}. Valid members: ${memberNames.join(", ")}`,
+            },
+          ],
+          details: {},
+        };
+      }
 
       return {
         content: [

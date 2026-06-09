@@ -72,12 +72,15 @@ export function deleteTeam(name: string, rootDir: string): boolean {
   }
 
   unlinkSync(filePath);
+  return true;
+}
 
-  // Clean up session files if any exist
+/** Delete session data directory for a team. Returns true if deleted, false if nothing to delete. */
+export function deleteTeamSessions(name: string, rootDir: string): boolean {
   const sessionDir = join(rootDir, "sessions", name);
-  if (existsSync(sessionDir)) {
-    rmSync(sessionDir, { recursive: true, force: true });
+  if (!existsSync(sessionDir)) {
+    return false;
   }
-
+  rmSync(sessionDir, { recursive: true, force: true });
   return true;
 }

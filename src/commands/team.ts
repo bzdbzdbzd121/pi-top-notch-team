@@ -3,7 +3,7 @@ import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import type { TeamContext } from "../session/context";
 import { startSession } from "../session/state";
 import { getSessionState, endSession } from "../session/state";
-import { readTeam, listTeams, deleteTeam } from "../team/store";
+import { readTeam, listTeams, deleteTeam, deleteTeamSessions } from "../team/store";
 import { getRootDir } from "../config";
 import type { StatusProvider } from "./status";
 
@@ -405,8 +405,34 @@ export function registerTeamCommand(
             return;
           }
 
+          // 1. Delete YAML file first
           deleteTeam(deleteName, getRootDir());
-          ctx.ui.notify(`团队 "${deleteName}" 已删除`, "info");
+
+          // 2. Check if session data exists and prompt user
+          const rootDir = getRootDir();
+          const { existsSync } = await import("node:fs");
+          const { join } = await import("node:path");
+          const sessionDir = join(rootDir, "sessions", deleteName);
+          if (existsSync(sessionDir)) {
+            const deleteSessions = await ctx.ui.confirm(
+              "删除会话数据",
+              `团队 "${deleteName}" 的会话数据目录存在。是否同时删除会话数据？`
+            );
+            if (deleteSessions) {
+              deleteTeamSessions(deleteName, rootDir);
+              ctx.ui.notify(
+                `团队 "${deleteName}" 及所有会话数据已删除`,
+                "info"
+              );
+            } else {
+              ctx.ui.notify(
+                `团队 "${deleteName}" 已删除，会话数据已保留`,
+                "info"
+              );
+            }
+          } else {
+            ctx.ui.notify(`团队 "${deleteName}" 已删除`, "info");
+          }
           return;
         }
 

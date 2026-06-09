@@ -68,8 +68,8 @@ export function createMemberProcess(
     for (const handler of eventHandlers) {
       try {
         handler(event);
-      } catch {
-        // Swallow handler errors
+      } catch (err) {
+        console.warn(`[team] Handler error for event ${event.type}:`, err);
       }
     }
   }
@@ -121,10 +121,16 @@ export function createMemberProcess(
 
         function handler(event: any) {
           if (settled) return;
-          if (event.type === "response" && event.id === id && matchFn(event)) {
+          try {
+            if (event.type === "response" && event.id === id && matchFn(event)) {
+              settled = true;
+              cleanup();
+              resolve(event);
+            }
+          } catch (err) {
             settled = true;
             cleanup();
-            resolve(event);
+            reject(err);
           }
         }
 
@@ -257,23 +263,26 @@ export function createMemberProcess(
         return;
       }
 
-      // SIGTERM first
+      // 1. Register exit listener BEFORE sending the signal
+      const exitPromise = new Promise<void>((resolve) => {
+        child!.on("exit", () => resolve());
+      });
+
+      // 2. Then send SIGTERM
       child.kill("SIGTERM");
 
-      // Wait briefly for graceful exit, then SIGKILL
-      await new Promise<void>((resolve) => {
-        const timeout = setTimeout(() => {
-          if (child && !child.killed) {
-            child.kill("SIGKILL");
-          }
-          resolve();
-        }, 3000);
-
-        child!.on("exit", () => {
-          clearTimeout(timeout);
-          resolve();
-        });
-      });
+      // 3. Race: wait for graceful exit or timeout → SIGKILL
+      await Promise.race([
+        exitPromise,
+        new Promise<void>((resolve) => {
+          setTimeout(() => {
+            if (child && !child.killed) {
+              child.kill("SIGKILL");
+            }
+            resolve();
+          }, 3000);
+        }),
+      ]);
 
       status = "stopped";
       pid = null;
