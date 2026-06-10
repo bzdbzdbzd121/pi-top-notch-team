@@ -178,7 +178,7 @@ describe("index.ts default export (integration)", () => {
 
       const handler = getBeforeAgentStartHandler();
       const result = await handler({ systemPrompt: "BASE" }, { ui: createMockUi() });
-      expect(result.systemPrompt).toContain("不必严格遵循");
+      expect(result.systemPrompt).toContain("作为工作流程参考");
       expect(result.systemPrompt).toContain("【build】");
     });
 

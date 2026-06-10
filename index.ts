@@ -349,7 +349,7 @@ export default function (pi: ExtensionAPI) {
         if (wf.strictness === "strict") {
           workflowText += `\n### 默认工作流（严格模式 ⚡）\n严格按照以下步骤执行，不得跳过或调序。\n\n`;
         } else {
-          workflowText += `\n### 默认工作流（参考模式 📋）\n作为工作参考，不必严格遵循步骤顺序，可根据实际情况灵活调整。\n\n`;
+          workflowText += `\n### 默认工作流（参考模式 📋）\n作为工作流程参考，尽可能遵循步骤顺序。\n\n`;
         }
         if (wf.description) workflowText += `**描述：** ${wf.description}\n\n`;
         workflowText += `**步骤序列：**\n`;

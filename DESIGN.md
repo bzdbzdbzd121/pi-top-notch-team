@@ -559,7 +559,7 @@ When `/team start` creates a team session, the extension sets up a `before_agent
 - **沟通风格**: 与用户交流简洁精炼，剔除客套话、语气词、多余铺垫
 - **可用工具**: 6 个团队管理工具（start_member、stop_member、list_members、get_member_log、get_member_status、team_send_and_wait）的介绍和使用指引
 - **工作流程**: 从需求讨论→拆解任务→编写共享上下文→启动 Member→分配任务（注明完成后必须回复TL）→监控进展→汇报结果的 9 个步骤
-- **默认工作流（可选）**: 如果团队配置了 `workflow` 字段，注入工作流阶段序列和循环段。Strict 模式注入强制顺序执行规则（"严格按照以下步骤执行，不得跳过或调序"），Reference 模式注入灵活参考指引（"不必严格遵循，可根据实际情况灵活调整"）
+- **默认工作流（可选）**: 如果团队配置了 `workflow` 字段，注入工作流阶段序列和循环段。Strict 模式注入强制顺序执行规则（"严格按照以下步骤执行，不得跳过或调序"），Reference 模式注入参考指引（"作为工作流程参考，尽可能遵循步骤顺序"）
 
 完整的注入提示词代码见 `index.ts` 中的 `before_agent_start` 处理器。
 
@@ -569,7 +569,7 @@ When `/team start` creates a team session, the extension sets up a `before_agent
 
 ```markdown
 ### 默认工作流（参考模式 📋）
-作为工作参考，不必严格遵循步骤顺序，可根据实际情况灵活调整。
+作为工作流程参考，尽可能遵循步骤顺序。
 
 **描述：** 标准开发流程：设计 → 编码 → 审查 → 循环
 
