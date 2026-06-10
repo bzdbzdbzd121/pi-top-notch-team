@@ -176,7 +176,7 @@ export function validateWorkflow(
 
     // stage.onFailure (optional object)
     if (stage.onFailure !== undefined) {
-      validateOnFailure(stage.onFailure, `workflow.stages[${i}]`, errors);
+      validateOnFailure(stage.onFailure, `workflow.stages[${i}]`, mainStageNames, errors);
     }
   }
 
@@ -224,6 +224,7 @@ export function validateWorkflow(
 function validateOnFailure(
   onFailure: unknown,
   prefix: string,
+  mainStageNames: Set<string>,
   errors: string[]
 ): void {
   if (typeof onFailure !== "object" || onFailure === null) {
@@ -235,6 +236,8 @@ function validateOnFailure(
 
   if (typeof of.returnToStage !== "string") {
     errors.push(`${prefix}.onFailure.returnToStage must be a string`);
+  } else if (mainStageNames.size > 0 && !mainStageNames.has(of.returnToStage)) {
+    errors.push(`${prefix}.onFailure.returnToStage "${of.returnToStage}": does not match any main flow stage name`);
   }
 
   if (!of.condition || typeof of.condition !== "string" || of.condition.trim() === "") {

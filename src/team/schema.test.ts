@@ -214,7 +214,24 @@ describe("validateTeamDefinition", () => {
       expect(result.errors.some((e) => e.includes("condition"))).toBe(true);
     });
 
-    describe("loops validation", () => {
+  it("rejects onFailure with returnToStage referencing non-existent stage name", () => {
+    const result = validateTeamDefinition({
+      name: "test",
+      description: "test",
+      members: [{ name: "architect", systemPrompt: "architect" }],
+      workflow: {
+        strictness: "reference",
+        stages: [
+          { member: "architect", name: "s1", description: "task", onFailure: { returnToStage: "ghost", condition: "failed" } },
+        ],
+      },
+    });
+    expect(result.valid).toBe(false);
+    expect(result.errors[0]).toContain("does not match any main flow stage name");
+  });
+
+    describe("loops validation"
+, () => {
       const loopDef = {
         stages: [
           { member: "architect", name: "analyze", description: "Analyze" },
