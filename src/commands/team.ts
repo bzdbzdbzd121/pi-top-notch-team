@@ -6,7 +6,7 @@ import { getSessionState, endSession } from "../session/state";
 import { readTeam, listTeams, deleteTeam, deleteTeamSessions } from "../team/store";
 import { getRootDir } from "../config";
 import type { StatusProvider } from "./status";
-import type { TeamWorkflow } from "../team/definition";
+import type { TeamWorkflow, TeamDefinition } from "../team/definition";
 
 interface ToolInputSchema {
   type: "object";
@@ -19,6 +19,7 @@ interface ToolInputSchema {
  *
  * Usage:
  *   /team create          — 通过自然语言创建团队
+ *   /team dynamic         — 动态团队模式（TL 自动设计团队）
  *   /team start <name>    — 启动团队会话
  *   /team stop            — 终止团队会话
  *   /team list            — 列出所有已创建的团队
@@ -36,29 +37,60 @@ export function registerTeamCommand(
     name: string;
     description: string;
     defaultModel?: string;
-    members: Array<{ name: string; label?: string; systemPrompt: string; model?: string }>;
+    members: Array<{ name: string; label?: string; systemPrompt?: string; model?: string }>;
     workflow?: TeamWorkflow;
   }
 
-  /** Validate and persist a team definition. Returns an error result if invalid, null if saved. */
-  async function saveTeamDefinition(params: TeamSaveParams, rootDir: string): Promise<any> {
+  /** Validate and persist a team definition. Returns an error result if invalid, null if saved.
+   *
+   * For updates (isUpdate=true): merges with existing team YAML on disk.
+   * - Members in params with missing systemPrompt auto-fill from stored data
+   * - Members omitted from params.members are deleted
+   * - workflow and defaults not in params are preserved from existing
+   */
+  async function saveTeamDefinition(params: TeamSaveParams, rootDir: string, isUpdate = false): Promise<any> {
     const { validateTeamDefinition } = await import("../team/schema");
     const { writeTeam } = await import("../team/store");
 
-    const teamData: Record<string, unknown> = {
-      name: params.name,
-      description: params.description,
-      defaults: params.defaultModel ? { model: params.defaultModel } : undefined,
-      members: params.members.map((m) => ({
+    // Read existing team for update merge
+    let existingTeam: TeamDefinition | null = null;
+    if (isUpdate) {
+      existingTeam = readTeam(params.name, rootDir);
+    }
+
+    // Merge members: for updates, fill in missing systemPrompt/label/model from existing
+    const mergedMembers = params.members.map((m) => {
+      if (existingTeam && !m.systemPrompt) {
+        const existing = existingTeam.members.find((em) => em.name === m.name);
+        if (existing) {
+          return {
+            name: m.name,
+            label: m.label ?? existing.label,
+            systemPrompt: existing.systemPrompt,
+            model: m.model ?? existing.model,
+          };
+        }
+      }
+      return {
         name: m.name,
         label: m.label,
         systemPrompt: m.systemPrompt,
         model: m.model,
-      })),
+      };
+    });
+
+
+    const teamData: Record<string, unknown> = {
+      name: params.name,
+      description: params.description,
+      defaults: params.defaultModel ? { model: params.defaultModel } : existingTeam?.defaults,
+      members: mergedMembers,
     };
 
     if (params.workflow) {
       teamData.workflow = params.workflow;
+    } else if (existingTeam?.workflow) {
+      teamData.workflow = existingTeam.workflow;
     }
 
     const validation = validateTeamDefinition(teamData);
@@ -139,7 +171,8 @@ export function registerTeamCommand(
     label: "Create Team Definition",
     description:
       "Call this tool after the user has confirmed the team details. " +
-      "Saves the team YAML to disk and runs validation.",
+      "Saves the team YAML to ~/.pi/top-notch-team/teams/<name>.yaml and runs validation. " +
+      "Path can be overridden via TOP_NOTCH_TEAM_ROOT env var.",
     parameters: {
       type: "object",
       properties: {
@@ -168,7 +201,7 @@ export function registerTeamCommand(
       _toolCallId: string,
       params: TeamSaveParams,
     ) {
-      const result = await saveTeamDefinition(params, getRootDir());
+      const result = await saveTeamDefinition(params, getRootDir(), false);
       if (result) return result;
       teamCtx.isCreatingTeam = false;
       return {
@@ -187,7 +220,11 @@ export function registerTeamCommand(
     label: "Update Team Definition",
     description:
       "Call this tool after the user has confirmed changes to an existing team. " +
-      "Overwrites the team YAML with the new definition and runs validation.",
+      "Overwrites the team YAML at ~/.pi/top-notch-team/teams/<name>.yaml with the new definition and runs validation. " +
+      "Path can be overridden via TOP_NOTCH_TEAM_ROOT env var.\n" +
+      "MERGE FEATURE: For existing (unchanged) members, you only need to pass {name: \"...\"} — " +
+      "systemPrompt/label/model auto-fill from stored YAML. Omit a member to delete it. " +
+      "New or modified members need full data.",
     parameters: {
       type: "object",
       properties: {
@@ -204,9 +241,9 @@ export function registerTeamCommand(
               systemPrompt: { type: "string" },
               model: { type: "string" },
             },
-            required: ["name", "systemPrompt"],
+            required: ["name"],
           },
-          description: "Team members",
+          description: "Team members. For existing unchanged members, just {name: \"...\"} suffices.",
         },
         workflow: workflowSchema,
       },
@@ -216,7 +253,7 @@ export function registerTeamCommand(
       _toolCallId: string,
       params: TeamSaveParams,
     ) {
-      const result = await saveTeamDefinition(params, getRootDir());
+      const result = await saveTeamDefinition(params, getRootDir(), true);
       if (result) return result;
       teamCtx.editingTeamName = null;
       return {
@@ -232,7 +269,7 @@ export function registerTeamCommand(
   pi.registerCommand("team", {
     description: "管理团队（create / start / stop / list / show / delete / status）",
     getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
-      const ALL_SUBCOMMANDS = ["create", "edit", "cancel", "start", "stop", "list", "show", "delete", "status", "help"];
+      const ALL_SUBCOMMANDS = ["create", "dynamic", "edit", "cancel", "start", "stop", "list", "show", "delete", "status", "help"];
       const TEAM_NAME_SUBCOMMANDS = ["start", "show", "delete", "edit"];
 
       const parts = prefix.split(/\s+/);
@@ -297,6 +334,47 @@ export function registerTeamCommand(
       const subargs = parts.slice(1).join(" ");
 
       switch (subcommand) {
+        // ── /team dynamic ─────────────────────────────────
+        case "dynamic": {
+          const session = getSessionState();
+          if (session.active) {
+            ctx.ui.notify("当前已有活跃会话。请先 /team stop 结束当前会话。", "warning");
+            return;
+          }
+
+          const { join } = await import("node:path");
+          const { mkdirSync } = await import("node:fs");
+          const ts = Date.now();
+          const teamName = `_dynamic_${ts}`;
+          const rootDir = getRootDir();
+          const dynamicDir = join(rootDir, "sessions", teamName);
+          mkdirSync(dynamicDir, { recursive: true });
+
+          const emptyTeam: TeamDefinition = {
+            name: teamName,
+            description: "动态团队",
+            members: [],
+          };
+
+          startSession(emptyTeam);
+          teamCtx.isDynamicSession = true;
+
+          // Activate TL tools (including add_dynamic_member for dynamic mode)
+          const tlToolNames = teamCtx.tlToolNames;
+          const currentActive = pi.getActiveTools();
+          const newActive = [...new Set([...currentActive, ...tlToolNames, "add_dynamic_member"])];
+          pi.setActiveTools(newActive);
+
+          // Install team status widget (design phase — 0 members)
+          teamCtx.onSessionStart?.(ctx.ui as unknown as SessionUI);
+
+          ctx.ui.notify(
+            `动态团队模式已启动。请告诉 TL 你的任务需求，TL 将与你讨论需求、设计团队并协作完成任务。`,
+            "info"
+          );
+          return;
+        }
+
         // ── /team create ──────────────────────────────────
         case "create": {
           teamCtx.isCreatingTeam = true;
@@ -328,9 +406,19 @@ export function registerTeamCommand(
             return;
           }
 
-          const team = readTeam(editName, getRootDir());
+          const { join } = await import("node:path");
+          const rootDir = getRootDir();
+          const teamsDir = join(rootDir, "teams");
+          const team = readTeam(editName, rootDir);
           if (!team) {
-            ctx.ui.notify(`团队 "${editName}" 不存在`, "warning");
+            const allTeams = listTeams(rootDir);
+            ctx.ui.notify(
+              `团队 "${editName}" 不存在。团队定义文件存于 ${teamsDir}，` +
+              (allTeams.length > 0
+                ? `可用团队：${allTeams.join(", ")}`
+                : "暂无团队，请先用 /team create 创建"),
+              "warning"
+            );
             return;
           }
 
@@ -384,6 +472,7 @@ export function registerTeamCommand(
           }
 
           const teamName = session.teamDefinition?.name ?? "unknown";
+          const isDynamic = teamCtx.isDynamicSession;
 
           if (teamCtx.processManager) {
             await teamCtx.processManager.stopAll();
@@ -395,11 +484,25 @@ export function registerTeamCommand(
 
           const tlToolNames = teamCtx.tlToolNames;
           const currentActive = pi.getActiveTools();
-          const newActive = currentActive.filter((t: string) => !tlToolNames.includes(t));
+          const toRemove = new Set([...tlToolNames, "add_dynamic_member"]);
+          const newActive = currentActive.filter((t: string) => !toRemove.has(t));
           pi.setActiveTools(newActive);
 
           // Remove team status widget immediately
           teamCtx.onSessionEnd?.();
+
+          // Clean up dynamic session directory
+          if (isDynamic) {
+            const { rmSync } = await import("node:fs");
+            const { join } = await import("node:path");
+            const dynamicDir = join(getRootDir(), "sessions", teamName);
+            try {
+              rmSync(dynamicDir, { recursive: true, force: true });
+            } catch {
+              // Best-effort cleanup
+            }
+            teamCtx.isDynamicSession = false;
+          }
 
           endSession();
           ctx.ui.notify(`团队 "${teamName}" 会话已结束`, "info");
@@ -574,6 +677,7 @@ export function registerTeamCommand(
           const usage = [
             `用法：/team <子命令> [参数]`,
             `  /team create           创建团队（自然语言对话）`,
+            `  /team dynamic          动态团队模式（TL 自动设计团队）`,
             `  /team edit <名称>       修改团队定义（自然语言对话）`,
             `  /team cancel           取消当前的创建或编辑操作`,
             `  /team start <名称>      启动团队会话`,

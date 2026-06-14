@@ -23,6 +23,8 @@ export interface TeamContext {
   isCreatingTeam: boolean;
   /** When editing, holds the team name. Null otherwise. */
   editingTeamName: string | null;
+  /** Whether the current session is a dynamic team mode (/team dynamic). */
+  isDynamicSession: boolean;
   processManager: ProcessManager | null;
   memberHandles: Map<string, MemberProcessHandle>;
   router: Router | null;

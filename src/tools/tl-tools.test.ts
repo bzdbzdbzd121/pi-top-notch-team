@@ -87,9 +87,9 @@ describe("registerTlTools", () => {
     });
   }
 
-  it("registers 6 tools", () => {
+  it("registers 7 tools", () => {
     callRegisterTlTools();
-    expect(pi.registerTool).toHaveBeenCalledTimes(6);
+    expect(pi.registerTool).toHaveBeenCalledTimes(7);
   });
 
   it("registers start_member tool", () => {

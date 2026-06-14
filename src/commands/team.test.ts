@@ -13,6 +13,7 @@ function createTeamContext(): TeamContext {
   return {
     isCreatingTeam: false,
     editingTeamName: null,
+    isDynamicSession: false,
     processManager: null,
     memberHandles: new Map(),
     router: { route: vi.fn(), updateMembers: vi.fn() } as any,

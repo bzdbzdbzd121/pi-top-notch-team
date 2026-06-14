@@ -70,7 +70,7 @@ pi-top-notch-team/
 ├── member.ts                 ← Extension entry point — Member side (auto-discovered via pi manifest)
 ├── src/
 │   ├── commands/
-│   │   ├── team.ts             ← Single /team command (10 subcommands + autocomplete)
+│   │   ├── team.ts             ← Single /team command (11 subcommands + autocomplete)
 │   │   └── status.ts           ← StatusProvider type export
 │   ├── tools/
 │   │   └── tl-tools.ts         ← 7 TL process management tools (DI-based dependencies)
@@ -139,7 +139,7 @@ Since TL and Member are declared as two separate extensions, but both are loaded
 
 | Scenario | `ctx.mode` | Role |
 |----------|-----------|------|
-| User's interactive session | `"tui"`, `"rpc"`, `"json"`, `"print"` | **TL** — registers /team command with 10 subcommands, waits for `/team start` to activate tools |
+| User's interactive session | `"tui"`, `"rpc"`, `"json"`, `"print"` | **TL** — registers /team command with 11 subcommands, waits for `/team start` or `/team dynamic` to activate tools |
 | Member RPC process | `"rpc"` | **Member** — registers `team_send_message` tool, injects team system prompt via env vars |
 
 **Detection logic:**
@@ -284,7 +284,12 @@ All subcommands are registered as a single `/team` command via `registerCommand(
 3. Sets `editingTeamName`, injects instructions via `before_agent_start` — includes workflow modification prompts
 4. TL discusses changes with user (member changes, workflow changes: add/remove/modify stages, loops, strictness)
 5. On confirmation, TL calls `update_team_definition` tool with optional `workflow` field
-6. Tool validates and overwrites YAML
+6. Tool reads existing YAML, merges changes:
+   - Members in params with missing `systemPrompt` auto-fill from stored data
+   - Members not in params (existing but omitted) are deleted
+   - Omit a member from `members` array to delete it
+   - workflow/defaults not in params preserve existing values
+   - Merged result validates and overwrites YAML
 7. If workflow was removed, the field is simply omitted from the YAML
 
 ### `/team cancel`
@@ -300,6 +305,29 @@ All subcommands are registered as a single `/team` command via `registerCommand(
 5. TL calls `create_team_definition` tool → validates YAML schema → saves to `~/.pi/top-notch-team/teams/<name>.yaml`
 6. `isCreatingTeam` set to `false`
 7. No team session is started
+
+### `/team dynamic`
+
+**Flow:**
+1. Check no active session exists
+2. Create temp directory `sessions/_dynamic_<ts>/`
+3. Create in-memory `TeamDefinition` with 0 members, name `_dynamic_<ts>`
+4. `startSession(emptyTeam)` — start session with empty team
+5. `teamCtx.isDynamicSession = true`
+6. Activate TL tools: `pi.setActiveTools([...current, ...tlToolNames])`
+7. Install team status widget (displays "设计阶段" with 0 members)
+8. `before_agent_start` handler checks `teamCtx.isDynamicSession` and injects dynamic mode prompt (see §10)
+9. Notify user that dynamic mode is active
+
+**Lifecycle after `/team dynamic`**
+1. TL discusses requirements with the user (one topic at a time)
+2. TL designs member roles and calls `add_dynamic_member` to register each
+3. TL writes Shared Context (§14) including suggested workflow
+4. TL starts Members via `start_member` and dispatches work
+5. TL monitors progress via `team_send_and_wait`
+6. Shared Context is updated as needed
+7. TL reports completion; user runs `/team stop`
+8. `/team stop` removes `sessions/_dynamic_<ts>/` directory
 
 ### `/team start <name>`
 
@@ -328,8 +356,9 @@ All subcommands are registered as a single `/team` command via `registerCommand(
 2. Clear `memberHandles` map
 3. `router.updateMembers([])` — clear message channel targets
 4. `pi.setActiveTools([...filter out tlToolNames])` — deactivate TL tools
-5. `endSession()` — clear session state
-6. `before_agent_start` handler remains registered but checks `session.active` to skip injection
+5. If dynamic session: `rmSync(sessions/_dynamic_<ts>/, {recursive:true, force:true})` and `teamCtx.isDynamicSession = false`
+6. `endSession()` — clear session state
+7. `before_agent_start` handler remains registered but checks `session.active` to skip injection
 
 ### `/team list`
 
@@ -360,6 +389,20 @@ All subcommands are registered as a single `/team` command via `registerCommand(
 ## 6. TL Process Management Tools
 
 Seven tools are registered when a team session is active. They are **not** available outside a team session.
+
+### `add_dynamic_member` (dynamic mode only)
+
+```typescript
+add_dynamic_member({ name: "coder", label: "编码员", systemPrompt: "...", model?: "..." })
+```
+
+- Only functional when `teamCtx.isDynamicSession` is `true` (i.e., during `/team dynamic`)
+- Adds a `TeamMember` to the in-memory `TeamDefinition` via `addMemberToSession()`
+- Refreshes the session state so `buildMemberConfig` can find the member later
+- Updates `router.updateMembers()` with the new member list
+- Triggers `onDynamicMemberAdded` callback for widget refresh
+- Parameters: `name` (identifier), `label` (Chinese display name), `systemPrompt` (role definition), `model` (optional override)
+- Error if called outside dynamic mode
 
 ### `start_member`
 
@@ -616,6 +659,7 @@ interface TeamSessionState {
 interface TeamContext {
   isCreatingTeam: boolean;
   editingTeamName: string | null;
+  isDynamicSession: boolean;  // true during /team dynamic
   processManager: ProcessManager | null;
   memberHandles: Map<string, MemberProcessHandle>;
   router: Router;
@@ -629,6 +673,8 @@ interface TeamContext {
 ```
 
 Session state (active + team definition) is stored in `session/state.ts` as a module-level variable. Member process handles, message channel, and other runtime objects are in `TeamContext` passed to command handlers. On `/team stop`, all processes are terminated, handles cleared, and state reset.
+
+**`addMemberToSession(member: TeamMember): TeamDefinition`** — Adds a member to the active session's team definition and refreshes the session state. Used by the `add_dynamic_member` tool during `/team dynamic`. Throws if no active session.
 
 ## 12. Error Handling
 

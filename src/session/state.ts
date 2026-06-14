@@ -36,3 +36,20 @@ export function endSession(): void {
     startedAt: null,
   };
 }
+
+/**
+ * Add a new member to the active session's team definition.
+ * Used by /team dynamic mode to dynamically build the team.
+ * Refreshes the session state so subsequent getSessionState() calls see the change.
+ */
+export function addMemberToSession(member: TeamMember): TeamDefinition {
+  if (!currentSession.active || !currentSession.teamDefinition) {
+    throw new Error("No active session — cannot add member");
+  }
+  const updatedTeam: TeamDefinition = {
+    ...currentSession.teamDefinition,
+    members: [...currentSession.teamDefinition.members, member],
+  };
+  startSession(updatedTeam);
+  return updatedTeam;
+}

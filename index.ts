@@ -1,8 +1,11 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerTeamCommand } from "./src/commands/team";
 import { TeamModeEditor } from "./src/ui/team-mode-editor";
-import { getSessionState, endSession } from "./src/session/state";
+import { getSessionState, endSession, addMemberToSession } from "./src/session/state";
 import type { TeamContext } from "./src/session/context";
+import { getRootDir } from "./src/config";
+import { join } from "node:path";
+import { rmSync } from "node:fs";
 import { registerTlTools } from "./src/tools/tl-tools";
 import { createProcessManager } from "./src/process/manager";
 import { createTeamStatusWidget } from "./src/ui/team-status-widget";
@@ -12,6 +15,7 @@ import {
   getMemberLog,
 } from "./src/setup/member-lifecycle";
 import { createMessageChannel } from "./src/setup/message-channel";
+import { buildDynamicModePrompt } from "./src/prompts/dynamic-mode";
 
 export default function (pi: ExtensionAPI) {
   // If running as a member process (TEAM_ROLE is set), skip TL-only tools
@@ -28,6 +32,7 @@ export default function (pi: ExtensionAPI) {
   const teamCtx: TeamContext = {
     isCreatingTeam: false,
     editingTeamName: null,
+    isDynamicSession: false,
     processManager: null,
     memberHandles: new Map(),
     tlToolNames: ["start_member", "stop_member", "list_members", "get_member_log", "team_send_and_wait", "get_member_status"],
@@ -93,6 +98,14 @@ export default function (pi: ExtensionAPI) {
     memberOpsStates,
     lastPendingCorrId,
     messageQueue,
+    isDynamicSession: () => teamCtx.isDynamicSession,
+    addMemberToSession,
+    onDynamicMemberAdded: () => {
+      const session = getSessionState();
+      if (session.teamDefinition) {
+        teamCtx.router!.updateMembers(session.teamDefinition.members.map((m) => m.name));
+      }
+    },
     createMember: (config) => {
       const handle = createAndRegisterMember(pi, config, memberLifecycleDeps);
       teamCtx.memberHandles.set(config.name, handle);
@@ -133,10 +146,18 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", () => {
     const _session = getSessionState();
     if (_session.active) {
+      const dynamicDir = teamCtx.isDynamicSession && _session.teamDefinition
+        ? join(getRootDir(), "sessions", _session.teamDefinition.name)
+        : null;
       endSession();
       if (teamCtx.onSessionEnd) {
         teamCtx.onSessionEnd();
       }
+      // Best-effort cleanup of dynamic session directory
+      if (dynamicDir) {
+        try { rmSync(dynamicDir, { recursive: true, force: true }); } catch {}
+      }
+      teamCtx.isDynamicSession = false;
     }
   });
 
@@ -146,10 +167,19 @@ export default function (pi: ExtensionAPI) {
       const entries = ctx.sessionManager.getEntries() ?? [];
       const isFresh = entries.length <= 1;
       if (isFresh && getSessionState().active) {
+        const isDynamic = teamCtx.isDynamicSession;
+        const dynamicTeamName = getSessionState().teamDefinition?.name;
+        const dynamicDir = isDynamic && dynamicTeamName
+          ? join(getRootDir(), "sessions", dynamicTeamName)
+          : null;
         endSession();
         if (teamCtx.onSessionEnd) {
           teamCtx.onSessionEnd();
         }
+        if (dynamicDir) {
+          try { rmSync(dynamicDir, { recursive: true, force: true }); } catch {}
+        }
+        teamCtx.isDynamicSession = false;
       }
     }
   });
@@ -219,7 +249,7 @@ export default function (pi: ExtensionAPI) {
     if (!session.teamDefinition) return;
     teamStatusWidget = createTeamStatusWidget({
       teamName: session.teamDefinition.name,
-      members: session.teamDefinition.members,
+      getMembers: () => getSessionState().teamDefinition?.members ?? [],
       teamCtx,
       memberOpsStates,
     });
@@ -255,7 +285,7 @@ export default function (pi: ExtensionAPI) {
     if (session.active && session.teamDefinition && !teamStatusWidget) {
       teamStatusWidget = createTeamStatusWidget({
         teamName: session.teamDefinition.name,
-        members: session.teamDefinition.members,
+        getMembers: () => getSessionState().teamDefinition?.members ?? [],
         teamCtx,
         memberOpsStates,
       });
@@ -325,9 +355,21 @@ export default function (pi: ExtensionAPI) {
 
 **不要**追问 name 和 label——从用户的描述中推断。
 
+### 关于 update_team_definition 的 merge 机制
+
+调用 \`update_team_definition\` 时注意以下规则以减小 payload：
+- **未变更的现有成员** — 只需传 \`{name: "成员名"}\`，不传 systemPrompt。systemPrompt/label/model 自动从磁盘已有配置填充
+- **新增或修改的成员** — 传完整数据（name、systemPrompt 等）
+- **要删除的成员** — 直接从 members 数组中排除
+- **workflow** 和 **defaults** — 如果不变可以不传，自动保留原有值
+
+这样你就不必在 tool call 中重复所有成员的长篇 systemPrompt，避免 payload 过大导致输出截断。
+
 了解清楚所有修改后，向用户展示修改汇总并确认，然后调用 \`update_team_definition\` 工具保存最终定义。
 如果用户想取消操作，告诉用户输入 \`/team cancel\`。
 `;
+    } else if (teamCtx.isDynamicSession && session.teamDefinition) {
+      extraPrompt = buildDynamicModePrompt(session.teamDefinition);
     } else if (session.active && session.teamDefinition) {
       const team = session.teamDefinition;
       const memberLines = team.members

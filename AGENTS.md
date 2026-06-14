@@ -11,10 +11,13 @@ pi install ./pi-top-notch-team
 # Create a team definition
 /team create
 
-# Start a team session
+# Start a team session with pre-defined team
 /team start <team-name>
 
-# After the TL completes work
+# Start a dynamic team session (TL designs team on the fly)
+/team dynamic
+
+# End the session
 /team stop
 ```
 
@@ -22,8 +25,8 @@ pi install ./pi-top-notch-team
 
 ```
 User's pi session (TL extension)
-  ├── 10 subcommands (/team create, edit, cancel, start, stop, list, show, delete, status, help)
-  ├── 6 TL tools (start_member, stop_member, list_members, get_member_log, get_member_status, team_send_and_wait)
+  ├── 11 subcommands (/team create, dynamic, edit, cancel, start, stop, list, show, delete, status, help)
+  ├── 7 TL tools (start_member, stop_member, list_members, get_member_log, get_member_status, team_send_and_wait, add_dynamic_member)
   ├── Message channel (queue → router → responseWaiter)
   ├── Member Process Manager
   │     ├── Member A (pi --mode rpc, member.ts)
@@ -36,7 +39,7 @@ User's pi session (TL extension)
 
 | File | Role |
 |------|------|
-| `index.ts` (~341 lines) | TL extension entry point. Registers `/team` command, wires DI dependencies, `before_agent_start` injection, team-status widget lifecycle, autocomplete provider. Refactored from ~800 lines via modular extraction. |
+| `index.ts` (~400 lines) | TL extension entry point. Registers `/team` command, wires DI dependencies, `before_agent_start` injection, team-status widget lifecycle, autocomplete provider. Refactored from ~800 lines via modular extraction. |
 | `member.ts` | Member extension entry point. Registers `team_send_message` tool, injects team awareness via env vars. Uses `JSON.parse` for TEAM_MEMBERS (no longer comma-delimited). |
 | `package.json` | pi package manifest with `pi.extensions` pointing to `["./index.ts", "./member.ts"]` |
 
@@ -45,9 +48,10 @@ User's pi session (TL extension)
 ```
 src/
 ├── commands/
-│   ├── team.ts       ← Single /team command (10 subcommands)
+│   ├── team.ts       ← Single /team command (11 subcommands, incl. `dynamic`)
 │   ├── status.ts     ← StatusProvider type for getMemberStatuses
-│   └── team.test.ts
+│   ├── team.test.ts
+│   └── team-dynamic.test.ts  ← /team dynamic tests
 ├── channel/          ← Real-time message channel
 │   ├── types.ts      ← TeamMessage interface
 │   ├── message-queue.ts  ← Serial FIFO queue (event-driven drain, no polling)
@@ -58,15 +62,19 @@ src/
 │   ├── member-process.ts  ← pi --mode rpc spawn wrapper (write queue, size guard)
 │   └── manager.ts    ← Multi-member lifecycle + operational state + auto-restart
 ├── tools/
-│   └── tl-tools.ts   ← 7 TL process management tools (Deps-based DI)
+│   ├── tl-tools.ts   ← 7 TL process management tools (Deps-based DI)
+│   └── tl-tools-add-dynamic.test.ts  ← add_dynamic_member tool tests
 ├── team/
 │   ├── definition.ts ← TeamDefinition / TeamMember types
 │   ├── schema.ts     ← YAML field validation
 │   └── store.ts      ← Read/write/delete team YAML files
 ├── session/
-│   ├── state.ts      ← TeamSessionState (structuredClone deep copy)
-│   ├── context.ts    ← TeamContext shared mutable state interface
+│   ├── state.ts      ← TeamSessionState (structuredClone deep copy), addMemberToSession()
+│   ├── state.test.ts ← addMemberToSession tests
+│   ├── context.ts    ← TeamContext shared mutable state interface (incl. isDynamicSession)
 │   └── state-machine.ts  ← Pure function state machine: MemberOperationalState transitions
+├── prompts/
+│   └── dynamic-mode.ts  ← TL system prompt template for /team dynamic mode
 ├── setup/            ← Modular extracted setup modules
 │   ├── member-lifecycle.ts  ← createAndRegisterMember, buildMemberConfig, getMemberLog
 │   └── message-channel.ts   ← createMessageChannel factory (queue+router+waiter wiring)
@@ -97,13 +105,15 @@ src/
    - `channel/response-waiter.ts` — correlation matching with response buffering
    - `session/state-machine.ts` — pure state transitions
 
+8. **Dynamic team mode (`/team dynamic`)** — A free-form mode where the TL designs the team at runtime. No YAML is written to disk. The TL enters a session with 0 members, discusses requirements with the user, uses `add_dynamic_member` to register member roles, then starts and dispatches them via the standard tool chain. The session guard blocks code file writes from the moment `/team dynamic` is entered. On `/team stop`, the temporary session directory (`sessions/_dynamic_<ts>/`) is cleaned up.
+
 ## Dependency Injection Pattern
 
 The codebase uses an explicit Dependency Injection (DI) pattern to decouple modules and enable testability. Every subsystem receives its dependencies through a typed interface, rather than importing them directly.
 
 | DI Interface | Module | Dependencies |
 |-------------|--------|-------------|
-| `TlToolsDeps` | `tools/tl-tools.ts` | `pi`, `manager`, `responseWaiter`, `memberOpsStates`, `lastPendingCorrId`, `messageQueue`, `createMember?`, `buildMemberConfig?`, `getMemberLog?`, `enqueueMessage?` |
+| `TlToolsDeps` | `tools/tl-tools.ts` | `pi`, `manager`, `responseWaiter`, `memberOpsStates`, `lastPendingCorrId`, `messageQueue`, `createMember?`, `buildMemberConfig?`, `getMemberLog?`, `isDynamicSession?`, `addMemberToSession?`, `onDynamicMemberAdded?` |
 | `MemberLifecycleDeps` | `setup/member-lifecycle.ts` | `pi`, `memberOpsStates`, `messageQueue`, `responseWaiter`, `lastPendingCorrId`, `recentlyProcessedMessages`, `processManager?` |
 | `MessageChannelDeps` | `setup/message-channel.ts` | `pi`, `memberOpsStates`, `lastPendingCorrId`, `memberHandles` |
 | `EventHandlerDeps` | `channel/event-handler.ts` | `pi`, `memberOpsStates`, `messageQueue`, `responseWaiter`, `lastPendingCorrId`, `recentlyProcessedMessages` |
@@ -169,7 +179,7 @@ npm test          # Run all tests (vitest)
 npm run test:watch  # Watch mode
 ```
 
-215 tests across 16 files (state-machine, member-process, event-handler, response-waiter, message-channel tests included). Tests live alongside source as `*.test.ts`.
+260 tests across 19 files (state-machine, member-process, event-handler, response-waiter, message-channel tests included). Tests live alongside source as `*.test.ts`.
 
 | Test Level | What | How |
 |-----------|------|-----|
@@ -195,9 +205,10 @@ npm run test:watch  # Watch mode
 | Command | Description |
 |---------|-------------|
 | `/team create` | Natural language team creation via TL dialogue |
+| `/team dynamic` | Dynamic team mode — TL designs team on the fly based on user requirements |
 | `/team edit <name>` | Natural language team modification via TL dialogue |
-| `/team start <name>` | Start team session, activate TL tools |
-| `/team stop` | Stop all members, deactivate TL tools |
+| `/team start <name>` | Start team session with a pre-defined YAML team, activate TL tools |
+| `/team stop` | Stop all members, deactivate TL tools (also cleans up dynamic session directories) |
 | `/team list` | List all team definitions |
 | `/team show <name>` | Display team definition details |
 | `/team cancel`           | Cancel current create or edit operation |
@@ -209,6 +220,7 @@ npm run test:watch  # Watch mode
 
 | Tool | Description |
 |------|-------------|
+| `add_dynamic_member(name, label, systemPrompt, model?)` | Register a member in `/team dynamic` mode. Name is the identifier, label is Chinese display name, systemPrompt is role definition. Only available in dynamic mode. |
 | `start_member(name)` | Launch a Member's pi RPC process |
 | `stop_member(name)` | Gracefully terminate a Member process |
 | `list_members()` | Show all member statuses |
@@ -216,11 +228,49 @@ npm run test:watch  # Watch mode
 | `get_member_status()` | Get operational status (idle/working/crashed/stopped) for all members. No parameters. |
 | `team_send_and_wait(to, content?, timeout?, correlationId?)` | Send message and wait for response. On timeout, re-wait with same `correlationId` (no new message sent). Response content returned as tool result. |
 
+## Extension Tools (create/edit team)
+
+These tools are registered by the TL extension (`index.ts` → `team.ts`) and invoked by the TL agent during `/team create` and `/team edit` flows.
+
+| Tool | Description |
+|------|-------------|
+| `create_team_definition` | Creates a new team YAML. Accepts full member data (name, label, systemPrompt, model) + optional workflow. Validates and writes to disk. |
+| `update_team_definition` | Updates an existing team YAML. **Merge mode**: for unchanged members, TL may omit `systemPrompt` — value auto-fills from stored YAML. Omit a member from `members` to delete it. Workflow/defaults not provided preserve existing values. This avoids large payloads that could cause model output truncation. |
+
 ### Team Session Guards
 
-During an active team session, a `tool_call` event handler intercepts `write`/`edit` tools:
+During an active team session (including `/team dynamic`), a `tool_call` event handler intercepts `write`/`edit` tools:
 - `.md` files (`.shared-context.md`, ADRs, planning docs) — allowed
 - Code files (`.ts`, `.js`, `.py`, etc.) — blocked with reason "请委派给 Member"
+
+In dynamic mode, the guard is active from the moment `/team dynamic` is entered — before any members exist.
+
+### Dynamic Mode Flow
+
+```
+/team dynamic
+  → mkdir sessions/_dynamic_<ts>/
+  → startSession({name:"_dynamic_<ts>", members:[]})
+  → isDynamicSession = true
+  → 激活 TL 工具 + 会话守卫 + widget（显示"设计阶段"）
+
+TL ↔ 用户讨论需求
+  → TL 构思成员配置
+
+TL: add_dynamic_member({name, label, systemPrompt, model?})
+  → addMemberToSession() 刷新 currentSession
+  → router / widget 更新
+
+TL: start_member("coder")
+  → buildMemberConfig 从 session 找到成员
+  → 创建进程
+
+TL: team_send_and_wait(...)
+  → 消息通道正常流转
+
+/team stop
+  → stopAll() → rm -rf sessions/_dynamic_<ts>/ → endSession()
+```
 
 
 ## ADRs

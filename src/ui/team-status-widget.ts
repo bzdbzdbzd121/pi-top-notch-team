@@ -31,11 +31,12 @@ export interface TeamStatusWidget {
 
 export function createTeamStatusWidget(options: {
   teamName: string;
-  members: TeamMember[];
+  /** Dynamic getter for members — called on each refresh so dynamically added members appear. */
+  getMembers: () => TeamMember[];
   teamCtx: TeamContext;
   memberOpsStates: Map<string, MemberOperationalState>;
 }): TeamStatusWidget {
-  const { teamName, members, teamCtx, memberOpsStates } = options;
+  const { teamName, getMembers, teamCtx, memberOpsStates } = options;
   const contextUsageMap = new Map<string, MemberContextInfo | null>();
 
   let pollingTimer: ReturnType<typeof setInterval> | null = null;
@@ -44,6 +45,25 @@ export function createTeamStatusWidget(options: {
 
   // ── Build display lines (with border) ──────────────────
   function buildLines(theme: { fg: (...args: any[]) => string }): string[] {
+    const currentMembers = getMembers();
+
+    // Handle design phase (0 members)
+    if (currentMembers.length === 0) {
+      const title = `● DYNAMIC TEAM — 设计阶段`;
+      const statusText = "✅ 设计团队中（尚无成员）";
+      const titleVw = visibleWidth(title);
+      const statusVw = visibleWidth(statusText);
+      const lineWidth = Math.max(titleVw + 4, statusVw + 2) + 4;
+      const titleFill = repeat("─", Math.max(0, lineWidth - titleVw - 4));
+      const statusPad = repeat(" ", Math.max(0, lineWidth - statusVw - 2));
+      const bottomFill = repeat("─", Math.max(0, lineWidth - 1));
+      return [
+        `┌─ ${theme.fg("accent", title)} ${titleFill}`,
+        `│ ${statusText}${statusPad}`,
+        `└${theme.fg("dim", bottomFill)}`,
+      ];
+    }
+
     // Build status segments (raw for width, styled for display)
     interface Segment {
       raw: string;
@@ -53,7 +73,7 @@ export function createTeamStatusWidget(options: {
     }
     const segments: Segment[] = [];
 
-    for (const m of members) {
+    for (const m of currentMembers) {
       const state = memberOpsStates.get(m.name) ?? "stopped";
       const info = contextUsageMap.get(m.name);
 
@@ -134,7 +154,8 @@ export function createTeamStatusWidget(options: {
 
   // ── Poll context usage from all running members ─────────
   async function pollContextUsage(): Promise<void> {
-    for (const member of members) {
+    const currentMembers = getMembers();
+    for (const member of currentMembers) {
       const handle = teamCtx.memberHandles.get(member.name);
       const state = memberOpsStates.get(member.name);
       if (!handle || state === "stopped" || state === "crashed") continue;

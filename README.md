@@ -26,8 +26,11 @@ pi -e ./index.ts
 /team create
 # → TL will guide you through creating a team definition
 
-# Start a team session
+# Start a team session with a pre-defined team
 /team start <team-name>
+
+# Or use dynamic mode (TL designs team on the fly)
+/team dynamic
 
 # Stop when done
 /team stop
@@ -38,9 +41,10 @@ pi -e ./index.ts
 | Command | Description |
 |---------|-------------|
 | `/team create` | Create a team via natural language dialogue |
+| `/team dynamic` | Dynamic team mode — TL designs team on the fly based on user requirements |
 | `/team edit <name>` | Modify an existing team via natural language dialogue |
-| `/team start <name>` | Start a team session |
-| `/team stop` | End the current team session |
+| `/team start <name>` | Start a team session with a pre-defined YAML team |
+| `/team stop` | End the current team session (cleans up dynamic session directories) |
 | `/team list` | List all team definitions |
 | `/team show <name>` | Display team definition details |
 | `/team cancel`           | Cancel current create/edit operation |
@@ -54,8 +58,8 @@ Tab completion for team names is supported on `/team start`, `/team show`, `/tea
 
 ```
 Your pi session (TL extension)
-  ├── /team command (10 subcommands)
-  ├── 7 process management tools
+  ├── /team command (11 subcommands)
+  ├── 7 process management tools (incl. add_dynamic_member)
   ├── Message channel (event-handler → queue → router → response-waiter)
   └── Member Process Manager
         ├── Member A (pi --mode rpc)
@@ -65,9 +69,9 @@ Your pi session (TL extension)
 
 ### Flow
 
-1. **Define a team** — Use `/team create` to describe your team. The TL collects details and saves a YAML definition to `~/.pi/top-notch-team/teams/`.
+1. **Define a team** — Use `/team create` to describe your team. The TL collects details and saves a YAML definition to `~/.pi/top-notch-team/teams/`. Or use `/team dynamic` to skip pre-definition and let the TL design the team at runtime.
 
-2. **Start a session** — `/team start <name>` activates TL tools (`start_member`, `stop_member`, `list_members`, `get_member_log`, `get_member_status`, `team_send_message`, `team_send_and_wait`) and injects team awareness into the TL's system prompt.
+2. **Start a session** — `/team start <name>` or `/team dynamic` activates TL tools (`start_member`, `stop_member`, `list_members`, `get_member_log`, `get_member_status`, `team_send_message`, `team_send_and_wait`, `add_dynamic_member`) and injects team awareness into the TL's system prompt.
 
 3. **TL works with you** — The TL clarifies requirements, writes a Shared Context document, and spawns Members via `start_member`.
 
@@ -126,6 +130,7 @@ A text-based fallback also parses `<team-message to="..." subject="...">...</tea
 | `list_members()` | Show all member statuses |
 | `get_member_log(name, lines?, maxContentLength?)` | Fetch recent member session via RPC. `maxContentLength` truncates each message (default 200 chars). |
 | `get_member_status()` | Quick status check: idle/working/crashed/stopped. No parameters. |
+| `add_dynamic_member(name, label, systemPrompt, model?)` | Register a member in /team dynamic mode (name=identifier, label=Chinese display name) |
 | `team_send_message(to, subject?, content?)` | Fire-and-forget message to another member or all members |
 | `team_send_and_wait(to, content?, timeout?, correlationId?)` | Send message and block until response, timeout, or all-idle. Re-wait with same correlationId. |
 
@@ -161,7 +166,7 @@ npm test           # Run all tests
 npm run test:watch # Watch mode
 ```
 
-215 tests across 16 files.
+260 tests across 19 files.
 
 ### Project Structure
 
@@ -174,13 +179,14 @@ pi-top-notch-team/
 ├── DESIGN.md             ← Full design specification
 ├── docs/adr/             ← Architecture Decision Records
 └── src/
-    ├── commands/team.ts  ← Unified /team command (10 subcommands)
+    ├── commands/team.ts  ← Unified /team command (11 subcommands)
     ├── commands/status.ts← StatusProvider type
     ├── channel/          ← Message queue + router + response-waiter + event-handler
     ├── process/          ← Member process lifecycle (write queue, size guard)
     ├── tools/tl-tools.ts ← 7 TL process management tools (DI-based)
+    ├── prompts/          ← TL system prompt templates (dynamic-mode.ts)
     ├── team/             ← Definition types, store, schema
-    ├── session/          ← Session state + context + state-machine
+    ├── session/          ← Session state + context + state-machine (incl. addMemberToSession)
     └── setup/            ← Member lifecycle + message channel wiring
 ```
 
