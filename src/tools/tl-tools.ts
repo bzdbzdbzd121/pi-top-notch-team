@@ -5,7 +5,6 @@ import type { ResponseWaiter } from "../channel/response-waiter";
 import type { MessageQueue } from "../channel/message-queue";
 import type { TeamMessage } from "../channel/types";
 import type { MemberOperationalState } from "../session/context";
-import type { TeamMember } from "../team/definition";
 import { createMemberProcess } from "../process/member-process";
 import { spawn } from "node:child_process";
 
@@ -26,12 +25,6 @@ export interface TlToolsDeps {
   createMember?: CreateMemberFn;
   buildMemberConfig?: BuildConfigFn;
   getMemberLog?: GetMemberLogFn;
-  /** Whether the current session is a dynamic team mode (/team dynamic). Function for live check. */
-  isDynamicSession?: boolean | (() => boolean);
-  /** Add a member to the active dynamic session (must update session state + router). */
-  addMemberToSession?: (member: TeamMember) => void;
-  /** Called after a dynamic member is added. Caller can read getSessionState() for updated list. */
-  onDynamicMemberAdded?: () => void;
 }
 
 // ── Tool result types ──────────────────────────────────────
@@ -320,64 +313,6 @@ export function registerTlTools(deps: TlToolsDeps): void {
         lastPendingCorrId,
         messageQueue,
       });
-    },
-  });
-
-  // ── add_dynamic_member ──────────────────────────────────
-  pi.registerTool({
-    name: "add_dynamic_member",
-    label: "Add Dynamic Member",
-    description:
-      "Add a member to the dynamic team session. Only available in /team dynamic mode. " +
-      "Each call adds one member to the in-memory team definition so start_member can launch it later. " +
-      "Parameters: name (identifier), label (Chinese display name), systemPrompt (role definition), model (optional).",
-    promptGuidelines: [
-      "Use add_dynamic_member to register a team member after discussing the role with the user.",
-      "Call once per member role. After all members are added, write .shared-context.md, then start members with start_member.",
-    ],
-    parameters: {
-      type: "object",
-      properties: {
-        name: { type: "string", description: "Member identifier (lowercase, e.g. 'coder', 'reviewer')" },
-        label: { type: "string", description: "Human-readable display name in Chinese (e.g. '编码员')" },
-        systemPrompt: { type: "string", description: "System prompt defining this member's role, skills, and behavior" },
-        model: { type: "string", description: "Optional model override (e.g. 'anthropic/claude-sonnet-4')" },
-      },
-      required: ["name", "label", "systemPrompt"],
-    } as ToolInputSchema,
-    async execute(
-      _toolCallId: string,
-      params: { name: string; label: string; systemPrompt: string; model?: string }
-    ): Promise<ToolResult> {
-      const isDynamic = typeof deps.isDynamicSession === "function" ? deps.isDynamicSession() : deps.isDynamicSession;
-      if (!isDynamic) {
-        return {
-          details: {},
-          content: [{ type: "text" as const, text: "add_dynamic_member 仅在 /team dynamic 动态团队模式下可用。请先使用 /team dynamic 进入动态模式。" }],
-        };
-      }
-
-      const member: TeamMember = {
-        name: params.name,
-        label: params.label,
-        systemPrompt: params.systemPrompt,
-        model: params.model,
-      };
-
-      try {
-        deps.addMemberToSession?.(member);
-        // Notify caller so it can update router + widget with the new member list
-        deps.onDynamicMemberAdded?.();
-        return {
-          details: {},
-          content: [{ type: "text" as const, text: `成员「${params.label}（${params.name}）」已添加到动态团队。使用 start_member ${params.name} 启动。` }],
-        };
-      } catch (err) {
-        return {
-          details: {},
-          content: [{ type: "text" as const, text: `添加成员失败：${err instanceof Error ? err.message : String(err)}` }],
-        };
-      }
     },
   });
 

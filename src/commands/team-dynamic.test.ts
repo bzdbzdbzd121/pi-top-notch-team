@@ -54,6 +54,9 @@ describe("/team dynamic", () => {
     expect(state.teamDefinition!.name).toMatch(/^_dynamic_/);
     expect(state.teamDefinition!.description).toBe("动态团队");
     expect(teamCtx.isDynamicSession).toBe(true);
+    expect(pi.registerTool).toHaveBeenCalledWith(
+      expect.objectContaining({ name: "add_dynamic_member" })
+    );
     expect(pi.setActiveTools).toHaveBeenCalled();
     expect(teamCtx.onSessionStart).toHaveBeenCalled();
     expect(ctx.ui.notify).toHaveBeenCalledWith(

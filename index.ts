@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerTeamCommand } from "./src/commands/team";
 import { TeamModeEditor } from "./src/ui/team-mode-editor";
-import { getSessionState, endSession, addMemberToSession } from "./src/session/state";
+import { getSessionState, endSession } from "./src/session/state";
 import type { TeamContext } from "./src/session/context";
 import { getRootDir } from "./src/config";
 import { join } from "node:path";
@@ -98,14 +98,6 @@ export default function (pi: ExtensionAPI) {
     memberOpsStates,
     lastPendingCorrId,
     messageQueue,
-    isDynamicSession: () => teamCtx.isDynamicSession,
-    addMemberToSession,
-    onDynamicMemberAdded: () => {
-      const session = getSessionState();
-      if (session.teamDefinition) {
-        teamCtx.router!.updateMembers(session.teamDefinition.members.map((m) => m.name));
-      }
-    },
     createMember: (config) => {
       const handle = createAndRegisterMember(pi, config, memberLifecycleDeps);
       teamCtx.memberHandles.set(config.name, handle);

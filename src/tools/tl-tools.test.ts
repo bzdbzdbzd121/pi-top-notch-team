@@ -87,9 +87,9 @@ describe("registerTlTools", () => {
     });
   }
 
-  it("registers 7 tools", () => {
+  it("registers 6 tools (add_dynamic_member is registered dynamically in /team dynamic)", () => {
     callRegisterTlTools();
-    expect(pi.registerTool).toHaveBeenCalledTimes(7);
+    expect(pi.registerTool).toHaveBeenCalledTimes(6);
   });
 
   it("registers start_member tool", () => {
