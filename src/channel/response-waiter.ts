@@ -20,7 +20,7 @@ export interface ResponseWaiter {
    *  - `timeoutMs` elapses → status: "timeout"
    *  - `cancelAll()` is called → status: "cancelled"
    *
-   * Default timeout: 120s. Capped at 300s.
+   * Default timeout: 30 min. Capped at 30 min.
    */
   waitForResponse(
     correlationId: string,
@@ -46,8 +46,8 @@ export interface ResponseWaiter {
   cancelAll(): void;
 }
 
-const DEFAULT_TIMEOUT_MS = 120_000;
-const MAX_TIMEOUT_MS = 300_000;
+const DEFAULT_TIMEOUT_MS = 1_800_000;
+const MAX_TIMEOUT_MS = 1_800_000;
 const MAX_PENDING_LIMIT = 100;
 
 /** TTL for orphaned response buffer entries (5 minutes). */

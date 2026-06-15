@@ -283,7 +283,7 @@ export function registerTlTools(deps: TlToolsDeps): void {
       + "Use instead of team_send_message when you need the member result. "
       + "Params: to (target), content (body, optional for re-wait), "
       + "Automatically stops waiting if all members become idle. "
-      + "timeout (optional ms, default 120000), "
+      + "timeout (optional ms, default 1800000 = 30 min), "
       + "correlationId (optional, reuse from timeout for re-wait).",
     promptGuidelines: [
       "Use team_send_and_wait when you need a member result before continuing.",
@@ -298,7 +298,7 @@ export function registerTlTools(deps: TlToolsDeps): void {
           type: "string",
           description: "Message body (required on first call; omit for re-wait after timeout)",
         },
-        timeout: { type: "number", description: "Max wait in ms (default 120000, max 300000)" },
+        timeout: { type: "number", description: "Max wait in ms (default 1800000 = 30 min, max 1800000)" },
         correlationId: { type: "string", description: "Reuse this correlation ID to re-wait after a timeout (no new message sent)" },
       },
       required: ["to", "content"],
@@ -423,7 +423,7 @@ async function sendAndWaitExecute(
   ctx: SendAndWaitCtx
 ): Promise<ToolResult> {
   const { responseWaiter, lastPendingCorrId, messageQueue } = ctx;
-  const effectiveTimeout = params.timeout ?? 120_000;
+  const effectiveTimeout = params.timeout ?? 1_800_000;
 
   // Re-wait: reuse existing correlation ID, no new message sent
   if (params.correlationId) {

@@ -69,22 +69,22 @@ describe("createResponseWaiter", () => {
     expect(result.status).toBe("timeout");
   });
 
-  it("uses default timeout of 120 seconds", async () => {
+  it("uses default timeout of 30 minutes", async () => {
     const waiter = createResponseWaiter();
     const waitPromise = waiter.waitForResponse("req-abc");
 
-    vi.advanceTimersByTime(120_001);
+    vi.advanceTimersByTime(1_800_001);
     const result = await waitPromise;
     expect(result.status).toBe("timeout");
   });
 
-  it("max timeout is capped at 300 seconds", async () => {
+  it("max timeout is capped at 30 minutes", async () => {
     const waiter = createResponseWaiter();
-    // pass a very large timeout; should be capped to 300s
-    const waitPromise = waiter.waitForResponse("req-abc", 600_000);
+    // pass a very large timeout; should be capped to 30 min
+    const waitPromise = waiter.waitForResponse("req-abc", 3_600_000);
 
-    // Should timeout at ~300s, not 600s
-    vi.advanceTimersByTime(300_001);
+    // Should timeout at ~30 min, not 60 min
+    vi.advanceTimersByTime(1_800_001);
     const result = await waitPromise;
     expect(result.status).toBe("timeout");
   });
