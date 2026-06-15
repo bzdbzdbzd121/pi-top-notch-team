@@ -473,7 +473,7 @@ get_member_status()
 team_send_and_wait({
   to: "analyzer",             // target member name
   content: "分析这段代码",     // message body (optional for re-wait)
-  timeout: 120_000,           // optional, max wait in ms (default 120000, max 300000)
+  timeout: 1_800_000,         // optional, max wait in ms (default 1800000 = 30 min, max 1800000)
   correlationId: "corr-abc"   // optional, reuse from timeout details for re-wait
 })
 ```
