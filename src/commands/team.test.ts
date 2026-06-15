@@ -254,17 +254,28 @@ members:
 
   // ── create_team_definition tool with workflow tests ──
 
-  describe("create_team_definition tool with workflow", () => {
-    it("persists workflow to YAML", async () => {
+  describe("create_team_definition tool with workflow (dynamically registered via /team create)", () => {
+    /** Simulate /team create + return the registered create_team_definition tool */
+    async function setupCreateTool(): Promise<{ pi: any; ctx: any; createTool: any; cmdHandler: any }> {
       const pi = createMockExtensionAPI();
       const registeredTools: any[] = [];
       pi.registerTool = vi.fn((def: any) => { registeredTools.push(def); });
       registerTeamCommand(pi, createTeamContext());
 
+      // Trigger /team create to dynamically register create_team_definition
+      const cmdHandler = (pi.registerCommand as any).mock.calls[0][1];
+      const ctx = createMockContext();
+      await cmdHandler.handler("create", ctx);
+
       const createTool = registeredTools.find((t) => t.name === "create_team_definition");
       expect(createTool).toBeDefined();
+      return { pi, ctx, createTool, cmdHandler };
+    }
 
-      const result = await createTool!.execute("id", {
+    it("persists workflow to YAML", async () => {
+      const { createTool } = await setupCreateTool();
+
+      const result = await createTool.execute("id", {
         name: "test-wf",
         description: "Test with workflow",
         members: [
@@ -296,15 +307,9 @@ members:
     });
 
     it("persists workflow with onFailure object", async () => {
-      const pi = createMockExtensionAPI();
-      const registeredTools: any[] = [];
-      pi.registerTool = vi.fn((def: any) => { registeredTools.push(def); });
-      registerTeamCommand(pi, createTeamContext());
+      const { createTool } = await setupCreateTool();
 
-      const createTool = registeredTools.find((t) => t.name === "create_team_definition");
-      expect(createTool).toBeDefined();
-
-      await createTool!.execute("id", {
+      await createTool.execute("id", {
         name: "test-onfail",
         description: "Test onfailure",
         members: [{ name: "w", systemPrompt: "work" }],
@@ -328,15 +333,9 @@ members:
     });
 
     it("validates workflow and rejects bad input", async () => {
-      const pi = createMockExtensionAPI();
-      const registeredTools: any[] = [];
-      pi.registerTool = vi.fn((def: any) => { registeredTools.push(def); });
-      registerTeamCommand(pi, createTeamContext());
+      const { createTool } = await setupCreateTool();
 
-      const createTool = registeredTools.find((t) => t.name === "create_team_definition");
-      expect(createTool).toBeDefined();
-
-      const result = await createTool!.execute("id", {
+      const result = await createTool.execute("id", {
         name: "bad-wf",
         description: "Bad workflow",
         members: [{ name: "w", systemPrompt: "work" }],

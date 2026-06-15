@@ -165,106 +165,128 @@ export function registerTeamCommand(
     },
   };
 
-  // Register the create_team_definition tool (used by TL during /team create)
-  pi.registerTool({
-    name: "create_team_definition",
-    label: "Create Team Definition",
-    description:
-      "Call this tool after the user has confirmed the team details. " +
-      "Saves the team YAML to ~/.pi/top-notch-team/teams/<name>.yaml and runs validation. " +
-      "Path can be overridden via TOP_NOTCH_TEAM_ROOT env var.",
-    parameters: {
-      type: "object",
-      properties: {
-        name: { type: "string", description: "Team name (identifier)" },
-        description: { type: "string", description: "Team description" },
-        defaultModel: { type: "string", description: "Optional default model for all members" },
-        members: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              name: { type: "string" },
-              label: { type: "string" },
-              systemPrompt: { type: "string" },
-              model: { type: "string" },
+  // ── Helper: register create_team_definition dynamically ──
+  function registerCreateDefinitionTool(
+    pi: ExtensionAPI,
+    saveFn: typeof saveTeamDefinition,
+    getRoot: typeof getRootDir,
+    ctx: TeamContext,
+    wfSchema: typeof workflowSchema,
+  ): void {
+    pi.registerTool({
+      name: "create_team_definition",
+      label: "Create Team Definition",
+      description:
+        "Call this tool after the user has confirmed the team details. " +
+        "Saves the team YAML to ~/.pi/top-notch-team/teams/<name>.yaml and runs validation. " +
+        "Path can be overridden via TOP_NOTCH_TEAM_ROOT env var.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Team name (identifier)" },
+          description: { type: "string", description: "Team description" },
+          defaultModel: { type: "string", description: "Optional default model for all members" },
+          members: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                name: { type: "string" },
+                label: { type: "string" },
+                systemPrompt: { type: "string" },
+                model: { type: "string" },
+              },
+              required: ["name", "systemPrompt"],
             },
-            required: ["name", "systemPrompt"],
+            description: "Team members",
           },
-          description: "Team members",
+          workflow: wfSchema,
         },
-        workflow: workflowSchema,
+        required: ["name", "description", "members"],
+      } as ToolInputSchema,
+      async execute(
+        _toolCallId: string,
+        params: TeamSaveParams,
+      ) {
+        const result = await saveFn(params, getRoot(), false);
+        if (result) return result;
+        ctx.isCreatingTeam = false;
+        // Deactivate tool after successful use
+        const cur = pi.getActiveTools();
+        pi.setActiveTools(cur.filter((t: string) => t !== "create_team_definition"));
+        return {
+          details: {},
+          content: [{
+            type: "text" as const,
+            text: `团队 "${params.name}" 已创建成功！${params.members.length} 个成员已配置。用 /team list 查看，用 /team start ${params.name} 启动。`,
+          }],
+        };
       },
-      required: ["name", "description", "members"],
-    } as ToolInputSchema,
-    async execute(
-      _toolCallId: string,
-      params: TeamSaveParams,
-    ) {
-      const result = await saveTeamDefinition(params, getRootDir(), false);
-      if (result) return result;
-      teamCtx.isCreatingTeam = false;
-      return {
-        details: {},
-        content: [{
-          type: "text" as const,
-          text: `团队 "${params.name}" 已创建成功！${params.members.length} 个成员已配置。用 /team list 查看，用 /team start ${params.name} 启动。`,
-        }],
-      };
-    },
-  });
+    });
+  }
 
-  // ── update_team_definition tool ───────────────────────────
-  pi.registerTool({
-    name: "update_team_definition",
-    label: "Update Team Definition",
-    description:
-      "Call this tool after the user has confirmed changes to an existing team. " +
-      "Overwrites the team YAML at ~/.pi/top-notch-team/teams/<name>.yaml with the new definition and runs validation. " +
-      "Path can be overridden via TOP_NOTCH_TEAM_ROOT env var.\n" +
-      "MERGE FEATURE: For existing (unchanged) members, you only need to pass {name: \"...\"} — " +
-      "systemPrompt/label/model auto-fill from stored YAML. Omit a member to delete it. " +
-      "New or modified members need full data.",
-    parameters: {
-      type: "object",
-      properties: {
-        name: { type: "string", description: "Team name (identifier)" },
-        description: { type: "string", description: "Team description" },
-        defaultModel: { type: "string", description: "Optional default model for all members" },
-        members: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              name: { type: "string" },
-              label: { type: "string" },
-              systemPrompt: { type: "string" },
-              model: { type: "string" },
+  // ── Helper: register update_team_definition dynamically ──
+  function registerUpdateDefinitionTool(
+    pi: ExtensionAPI,
+    saveFn: typeof saveTeamDefinition,
+    getRoot: typeof getRootDir,
+    ctx: TeamContext,
+    wfSchema: typeof workflowSchema,
+  ): void {
+    pi.registerTool({
+      name: "update_team_definition",
+      label: "Update Team Definition",
+      description:
+        "Call this tool after the user has confirmed changes to an existing team. " +
+        "Overwrites the team YAML at ~/.pi/top-notch-team/teams/<name>.yaml with the new definition and runs validation. " +
+        "Path can be overridden via TOP_NOTCH_TEAM_ROOT env var.\n" +
+        "MERGE FEATURE: For existing (unchanged) members, you only need to pass {name: \"...\"} — " +
+        "systemPrompt/label/model auto-fill from stored YAML. Omit a member to delete it. " +
+        "New or modified members need full data.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Team name (identifier)" },
+          description: { type: "string", description: "Team description" },
+          defaultModel: { type: "string", description: "Optional default model for all members" },
+          members: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                name: { type: "string" },
+                label: { type: "string" },
+                systemPrompt: { type: "string" },
+                model: { type: "string" },
+              },
+              required: ["name"],
             },
-            required: ["name"],
+            description: "Team members. For existing unchanged members, just {name: \"...\"} suffices.",
           },
-          description: "Team members. For existing unchanged members, just {name: \"...\"} suffices.",
+          workflow: wfSchema,
         },
-        workflow: workflowSchema,
+        required: ["name", "description", "members"],
+      } as ToolInputSchema,
+      async execute(
+        _toolCallId: string,
+        params: TeamSaveParams,
+      ) {
+        const result = await saveFn(params, getRoot(), true);
+        if (result) return result;
+        ctx.editingTeamName = null;
+        // Deactivate tool after successful use
+        const cur = pi.getActiveTools();
+        pi.setActiveTools(cur.filter((t: string) => t !== "update_team_definition"));
+        return {
+          details: {},
+          content: [{
+            type: "text" as const,
+            text: `团队 "${params.name}" 已更新成功！${params.members.length} 个成员已配置。`,
+          }],
+        };
       },
-      required: ["name", "description", "members"],
-    } as ToolInputSchema,
-    async execute(
-      _toolCallId: string,
-      params: TeamSaveParams,
-    ) {
-      const result = await saveTeamDefinition(params, getRootDir(), true);
-      if (result) return result;
-      teamCtx.editingTeamName = null;
-      return {
-        details: {},
-        content: [{
-          type: "text" as const,
-          text: `团队 "${params.name}" 已更新成功！${params.members.length} 个成员已配置。`,
-        }],
-      };
-    },
-  });
+    });
+  }
 
   pi.registerCommand("team", {
     description: "管理团队（create / start / stop / list / show / delete / status）",
@@ -419,7 +441,8 @@ export function registerTeamCommand(
           // Activate TL tools (including add_dynamic_member for dynamic mode)
           const tlToolNames = teamCtx.tlToolNames;
           const currentActive = pi.getActiveTools();
-          const newActive = [...new Set([...currentActive, ...tlToolNames, "add_dynamic_member"])];
+          const newActive = [...new Set([...currentActive, ...tlToolNames, "add_dynamic_member"])]
+            .filter((t) => t !== "create_team_definition" && t !== "update_team_definition");
           pi.setActiveTools(newActive);
 
           // Install team status widget (design phase — 0 members)
@@ -435,6 +458,16 @@ export function registerTeamCommand(
         // ── /team create ──────────────────────────────────
         case "create": {
           teamCtx.isCreatingTeam = true;
+
+          // Register create_team_definition tool dynamically
+          const allToolsC = ((pi as any).getAllTools?.() ?? []) as Array<{ name: string }>;
+          if (!allToolsC.find((t: { name: string }) => t.name === "create_team_definition")) {
+            registerCreateDefinitionTool(pi, saveTeamDefinition, getRootDir, teamCtx, workflowSchema);
+          }
+          const currentActiveC = pi.getActiveTools();
+          const newActiveC = [...new Set([...currentActiveC, "create_team_definition"])];
+          pi.setActiveTools(newActiveC);
+
           ctx.ui.notify(
             "团队创建模式已启动。请告诉我你想创建的团队信息，TL 会引导你完成。",
             "info"
@@ -451,6 +484,9 @@ export function registerTeamCommand(
           const mode = teamCtx.isCreatingTeam ? "创建" : "编辑";
           teamCtx.isCreatingTeam = false;
           teamCtx.editingTeamName = null;
+          // Deactivate team definition tools
+          const curActive = pi.getActiveTools();
+          pi.setActiveTools(curActive.filter((t: string) => t !== "create_team_definition" && t !== "update_team_definition"));
           ctx.ui.notify(`已取消${mode}操作`, "info");
           return;
         }
@@ -480,6 +516,16 @@ export function registerTeamCommand(
           }
 
           teamCtx.editingTeamName = editName;
+
+          // Register update_team_definition tool dynamically
+          const allToolsE = ((pi as any).getAllTools?.() ?? []) as Array<{ name: string }>;
+          if (!allToolsE.find((t: { name: string }) => t.name === "update_team_definition")) {
+            registerUpdateDefinitionTool(pi, saveTeamDefinition, getRootDir, teamCtx, workflowSchema);
+          }
+          const currentActiveE = pi.getActiveTools();
+          const newActiveE = [...new Set([...currentActiveE, "update_team_definition"])];
+          pi.setActiveTools(newActiveE);
+
           ctx.ui.notify(
             `正在编辑团队 "${editName}"。请告诉 TL 你想做的修改，TL 会引导你完成。`,
             "info"
@@ -508,7 +554,8 @@ export function registerTeamCommand(
 
           const tlToolNames = teamCtx.tlToolNames;
           const currentActive = pi.getActiveTools();
-          const newActive = [...new Set([...currentActive, ...tlToolNames])];
+          const newActive = [...new Set([...currentActive, ...tlToolNames])]
+            .filter((t) => t !== "create_team_definition" && t !== "update_team_definition");
           pi.setActiveTools(newActive);
 
           ctx.ui.notify(
@@ -541,7 +588,7 @@ export function registerTeamCommand(
 
           const tlToolNames = teamCtx.tlToolNames;
           const currentActive = pi.getActiveTools();
-          const toRemove = new Set([...tlToolNames, "add_dynamic_member"]);
+          const toRemove = new Set([...tlToolNames, "add_dynamic_member", "create_team_definition", "update_team_definition"]);
           const newActive = currentActive.filter((t: string) => !toRemove.has(t));
           pi.setActiveTools(newActive);
 
