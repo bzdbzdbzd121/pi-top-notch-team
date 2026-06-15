@@ -228,9 +228,11 @@ npm run test:watch  # Watch mode
 | `get_member_status()` | Get operational status (idle/working/crashed/stopped) for all members. No parameters. |
 | `team_send_and_wait(to, content?, timeout?, correlationId?)` | Send message and wait for response. On timeout, re-wait with same `correlationId` (no new message sent). Response content returned as tool result. |
 
-## Extension Tools (create/edit team)
+## Design Time Tools (create/edit team)
 
-These tools are registered by the TL extension (`index.ts` → `team.ts`) and invoked by the TL agent during `/team create` and `/team edit` flows.
+These tools are dynamically registered and only available during their respective modes:
+- `create_team_definition` — **only during `/team create`** (registered on enter, deactivated on cancel/success)
+- `update_team_definition` — **only during `/team edit <name>`** (registered on enter, deactivated on cancel/success)
 
 | Tool | Description |
 |------|-------------|
