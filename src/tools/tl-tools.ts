@@ -280,32 +280,25 @@ export function registerTlTools(deps: TlToolsDeps): void {
     label: "Send Message and Wait",
     description:
       "Send a message to a team member and WAIT for their response. "
-      + "Use instead of team_send_message when you need the member result. "
-      + "Params: to (target), content (body, optional for re-wait), "
-      + "Automatically stops waiting if all members become idle. "
-      + "timeout (optional ms, default 1800000 = 30 min), "
-      + "correlationId (optional, reuse from timeout for re-wait).",
+      + "Use instead of team_send_message when you need the member result.\n"
+      + "Waits indefinitely until the member replies or all members become idle.\n"
+      + "Params: to (target), content (message body).",
     promptGuidelines: [
       "Use team_send_and_wait when you need a member result before continuing.",
-      "On timeout: check get_member_status; if still working, call team_send_and_wait again with the same correlationId (from timeout details) to re-wait without sending a new message.",
       "team_send_and_wait returns early with allIdle status when all members become idle.",
+      "If all_idle is returned, check work results. If member is still working, call team_send_and_wait again.",
     ],
     parameters: {
       type: "object",
       properties: {
         to: { type: "string", description: "Target member name" },
-        content: {
-          type: "string",
-          description: "Message body (required on first call; omit for re-wait after timeout)",
-        },
-        timeout: { type: "number", description: "Max wait in ms (default 1800000 = 30 min, max 1800000)" },
-        correlationId: { type: "string", description: "Reuse this correlation ID to re-wait after a timeout (no new message sent)" },
+        content: { type: "string", description: "Message body" },
       },
       required: ["to", "content"],
     } as ToolInputSchema,
     async execute(
       _toolCallId: string,
-      params: { to: string; content?: string; timeout?: number; correlationId?: string }
+      params: { to: string; content: string }
     ): Promise<ToolResult> {
       return sendAndWaitExecute(params, {
         responseWaiter,
@@ -362,13 +355,12 @@ interface SendAndWaitCtx {
 
 async function waitWithAllIdleCheck(
   corrId: string,
-  timeoutMs: number,
   memberName: string,
   ctx: SendAndWaitCtx
 ): Promise<ToolResult> {
   const { responseWaiter, memberOpsStates, lastPendingCorrId } = ctx;
 
-  const waitPromise = responseWaiter.waitForResponse(corrId, timeoutMs);
+  const waitPromise = responseWaiter.waitForResponse(corrId);
 
   let pollTimer: ReturnType<typeof setInterval> | null = null;
   const allIdlePromise = new Promise<any>((resolve) => {
@@ -401,36 +393,22 @@ async function waitWithAllIdleCheck(
       content: [{ type: "text" as const, text: "Wait for " + memberName + " was cancelled." }],
     };
   }
-  if (result.status === "all_idle") {
-    // Cancel the waiter so it doesn't orphan; keep lastPendingCorrId alive
-    // so auto-injection works when the member's reply eventually arrives.
-    // reply → resolveIfWaiting (no waiter) → buffers → sendToTl → pi.sendMessage()
-    responseWaiter.cancelByCorrId(corrId);
-    return {
-      details: { allIdle: true },
-      content: [{ type: "text" as const, text: "所有团队成员均处于空闲状态，" + memberName + " 可能已完成任务。请检查工作成果。" }],
-    };
-  }
-  // timeout — keep lastPendingCorrId entry for potential re-wait
+  // all_idle — cancel the waiter so it doesn't orphan; keep lastPendingCorrId alive
+  // so auto-injection works when the member's reply eventually arrives
+  responseWaiter.cancelByCorrId(corrId);
   return {
-    details: { timeout: true, correlationId: corrId },
-    content: [{ type: "text" as const, text: "Timeout waiting for " + memberName + ". Use get_member_status to check. If still working, call team_send_and_wait again with the same correlationId to re-wait." }],
+    details: { allIdle: true },
+    content: [{ type: "text" as const, text: "所有团队成员均处于空闲状态，" + memberName + " 可能已完成任务。请检查工作成果。" }],
   };
 }
 
 async function sendAndWaitExecute(
-  params: { to: string; content?: string; timeout?: number; correlationId?: string },
+  params: { to: string; content: string },
   ctx: SendAndWaitCtx
 ): Promise<ToolResult> {
   const { responseWaiter, lastPendingCorrId, messageQueue } = ctx;
-  const effectiveTimeout = params.timeout ?? 1_800_000;
 
-  // Re-wait: reuse existing correlation ID, no new message sent
-  if (params.correlationId) {
-    return waitWithAllIdleCheck(params.correlationId, effectiveTimeout, params.to, ctx);
-  }
-
-  // First-time wait: generate corr ID, send message, register waiter
+  // Generate corr ID, send message, register waiter
   const corrId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
   lastPendingCorrId.set(params.to, corrId);
 
@@ -445,5 +423,5 @@ async function sendAndWaitExecute(
 
   messageQueue.enqueue(messagePayload as TeamMessage);
 
-  return waitWithAllIdleCheck(corrId, effectiveTimeout, params.to, ctx);
+  return waitWithAllIdleCheck(corrId, params.to, ctx);
 }

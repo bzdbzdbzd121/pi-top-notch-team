@@ -147,10 +147,9 @@ are also parsed via parseTeamMessageTag() (non-greedy regex, length guard) and e
 
 team_send_and_wait flow:
   TL calls team_send_and_wait(to, content) →
-    → responseWaiter.waitForResponse(corrId, timeout)
+    → responseWaiter.waitForResponse(corrId)
     → Message enqueued with <corr:...> tag
     → Member replies → responseWaiter.resolveIfWaiting(corrId, ...) → TL continues
-    → On timeout: TL can re-wait with same correlationId (no duplicate message sent)
     → All-idle detection: returns early when all members are idle
 ```
 
@@ -226,7 +225,7 @@ npm run test:watch  # Watch mode
 | `list_members()` | Show all member statuses |
 | `get_member_log(name, lines?, maxContentLength?)` | Query Member's recent session via RPC. `maxContentLength` truncates each message content (default 200 chars). Truncation uses `slice(0, max-3) + "..."` so total length = maxContentLength. |
 | `get_member_status()` | Get operational status (idle/working/crashed/stopped) for all members. No parameters. |
-| `team_send_and_wait(to, content?, timeout?, correlationId?)` | Send message and wait for response. On timeout, re-wait with same `correlationId` (no new message sent). Response content returned as tool result. |
+| `team_send_and_wait(to, content)` | Send message and wait for response. Blocks until member replies or all members become idle. Response content returned as tool result. |
 
 ## Design Time Tools (create/edit team)
 

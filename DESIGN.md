@@ -469,22 +469,16 @@ get_member_status()
 ### `team_send_and_wait`
 
 ```typescript
-// First-time wait
 team_send_and_wait({
-  to: "analyzer",             // target member name
-  content: "分析这段代码",     // message body (optional for re-wait)
-  timeout: 1_800_000,         // optional, max wait in ms (default 1800000 = 30 min, max 1800000)
-  correlationId: "corr-abc"   // optional, reuse from timeout details for re-wait
+  to: "analyzer",            // target member name
+  content: "分析这段代码",    // message body
 })
 ```
 
-- **First call**: enqueues a message with a correlation ID (`<corr:...>`) embedded in the content
-- **Re-wait after timeout**: pass the `correlationId` from the timeout details to re-register the wait. No new message is sent — the existing correlation tag in the member's context is reused
-- **Blocks** the tool until a matching response arrives or timeout expires
+- **Blocks** the tool until a matching response arrives or all members become idle (all-idle early return)
 - **Correlation matching**: scans incoming messages for `<corr:...>` tags matching the original correlation ID. Supports chain workflows: Member A can forward the tag to Member B
 - **Auto-injection**: if a member's reply is directed to `"tl"` but lacks a `<corr:...>` tag, the TL extension automatically appends the most recent pending correlation ID for that member. This ensures responses are matched even if the member AI forgets to include the tag
-- **Response buffer**: if a member replies between timeout and re-wait, the response is buffered. The subsequent re-wait picks it up immediately instead of timing out again
-- **Timeout**: returns `{ status: "timeout", correlationId }` — check status and re-wait with the same correlationId if still working
+- **No timeout**: waits indefinitely. The only exit paths are: member replies, all members become idle, or `/team stop` cancels the wait
 - **Cancellation**: on `/team stop`, all pending waits are cancelled
 
 **Difference from `team_send_message`:**
@@ -492,7 +486,7 @@ team_send_and_wait({
 | tool | behavior |
 |------|----------|
 | `team_send_message` | Fire-and-forget. Message sent, tool returns immediately. |
-| `team_send_and_wait` | Message sent, tool blocks until response or timeout. Response content is returned as tool result, NOT injected into TL context via `pi.sendMessage()`. |
+| `team_send_and_wait` | Message sent, tool blocks until response or all idle. Response content is returned as tool result, NOT injected into TL context via `pi.sendMessage()`. |
 
 ## 7. Member Tool: `team_send_message`
 

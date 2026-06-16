@@ -283,40 +283,12 @@ describe("registerTlTools", () => {
       expect(result.details).toEqual({});
     });
 
-    it("team_send_and_wait execute returns timeout result after timeout", async () => {
-      const mockResponseWaiter = createMockResponseWaiter();
-      mockResponseWaiter.waitForResponse = vi.fn().mockResolvedValue({
-        status: "timeout",
-      });
+    it("team_send_and_wait returns all_idle when all members become idle", async () => {
+      memberOpsStates.set("analyzer", "idle");
+      memberOpsStates.set("worker", "idle");
 
-      let executeFn: Function = () => {};
-      pi.registerTool = vi.fn((def: any) => {
-        if (def.name === "team_send_and_wait") {
-          executeFn = def.execute;
-        }
-      });
-
-      registerTlTools({
-        pi,
-        manager,
-        responseWaiter: mockResponseWaiter,
-        memberOpsStates,
-        lastPendingCorrId,
-        messageQueue,
-      });
-
-      const result = await executeFn("call-2", { to: "worker", content: "Hello" });
-
-      expect(result.content[0].text).toContain("Timeout");
-      expect(result.details).toHaveProperty("correlationId");
-    });
-
-    it("team_send_and_wait re-wait reuses correlationId", async () => {
-      responseWaiter.waitForResponse = vi.fn().mockResolvedValue({
-        status: "response",
-        from: "worker",
-        content: "Reply on re-wait",
-      });
+      // Mock waitForResponse to return a never-resolving promise so all_idle wins
+      responseWaiter.waitForResponse = vi.fn(() => new Promise(() => {}));
 
       let executeFn: Function = () => {};
       pi.registerTool = vi.fn((def: any) => {
@@ -327,42 +299,9 @@ describe("registerTlTools", () => {
 
       callRegisterTlTools();
 
-      const result = await executeFn("call-3", {
-        to: "worker",
-        correlationId: "existing-corr-id",
-      });
+      const result = await executeFn("call-2", { to: "worker", content: "Hello" });
 
-      expect(result.content[0].text).toContain("Reply on re-wait");
-    });
-
-    it("team_send_and_wait returns all_idle when all members become idle", async () => {
-      memberOpsStates.set("analyzer", "idle");
-      memberOpsStates.set("worker", "idle");
-
-      const mockResponseWaiter = createMockResponseWaiter();
-      mockResponseWaiter.waitForResponse = vi.fn().mockResolvedValue({
-        status: "timeout",
-      });
-
-      let executeFn: Function = () => {};
-      pi.registerTool = vi.fn((def: any) => {
-        if (def.name === "team_send_and_wait") {
-          executeFn = def.execute;
-        }
-      });
-
-      registerTlTools({
-        pi,
-        manager,
-        responseWaiter: mockResponseWaiter,
-        memberOpsStates,
-        lastPendingCorrId,
-        messageQueue,
-      });
-
-      const result = await executeFn("call-4", { to: "worker", content: "Hello" });
-
-      expect(result.details).toHaveProperty("correlationId");
+      expect(result.details).toHaveProperty("allIdle");
     });
   });
 
