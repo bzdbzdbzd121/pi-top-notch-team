@@ -132,7 +132,7 @@ A text-based fallback also parses `<team-message to="..." subject="...">...</tea
 | `get_member_status()` | Quick status check: idle/working/crashed/stopped. No parameters. |
 | `add_dynamic_member(name, label, systemPrompt, model?)` | Register a member in /team dynamic mode (name=identifier, label=Chinese display name) |
 | `team_send_message(to, subject?, content?)` | Fire-and-forget message to another member or all members |
-| `team_send_and_wait(to, content?, timeout?, correlationId?)` | Send message and block until response, timeout, or all-idle. Re-wait with same correlationId. |
+| `team_send_and_wait(to, content)` | Send message and block until member replies or all members become idle. No timeout. |
 
 These tools are only available while a team session is active.
 

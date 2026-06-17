@@ -400,6 +400,8 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
+      const sharedCtxPath = join(getRootDir(), "sessions", team.name, ".shared-context.md");
+
       extraPrompt = `
 ## 当前任务：Team Lead
 
@@ -430,7 +432,7 @@ ${workflowText}
 - **挑战模糊语言** — 当用户用词不精确时，提出更精确的术语。例如用户说"优化性能"——追问"你指的是减少响应时间还是降低资源占用？"
 - **用场景检验边界** — 提出具体的边界场景来检验需求。例如"如果 A 成员依赖 B 成员的结果，但 B 还没完成怎么办？"
 - **对照实际代码** — 当用户描述现有行为时，检查代码是否一致。发现矛盾时指出来让用户确认。
-- **术语和决策立即固化** — 讨论中确定的关键术语、决策、约定，立即写入 .shared-context.md 的对应章节，不攒到后面。
+- **术语和决策立即固化** — 讨论中确定的关键术语、决策、约定，立即写入 shared-context.md（${sharedCtxPath}）的对应章节，不攒到后面。
 
 .shared-context.md 应作为术语表和关键决策记录，不包含实现细节。当某个决策满足以下三个条件时，考虑创建 ADR 文档（在 docs/adr 目录下）：逆决策成本高、外人看会觉得意外、是经过真正权衡后选择的。
 
@@ -444,7 +446,7 @@ ${workflowText}
 ### 可用工具
 你拥有 7 个团队管理工具：
 
-1. **先写 Shared Context** — 用编辑器的 write 或 edit 工具创建 .shared-context.md
+1. **先写 Shared Context** — 用 \`write\` 工具写入 \`${sharedCtxPath}\`
 2. **start_member(name)** — 启动一个 Member 进程
 3. **team_send_and_wait(to, content)** — 给 Member 发任务并等待回复（阻塞），直到收到回复或所有成员空闲
 4. **list_members** — 查看各 Member 的运行状态
