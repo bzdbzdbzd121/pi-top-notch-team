@@ -66,11 +66,20 @@ export function buildMemberConfig(
   if (!memberDef) return null;
 
   const rootDir = getRootDir();
-  const sessionDir = join(rootDir, "sessions", team.name, memberName);
+  const sessionId = session.sessionId;
+  if (!sessionId) {
+    console.warn(
+      `[team] No sessionId in session state — member "${memberName}" will use flat path.`
+    );
+  }
+  // Isolate session data under <rootDir>/sessions/<team-name>/<sessionId>/
+  // This prevents conflicts when the same team is used across multiple sessions.
+  const sessionSubDir = sessionId ? join(team.name, sessionId) : team.name;
+  const sessionDir = join(rootDir, "sessions", sessionSubDir, memberName);
   const sharedContextPath = join(
     rootDir,
     "sessions",
-    team.name,
+    sessionSubDir,
     ".shared-context.md"
   );
 

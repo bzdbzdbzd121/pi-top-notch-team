@@ -1,11 +1,13 @@
 // ── Types ──────────────────────────────────────────────────
 
-export type MemberOperationalState = "idle" | "working" | "crashed" | "stopped";
+import type { MemberOperationalState } from "./context";
+export type { MemberOperationalState };
 
 export type MemberEvent =
   | { type: "task_started" }
   | { type: "task_completed" }
   | { type: "process_exit"; isCrashLoop: boolean }
+  /** Emitted after a member process has been spawned and its RPC is ready (ready promise resolved). */
   | { type: "started" }
   | { type: "stopped" };
 
@@ -33,7 +35,9 @@ export function transitionState(
       return event.isCrashLoop ? "crashed" : "stopped";
 
     case "started":
-      // Started resets any state to idle
+      // Started is emitted after handle.start()'s ready promise resolves,
+      // indicating the member's RPC process is ready to receive commands.
+      // Resets any prior state to idle.
       return "idle";
 
     case "stopped":

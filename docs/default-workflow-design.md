@@ -1,7 +1,7 @@
 # 默认工作流功能 — 详细设计方案
 
-> 版本：v1.0  
-> 日期：2026-06-10  
+> 版本：v1.1  
+> 日期：2026-06-10 (v1.1: onFailure 类型纠正为对象 `{returnToStage, condition}`，loops.stages 类型纠正为 `string[]` 引用)  
 > 作者：Architect
 
 ---
@@ -56,12 +56,11 @@ export interface WorkflowStage {
 
   /**
    * 步骤失败时的处理策略 — 可选。
-   * 不填则使用整体 strictness 默认策略。
-   * - "stop": 步骤失败则终止整个工作流
-   * - "skip": 跳过此步骤，继续执行下一个
-   * - "retry": 重试此步骤（TL 决定重试次数）
+   * 当 stage 失败时，TL 应将工作流回退到指定 stage 重新执行。
+   * returnToStage: 回退到的 stage name（须引用主流程 stages 中的 name）
+   * condition: 触发回退的条件（自然语言描述）
    */
-  onFailure?: "stop" | "skip" | "retry";
+  onFailure?: { returnToStage: string; condition: string };
 }
 ```
 
@@ -79,8 +78,8 @@ export interface WorkflowLoop {
    */
   condition: string;
 
-  /** 循环体内的步骤序列 */
-  stages: WorkflowStage[];
+  /** 循环体内的步骤名称序列（引用主流程 stages 中的 name） */
+  stages: string[];
 }
 ```
 
@@ -172,15 +171,8 @@ workflow:
   loops:
     - condition: "审查不通过需要修改"
       stages:
-        - member: "coder"
-          name: "fix"
-          description: "根据审查意见修改代码"
-          constraints: "reviewer 的审查意见已交付"
-          onFailure: "retry"
-        - member: "reviewer"
-          name: "re-review"
-          description: "验证修改"
-          onFailure: "skip"
+        - implement
+        - review
 ```
 
 **严格模式 CI/CD 流程：**
@@ -192,15 +184,21 @@ workflow:
     - member: "tester"
       name: "lint"
       description: "运行静态分析和 lint"
-      onFailure: "stop"
+      onFailure:
+        returnToStage: "lint"
+        condition: "lint 未通过"
     - member: "tester"
       name: "test"
       description: "运行单元测试和集成测试"
-      onFailure: "stop"
+      onFailure:
+        returnToStage: "test"
+        condition: "测试未通过"
     - member: "builder"
       name: "build"
       description: "构建制品"
-      onFailure: "stop"
+      onFailure:
+        returnToStage: "build"
+        condition: "构建失败"
 ```
 
 ---
@@ -225,7 +223,7 @@ workflow:
 | `input` | string | 否 | — |
 | `output` | string | 否 | — |
 | `constraints` | string | 否 | — |
-| `onFailure` | string | 否 | 仅允许 `"stop"` / `"skip"` / `"retry"` |
+| `onFailure` | object | 否 | `{ returnToStage: string; condition: string }` — returnToStage 须引用主流程中某 stage 的 name |
 
 ### 2.3 strictness 校验
 
@@ -238,7 +236,7 @@ workflow:
 | 字段 | 类型 | 必填 | 约束 |
 |------|------|------|------|
 | `condition` | string | 是 | 非空 |
-| `stages` | array[WorkflowStage] | 是 | 至少一个，校验同普通 stage |
+| `stages` | string[] | 是 | 至少一个，每个 string 须匹配主流程中某 stage 的 name |
 
 ### 2.5 交叉校验
 
@@ -321,9 +319,13 @@ pi.registerTool({
                 output: { type: "string", description: "步骤输出描述（可选）" },
                 constraints: { type: "string", description: "约束条件（可选）" },
                 onFailure: {
-                  type: "string",
-                  enum: ["stop", "skip", "retry"],
-                  description: "失败策略：stop/skip/retry（可选）",
+                  type: "object",
+                  properties: {
+                    returnToStage: { type: "string", description: "回退到的 stage name（引用主流程 stages 中的 name）" },
+                    condition: { type: "string", description: "触发回退的条件（自然语言描述）" },
+                  },
+                  required: ["returnToStage", "condition"],
+                  description: "失败处理策略（可选）",
                 },
               },
               required: ["member", "name", "description"],
@@ -338,8 +340,8 @@ pi.registerTool({
                 condition: { type: "string", description: "循环条件（自然语言描述）" },
                 stages: {
                   type: "array",
-                  items: { /* 同 stages item schema */ },
-                  description: "循环体内的步骤",
+                  items: { type: "string" },
+                  description: "循环体内的步骤名称（引用主流程 stages 中的 name）",
                 },
               },
               required: ["condition", "stages"],
@@ -404,9 +406,7 @@ TL 行为期待：
 - 收到任务后，按 stages 顺序向对应 member 发送任务
 - 用 `team_send_and_wait` 等待每个 stage 完成
 - 完成一个 stage 后才进入下一个
-- 如果 stage 的 `onFailure` 为 `"stop"`，该 stage 失败则停止并通知用户
-- 遇到 `"retry"` 时重试该 stage
-- 遇到 `"skip"` 时跳过，继续下一个
+- 如果 stage 的 `onFailure` 配置了 `returnToStage`，该 stage 失败则回退到指定 stage 重新执行
 
 ### 4.3 Reference 模式提示词注入
 
@@ -453,11 +453,7 @@ if (team.workflow) {
     if (s.input) txt += `\n${prefix}  输入：${s.input}`;
     if (s.output) txt += `\n${prefix}  输出：${s.output}`;
     if (s.constraints) txt += `\n${prefix}  约束：${s.constraints}`;
-    if (s.onFailure) txt += `\n${prefix}  失败策略：${
-      s.onFailure === "stop" ? "终止工作流" :
-      s.onFailure === "skip" ? "跳过继续" :
-      "重试"
-    }`;
+    if (s.onFailure) txt += `\n${prefix}  失败处理：条件「${s.onFailure.condition}」→ 回退至「${s.onFailure.returnToStage}」`;
     return txt;
   };
 
@@ -479,8 +475,8 @@ if (team.workflow) {
     workflowText += `循环段：\n`;
     wf.loops.forEach((loop, i) => {
       workflowText += `  🔁 循环 ${i + 1}：条件「${loop.condition}」\n`;
-      loop.stages.forEach((s) => {
-        workflowText += stageText(s, "    ") + "\n";
+      loop.stages.forEach((stageName) => {
+        workflowText += `    → ${stageName}\n`;
       });
     });
   }
@@ -593,7 +589,7 @@ TL: 明白，在 test 步骤前插入 lint 步骤：
     - 名称：lint
     - 执行成员：tester
     - 描述：运行静态分析和 lint 检查
-    - 失败策略：stop（lint 失败应终止）
+    - 失败处理：条件「lint 未通过」→ 回退至 lint
     还有其他修改吗？
 ```
 
@@ -611,7 +607,7 @@ TL: 明白，在 test 步骤前插入 lint 步骤：
 对话流程：
 1. 问用户是否需要工作流
 2. 需要则问 strictness（strict/reference）
-3. 逐步骤收集（member/name/description/input/output/constraints/onFailure）
+3. 逐步骤收集（member/name/description/input/output/constraints/onFailure — onFailure 含 returnToStage + condition）
 4. 问是否需要循环段
 5. 最后调用 create_team_definition 时一并提交
 ```

@@ -25,14 +25,30 @@ export interface TlToolsDeps {
   createMember?: CreateMemberFn;
   buildMemberConfig?: BuildConfigFn;
   getMemberLog?: GetMemberLogFn;
+  /** Called after a member is successfully started (for dynamic mode phase transitions). */
+  onDynamicPhaseTransition?: () => void;
 }
 
 // ── Tool result types ──────────────────────────────────────
 
+/** JSON Schema property descriptor (recursive). */
+export interface ToolParameterProperty {
+  type: string;
+  description?: string;
+  items?: ToolParameterProperty;
+  properties?: Record<string, ToolParameterProperty>;
+  required?: readonly string[];
+  enum?: readonly string[];
+  oneOf?: readonly Record<string, unknown>[];
+  // Allow additional JSON Schema fields
+  [key: string]: unknown;
+}
+
 /** JSON Schema for tool parameters (passed to LLM). */
 export interface ToolInputSchema {
   type: "object";
-  properties: Record<string, unknown>;
+  description?: string;
+  properties: Record<string, ToolParameterProperty>;
   required?: readonly string[];
 }
 
@@ -75,7 +91,7 @@ export function registerTlTools(deps: TlToolsDeps): void {
         },
       },
       required: ["name"],
-    } as ToolInputSchema,
+    },
     async execute(_toolCallId: string, params: { name: string }): Promise<ToolResult> {
       const config = buildMemberConfig?.(params.name);
       if (!config) {
@@ -93,6 +109,8 @@ export function registerTlTools(deps: TlToolsDeps): void {
       try {
         const handle = createMember(config);
         await handle.start();
+        // Notify the host about phase transition (e.g. dynamic mode design → execution)
+        deps.onDynamicPhaseTransition?.();
         return {
           details: {},
           content: [
@@ -135,7 +153,7 @@ export function registerTlTools(deps: TlToolsDeps): void {
         },
       },
       required: ["name"],
-    } as ToolInputSchema,
+    },
     async execute(_toolCallId: string, params: { name: string }): Promise<ToolResult> {
       await manager.stop(params.name);
       return {
@@ -161,7 +179,7 @@ export function registerTlTools(deps: TlToolsDeps): void {
     parameters: {
       type: "object",
       properties: {},
-    } as ToolInputSchema,
+    },
     async execute(): Promise<ToolResult> {
       const statuses = manager.listStatus();
       if (statuses.length === 0) {
@@ -198,8 +216,8 @@ export function registerTlTools(deps: TlToolsDeps): void {
       "Retrieve a Member's recent conversation log to check their progress. " +
       "Parameters: name (member identifier), lines (number of recent lines, default 3).",
     promptGuidelines: [
-      "Use get_member_status FIRST for a quick status check (idle/working/crashed/stopped).",
-      "Only use get_member_log when you need the detailed conversation content — it is heavier than get_member_status.",
+      "Use wait_and_get_member_status FIRST for a quick status check (idle/working/crashed/stopped).",
+      "Only use get_member_log when you need the detailed conversation content — it is heavier than wait_and_get_member_status.",
     ],
     parameters: {
       type: "object",
@@ -218,7 +236,7 @@ export function registerTlTools(deps: TlToolsDeps): void {
         },
       },
       required: ["name"],
-    } as ToolInputSchema,
+    },
     async execute(
       _toolCallId: string,
       params: { name: string; lines?: number; maxContentLength?: number }
@@ -282,23 +300,25 @@ export function registerTlTools(deps: TlToolsDeps): void {
       "Send a message to a team member and WAIT for their response. "
       + "Use instead of team_send_message when you need the member result.\n"
       + "Waits indefinitely until the member replies or all members become idle.\n"
-      + "Params: to (target), content (message body).",
+      + "Params: to (target), content (message body), nextSteps (下一步计划，wait 结束后返回给 TL 以强调工作流程).",
     promptGuidelines: [
       "Use team_send_and_wait when you need a member result before continuing.",
       "team_send_and_wait returns early with allIdle status when all members become idle.",
       "If all_idle is returned, check work results. If member is still working, call team_send_and_wait again.",
+      "Always fill in nextSteps with what you plan to do after the wait ends — it will be returned to you to keep the workflow on track.",
     ],
     parameters: {
       type: "object",
       properties: {
         to: { type: "string", description: "Target member name" },
         content: { type: "string", description: "Message body" },
+        nextSteps: { type: "string", description: "基于工作流程，wait 结束后下一步计划是什么。该信息会在工具返回时一并发送给你，用于强调工作流程方向。" },
       },
-      required: ["to", "content"],
-    } as ToolInputSchema,
+      required: ["to", "content", "nextSteps"],
+    },
     async execute(
       _toolCallId: string,
-      params: { to: string; content: string }
+      params: { to: string; content: string; nextSteps: string }
     ): Promise<ToolResult> {
       return sendAndWaitExecute(params, {
         responseWaiter,
@@ -309,18 +329,21 @@ export function registerTlTools(deps: TlToolsDeps): void {
     },
   });
 
-  // ── get_member_status ───────────────────────────────────
+    // ── wait_and_get_member_status ───────────────────────────────────
   pi.registerTool({
-    name: "get_member_status",
+    name: "wait_and_get_member_status",
     label: "Get Member Operational Status",
     description:
-      "Quick lightweight check of all members' operational status (idle/working/crashed/stopped). " +
-      "No parameters. Use this instead of get_member_log when you just need to know if a member is available.",
+      "等待所有 member 空闲后查看所有 Member 的运行状态 (idle/working/crashed/stopped)。" +
+      "No parameters. 如果任何 member 仍在工作中，该工具会阻塞直到所有 member 变为 idle。" +
+      "和 team_send_and_wait 检测 all-idle 的方式相同。",
     promptGuidelines: [
-      "Use get_member_status FIRST to quickly check if members are idle, working, or crashed.",
+      "Use wait_and_get_member_status FIRST to quickly check if members are idle, working, or crashed.",
+      "wait_and_get_member_status now WAITS until all members are idle before returning.",
+      "If no members started, returns immediately.",
       "Only use get_member_log when you need detailed conversation content.",
     ],
-    parameters: { type: "object", properties: {} } as ToolInputSchema,
+    parameters: { type: "object", properties: {} },
     async execute(): Promise<ToolResult> {
       const entries = Array.from(memberOpsStates.entries());
       if (entries.length === 0) {
@@ -329,6 +352,13 @@ export function registerTlTools(deps: TlToolsDeps): void {
           content: [{ type: "text" as const, text: "还没有启动任何团队成员。请先使用 start_member 启动成员。" }],
         };
       }
+
+      // Quick check: if all members are already idle, skip waiting
+      if (!entries.every(([, s]) => s === "idle")) {
+        // Wait until all members are idle (same mechanism as team_send_and_wait)
+        await waitForAllIdle(memberOpsStates);
+      }
+
       const lines = entries.map(([name, state]) => {
         const icon = state === "working" ? "🔧"
                    : state === "idle" ? "✅"
@@ -344,7 +374,38 @@ export function registerTlTools(deps: TlToolsDeps): void {
   });
 }
 
-// ── Shared helper: wait with all-idle early detection ──────
+// ── Shared helpers ──────────────────────────────────────────
+
+// Exported for testability
+ export const WAIT_IDLE_REQUIRED_CONSECUTIVE = 4;
+ export const WAIT_IDLE_CHECK_INTERVAL_MS = 3000;
+
+/**
+ * Wait until all members are in "idle" operational state.
+ * Uses the same consecutive-idle-count mechanism as team_send_and_wait.
+ * NOTE: Does NOT do a quick-start check — always polls for at least
+ * WAIT_IDLE_REQUIRED_CONSECUTIVE checks. Callers that want a fast path
+ * (e.g. wait_and_get_member_status) should do their own pre-check before calling.
+ */
+async function waitForAllIdle(
+  memberOpsStates: Map<string, MemberOperationalState>
+): Promise<void> {
+  return new Promise<void>((resolve) => {
+    let consecutiveIdleCount = 0;
+    const pollTimer = setInterval(() => {
+      const currentEntries = Array.from(memberOpsStates.entries());
+      if (currentEntries.length > 0 && currentEntries.every(([, s]) => s === "idle")) {
+        consecutiveIdleCount++;
+        if (consecutiveIdleCount >= WAIT_IDLE_REQUIRED_CONSECUTIVE) {
+          clearInterval(pollTimer);
+          resolve();
+        }
+      } else {
+        consecutiveIdleCount = 0;
+      }
+    }, WAIT_IDLE_CHECK_INTERVAL_MS);
+  });
+}
 
 interface SendAndWaitCtx {
   responseWaiter: ResponseWaiter;
@@ -356,54 +417,43 @@ interface SendAndWaitCtx {
 async function waitWithAllIdleCheck(
   corrId: string,
   memberName: string,
+  nextSteps: string,
   ctx: SendAndWaitCtx
 ): Promise<ToolResult> {
   const { responseWaiter, memberOpsStates, lastPendingCorrId } = ctx;
 
   const waitPromise = responseWaiter.waitForResponse(corrId);
-
-  let pollTimer: ReturnType<typeof setInterval> | null = null;
-  const allIdlePromise = new Promise<any>((resolve) => {
-    pollTimer = setInterval(() => {
-      const entries = Array.from(memberOpsStates.entries());
-      if (entries.length > 0 && entries.every(([, s]) => s === "idle")) {
-        clearInterval(pollTimer!);
-        resolve({ status: "all_idle" });
-      }
-    }, 3000);
-  });
-
-  waitPromise.finally(() => {
-    if (pollTimer) clearInterval(pollTimer);
-  });
+  const allIdlePromise = waitForAllIdle(memberOpsStates);
 
   const result = await Promise.race([waitPromise, allIdlePromise]);
 
-  if (result.status === "response") {
+  const nextStepsFooter = "\n\n---\n下一步计划：" + nextSteps;
+
+  if (result && result.status === "response") {
     lastPendingCorrId.delete(memberName);
     return {
-      details: {},
-      content: [{ type: "text" as const, text: "[" + memberName + " reply] " + result.content }],
+      details: { nextSteps },
+      content: [{ type: "text" as const, text: "[" + memberName + " reply] " + result.content + nextStepsFooter }],
     };
   }
-  if (result.status === "cancelled") {
+  if (result && result.status === "cancelled") {
     lastPendingCorrId.delete(memberName);
     return {
-      details: {},
-      content: [{ type: "text" as const, text: "Wait for " + memberName + " was cancelled." }],
+      details: { nextSteps },
+      content: [{ type: "text" as const, text: "Wait for " + memberName + " was cancelled." + nextStepsFooter }],
     };
   }
   // all_idle — cancel the waiter so it doesn't orphan; keep lastPendingCorrId alive
   // so auto-injection works when the member's reply eventually arrives
   responseWaiter.cancelByCorrId(corrId);
   return {
-    details: { allIdle: true },
-    content: [{ type: "text" as const, text: "所有团队成员均处于空闲状态，" + memberName + " 可能已完成任务。请检查工作成果。" }],
+    details: { allIdle: true, nextSteps },
+    content: [{ type: "text" as const, text: "所有团队成员均处于空闲状态，" + memberName + " 可能已完成任务。请检查工作成果。" + nextStepsFooter }],
   };
 }
 
 async function sendAndWaitExecute(
-  params: { to: string; content: string },
+  params: { to: string; content: string; nextSteps: string },
   ctx: SendAndWaitCtx
 ): Promise<ToolResult> {
   const { responseWaiter, lastPendingCorrId, messageQueue } = ctx;
@@ -423,5 +473,5 @@ async function sendAndWaitExecute(
 
   messageQueue.enqueue(messagePayload as TeamMessage);
 
-  return waitWithAllIdleCheck(corrId, params.to, ctx);
+  return waitWithAllIdleCheck(corrId, params.to, params.nextSteps, ctx);
 }

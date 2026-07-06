@@ -71,7 +71,7 @@ Your pi session (TL extension)
 
 1. **Define a team** — Use `/team create` to describe your team. The TL collects details and saves a YAML definition to `~/.pi/top-notch-team/teams/`. Or use `/team dynamic` to skip pre-definition and let the TL design the team at runtime.
 
-2. **Start a session** — `/team start <name>` or `/team dynamic` activates TL tools (`start_member`, `stop_member`, `list_members`, `get_member_log`, `get_member_status`, `team_send_message`, `team_send_and_wait`, `add_dynamic_member`) and injects team awareness into the TL's system prompt.
+2. **Start a session** — `/team start <name>` or `/team dynamic` activates TL tools (`start_member`, `stop_member`, `list_members`, `get_member_log`, `wait_and_get_member_status`, `team_send_message`, `team_send_and_wait`, `add_dynamic_member`) and injects team awareness into the TL's system prompt.
 
 3. **TL works with you** — The TL clarifies requirements, writes a Shared Context document, and spawns Members via `start_member`.
 
@@ -103,23 +103,15 @@ members:
 
 ## Architecture
 
-### Message Channel
+See [DESIGN.md](DESIGN.md) for the full architecture spec and [docs/adr/](docs/adr/) for decision records.
 
-```
-Member A calls team_send_message({to: "mover", content: "..."})
-  → RPC stdout emits tool_execution_end event
-  → event-handler.ts catches, deduplicates via Map-based cache,
-    auto-populates <corr:...> for TL-directed messages
-  → Message enqueued in serial FIFO queue (event-driven drain, no polling)
-  → Router dispatches:
-    ├── to="mover"  → writes prompt to Member B's RPC stdin
-    ├── to="tl"     → responseWaiter.resolveIfWaiting() or buffer
-                         → pi.sendMessage({customType:"team-message",...})
-    ├── to="all"    → broadcasts to all Members
-    └── unknown     → notify via pi.sendMessage
-```
+**TL** — user's pi session, registers `/team` command + process management tools.
 
-A text-based fallback also parses `<team-message to="..." subject="...">...</team-message>` tags in assistant output, so messages work even when the LLM writes them as text instead of calling the tool.
+**Members** — independent `pi --mode rpc` subprocesses, keep own context.
+
+**Message Channel** — TL routes messages between agents via RPC event stream. No external infrastructure needed.
+
+**Role injection** — env vars (`TEAM_ROLE`, `TEAM_NAME`, etc.) set on Member spawn.
 
 ### TL Tools
 
@@ -129,10 +121,9 @@ A text-based fallback also parses `<team-message to="..." subject="...">...</tea
 | `stop_member(name)` | Gracefully terminate a Member process |
 | `list_members()` | Show all member statuses |
 | `get_member_log(name, lines?, maxContentLength?)` | Fetch recent member session via RPC. `maxContentLength` truncates each message (default 200 chars). |
-| `get_member_status()` | Quick status check: idle/working/crashed/stopped. No parameters. |
+| `wait_and_get_member_status()` | 等待所有 member 空闲后查看运行状态: idle/working/crashed/stopped。如有 member 在工作则阻塞。No parameters. |
 | `add_dynamic_member(name, label, systemPrompt, model?)` | Register a member in /team dynamic mode (name=identifier, label=Chinese display name) |
-| `team_send_message(to, subject?, content?)` | Fire-and-forget message to another member or all members |
-| `team_send_and_wait(to, content)` | Send message and block until member replies or all members become idle. No timeout. |
+| `team_send_and_wait(to, content, nextSteps)` | Send message and block until member replies or all members become idle. nextSteps 在 wait 结束后随结果返回。No timeout. |
 
 These tools are only available while a team session is active.
 
@@ -166,37 +157,16 @@ npm test           # Run all tests
 npm run test:watch # Watch mode
 ```
 
-260 tests across 19 files.
 
-### Project Structure
-
-```
-pi-top-notch-team/
-├── index.ts              ← TL extension (entry point)
-├── member.ts             ← Member extension (team_send_message tool)
-├── AGENTS.md             ← AI agent codebase guide
-├── CONTEXT.md            ← Glossary & key decisions
-├── DESIGN.md             ← Full design specification
-├── docs/adr/             ← Architecture Decision Records
-└── src/
-    ├── commands/team.ts  ← Unified /team command (11 subcommands)
-    ├── commands/status.ts← StatusProvider type
-    ├── channel/          ← Message queue + router + response-waiter + event-handler
-    ├── process/          ← Member process lifecycle (write queue, size guard)
-    ├── tools/tl-tools.ts ← 7 TL process management tools (DI-based)
-    ├── prompts/          ← TL system prompt templates (dynamic-mode.ts)
-    ├── team/             ← Definition types, store, schema
-    ├── session/          ← Session state + context + state-machine (incl. addMemberToSession)
-    └── setup/            ← Member lifecycle + message channel wiring
-```
+260+ tests. See [AGENTS.md](AGENTS.md) for full source map and DI pattern documentation.
 
 ## Design Decisions
 
-- **Members as independent `pi --mode rpc` processes** — each Member has its own session context, unlike subagent delegation which loses context after each task. See [ADR-0001](docs/adr/0001-members-as-independent-pi-rpc-processes.md).
+Key decisions documented in [ADRs](docs/adr/):
 
-- **TL as central message router** — no external message bus needed. Member messages are detected via RPC `tool_execution_end` events, enqueued, and routed. See [ADR-0002](docs/adr/0002-tl-as-central-message-router.md).
-
-- **Environment variables for role injection** — `TEAM_ROLE`, `TEAM_NAME`, `TEAM_MEMBERS` etc. are set on spawn. The Member extension reads these to inject team awareness without accessing the YAML file.
+- **Members as independent pi --mode rpc processes** — own context, session persistence, recoverable. [ADR-0001](docs/adr/0001-members-as-independent-pi-rpc-processes.md)
+- **TL as central message router** — RPC event stream, no external bus needed. [ADR-0002](docs/adr/0002-tl-as-central-message-router.md)
+- **Environment variables for role injection** — spawned Member gets role/config via env vars, not YAML file access.
 
 ## License
 

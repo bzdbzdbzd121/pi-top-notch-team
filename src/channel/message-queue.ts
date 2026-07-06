@@ -86,9 +86,8 @@ export function createMessageQueue(
         }
         if (stopped) return;
 
-        // If more items were added during or after processing, wait
-        // for them to be processed without polling
-        if (queue.length > 0) {
+        // Iteratively wait for processing cycles until queue is empty
+        while (queue.length > 0 && !stopped) {
           await new Promise<void>((resolve) => {
             drainResolve = resolve;
             // Re-check: queue may have been drained since our last check
@@ -97,7 +96,6 @@ export function createMessageQueue(
               resolve();
             }
           });
-          return drainLoop();
         }
       };
       return drainLoop();

@@ -114,6 +114,24 @@ describe("createResponseWaiter", () => {
     // Should not throw
     waiter.cancelByCorrId("nonexistent");
   });
+
+  it("clearCorrelation silently removes a pending entry without resolving", () => {
+    const waiter = createResponseWaiter();
+    waiter.waitForResponse("corr-123");
+
+    // Clear the correlation silently
+    waiter.clearCorrelation("corr-123");
+
+    // resolveIfWaiting should now return false (entry removed)
+    const resolved = waiter.resolveIfWaiting("corr-123", "worker", "reply");
+    expect(resolved).toBe(false);
+  });
+
+  it("clearCorrelation does nothing for non-existent correlationId", () => {
+    const waiter = createResponseWaiter();
+    expect(() => waiter.clearCorrelation("nonexistent")).not.toThrow();
+  });
+
 });
 
 describe("extractCorrelationId", () => {

@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
-import { createMemberProcess, MAX_COMMAND_SIZE, type MemberProcessConfig } from "./member-process";
+import { createMemberProcess, MAX_COMMAND_SIZE, MAX_PENDING_WRITES, type MemberProcessConfig } from "./member-process";
 
 function createMockSpawn() {
   const stdin = new PassThrough();
@@ -314,6 +314,31 @@ describe("createMemberProcess", () => {
   describe("MAX_COMMAND_SIZE", () => {
     it("is exported and equals 1MB", () => {
       expect(MAX_COMMAND_SIZE).toBe(1024 * 1024);
+    });
+  });
+
+  describe("MAX_PENDING_WRITES", () => {
+    it("is exported and equals 1000", () => {
+      expect(MAX_PENDING_WRITES).toBe(1000);
+    });
+  });
+
+  describe("startingInProgress flag", () => {
+    it("should prevent concurrent start() calls", async () => {
+      const { process: mockProcess, stdout } = createMockSpawn();
+      const spawnMock = vi.fn().mockReturnValue(mockProcess);
+
+      const member = createMemberProcess(defaultConfig, spawnMock);
+
+      // Call start twice concurrently
+      const start1 = member.start();
+      const start2 = member.start();
+      emitReadyStdout(stdout);
+      await Promise.all([start1, start2]);
+
+      // Only one spawn should have happened
+      expect(spawnMock).toHaveBeenCalledTimes(1);
+      expect(member.getState().status).toBe("running");
     });
   });
 });

@@ -5,6 +5,7 @@ import type { MemberOperationalState } from "../session/context";
 import type { MessageQueue } from "../channel/message-queue";
 import type { ResponseWaiter } from "../channel/response-waiter";
 import type { TeamMessage } from "../channel/types";
+import type { ProcessManager } from "../process/manager";
 
 // ── Constants ──────────────────────────────────────────────
 
@@ -26,6 +27,8 @@ export interface EventHandlerDeps {
   lastPendingCorrId: Map<string, string>;
   /** Map<dedupKey, timestamp> — replaces Set<string> + individual setTimeout pattern. */
   recentlyProcessedMessages: Map<string, number>;
+  /** Optional ProcessManager for auto-restart handling on process exit. */
+  processManager?: ProcessManager;
 }
 
 // ── Dedup helpers ───────────────────────────────────────────
@@ -34,45 +37,39 @@ export interface EventHandlerDeps {
 // and a max-size cap prevents unbounded growth.
 
 /**
- * Mark a dedup key as processed with the current timestamp.
- * Prunes expired entries and enforces a max size limit.
+ * Mark a dedup key as processed, storing its expiry timestamp.
+ * Lazy cleanup: only prunes expired entries when size exceeds 2x max.
+ * Typical case is O(1) — just a map set.
  */
 export function markDedupProcessed(
   map: Map<string, number>,
   key: string
 ): void {
-  const now = Date.now();
-  map.set(key, now);
+  const expiry = Date.now() + DEDUP_TTL_MS;
+  map.set(key, expiry);
 
-  // Prune expired entries (older than DEDUP_TTL_MS)
-  for (const [k, ts] of map) {
-    if (now - ts > DEDUP_TTL_MS) {
-      map.delete(k);
-    }
-  }
-
-  // If still over the max size after pruning, remove oldest entries
-  if (map.size > DEDUP_MAX_SIZE) {
-    // Sort by timestamp (oldest first) and keep only the newest DEDUP_MAX_SIZE
-    const sorted = [...map.entries()].sort((a, b) => a[1] - b[1]);
-    const toRemove = sorted.slice(0, map.size - DEDUP_MAX_SIZE);
-    for (const [k] of toRemove) {
-      map.delete(k);
+  // Lazy cleanup: only prune when map exceeds 2x the max size
+  if (map.size > DEDUP_MAX_SIZE * 2) {
+    const now = Date.now();
+    for (const [k, ts] of map) {
+      if (ts < now) {
+        map.delete(k);
+      }
     }
   }
 }
 
 /**
  * Check if a dedup key was recently processed (within DEDUP_TTL_MS).
- * Also removes the entry if it has expired.
+ * Lazily removes the entry if expired (single-entry cleanup).
  */
 export function wasDedupProcessed(
   map: Map<string, number>,
   key: string
 ): boolean {
-  const ts = map.get(key);
-  if (ts === undefined) return false;
-  if (Date.now() - ts > DEDUP_TTL_MS) {
+  const expiry = map.get(key);
+  if (expiry === undefined) return false;
+  if (Date.now() > expiry) {
     map.delete(key);
     return false;
   }
@@ -234,6 +231,10 @@ export function createMemberEventHandler(
           display: true,
         });
       }
+
+      // Notify ProcessManager for auto-restart handling (only for unexpected exits)
+      deps.processManager?.handleExit(event.memberName, exitCode);
+
       return;
     }
 

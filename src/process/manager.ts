@@ -1,9 +1,24 @@
 import type { MemberProcessHandle, MemberState } from "./member-process";
 import { transitionState } from "../session/state-machine";
-import type { MemberOperationalState } from "../session/state-machine";
+import type { MemberOperationalState } from "../session/context";
 
 export interface ProcessManagerOptions {
-  /** Whether to automatically restart crashed members. Default: true */
+  /**
+   * Whether to automatically restart crashed members. Default: true
+   *
+   * When a member crashes, `handleExit()` uses exponential backoff:
+   *   1st crash → restart after `initialBackoffMs` (default 1s)
+   *   2nd crash → restart after `initialBackoffMs * 2` (2s)
+   *   3rd crash → restart after `initialBackoffMs * 4` (4s)
+   *   4th crash → restart after `initialBackoffMs * 8` (8s)
+   *   5th crash → restart after `initialBackoffMs * 16` (16s)
+   *   6th+      → crash loop detected if within `restartWindowMs`
+   *
+   * `restartWindowMs`: sliding window duration. Crashes outside this window
+   *   are not counted toward maxRestarts.
+   * `maxRestarts`: max crashes allowed within the sliding window before
+   *   onCrashLoopDetected fires and auto-restart stops.
+   */
   autoRestart?: boolean;
   /** Max restarts within the tracking window before giving up. Default: 5 */
   maxRestarts?: number;
@@ -79,16 +94,20 @@ export function createProcessManager(
   }
 
   /**
-   * Record a crash and check if the limit is exceeded.
+   * Record a crash timestamp, prune old entries, and return { exceeded, count }.
+   * count is the number of crashes within the sliding window (including current).
    */
-  function recordCrash(name: string): boolean {
+  function recordCrash(name: string): { exceeded: boolean; count: number } {
     const now = Date.now();
     let timestamps = crashTimestamps.get(name) ?? [];
     // Prune old entries
     timestamps = timestamps.filter((t) => now - t < restartWindowMs);
     timestamps.push(now);
     crashTimestamps.set(name, timestamps);
-    return timestamps.length > maxRestarts;
+    return {
+      exceeded: timestamps.length > maxRestarts,
+      count: timestamps.length,
+    };
   }
 
   /**
@@ -155,9 +174,13 @@ export function createProcessManager(
       pendingRestartTimers.clear();
       crashTimestamps.clear();
       frozenMembers.clear();
-      await Promise.all(
+      const results = await Promise.allSettled(
         Array.from(memberMap.values()).map((h) => h.stop())
       );
+      const failures = results.filter(r => r.status === "rejected");
+      if (failures.length > 0) {
+        console.warn(`[top-notch-team] ${failures.length} member(s) failed to stop gracefully`);
+      }
     },
 
     handleExit(name: string, exitCode: number | null): void {
@@ -174,8 +197,8 @@ export function createProcessManager(
       // Regular error codes (code=1, etc.) go through the normal crash loop
       const isSevere = exitCode === 6 || exitCode === 11;
 
-      // Check crash loop
-      const exceeded = recordCrash(name);
+      // Check crash loop (recordCrash returns both exceeded flag and current count)
+      const { exceeded, count } = recordCrash(name);
       if (exceeded || isSevere) {
         frozenMembers.add(name);
         operationalStates.set(name, transitionState(operationalStates.get(name) ?? "idle", { type: "process_exit", isCrashLoop: true }));
@@ -184,8 +207,7 @@ export function createProcessManager(
         return;
       }
 
-      // Prune crash count and compute backoff delay separately
-      const count = pruneCrashCount(name);
+      // Use the count from recordCrash directly (avoid redundant pruneCrashCount call)
       const delayMs = getBackoffDelay(count);
       const attempt = count;
 

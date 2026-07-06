@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 
-import type { MemberOperationalState, MemberEvent } from "./state-machine";
+import type { MemberOperationalState } from "./context";
+import type { MemberEvent } from "./state-machine";
 import { transitionState } from "./state-machine";
 
 describe("MemberOperationalState type", () => {

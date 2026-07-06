@@ -1,7 +1,8 @@
-# 默认工作流功能 — 任务拆解方案
+# 默认工作流功能 — 任务拆解方案 (归档)
 
-> 基于：`.shared-context.md`（需求）+ `docs/default-workflow-design.md`（设计方案）  
-> 注意：设计方案中 `onFailure` 和 `loops.stages` 需按用户确认纠正
+> **状态：已实现。** 此文件为功能实现前的任务规划，保留作实现记录。
+> `onFailure` 和 `loops.stages` 的纠正已合并到 `default-workflow-design.md`。
+> 基于：`.shared-context.md`（需求）+ `docs/default-workflow-design.md`（设计方案）
 
 ---
 

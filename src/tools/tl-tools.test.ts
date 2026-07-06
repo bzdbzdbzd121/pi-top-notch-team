@@ -1,5 +1,5 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import { registerTlTools } from "./tl-tools";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { registerTlTools, WAIT_IDLE_CHECK_INTERVAL_MS, WAIT_IDLE_REQUIRED_CONSECUTIVE } from "./tl-tools";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { ProcessManager } from "../process/manager";
 import type { ResponseWaiter } from "../channel/response-waiter";
@@ -174,10 +174,10 @@ describe("registerTlTools", () => {
     );
   });
 
-  it("registers get_member_status tool", () => {
+  it("registers wait_and_get_member_status tool", () => {
     callRegisterTlTools();
     expect(pi.registerTool).toHaveBeenCalledWith(
-      expect.objectContaining({ name: "get_member_status" })
+      expect.objectContaining({ name: "wait_and_get_member_status" })
     );
   });
 
@@ -245,8 +245,11 @@ describe("registerTlTools", () => {
 
       expect(toolDef.parameters.required).toContain("to");
       expect(toolDef.parameters.required).toContain("content");
+      expect(toolDef.parameters.required).toContain("nextSteps");
       expect(toolDef.parameters.properties.content).toBeDefined();
       expect(toolDef.parameters.properties.content.type).toBe("string");
+      expect(toolDef.parameters.properties.nextSteps).toBeDefined();
+      expect(toolDef.parameters.properties.nextSteps.type).toBe("string");
     });
 
     it("team_send_and_wait execute sends message and waits for response", async () => {
@@ -273,17 +276,18 @@ describe("registerTlTools", () => {
         messageQueue,
       });
 
-      const result = await executeFn("call-1", { to: "worker", content: "Do the task" });
+      const result = await executeFn("call-1", { to: "worker", content: "Do the task", nextSteps: "Check the result and assign the next task" });
 
       expect(messageQueue.enqueue).toHaveBeenCalledWith(
         expect.objectContaining({ to: "worker" })
       );
       expect(result.content[0].text).toContain("worker");
       expect(result.content[0].text).toContain("Task done");
-      expect(result.details).toEqual({});
+      expect(result.content[0].text).toContain("下一步计划");
+      expect(result.details).toEqual({ nextSteps: "Check the result and assign the next task" });
     });
 
-    it("team_send_and_wait returns all_idle when all members become idle", async () => {
+    it("team_send_and_wait returns all_idle when all members become idle", { timeout: 15000 }, async () => {
       memberOpsStates.set("analyzer", "idle");
       memberOpsStates.set("worker", "idle");
 
@@ -299,17 +303,23 @@ describe("registerTlTools", () => {
 
       callRegisterTlTools();
 
-      const result = await executeFn("call-2", { to: "worker", content: "Hello" });
+      const result = await executeFn("call-2", { to: "worker", content: "Hello", nextSteps: "Review output and start next phase" });
 
       expect(result.details).toHaveProperty("allIdle");
+      expect(result.details).toHaveProperty("nextSteps");
+      expect(result.details.nextSteps).toBe("Review output and start next phase");
     });
   });
 
-  describe("get_member_status", () => {
-    it("get_member_status returns empty message when no members", async () => {
+  describe("wait_and_get_member_status", () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("wait_and_get_member_status returns empty message when no members", async () => {
       let executeFn: Function = () => {};
       pi.registerTool = vi.fn((def: any) => {
-        if (def.name === "get_member_status") {
+        if (def.name === "wait_and_get_member_status") {
           executeFn = def.execute;
         }
       });
@@ -320,13 +330,13 @@ describe("registerTlTools", () => {
       expect(result.content[0].text).toContain("还没有启动任何团队成员");
     });
 
-    it("get_member_status returns member states", async () => {
+    it("wait_and_get_member_status returns immediately when all members already idle", async () => {
       memberOpsStates.set("analyzer", "idle");
-      memberOpsStates.set("worker", "working");
+      memberOpsStates.set("worker", "idle");
 
       let executeFn: Function = () => {};
       pi.registerTool = vi.fn((def: any) => {
-        if (def.name === "get_member_status") {
+        if (def.name === "wait_and_get_member_status") {
           executeFn = def.execute;
         }
       });
@@ -337,7 +347,39 @@ describe("registerTlTools", () => {
       expect(result.content[0].text).toContain("analyzer");
       expect(result.content[0].text).toContain("worker");
       expect(result.content[0].text).toContain("idle");
-      expect(result.content[0].text).toContain("working");
+    });
+
+    it("wait_and_get_member_status waits until all members become idle", { timeout: 5000 }, async () => {
+      vi.useFakeTimers();
+
+      memberOpsStates.set("analyzer", "idle");
+      memberOpsStates.set("worker", "working");
+
+      let executeFn: Function = () => {};
+      pi.registerTool = vi.fn((def: any) => {
+        if (def.name === "wait_and_get_member_status") {
+          executeFn = def.execute;
+        }
+      });
+
+      callRegisterTlTools();
+
+      // Start the execute (will block waiting for worker to become idle)
+      const resultPromise = executeFn("call-3");
+
+      // Advance timers partway — worker is still working, so no resolve yet
+      await vi.advanceTimersByTimeAsync(WAIT_IDLE_CHECK_INTERVAL_MS * 2);
+
+      // Now make worker idle
+      memberOpsStates.set("worker", "idle");
+
+      // Advance enough for 4 consecutive idle checks
+      await vi.advanceTimersByTimeAsync(WAIT_IDLE_CHECK_INTERVAL_MS * (WAIT_IDLE_REQUIRED_CONSECUTIVE + 1));
+
+      const result = await resultPromise;
+      expect(result.content[0].text).toContain("analyzer");
+      expect(result.content[0].text).toContain("worker");
+      expect(result.content[0].text).toContain("idle");
     });
   });
 });

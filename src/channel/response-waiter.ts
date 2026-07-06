@@ -38,6 +38,12 @@ export interface ResponseWaiter {
   /** Cancel a single pending wait by correlation ID. */
   cancelByCorrId(correlationId: string): void;
 
+  /**
+   * Clear a correlation ID without resolving (silent cleanup).
+   * Unlike cancelByCorrId, this does not emit a cancellation event.
+   */
+  clearCorrelation(correlationId: string): void;
+
   /** Cancel all pending waits (e.g. on /team stop). */
   cancelAll(): void;
 }
@@ -92,6 +98,10 @@ export function createResponseWaiter(): ResponseWaiter {
       if (!entry) return;
       pending.delete(correlationId);
       entry.resolve({ status: "cancelled" });
+    },
+
+    clearCorrelation(correlationId: string): void {
+      pending.delete(correlationId);
     },
 
     cancelAll(): void {

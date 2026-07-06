@@ -25,8 +25,18 @@ export interface TeamContext {
   editingTeamName: string | null;
   /** Whether the current session is a dynamic team mode (/team dynamic). */
   isDynamicSession: boolean;
+  /** Dynamic team mode phase: "design" (discuss + plan) or "execution" (started members, dispatching tasks).
+   *  Only relevant when isDynamicSession is true. */
+  dynamicPhase: "design" | "execution";
   processManager: ProcessManager | null;
-  memberHandles: Map<string, MemberProcessHandle>;
+  /** Direct Map access (read-only view). Prefer getHandle/setHandle for writes. */
+  memberHandles: ReadonlyMap<string, MemberProcessHandle>;
+  /** Get a member process handle by name. */
+  getHandle(name: string): MemberProcessHandle | undefined;
+  /** Set a member process handle. */
+  setHandle(name: string, handle: MemberProcessHandle): void;
+  /** Remove all member handles. */
+  clearHandles(): void;
   router: Router | null;
   messageQueue: MessageQueue | null;
   responseWaiter: ResponseWaiter | null;
@@ -39,4 +49,12 @@ export interface TeamContext {
   onSessionStart?: (ui: SessionUI) => void;
   /** Called immediately when /team stop runs. Removes team status widget. */
   onSessionEnd?: () => void;
+  /** Called when /team edit <name> enters. Installs edit-mode widget. */
+  onEditStart?: (ui: SessionUI) => void;
+  /** Called when edit mode exits (cancel/save/start/stop). Removes edit-mode widget. */
+  onEditEnd?: () => void;
+  /** Called when /team create enters. Installs create-mode widget. */
+  onCreateStart?: (ui: SessionUI) => void;
+  /** Called when create mode exits (cancel/save/start). Removes create-mode widget. */
+  onCreateEnd?: () => void;
 }

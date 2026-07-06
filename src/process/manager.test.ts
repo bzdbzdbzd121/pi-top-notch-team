@@ -219,4 +219,84 @@ describe("createProcessManager", () => {
     expect(manager.getStatus("loopy")?.status).toBe("error");
     expect(manager.listStatus()[0].status).toBe("error");
   });
+
+  describe("stopAll with allSettled", () => {
+    it("should continue stopping other members when one member's stop fails", async () => {
+      const stopMock1 = vi.fn().mockResolvedValue(undefined);
+      const stopMock2 = vi.fn().mockRejectedValue(new Error("Connection lost"));
+      const stopMock3 = vi.fn().mockResolvedValue(undefined);
+
+      const handles = [
+        createMockHandle("member1", { stop: stopMock1 }),
+        createMockHandle("member2", { stop: stopMock2 }),
+        createMockHandle("member3", { stop: stopMock3 }),
+      ];
+
+      const manager = createProcessManager(handles);
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      // Should not reject
+      await expect(manager.stopAll()).resolves.toBeUndefined();
+
+      // All handles should have stop called
+      expect(stopMock1).toHaveBeenCalled();
+      expect(stopMock2).toHaveBeenCalled();
+      expect(stopMock3).toHaveBeenCalled();
+
+      // Should warn about the failure
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("1 member(s) failed to stop")
+      );
+
+      warnSpy.mockRestore();
+    });
+
+    it("should resolve successfully when all members stop cleanly", async () => {
+      const handles = [
+        createMockHandle("member1"),
+        createMockHandle("member2"),
+      ];
+
+      const manager = createProcessManager(handles);
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      await expect(manager.stopAll()).resolves.toBeUndefined();
+
+      expect(warnSpy).not.toHaveBeenCalledWith(
+        expect.stringContaining("member(s) failed to stop")
+      );
+
+      warnSpy.mockRestore();
+    });
+
+    it("should not reject with empty members", async () => {
+      const manager = createProcessManager([]);
+      await expect(manager.stopAll()).resolves.toBeUndefined();
+    });
+
+    it("should cancel pending restart timers before stopping", async () => {
+      const startMock = vi.fn().mockResolvedValue(undefined);
+      const stopMock = vi.fn().mockResolvedValue(undefined);
+      const handle = createMockHandle("restarty", {
+        start: startMock,
+        stop: stopMock,
+        getState: vi.fn().mockReturnValue({ name: "restarty", pid: null, status: "stopped" }),
+      });
+
+      const manager = createProcessManager([handle], {
+        autoRestart: true,
+        initialBackoffMs: 1000,
+      });
+
+      // Trigger crash handling (schedules pending restart timer)
+      manager.handleExit("restarty", 1);
+
+      // stopAll should cancel the timer and stop the member
+      await manager.stopAll();
+
+      // start should NOT have been called (timer was cancelled)
+      expect(startMock).not.toHaveBeenCalled();
+      expect(stopMock).toHaveBeenCalled();
+    });
+  });
 });

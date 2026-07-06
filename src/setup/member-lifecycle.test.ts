@@ -67,6 +67,7 @@ describe("buildMemberConfig", () => {
       active: true,
       teamDefinition: createMockTeamDefinition(),
       startedAt: Date.now(),
+      sessionId: "abc123",
     };
   });
 
@@ -122,9 +123,19 @@ describe("buildMemberConfig", () => {
     expect(result!.roleLabel).toBe("tester");
   });
 
-  it("should construct correct session dir and shared context dir paths", async () => {
+  it("should construct correct session dir and shared context dir paths with sessionId", async () => {
     const { buildMemberConfig } = await loadModule();
     const result = buildMemberConfig("analyzer", session);
+    expect(result!.sessionDir).toBe(join(tmpDir, "sessions", "test-team", "abc123", "analyzer"));
+    expect(result!.sharedContextPath).toBe(
+      join(tmpDir, "sessions", "test-team", "abc123", ".shared-context.md")
+    );
+  });
+
+  it("should fall back to flat path when sessionId is null", async () => {
+    const { buildMemberConfig } = await loadModule();
+    const sessionNoId = { ...session, sessionId: null };
+    const result = buildMemberConfig("analyzer", sessionNoId);
     expect(result!.sessionDir).toBe(join(tmpDir, "sessions", "test-team", "analyzer"));
     expect(result!.sharedContextPath).toBe(
       join(tmpDir, "sessions", "test-team", ".shared-context.md")

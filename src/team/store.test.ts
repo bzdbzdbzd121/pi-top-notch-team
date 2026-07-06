@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -48,6 +48,19 @@ describe("TeamStore", () => {
       expect(content).toContain("name: test-team");
       expect(content).toContain("description: A test team");
       expect(content).toContain("worker");
+    });
+
+    it("warns for invalid data but still writes the file", () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const badTeam: any = { name: "", description: "Bad", members: [] };
+
+      writeTeam(badTeam, tmpDir);
+
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("validation failed")
+      );
+
+      warnSpy.mockRestore();
     });
   });
 

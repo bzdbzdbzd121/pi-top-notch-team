@@ -4,7 +4,7 @@ import type { MemberProcessHandle } from "../process/member-process";
 
 // ── Test helpers ────────────────────────────────────────────
 
-function createMockDeps() {
+function createMockDeps(overrides?: Record<string, any>) {
   return {
     pi: { sendMessage: vi.fn() },
     memberOpsStates: new Map<string, MemberOperationalState>(),
@@ -13,6 +13,8 @@ function createMockDeps() {
     lastPendingCorrId: new Map<string, string>(),
     recentlyProcessedMessages: new Map<string, number>(),
     memberHandles: new Map<string, MemberProcessHandle>(),
+    processManager: { handleExit: vi.fn() },
+    ...overrides,
   };
 }
 
@@ -311,6 +313,97 @@ describe("createMemberEventHandler", () => {
     handler({ type: "process_error", memberName: "worker" });
 
     expect(deps.memberOpsStates.get("worker")).toBe("crashed");
+  });
+
+  it("should call processManager.handleExit on abnormal process_exit with wasRunning=true", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const deps = createMockDeps();
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    handler({
+      type: "process_exit",
+      memberName: "worker",
+      exitCode: 1,
+      wasRunning: true,
+    });
+
+    expect(deps.processManager.handleExit).toHaveBeenCalledWith("worker", 1);
+  });
+
+  it("should call processManager.handleExit on normal process_exit with wasRunning=true", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const deps = createMockDeps();
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    handler({
+      type: "process_exit",
+      memberName: "worker",
+      exitCode: 0,
+      wasRunning: true,
+    });
+
+    expect(deps.processManager.handleExit).toHaveBeenCalledWith("worker", 0);
+  });
+
+  it("should NOT call processManager.handleExit when wasRunning=false (intentional stop)", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const deps = createMockDeps();
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    handler({
+      type: "process_exit",
+      memberName: "worker",
+      exitCode: 1,
+      wasRunning: false,
+    });
+
+    expect(deps.processManager.handleExit).not.toHaveBeenCalled();
+  });
+
+  it("should NOT call processManager.handleExit on process_error", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const deps = createMockDeps();
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    handler({ type: "process_error", memberName: "worker" });
+
+    expect(deps.processManager.handleExit).not.toHaveBeenCalled();
+  });
+
+  it("should not throw when processManager is not provided", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const deps = createMockDeps({ processManager: undefined });
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    expect(() => {
+      handler({
+        type: "process_exit",
+        memberName: "worker",
+        exitCode: 1,
+        wasRunning: true,
+      });
+    }).not.toThrow();
+  });
+
+  it("should still notify TL on abnormal process_exit when processManager is present", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const deps = createMockDeps();
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    handler({
+      type: "process_exit",
+      memberName: "worker",
+      exitCode: 1,
+      wasRunning: true,
+    });
+
+    // TL should still receive the crash notification
+    expect(deps.pi.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customType: "team-message",
+        display: true,
+      })
+    );
   });
 
   it("should ignore unhandled event types", async () => {

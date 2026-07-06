@@ -18,8 +18,16 @@ _Avoid_: Worker, sub-agent, child agent, slave agent
 A YAML file at `~/.pi/top-notch-team/teams/<team-name>.yaml` describing a team's members and their configurations. Created interactively via `/team create`. Validated at creation time.
 _Avoid_: Hardcoded team config, JSON config
 
+**Member Role Definition**:
+The fixed configuration (name, label, systemPrompt, optional model) stored in the Team Definition File for each member. Defines the member's inherent role and expertise scope — e.g. "代码分析员" who analyzes code structure and dependencies. Does not include task-specific instructions or session-level constraints.
+_Avoid_: Per-task role config
+
+**Task-Specific Instructions**:
+The per-session behavior and constraints that the TL communicates to a Member during the team session (via Shared Context or message channel). These are not part of the Member Role Definition. The TL is responsible for providing context-specific guidance on what to do, what patterns to follow, what constraints apply, etc.
+_Avoid_: Baking session tasks into YAML definition
+
 **Process Management Tools**:
-A set of seven tools (six general + one dynamic-mode-specific) registered only during an active Team Session: `start_member`, `stop_member`, `list_members`, `get_member_log`, `get_member_status`, `team_send_and_wait`, and `add_dynamic_member` (dynamic mode only). These tools manage the lifecycle of Member `pi --mode rpc` processes and enable TL-to-Member communication and status checks. Not available outside a Team Session.
+A set of seven tools (six general + one dynamic-mode-specific) registered only during an active Team Session: `start_member`, `stop_member`, `list_members`, `get_member_log`, `wait_and_get_member_status`, `team_send_and_wait`, and `add_dynamic_member` (dynamic mode only). These tools manage the lifecycle of Member `pi --mode rpc` processes and enable TL-to-Member communication and status checks. Not available outside a Team Session.
 
 **Real-time Message Channel**:
 The communication medium through which agents (Team Lead and Members) exchange information during a Team Session. Implementation is separate from the team orchestration logic.
@@ -27,6 +35,9 @@ The communication medium through which agents (Team Lead and Members) exchange i
 **Shared Context**:
 A Markdown document (`.shared-context.md`) maintained by the TL during a team session. Contains project background, goals, team member overview, terminology glossary, collaboration rules, and current progress. Created by the TL before spawning Members, and updated as needed. Members receive the Shared Context via the message channel on their first task assignment, and are notified of updates thereafter.
 _Avoid_: Mission brief, team doc, session context
+
+**Session Isolation**:
+Each team session gets a unique `sessionId` (timestamp + random suffix). Session data is isolated under `sessions/<team-name>/<sessionId>/` to prevent conflicts when the same pre-defined team is used across multiple sessions. Dynamic mode sessions use timestamp-based team names (`_dynamic_<ts>`) for the same purpose. All session directories are cleaned up on `/team stop`.
 
 **Dynamic Team Mode** (`/team dynamic`):
 A free-form session mode where the Team Definition is built at runtime rather than loaded from YAML. The TL enters a session with 0 members, discusses requirements with the user, and uses `add_dynamic_member` to register each role. Session data lives in `sessions/_dynamic_<ts>/` and is cleaned up on `/team stop`. The session guard blocks code file writes from the moment of entry.
@@ -44,23 +55,6 @@ _Avoid_: Ad-hoc team, on-the-fly team, temporary team
 9. User decides when to run `/team stop` to terminate all Member processes
 10. Member session files are preserved for future resumption
 
-## Commands
-
-| Command | Description |
-|---------|-------------|
-| `/team create` | Interactive team creation via natural language dialog with TL. TL collects info, auto-derives name/label from role descriptions, writes YAML via `create_team_definition` tool. |
-| `/team dynamic` | Dynamic team mode — no YAML needed. TL discusses requirements with user, designs members via `add_dynamic_member`, then starts/dispatches them. Temp dir cleaned on `/team stop`. |
-| `/team edit <name>` | Interactive team modification via natural language dialog. TL discusses changes with user, then saves via `update_team_definition` tool (merge mode: only changed/new members need full data, unchanged members auto-fill from disk). |
-| `/team start <name>` | Start a team session with a pre-defined YAML team. Activates TL's process management tools, injects TL system prompt via `before_agent_start`. |
-| `/team stop` | Terminate all Member processes and end the current team session. Also cleans up dynamic session directories. |
-| `/team list` | List all team definitions in `~/.pi/top-notch-team/teams/`. |
-| `/team show <name>` | Display a formatted view of a team's YAML definition. |
-| `/team cancel`           | Cancel current create or edit operation |
-| `/team delete <name>` | Delete a team definition file (with confirmation). |
-| `/team status` | Show the current team session state with member process statuses (🟢running/⚪stopped/🔴error). |
-| `/team help` | Display usage help for all subcommands. |
-
-Tab completion is supported for team names on `/team start`, `/team show`, `/team delete`, `/team edit`.
 
 ## Example Dialogue
 

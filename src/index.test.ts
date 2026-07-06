@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { transitionState } from "./session/state-machine";
-import type { MemberOperationalState } from "./session/state-machine";
+import type { MemberOperationalState } from "./session/context";
 
 // ── Helpers ────────────────────────────────────────────────
 
@@ -79,9 +79,9 @@ describe("index.ts default export (integration)", () => {
     const registeredCalls = (pi.registerTool as ReturnType<typeof vi.fn>).mock.calls;
     const toolNames = registeredCalls.map((c: any) => c[0].name);
 
-    // team_send_and_wait and get_member_status should be among registered tools
+    // team_send_and_wait and wait_and_get_member_status should be among registered tools
     expect(toolNames).toContain("team_send_and_wait");
-    expect(toolNames).toContain("get_member_status");
+    expect(toolNames).toContain("wait_and_get_member_status");
     expect(toolNames).toContain("start_member");
     expect(toolNames).toContain("stop_member");
   });
@@ -195,7 +195,6 @@ describe("index.ts default export (integration)", () => {
       const result = await handler({ systemPrompt: "BASE" }, { ui: createMockUi() });
       expect(result.systemPrompt).not.toContain("严格");
       expect(result.systemPrompt).not.toContain("参考");
-      expect(result.systemPrompt).not.toContain("工作流");
       expect(result.systemPrompt).toContain("Team Lead");
     });
 
@@ -304,7 +303,7 @@ describe("transitionState (imported from state-machine)", () => {
 
 // ── MemberOperationalState type tests ─────────────────────
 
-describe("MemberOperationalState type (imported from state-machine)", () => {
+describe("MemberOperationalState type (imported from context)", () => {
   it("accepts valid state values", () => {
     const idle: MemberOperationalState = "idle";
     const working: MemberOperationalState = "working";

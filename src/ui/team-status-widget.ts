@@ -29,6 +29,11 @@ export interface TeamStatusWidget {
   refresh(): void;
 }
 
+/** Poll interval when all members are idle (30s). */
+const IDLE_POLL_INTERVAL = 30_000;
+/** Poll interval when at least one member is working (5s). */
+const ACTIVE_POLL_INTERVAL = 5_000;
+
 export function createTeamStatusWidget(options: {
   teamName: string;
   /** Dynamic getter for members — called on each refresh so dynamically added members appear. */
@@ -39,7 +44,7 @@ export function createTeamStatusWidget(options: {
   const { teamName, getMembers, teamCtx, memberOpsStates } = options;
   const contextUsageMap = new Map<string, MemberContextInfo | null>();
 
-  let pollingTimer: ReturnType<typeof setInterval> | null = null;
+  let pollingTimer: ReturnType<typeof setTimeout> | null = null;
   let currentUi: { setWidget: (key: string, content: any) => void } | null = null;
   let currentTheme: { fg: (...args: any[]) => string } | null = null;
 
@@ -152,11 +157,28 @@ export function createTeamStatusWidget(options: {
     }
   }
 
+  // ── AbortController for cancelling in-flight poll requests ──
+  let abortController = new AbortController();
+
+  // ── Schedule next poll with adaptive interval ─────────
+  function scheduleNextPoll(): void {
+    const hasActiveMember = Array.from(memberOpsStates.values()).some(
+      (state) => state === "working"
+    );
+    const interval = hasActiveMember ? ACTIVE_POLL_INTERVAL : IDLE_POLL_INTERVAL;
+    pollingTimer = setTimeout(() => {
+      pollContextUsage();
+    }, interval);
+  }
+
   // ── Poll context usage from all running members ─────────
   async function pollContextUsage(): Promise<void> {
+    abortController = new AbortController();
+    const signal = abortController.signal;
     const currentMembers = getMembers();
     for (const member of currentMembers) {
-      const handle = teamCtx.memberHandles.get(member.name);
+      if (signal.aborted) break;
+      const handle = teamCtx.getHandle(member.name);
       const state = memberOpsStates.get(member.name);
       if (!handle || state === "stopped" || state === "crashed") continue;
 
@@ -179,6 +201,8 @@ export function createTeamStatusWidget(options: {
       }
     }
     refresh();
+    // Schedule next poll with adaptive interval (recursive setTimeout)
+    scheduleNextPoll();
   }
 
   // ── Public API ──────────────────────────────────────────
@@ -190,15 +214,19 @@ export function createTeamStatusWidget(options: {
       // Initial render
       refresh();
 
-      // Start polling (immediate + every 10s)
+      // Start first poll (subsequent polls scheduled adaptively)
       pollContextUsage();
-      pollingTimer = setInterval(pollContextUsage, 10_000);
     },
 
     uninstall() {
       if (pollingTimer) {
-        clearInterval(pollingTimer);
+        clearTimeout(pollingTimer);
         pollingTimer = null;
+      }
+      // Cancel any in-flight poll requests
+      if (abortController) {
+        abortController.abort();
+        abortController = null;
       }
       if (currentUi) {
         try {

@@ -16,6 +16,15 @@ export function writeTeam(team: TeamDefinition, rootDir: string): void {
   const dir = getTeamsDir(rootDir);
   const filePath = join(dir, `${team.name}.yaml`);
 
+  // Defensive validation before writing
+  const validation = validateTeamDefinition(team as any);
+  if (!validation.valid) {
+    console.warn(
+      `[top-notch-team] writeTeam validation failed for "${team.name}":\n${validation.errors.join("\n")}`
+    );
+    // Still write to avoid data loss for the caller
+  }
+
   // Ensure the directory exists
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true });

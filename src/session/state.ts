@@ -4,28 +4,45 @@ export interface TeamSessionState {
   active: boolean;
   teamDefinition: TeamDefinition | null;
   startedAt: number | null;
+  /** Unique session identifier (timestamp-based). Used to isolate session directories. */
+  sessionId: string | null;
 }
 
 let currentSession: TeamSessionState = {
   active: false,
   teamDefinition: null,
   startedAt: null,
+  sessionId: null,
 };
 
-export function getSessionState(): TeamSessionState {
+/** Returns a snapshot of the current session state (defensive clone, read-only). */
+export function getSessionState(): Readonly<TeamSessionState> {
   return structuredClone(currentSession);
 }
 
-/** Return a frozen read-only snapshot of the current team members. */
-export function getFrozenMembers(): readonly TeamMember[] {
-  return Object.freeze([...currentSession.teamDefinition?.members ?? []]);
+/** Quick check whether there's an active session (no clone needed). */
+export function isActive(): boolean {
+  return currentSession.active;
 }
 
-export function startSession(team: TeamDefinition): void {
+/** Return a snapshot of current team members (new array, not frozen). */
+export function getFrozenMembers(): TeamMember[] {
+  return [...currentSession.teamDefinition?.members ?? []];
+}
+
+/** Generate a short unique session ID (timestamp + random suffix). */
+function generateSessionId(): string {
+  const ts = Date.now().toString(36);
+  const rand = Math.random().toString(36).slice(2, 6);
+  return `${ts}-${rand}`;
+}
+
+export function startSession(team: TeamDefinition, sessionId?: string): void {
   currentSession = {
     active: true,
     teamDefinition: team,
     startedAt: Date.now(),
+    sessionId: sessionId ?? generateSessionId(),
   };
 }
 
@@ -34,13 +51,15 @@ export function endSession(): void {
     active: false,
     teamDefinition: null,
     startedAt: null,
+    sessionId: null,
   };
 }
 
 /**
  * Add a new member to the active session's team definition.
  * Used by /team dynamic mode to dynamically build the team.
- * Refreshes the session state so subsequent getSessionState() calls see the change.
+ * Unlike startSession, this does NOT reset startedAt.
+ * Mutates currentSession directly to preserve session ID and startedAt.
  */
 export function addMemberToSession(member: TeamMember): TeamDefinition {
   if (!currentSession.active || !currentSession.teamDefinition) {
@@ -50,6 +69,9 @@ export function addMemberToSession(member: TeamMember): TeamDefinition {
     ...currentSession.teamDefinition,
     members: [...currentSession.teamDefinition.members, member],
   };
-  startSession(updatedTeam);
+  currentSession = {
+    ...currentSession,
+    teamDefinition: updatedTeam,
+  };
   return updatedTeam;
 }

@@ -3,6 +3,9 @@ import { spawn, type ChildProcess } from "node:child_process";
 /** Maximum allowed serialized command size in bytes (1 MB). */
 export const MAX_COMMAND_SIZE = 1024 * 1024;
 
+/** Maximum number of pending writes before dropping oldest entries (OOM guard). */
+export const MAX_PENDING_WRITES = 1000;
+
 /** Compute the UTF-8 byte length of a string. */
 function utf8ByteLength(str: string): number {
   return Buffer.byteLength(str, "utf-8");
@@ -70,11 +73,22 @@ export function createMemberProcess(
   let child: ChildProcess | null = null;
   let status: MemberStatus = "stopped";
   let pid: number | null = null;
+  let startingInProgress = false;
   const eventHandlers: Array<(event: any) => void> = [];
 
   // Write queue for handling backpressure (drain event)
   let pendingWrites: string[] = [];
   let drainPending = false;
+
+  function enqueueWrite(data: string): void {
+    if (pendingWrites.length >= MAX_PENDING_WRITES) {
+      pendingWrites.shift();
+      console.warn(
+        `[top-notch-team] pendingWrites for ${name} overflow: dropped 1 entry (${pendingWrites.length} remaining)`
+      );
+    }
+    pendingWrites.push(data);
+  }
 
   function writeOrQueue(data: string): void {
     if (!child || !child.stdin || child.stdin.destroyed) {
@@ -83,7 +97,7 @@ export function createMemberProcess(
 
     const ok = child.stdin.write(data);
     if (!ok) {
-      pendingWrites.push(data);
+      enqueueWrite(data);
       if (!drainPending) {
         drainPending = true;
         child.stdin.once("drain", () => {
@@ -221,18 +235,21 @@ export function createMemberProcess(
             cleanup();
             reject(err);
           }
+          // If already settled, cleanup is still safe to call (idempotent)
         }
       });
     },
 
     async start(): Promise<void> {
-      if (status === "running") {
+      if (status === "running" || startingInProgress) {
         return;
       }
+      startingInProgress = true;
 
-      // Reset write queue from any previous session
-      pendingWrites = [];
-      drainPending = false;
+      try {
+        // Reset write queue from any previous session
+        pendingWrites = [];
+        drainPending = false;
 
       const env: Record<string, string> = {
         TEAM_ROLE: role,
@@ -340,9 +357,22 @@ export function createMemberProcess(
 
       // Wait for RPC process to be ready (first JSON line on stdout)
       await readyPromise;
+      } finally {
+        startingInProgress = false;
+      }
     },
 
     async stop(): Promise<void> {
+      // If start is in progress, wait for it to complete before stopping
+      if (startingInProgress) {
+        console.warn(
+          `[top-notch-team] stop() called while "${name}" is starting, waiting...`
+        );
+        while (startingInProgress) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+      }
+
       if (!child || status !== "running") {
         status = "stopped";
         return;

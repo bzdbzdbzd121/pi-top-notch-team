@@ -14,10 +14,13 @@ function createTeamContext(): TeamContext {
     isDynamicSession: false,
     processManager: null,
     memberHandles: new Map(),
+    getHandle: vi.fn(),
+    setHandle: vi.fn(),
+    clearHandles: vi.fn(),
     router: { route: vi.fn(), updateMembers: vi.fn() } as any,
     messageQueue: { enqueue: vi.fn(), drain: vi.fn(), length: vi.fn(), stop: vi.fn() } as any,
     responseWaiter: { waitForResponse: vi.fn(), resolveIfWaiting: vi.fn(), cancelAll: vi.fn(), cancelByCorrId: vi.fn() } as any,
-    tlToolNames: ["start_member", "stop_member", "list_members", "get_member_log", "team_send_and_wait", "get_member_status"],
+    tlToolNames: ["start_member", "stop_member", "list_members", "get_member_log", "team_send_and_wait", "wait_and_get_member_status"],
     memberOperationalStates: null,
   };
 }

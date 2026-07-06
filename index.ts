@@ -9,6 +9,8 @@ import { rmSync } from "node:fs";
 import { registerTlTools } from "./src/tools/tl-tools";
 import { createProcessManager } from "./src/process/manager";
 import { createTeamStatusWidget } from "./src/ui/team-status-widget";
+import { createEditModeWidget } from "./src/ui/edit-mode-widget";
+import { createCreateModeWidget } from "./src/ui/create-mode-widget";
 import {
   createAndRegisterMember,
   buildMemberConfig,
@@ -29,13 +31,20 @@ export default function (pi: ExtensionAPI) {
   let sessionUiRef: any = null;
 
   // ── Shared mutable state ──────────────────────────────────
+  const memberHandles = new Map<string, MemberProcessHandle>();
+  const memberHandlesRO: ReadonlyMap<string, MemberProcessHandle> = memberHandles;
+
   const teamCtx: TeamContext = {
     isCreatingTeam: false,
     editingTeamName: null,
     isDynamicSession: false,
+    dynamicPhase: "design",
     processManager: null,
-    memberHandles: new Map(),
-    tlToolNames: ["start_member", "stop_member", "list_members", "get_member_log", "team_send_and_wait", "get_member_status"],
+    memberHandles: memberHandlesRO,
+    getHandle: (name) => memberHandles.get(name),
+    setHandle: (name, handle) => { memberHandles.set(name, handle); },
+    clearHandles: () => { memberHandles.clear(); },
+    tlToolNames: ["start_member", "stop_member", "list_members", "get_member_log", "team_send_and_wait", "wait_and_get_member_status"],
     router: null,
     messageQueue: null,
     responseWaiter: null,
@@ -71,7 +80,7 @@ export default function (pi: ExtensionAPI) {
     pi,
     memberOpsStates,
     lastPendingCorrId,
-    memberHandles: teamCtx.memberHandles,
+    memberHandles,
   });
 
   teamCtx.router = router;
@@ -100,29 +109,72 @@ export default function (pi: ExtensionAPI) {
     messageQueue,
     createMember: (config) => {
       const handle = createAndRegisterMember(pi, config, memberLifecycleDeps);
-      teamCtx.memberHandles.set(config.name, handle);
+      teamCtx.setHandle(config.name, handle);
       return handle;
     },
     buildMemberConfig: (memberName) => buildMemberConfig(memberName, getSessionState()),
     getMemberLog: async (memberName, maxLines, maxContentLength) => {
-      const handle = teamCtx.memberHandles.get(memberName);
+      const handle = teamCtx.getHandle(memberName);
       if (!handle) {
         throw new Error(`Member "${memberName}" not found`);
       }
       return getMemberLog(handle, maxLines, maxContentLength);
     },
+    // Dynamic mode phase transition: design → execution on first member start
+    onDynamicPhaseTransition: () => {
+      if (teamCtx.isDynamicSession && teamCtx.dynamicPhase === "design") {
+        teamCtx.dynamicPhase = "execution";
+        pi.sendMessage({
+          customType: "team-message",
+          content: "[系统] 动态团队模式已进入执行阶段。TL 现在可以读取项目代码和分析文件。",
+          display: true,
+        });
+      }
+    },
   });
 
-  // team_send_and_wait and get_member_status are registered in src/tools/tl-tools.ts
+  // team_send_and_wait and wait_and_get_member_status are registered in src/tools/tl-tools.ts
+
+  // ── Helper: safely extract path from tool input ─────────
+  function extractPathFromInput(input: unknown): string | undefined {
+    if (typeof input === "object" && input !== null) {
+      const obj = input as Record<string, unknown>;
+      return typeof obj.path === "string" ? obj.path : undefined;
+    }
+    return undefined;
+  }
 
   // ── Call-level guard: block code-file writes during team session ───
   pi.on("tool_call", (event) => {
     if (!getSessionState().active) return; // only block during active team session
 
+    // ── Dynamic mode: design phase — block ALL exploratory tools ──
+    if (teamCtx.isDynamicSession && teamCtx.dynamicPhase === "design") {
+      const blockedExploratoryTools = ["bash", "read", "code_search", "fetch_content", "edit"];
+      if (blockedExploratoryTools.includes(event.toolName)) {
+        return {
+          block: true,
+          reason: `动态团队模式设计阶段不得使用 ${event.toolName}。请专注于与用户讨论需求、设计团队方案。`,
+        };
+      }
+      // write: only allow .md files (for shared-context.md / ADRs)
+      if (event.toolName === "write") {
+        const filePath = extractPathFromInput(event.input) ?? "";
+        if (!filePath.endsWith(".md")) {
+          return {
+            block: true,
+            reason: `动态团队模式设计阶段只能编写 .md 文档（如共享上下文文档）。代码文件请委派给 Member 执行。`,
+          };
+        }
+        return; // allow .md writes
+      }
+      return; // management tools allowed
+    }
+
+    // ── Normal team session / execution phase guard: block code file writes ──
     if (event.toolName !== "write" && event.toolName !== "edit") return;
 
-    const input = event.input as { path?: string };
-    const filePath = input?.path ?? "";
+    const filePath = extractPathFromInput(event.input) ?? "";
 
     // Allow .md files (shared context, ADRs, planning docs)
     if (filePath.endsWith(".md")) return;
@@ -138,46 +190,58 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", () => {
     const _session = getSessionState();
     if (_session.active) {
-      const dynamicDir = teamCtx.isDynamicSession && _session.teamDefinition
-        ? join(getRootDir(), "sessions", _session.teamDefinition.name)
-        : null;
+      const teamName = _session.teamDefinition?.name;
+      const sessionId = _session.sessionId;
+      const isDynamic = teamCtx.isDynamicSession;
+
       endSession();
       if (teamCtx.onSessionEnd) {
         teamCtx.onSessionEnd();
       }
-      // Best-effort cleanup of dynamic session directory
-      if (dynamicDir) {
-        try { rmSync(dynamicDir, { recursive: true, force: true }); } catch {}
+      teamCtx.onEditEnd?.();
+      teamCtx.onCreateEnd?.();
+
+      // Best-effort cleanup of session directory
+      if (isDynamic && teamName) {
+        try { rmSync(join(getRootDir(), "sessions", teamName), { recursive: true, force: true }); } catch (e) { console.warn('[top-notch-team] Failed to clean up dynamic session dir:', e); }
+      } else if (teamName && sessionId) {
+        try { rmSync(join(getRootDir(), "sessions", teamName, sessionId), { recursive: true, force: true }); } catch (e) { console.warn('[top-notch-team] Failed to clean up session dir:', e); }
       }
       teamCtx.isDynamicSession = false;
+      teamCtx.dynamicPhase = "design";
     }
   });
 
-  // ── session_start: reset stale team state when fresh session detected ──
+  // ── session_start: reset stale team state + register autocomplete/editor ──
   pi.on("session_start", (_event, ctx) => {
+    // Part 1: Clean up stale team state when fresh session detected
     if (ctx.sessionManager) {
       const entries = ctx.sessionManager.getEntries() ?? [];
       const isFresh = entries.length <= 1;
       if (isFresh && getSessionState().active) {
+        const _session = getSessionState();
+        const teamName = _session.teamDefinition?.name;
+        const sessionId = _session.sessionId;
         const isDynamic = teamCtx.isDynamicSession;
-        const dynamicTeamName = getSessionState().teamDefinition?.name;
-        const dynamicDir = isDynamic && dynamicTeamName
-          ? join(getRootDir(), "sessions", dynamicTeamName)
-          : null;
+
         endSession();
         if (teamCtx.onSessionEnd) {
           teamCtx.onSessionEnd();
         }
-        if (dynamicDir) {
-          try { rmSync(dynamicDir, { recursive: true, force: true }); } catch {}
+        teamCtx.onEditEnd?.();
+        teamCtx.onCreateEnd?.();
+
+        if (isDynamic && teamName) {
+          try { rmSync(join(getRootDir(), "sessions", teamName), { recursive: true, force: true }); } catch (e) { console.warn('[top-notch-team] Failed to clean up dynamic session dir:', e); }
+        } else if (teamName && sessionId) {
+          try { rmSync(join(getRootDir(), "sessions", teamName, sessionId), { recursive: true, force: true }); } catch (e) { console.warn('[top-notch-team] Failed to clean up session dir:', e); }
         }
         teamCtx.isDynamicSession = false;
+        teamCtx.dynamicPhase = "design";
       }
     }
-  });
 
-  // ── Custom autocomplete: team names for /team start|show|delete|edit ──
-  pi.on("session_start", (_event, ctx) => {
+    // Part 2: Register autocomplete + editor component
     // Store UI ref for session end cleanup
     sessionUiRef = ctx.ui;
 
@@ -268,6 +332,40 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
+  // ── Edit mode widget (visual indicator for /team edit) ───
+  let editModeWidget: ReturnType<typeof createEditModeWidget> | null = null;
+
+  teamCtx.onEditStart = (ui) => {
+    if (editModeWidget) return; // already installed
+    const editingName = teamCtx.editingTeamName;
+    if (!editingName) return;
+    editModeWidget = createEditModeWidget(editingName);
+    editModeWidget.install(ui, ui.theme);
+  };
+
+  teamCtx.onEditEnd = () => {
+    if (editModeWidget) {
+      editModeWidget.uninstall();
+      editModeWidget = null;
+    }
+  };
+
+  // ── Create mode widget (visual indicator for /team create) ───
+  let createModeWidget: ReturnType<typeof createCreateModeWidget> | null = null;
+
+  teamCtx.onCreateStart = (ui) => {
+    if (createModeWidget) return; // already installed
+    createModeWidget = createCreateModeWidget();
+    createModeWidget.install(ui, ui.theme);
+  };
+
+  teamCtx.onCreateEnd = () => {
+    if (createModeWidget) {
+      createModeWidget.uninstall();
+      createModeWidget = null;
+    }
+  };
+
   // ── TL system prompt injection ───────────────────────────
   pi.on("before_agent_start", async (event, _ctx) => {
     const session = getSessionState();
@@ -286,6 +384,26 @@ export default function (pi: ExtensionAPI) {
     if (!session.active && teamStatusWidget) {
       teamStatusWidget.uninstall();
       teamStatusWidget = null;
+    }
+
+    // Edit mode widget safety net
+    if (teamCtx.editingTeamName && !editModeWidget && _ctx.ui) {
+      editModeWidget = createEditModeWidget(teamCtx.editingTeamName);
+      editModeWidget.install(_ctx.ui, _ctx.ui.theme);
+    }
+    if (!teamCtx.editingTeamName && editModeWidget) {
+      editModeWidget.uninstall();
+      editModeWidget = null;
+    }
+
+    // Create mode widget safety net
+    if (teamCtx.isCreatingTeam && !createModeWidget && _ctx.ui) {
+      createModeWidget = createCreateModeWidget();
+      createModeWidget.install(_ctx.ui, _ctx.ui.theme);
+    }
+    if (!teamCtx.isCreatingTeam && createModeWidget) {
+      createModeWidget.uninstall();
+      createModeWidget = null;
     }
 
     let extraPrompt = "";
@@ -325,7 +443,7 @@ export default function (pi: ExtensionAPI) {
 如果用户说不需要工作流，跳过即可。不要强行推荐。
 
 收集完后向用户展示汇总并确认，然后调用 \`create_team_definition\` 工具保存。
-如果用户想取消操作，告诉用户输入 \`/team cancel\`。
+如果用户想取消操作，告诉用户输入 \`/team done\`（或 \`/team cancel\`）退出。
 `;
     } else if (teamCtx.editingTeamName) {
       const editName = teamCtx.editingTeamName;
@@ -358,10 +476,10 @@ export default function (pi: ExtensionAPI) {
 这样你就不必在 tool call 中重复所有成员的长篇 systemPrompt，避免 payload 过大导致输出截断。
 
 了解清楚所有修改后，向用户展示修改汇总并确认，然后调用 \`update_team_definition\` 工具保存最终定义。
-如果用户想取消操作，告诉用户输入 \`/team cancel\`。
+如果用户想取消操作，告诉用户输入 \`/team done\`（或 \`/team cancel\`）退出。
 `;
     } else if (teamCtx.isDynamicSession && session.teamDefinition) {
-      extraPrompt = buildDynamicModePrompt(session.teamDefinition);
+      extraPrompt = buildDynamicModePrompt(session.teamDefinition, teamCtx.dynamicPhase, session.sessionId);
     } else if (session.active && session.teamDefinition) {
       const team = session.teamDefinition;
       const memberLines = team.members
@@ -400,7 +518,8 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
-      const sharedCtxPath = join(getRootDir(), "sessions", team.name, ".shared-context.md");
+      const sessionSubDir = session.sessionId ? join(team.name, session.sessionId) : team.name;
+      const sharedCtxPath = join(getRootDir(), "sessions", sessionSubDir, ".shared-context.md");
 
       extraPrompt = `
 ## 当前任务：Team Lead
@@ -448,9 +567,9 @@ ${workflowText}
 
 1. **先写 Shared Context** — 用 \`write\` 工具写入 \`${sharedCtxPath}\`
 2. **start_member(name)** — 启动一个 Member 进程
-3. **team_send_and_wait(to, content)** — 给 Member 发任务并等待回复（阻塞），直到收到回复或所有成员空闲
+3. **team_send_and_wait(to, content, nextSteps)** — 给 Member 发任务并等待回复（阻塞），直到收到回复或所有成员空闲。必须传入 nextSteps（下一步计划），wait 结束后该信息会随结果返回，用于强调工作流程方向
 4. **list_members** — 查看各 Member 的运行状态
-5. **get_member_status()** — **优先使用**。快速查看所有成员当前操作状态（idle/working/crashed/stopped），负担轻
+5. **wait_and_get_member_status()** — **优先使用**。等待所有成员空闲后查看操作状态（idle/working/crashed/stopped）。如有成员在工作则阻塞，和 team_send_and_wait 检测 all-idle 的方式相同
 6. **get_member_log(name, lines?)** — 查看 Member 最近的详细对话记录，负担较重，仅当需要了解具体内容时才使用
 7. **stop_member(name)** — 终止 Member 进程
 

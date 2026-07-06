@@ -1,6 +1,82 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { startSession, endSession, getSessionState, addMemberToSession } from "./state";
+import { startSession, endSession, getSessionState, addMemberToSession, isActive, getFrozenMembers } from "./state";
 import type { TeamDefinition, TeamMember } from "../team/definition";
+
+describe("sessionId", () => {
+  let baseTeam: TeamDefinition;
+
+  beforeEach(() => {
+    endSession();
+    baseTeam = {
+      name: "test-team",
+      description: "A test team",
+      members: [],
+    };
+  });
+
+  it("generates a sessionId on startSession", () => {
+    startSession(baseTeam);
+    const state = getSessionState();
+    expect(state.sessionId).toBeTruthy();
+    expect(typeof state.sessionId).toBe("string");
+    expect(state.sessionId!.length).toBeGreaterThan(0);
+  });
+
+  it("sessionId is null on endSession", () => {
+    startSession(baseTeam);
+    endSession();
+    const state = getSessionState();
+    expect(state.sessionId).toBeNull();
+  });
+
+  it("generates different sessionIds for consecutive sessions", () => {
+    startSession(baseTeam);
+    const id1 = getSessionState().sessionId;
+    endSession();
+    startSession(baseTeam);
+    const id2 = getSessionState().sessionId;
+    expect(id1).not.toBe(id2);
+  });
+
+  it("preserves sessionId across addMemberToSession calls", () => {
+    startSession(baseTeam);
+    const originalId = getSessionState().sessionId;
+    addMemberToSession({ name: "coder", label: "编码员", systemPrompt: "Code" });
+    const state = getSessionState();
+    expect(state.sessionId).toBe(originalId);
+  });
+
+  it("accepts a custom sessionId via parameter", () => {
+    startSession(baseTeam, "my-custom-id");
+    const state = getSessionState();
+    expect(state.sessionId).toBe("my-custom-id");
+  });
+
+  it("isActive returns false when no session", () => {
+    endSession();
+    expect(isActive()).toBe(false);
+  });
+
+  it("isActive returns true when session active", () => {
+    startSession(baseTeam);
+    expect(isActive()).toBe(true);
+  });
+
+  it("addMemberToSession does NOT reset startedAt", () => {
+    startSession(baseTeam);
+    const before = getSessionState().startedAt;
+    addMemberToSession({ name: "coder", label: "编码员", systemPrompt: "Code" });
+    const after = getSessionState().startedAt;
+    expect(after).toBe(before);
+  });
+
+  it("getFrozenMembers returns a plain array (not Object.freeze)", () => {
+    startSession(baseTeam);
+    // Only check that it's a regular array — Object.isFrozen would be true
+    // for empty arrays even without freeze; just verify it returns members
+    expect(getFrozenMembers()).toEqual([]);
+  });
+});
 
 describe("addMemberToSession", () => {
   let baseTeam: TeamDefinition;
@@ -62,6 +138,8 @@ describe("addMemberToSession", () => {
     expect(state.teamDefinition!.name).toBe("test-team");
     expect(state.teamDefinition!.description).toBe("A test team");
     expect(state.startedAt).toBeGreaterThanOrEqual(startTime);
+    // sessionId preserved across addMemberToSession
+    expect(state.sessionId).toBeTruthy();
   });
 
   it("does not affect non-dynamic sessions (works with any active session)", () => {

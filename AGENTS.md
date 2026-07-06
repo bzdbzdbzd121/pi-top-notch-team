@@ -26,7 +26,7 @@ pi install ./pi-top-notch-team
 ```
 User's pi session (TL extension)
   ├── 11 subcommands (/team create, dynamic, edit, cancel, start, stop, list, show, delete, status, help)
-  ├── 7 TL tools (start_member, stop_member, list_members, get_member_log, get_member_status, team_send_and_wait, add_dynamic_member)
+  ├── 7 TL tools (start_member, stop_member, list_members, get_member_log, wait_and_get_member_status, team_send_and_wait, add_dynamic_member)
   ├── Message channel (queue → router → responseWaiter)
   ├── Member Process Manager
   │     ├── Member A (pi --mode rpc, member.ts)
@@ -39,7 +39,7 @@ User's pi session (TL extension)
 
 | File | Role |
 |------|------|
-| `index.ts` (~400 lines) | TL extension entry point. Registers `/team` command, wires DI dependencies, `before_agent_start` injection, team-status widget lifecycle, autocomplete provider. Refactored from ~800 lines via modular extraction. |
+| `index.ts` (~400 lines) | TL extension entry point. Registers `/team` command, wires DI dependencies, `before_agent_start` injection, team-status + edit-mode widget lifecycle, autocomplete provider. Refactored from ~800 lines via modular extraction. |
 | `member.ts` | Member extension entry point. Registers `team_send_message` tool, injects team awareness via env vars. Uses `JSON.parse` for TEAM_MEMBERS (no longer comma-delimited). |
 | `package.json` | pi package manifest with `pi.extensions` pointing to `["./index.ts", "./member.ts"]` |
 
@@ -48,9 +48,27 @@ User's pi session (TL extension)
 ```
 src/
 ├── commands/
-│   ├── team.ts       ← Single /team command (11 subcommands, incl. `dynamic`)
+│   ├── team.ts       ← Dispatcher: ~150 lines, registers /team command, delegates to handlers
+│   ├── save-team-definition.ts  ← Pure function: team merge & persist logic
 │   ├── status.ts     ← StatusProvider type for getMemberStatuses
+│   ├── handlers/     ← 11 extracted subcommand handlers (< 120 lines each)
+│   │   ├── create-handler.ts
+│   │   ├── dynamic-handler.ts
+│   │   ├── edit-handler.ts
+│   │   ├── start-handler.ts
+│   │   ├── stop-handler.ts
+│   │   ├── list-handler.ts
+│   │   ├── show-handler.ts
+│   │   ├── delete-handler.ts
+│   │   ├── status-handler.ts
+│   │   ├── done-handler.ts
+│   │   └── help-handler.ts
+│   ├── shared/        ← Shared schemas, tool helpers, and extracted pure functions
+│   │   ├── workflow-schema.ts     ← workflowStageSchema + workflowSchema
+│   │   ├── register-definition-tool.ts  ← Unified registerTeamDefinitionTool (mode: create|update)
+│   │   └── ensure-tool.ts         ← ensureToolRegistered(): dedup getAllTools pattern
 │   ├── team.test.ts
+│   ├── save-team-definition.test.ts  ← saveTeamDefinition merge logic tests
 │   └── team-dynamic.test.ts  ← /team dynamic tests
 ├── channel/          ← Real-time message channel
 │   ├── types.ts      ← TeamMessage interface
@@ -79,8 +97,11 @@ src/
 │   ├── member-lifecycle.ts  ← createAndRegisterMember, buildMemberConfig, getMemberLog
 │   └── message-channel.ts   ← createMessageChannel factory (queue+router+waiter wiring)
 ├── ui/               ← TUI components for team mode
-│   └── team-status-widget.ts  ← Bordered widget: live member status + context %
+│   ├── team-status-widget.ts  ← Bordered widget: live member status + context %
+│   ├── edit-mode-widget.ts   ← Bordered widget: ✏️ EDIT MODE — <team name>
+│   └── create-mode-widget.ts ← Bordered widget: 🆕 CREATE MODE
 ├── config.ts         ← getRootDir() via env var or ~/.pi/top-notch-team
+├── config.test.ts    ← getRootDir() env var tests
 └── test/fixtures/    ← Test YAML files + mock-extension-api.ts
 ```
 
@@ -107,16 +128,23 @@ src/
 
 8. **Dynamic team mode (`/team dynamic`)** — A free-form mode where the TL designs the team at runtime. No YAML is written to disk. The TL enters a session with 0 members, discusses requirements with the user, uses `add_dynamic_member` to register member roles, then starts and dispatches them via the standard tool chain. The session guard blocks code file writes from the moment `/team dynamic` is entered. On `/team stop`, the temporary session directory (`sessions/_dynamic_<ts>/`) is cleaned up.
 
+9. **Session isolation via sessionId** — Each team session generates a unique `sessionId` in `TeamSessionState`. `buildMemberConfig` uses this ID to nest session data under `sessions/<team-name>/<sessionId>/` instead of the flat `sessions/<team-name>/`. This prevents conflicts when the same pre-defined team is used across multiple sessions. On `/team stop`, the session subdirectory is cleaned up. Dynamic mode sessions (`_dynamic_<ts>`) use their unique team name for the same purpose — the entire team directory is removed on stop.
+
+10. **Two-phase dynamic mode** — `/team dynamic` is split into a **design phase** and an **execution phase**:
+   - **Design phase** (entered on `/team dynamic`): TL is blocked from using `bash`/`read`/`code_search`/`fetch_content`/`edit` entirely. `write` is restricted to `.md` files only. This forces TL to focus on discussing requirements and designing the team rather than exploring or modifying code. The only tools available are `add_dynamic_member`, team management tools, and `.md` writes.
+   - **Execution phase** (entered when the first `start_member` succeeds): TL regains access to all tools for monitoring and coordination. The standard team session guard still blocks code file writes.
+   - Phase transition is automatic: `start_member` tool calls `onDynamicPhaseTransition`, which flips `teamCtx.dynamicPhase` from `"design"` to `"execution"`. The `before_agent_start` handler injects different prompts depending on the current phase.
+
 ## Dependency Injection Pattern
 
 The codebase uses an explicit Dependency Injection (DI) pattern to decouple modules and enable testability. Every subsystem receives its dependencies through a typed interface, rather than importing them directly.
 
 | DI Interface | Module | Dependencies |
 |-------------|--------|-------------|
-| `TlToolsDeps` | `tools/tl-tools.ts` | `pi`, `manager`, `responseWaiter`, `memberOpsStates`, `lastPendingCorrId`, `messageQueue`, `createMember?`, `buildMemberConfig?`, `getMemberLog?`, `isDynamicSession?`, `addMemberToSession?`, `onDynamicMemberAdded?` |
+| `TlToolsDeps` | `tools/tl-tools.ts` | `pi`, `manager`, `responseWaiter`, `memberOpsStates`, `lastPendingCorrId`, `messageQueue`, `createMember?`, `buildMemberConfig?`, `getMemberLog?`, `isDynamicSession?`, `addMemberToSession?`, `onDynamicMemberAdded?`, `onDynamicPhaseTransition?` |
 | `MemberLifecycleDeps` | `setup/member-lifecycle.ts` | `pi`, `memberOpsStates`, `messageQueue`, `responseWaiter`, `lastPendingCorrId`, `recentlyProcessedMessages`, `processManager?` |
 | `MessageChannelDeps` | `setup/message-channel.ts` | `pi`, `memberOpsStates`, `lastPendingCorrId`, `memberHandles` |
-| `EventHandlerDeps` | `channel/event-handler.ts` | `pi`, `memberOpsStates`, `messageQueue`, `responseWaiter`, `lastPendingCorrId`, `recentlyProcessedMessages` |
+| `EventHandlerDeps` | `channel/event-handler.ts` | `pi`, `memberOpsStates`, `messageQueue`, `responseWaiter`, `lastPendingCorrId`, `recentlyProcessedMessages`, `processManager?` |
 | `SendToMemberDeps` | `channel/event-handler.ts` | `pi`, `memberOpsStates`, `memberHandles` |
 
 Benefits:
@@ -141,12 +169,23 @@ Member A calls team_send_message({to: "mover", content: "..."})
       ├── to="all"    → broadcast to all (skip self)
       └── unknown     → pi.sendMessage ("无法路由消息到未知成员")
 
+Process exit + auto-restart flow:
+  Member process exits unexpectedly
+  → child.on("exit") → notifyHandlers({type:"process_exit", memberName, exitCode, wasRunning})
+  → event-handler.ts
+    → Update memberOpsStates ("crashed" / "stopped" via state machine)
+    → Notify TL (crash/stop message)
+    → Invoke processManager.handleExit(memberName, exitCode) ← NEW bridge
+      → Crash tracking (sliding window, exponential backoff 1s/2s/4s/8s/16s)
+      → Auto-restart timer or crash-loop freeze
+      → onRestarting / onCrashLoopDetected callbacks
+
 Backup path: assistant text outputs matching
   `<team-message to="..." subject="...">...</team-message>`
 are also parsed via parseTeamMessageTag() (non-greedy regex, length guard) and enqueued.
 
 team_send_and_wait flow:
-  TL calls team_send_and_wait(to, content) →
+  TL calls team_send_and_wait(to, content, nextSteps) →
     → responseWaiter.waitForResponse(corrId)
     → Message enqueued with <corr:...> tag
     → Member replies → responseWaiter.resolveIfWaiting(corrId, ...) → TL continues
@@ -171,6 +210,26 @@ members:
 
 Validation rules in `src/team/schema.ts`.
 
+## Development Workflow
+
+### 1. Test-driven development (TDD)
+- 先写测试用例描述预期行为，再写实现代码
+- 新增功能需添加对应的 `*.test.ts` 文件
+- 测试文件放在源码同目录下（如 `src/team/store.test.ts`）
+
+### 2. 已有测试必须全部通过
+- 不涉及本次改动的已有功能，其测试用例必须保持绿色
+- 提交前运行 `npm test` 确认 0 failure
+- 如果现有测试因修改而红，检查是破坏性变更还是测试过时需要更新
+
+### 3. 文档同步更新
+- 每次新增或修改功能，检查以下文档是否需要对应更新：
+  - `AGENTS.md` — 源文件映射、命令参考、设计决策
+  - `DESIGN.md` — 架构、流程、接口说明
+  - `docs/adr/` — 当决策满足 ADR 条件（高逆成本、外人意外、真正权衡）
+- 修改接口签名（`TeamContext`、工具参数等）时必须同步更新文档中的类型定义
+- 新增 UI 组件时需在 Source Map 中登记
+
 ## Testing
 
 ```bash
@@ -178,7 +237,7 @@ npm test          # Run all tests (vitest)
 npm run test:watch  # Watch mode
 ```
 
-260 tests across 19 files (state-machine, member-process, event-handler, response-waiter, message-channel tests included). Tests live alongside source as `*.test.ts`.
+306 tests across 25 files (state-machine, member-process, event-handler, response-waiter, message-channel, member, save-team-definition, config, ui-widget tests included). Tests live alongside source as `*.test.ts`.
 
 | Test Level | What | How |
 |-----------|------|-----|
@@ -196,8 +255,8 @@ npm run test:watch  # Watch mode
 | `TEAM_NAME` | Member process | Team name |
 | `TEAM_MEMBERS` | Member process | JSON-serialized member name array (e.g. `'["analyzer","mover"]'`). Parsed via `JSON.parse` with comma-delimited fallback for backward compatibility. |
 | `TEAM_MEMBER_DESCRIPTION` | Member process | System prompt for role |
-| `TEAM_SESSION_DIR` | Member process | Session file storage path |
-| `TEAM_SHARED_CONTEXT_PATH` | Member process | Shared context file path |
+| `TEAM_SESSION_DIR` | Member process | Session file storage path (`sessions/<team-name>/<sessionId>/<memberName>/`) |
+| `TEAM_SHARED_CONTEXT_PATH` | Member process | Shared context file path (`sessions/<team-name>/<sessionId>/.shared-context.md`) |
 
 ## Commands Reference
 
@@ -205,12 +264,13 @@ npm run test:watch  # Watch mode
 |---------|-------------|
 | `/team create` | Natural language team creation via TL dialogue |
 | `/team dynamic` | Dynamic team mode — TL designs team on the fly based on user requirements |
-| `/team edit <name>` | Natural language team modification via TL dialogue |
+| `/team edit <name>` | Natural language team modification via TL dialogue; installs edit-mode widget (⟳ `onEditStart`/`onEditEnd` hooks) |
 | `/team start <name>` | Start team session with a pre-defined YAML team, activate TL tools |
 | `/team stop` | Stop all members, deactivate TL tools (also cleans up dynamic session directories) |
 | `/team list` | List all team definitions |
 | `/team show <name>` | Display team definition details |
-| `/team cancel`           | Cancel current create or edit operation |
+| `/team done`             | Finish and exit current create or edit mode |
+| `/team cancel`           | Alias for `/team done` (backward compatibility) |
 | `/team delete <name>` | Delete a team definition (with confirmation) |
 | `/team status` | Show active session + member process statuses |
 | `/team help` | Display usage help for all subcommands |
@@ -220,18 +280,18 @@ npm run test:watch  # Watch mode
 | Tool | Description |
 |------|-------------|
 | `add_dynamic_member(name, label, systemPrompt, model?)` | Register a member in `/team dynamic` mode. Name is the identifier, label is Chinese display name, systemPrompt is role definition. Only available in dynamic mode. |
-| `start_member(name)` | Launch a Member's pi RPC process |
+| `start_member(name)` | Launch a Member's pi RPC process. In dynamic mode, the first call triggers the design→execution phase transition. |
 | `stop_member(name)` | Gracefully terminate a Member process |
 | `list_members()` | Show all member statuses |
 | `get_member_log(name, lines?, maxContentLength?)` | Query Member's recent session via RPC. `maxContentLength` truncates each message content (default 200 chars). Truncation uses `slice(0, max-3) + "..."` so total length = maxContentLength. |
-| `get_member_status()` | Get operational status (idle/working/crashed/stopped) for all members. No parameters. |
-| `team_send_and_wait(to, content)` | Send message and wait for response. Blocks until member replies or all members become idle. Response content returned as tool result. |
+| `wait_and_get_member_status()` | 等待所有 member 空闲后查看所有 Member 的运行状态 (idle/working/crashed/stopped)。No parameters. 如果任何 member 仍在工作中会阻塞，和 team_send_and_wait 检测 all-idle 的方式相同。 |
+| `team_send_and_wait(to, content, nextSteps)` | Send message and wait for response. Blocks until member replies or all members become idle. nextSteps（下一步计划）在 wait 结束后随结果返回，用于强调工作流程方向。Response content returned as tool result. |
 
 ## Design Time Tools (create/edit team)
 
 These tools are dynamically registered and only available during their respective modes:
 - `create_team_definition` — **only during `/team create`** (registered on enter, deactivated on cancel/success)
-- `update_team_definition` — **only during `/team edit <name>`** (registered on enter, deactivated on cancel/success)
+- `update_team_definition` — **only during `/team edit <name>`** (registered on enter, deactivated on cancel)
 
 | Tool | Description |
 |------|-------------|
@@ -240,11 +300,18 @@ These tools are dynamically registered and only available during their respectiv
 
 ### Team Session Guards
 
-During an active team session (including `/team dynamic`), a `tool_call` event handler intercepts `write`/`edit` tools:
-- `.md` files (`.shared-context.md`, ADRs, planning docs) — allowed
-- Code files (`.ts`, `.js`, `.py`, etc.) — blocked with reason "请委派给 Member"
+During an active team session (including `/team dynamic`), a `tool_call` event handler enforces tool restrictions:
 
-In dynamic mode, the guard is active from the moment `/team dynamic` is entered — before any members exist.
+**Standard team session / execution phase:**
+- `.md` files (`.shared-context.md`, ADRs, planning docs) — `write`/`edit` allowed
+- Code files (`.ts`, `.js`, `.py`, etc.) — `write`/`edit` blocked with reason "请委派给 Member"
+
+**Dynamic mode design phase (stricter):**
+- `bash`, `read`, `code_search`, `fetch_content`, `edit` — **all blocked** (TL cannot explore or modify code)
+- `write` — only `.md` files allowed (for shared-context.md / ADRs)
+- Only management tools + `add_dynamic_member` remain available
+
+The design phase guard is active from the moment `/team dynamic` is entered. It lifts when the first `start_member` call succeeds, transitioning to the execution phase.
 
 ### Dynamic Mode Flow
 
@@ -253,24 +320,40 @@ In dynamic mode, the guard is active from the moment `/team dynamic` is entered 
   → mkdir sessions/_dynamic_<ts>/
   → startSession({name:"_dynamic_<ts>", members:[]})
   → isDynamicSession = true
-  → 激活 TL 工具 + 会话守卫 + widget（显示"设计阶段"）
+  → dynamicPhase = "design"
+  → 激活 TL 工具 + 设计阶段严格守卫 + widget（显示"设计阶段"）
+  → 注入设计阶段提示词
 
-TL ↔ 用户讨论需求
-  → TL 构思成员配置
+═══ 设计阶段（TL 被阻断：不能 bash/read/code_search/fetch_content/edit，write 仅限 .md）═══
+
+TL ↔ 用户讨论需求（逐个方面，一次只问一个问题）
+  → TL 构思团队角色 + 工作流
+  → TL 向用户展示方案 → 用户确认
 
 TL: add_dynamic_member({name, label, systemPrompt, model?})
   → addMemberToSession() 刷新 currentSession
   → router / widget 更新
 
+TL: write .shared-context.md（团队成员、术语、工作流、协作规则）
+
+═══ 阶段门：start_member 首次调用自动进入执行阶段 ═══
+
 TL: start_member("coder")
   → buildMemberConfig 从 session 找到成员
   → 创建进程
+  → onDynamicPhaseTransition() → dynamicPhase = "execution"
+  → 设计阶段守卫解除，恢复工具权限
+  → 下次 before_agent_start 注入执行阶段提示词
+
+═══ 执行阶段（标准团队会话守卫）═══
 
 TL: team_send_and_wait(...)
   → 消息通道正常流转
 
+TL: 监控进展、协调异常、更新 shared-context
+
 /team stop
-  → stopAll() → rm -rf sessions/_dynamic_<ts>/ → endSession()
+  → stopAll() → rm -rf sessions/_dynamic_<ts>/ → endSession() → dynamicPhase = "design"
 ```
 
 
