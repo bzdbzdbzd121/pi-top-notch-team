@@ -58,7 +58,10 @@ const TOOL_CONFIG: Record<DefinitionToolMode, {
       "Path can be overridden via TOP_NOTCH_TEAM_ROOT env var.\n" +
       "MERGE FEATURE: For existing (unchanged) members, you only need to pass {name: \"...\"} \u2014 " +
       "systemPrompt/label/model auto-fill from stored YAML. Omit a member to delete it. " +
-      "New or modified members need full data.",
+      "New or modified members need full data.\n" +
+      "Only name is required for updates \u2014 you can omit description, members, and defaultModel " +
+      "if you only want to change the workflow (or any other subset of fields). " +
+      "Unprovided fields preserve their existing values from the stored YAML.",
     membersRequired: ["name"],
     isUpdate: true,
   },
@@ -66,10 +69,23 @@ const TOOL_CONFIG: Record<DefinitionToolMode, {
 
 const SUCCESS_MESSAGES: Record<DefinitionToolMode, (params: TeamSaveParams) => string> = {
   create: (params) =>
-    `团队 "${params.name}" 已创建成功！${params.members.length} 个成员已配置。用 /team list 查看，用 /team start ${params.name} 启动。`,
+    `团队 "${params.name}" 已创建成功！${params.members!.length} 个成员已配置。用 /team list 查看，用 /team start ${params.name} 启动。`,
   update: (params) =>
-    `团队 "${params.name}" 已更新成功！${params.members.length} 个成员已配置。若需继续修改，请继续描述；完成编辑后输入 /team done 退出编辑模式。`,
+    `团队 "${params.name}" 已更新成功！${params.members ? params.members.length + ' 个成员' : '成员'}已就绪。若需继续修改，请继续描述；完成编辑后输入 /team done 退出编辑模式。`,
 };
+
+/**
+ * Build the `required` field for tool parameters.
+ * Create mode requires name + description + members.
+ * Update mode requires only name — allows partial updates (e.g. workflow-only).
+ */
+function buildParametersRequired(mode: DefinitionToolMode): string[] {
+  if (mode === "create") {
+    return ["name", "description", "members"];
+  }
+  // update mode: only name is required; everything else is optional
+  return ["name"];
+}
 
 /**
  * Dynamically register a team definition tool (create or update) for /team mode.
@@ -105,7 +121,7 @@ export function registerTeamDefinitionTool(deps: RegisterDefinitionDeps): void {
         },
         workflow: wfSchema,
       },
-      required: ["name", "description", "members"],
+      required: buildParametersRequired(mode),
     },
     async execute(
       _toolCallId: string,
