@@ -27,7 +27,7 @@ The per-session behavior and constraints that the TL communicates to a Member du
 _Avoid_: Baking session tasks into YAML definition
 
 **Process Management Tools**:
-A set of seven tools (six general + one dynamic-mode-specific) registered only during an active Team Session: `start_member`, `stop_member`, `list_members`, `get_member_log`, `wait_and_get_member_status`, `team_send_and_wait`, and `add_dynamic_member` (dynamic mode only). These tools manage the lifecycle of Member `pi --mode rpc` processes and enable TL-to-Member communication and status checks. Not available outside a Team Session.
+A set of nine tools registered only during an active Team Session: `start_member`, `stop_member`, `list_members`, `get_member_log`, `wait_and_get_member_status`, `team_send_and_wait`, `add_dynamic_member` (dynamic mode only), `set_goal`, and `finish_goal`. These tools manage the lifecycle of Member `pi --mode rpc` processes, enable TL-to-Member communication, and provide a goal-tracking system to keep the TL on task. Not available outside a Team Session.
 
 **Real-time Message Channel**:
 The communication medium through which agents (Team Lead and Members) exchange information during a Team Session. Implementation is separate from the team orchestration logic.
@@ -43,17 +43,22 @@ Each team session gets a unique `sessionId` (timestamp + random suffix). Session
 A free-form session mode where the Team Definition is built at runtime rather than loaded from YAML. The TL enters a session with 0 members, discusses requirements with the user, and uses `add_dynamic_member` to register each role. Session data lives in `sessions/_dynamic_<ts>/` and is cleaned up on `/team stop`. The session guard blocks code file writes from the moment of entry.
 _Avoid_: Ad-hoc team, on-the-fly team, temporary team
 
+**Goal**:
+A session-scoped objective set by the TL at the start of a task using the `set_goal` tool. Consists of a summary text and verifiable completion criteria. When the TL finishes a turn (`agent_end`) with an active, incomplete goal, the system automatically sends a user message reminding the TL to continue working rather than asking the user for permission. The TL calls `finish_goal` when the goal is met or an unresolvable blocker prevents completion.
+_Avoid_: Task objective, milestone, checkpoint
+
 **Team Session Lifecycle**:
 1. User runs `/team start <name>` or `/team dynamic`
 2. TL clarifies requirements with the user (possibly multiple rounds)
 3. TL breaks down tasks, creates a plan, and writes the Shared Context
-4. TL uses `start_member` to launch Member RPC processes (each receives role info via env vars)
-5. TL sends Shared Context to Members along with initial task assignments
-6. TL and Members communicate via the message channel; TL monitors progress
-7. TL updates Shared Context as needed and notifies Members
-8. TL reports completion to user when all tasks are done
-9. User decides when to run `/team stop` to terminate all Member processes
-10. Member session files are preserved for future resumption
+4. TL sets a **Goal** via `set_goal` to define the session's objective
+5. TL uses `start_member` to launch Member RPC processes (each receives role info via env vars)
+6. TL sends Shared Context to Members along with initial task assignments
+7. TL and Members communicate via the message channel; TL monitors progress
+8. If TL finishes a turn with an incomplete goal, the system auto-reminds the TL to continue
+9. TL calls `finish_goal` when all criteria are met
+10. TL reports completion to user when all tasks are done
+11. User decides when to run `/team stop` to terminate all Member processes
 
 
 ## Example Dialogue

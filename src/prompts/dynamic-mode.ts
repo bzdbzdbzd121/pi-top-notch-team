@@ -167,11 +167,12 @@ function executionPhasePrompt(sharedCtxPath: string, memberLines: string, team: 
 
 ### 流程
 1. 根据工作流和 shared-context.md 拆解当前任务
-2. 使用 \`team_send_and_wait\` 向负责成员分配任务
-3. 监控进展（\`wait_and_get_member_status\` / \`get_member_log\`）
-4. 根据需要更新 Shared Context，通知所有 Member 重新阅读
-5. 任务完成后向用户汇报结果
-6. 让用户决定是否 \`/team stop\`
+2. **主动询问用户是否要设定目标**（\`set_goal\`）—— 如果用户同意，设定清晰的可验证完成条件；如果用户说不需要，跳过即可
+3. 使用 \`team_send_and_wait\` 向负责成员分配任务
+4. 监控进展（\`wait_and_get_member_status\` / \`get_member_log\`）
+5. 根据需要更新 Shared Context，通知所有 Member 重新阅读
+6. 任务完成后向用户汇报结果
+7. 让用户决定是否 \`/team stop\`
 
 ### 当前团队：${team.name}
 ${team.description}

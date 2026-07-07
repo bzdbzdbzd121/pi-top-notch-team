@@ -26,7 +26,7 @@ pi install ./pi-top-notch-team
 ```
 User's pi session (TL extension)
   ├── 11 subcommands (/team create, dynamic, edit, cancel, start, stop, list, show, delete, status, help)
-  ├── 7 TL tools (start_member, stop_member, list_members, get_member_log, wait_and_get_member_status, team_send_and_wait, add_dynamic_member)
+  ├── 9 TL tools (start_member, stop_member, list_members, get_member_log, wait_and_get_member_status, team_send_and_wait, add_dynamic_member, set_goal, finish_goal)
   ├── Message channel (queue → router → responseWaiter)
   ├── Member Process Manager
   │     ├── Member A (pi --mode rpc, member.ts)
@@ -81,6 +81,7 @@ src/
 │   └── manager.ts    ← Multi-member lifecycle + operational state + auto-restart
 ├── tools/
 │   ├── tl-tools.ts   ← 7 TL process management tools (Deps-based DI)
+│   ├── goal-tools.ts  ← Goal system: set_goal/finish_goal tools + agent_end reminder
 │   └── tl-tools-add-dynamic.test.ts  ← add_dynamic_member tool tests
 ├── team/
 │   ├── definition.ts ← TeamDefinition / TeamMember types
@@ -130,7 +131,9 @@ src/
 
 9. **Session isolation via sessionId** — Each team session generates a unique `sessionId` in `TeamSessionState`. `buildMemberConfig` uses this ID to nest session data under `sessions/<team-name>/<sessionId>/` instead of the flat `sessions/<team-name>/`. This prevents conflicts when the same pre-defined team is used across multiple sessions. On `/team stop`, the session subdirectory is cleaned up. Dynamic mode sessions (`_dynamic_<ts>`) use their unique team name for the same purpose — the entire team directory is removed on stop.
 
-10. **Two-phase dynamic mode** — `/team dynamic` is split into a **design phase** and an **execution phase**:
+10. **Goal system for TL autonomy** — `src/tools/goal-tools.ts` registers `set_goal` and `finish_goal` tools plus an `agent_end` event handler. When the TL sets a goal at session start and later finishes a turn (agent_end), the system checks if the goal is still active and incomplete. If so, it queues a user message (via `setTimeout(0)` to avoid the agent_end lifecycle conflict with `sendUserMessage`) re-triggering the TL with a reminder of the goal and its completion criteria. This prevents the TL from unnecessarily asking the user "should I continue?" mid-task. The goal is stored in module-level memory, has a 10-second cooldown between reminders to prevent loops, checks `ctx.signal?.aborted` to skip reminders when the user pressed Esc or redirected the agent, and is reset on session shutdown.
+
+11. **Two-phase dynamic mode** — `/team dynamic` is split into a **design phase** and an **execution phase**:
    - **Design phase** (entered on `/team dynamic`): TL is blocked from using `bash`/`read`/`code_search`/`fetch_content`/`edit` entirely. `write` is restricted to `.md` files only. This forces TL to focus on discussing requirements and designing the team rather than exploring or modifying code. The only tools available are `add_dynamic_member`, team management tools, and `.md` writes.
    - **Execution phase** (entered when the first `start_member` succeeds): TL regains access to all tools for monitoring and coordination. The standard team session guard still blocks code file writes.
    - Phase transition is automatic: `start_member` tool calls `onDynamicPhaseTransition`, which flips `teamCtx.dynamicPhase` from `"design"` to `"execution"`. The `before_agent_start` handler injects different prompts depending on the current phase.
@@ -237,7 +240,7 @@ npm test          # Run all tests (vitest)
 npm run test:watch  # Watch mode
 ```
 
-306 tests across 25 files (state-machine, member-process, event-handler, response-waiter, message-channel, member, save-team-definition, config, ui-widget tests included). Tests live alongside source as `*.test.ts`.
+318 tests across 25 files (state-machine, member-process, event-handler, response-waiter, message-channel, member, save-team-definition, config, ui-widget tests included). Tests live alongside source as `*.test.ts`.
 
 | Test Level | What | How |
 |-----------|------|-----|
@@ -280,6 +283,8 @@ npm run test:watch  # Watch mode
 | Tool | Description |
 |------|-------------|
 | `add_dynamic_member(name, label, systemPrompt, model?)` | Register a member in `/team dynamic` mode. Name is the identifier, label is Chinese display name, systemPrompt is role definition. Only available in dynamic mode. |
+| `set_goal(text, criteria)` | Set a session goal with verifiable completion criteria. The system will automatically re-trigger the TL with a reminder if it stops working before the goal is met. Call at the start of a task to prevent unnecessary mid-task interruptions. |
+| `finish_goal()` | Mark the current goal as completed and stop the reminder system. Call when all goal criteria are met, or when an unresolvable blocker is encountered. |
 | `start_member(name)` | Launch a Member's pi RPC process. In dynamic mode, the first call triggers the design→execution phase transition. |
 | `stop_member(name)` | Gracefully terminate a Member process |
 | `list_members()` | Show all member statuses |

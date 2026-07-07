@@ -7,6 +7,7 @@ import { getRootDir } from "./src/config";
 import { join } from "node:path";
 import { rmSync } from "node:fs";
 import { registerTlTools } from "./src/tools/tl-tools";
+import { registerGoalTools, resetGoal } from "./src/tools/goal-tools";
 import { createProcessManager } from "./src/process/manager";
 import { createTeamStatusWidget } from "./src/ui/team-status-widget";
 import { createEditModeWidget } from "./src/ui/edit-mode-widget";
@@ -44,7 +45,7 @@ export default function (pi: ExtensionAPI) {
     getHandle: (name) => memberHandles.get(name),
     setHandle: (name, handle) => { memberHandles.set(name, handle); },
     clearHandles: () => { memberHandles.clear(); },
-    tlToolNames: ["start_member", "stop_member", "list_members", "get_member_log", "team_send_and_wait", "wait_and_get_member_status"],
+    tlToolNames: ["start_member", "stop_member", "list_members", "get_member_log", "team_send_and_wait", "wait_and_get_member_status", "set_goal", "finish_goal"],
     router: null,
     messageQueue: null,
     responseWaiter: null,
@@ -99,6 +100,8 @@ export default function (pi: ExtensionAPI) {
     recentlyProcessedMessages,
     processManager: manager,
   };
+
+  registerGoalTools(pi);
 
   registerTlTools({
     pi,
@@ -195,6 +198,7 @@ export default function (pi: ExtensionAPI) {
       const isDynamic = teamCtx.isDynamicSession;
 
       endSession();
+      resetGoal();
       if (teamCtx.onSessionEnd) {
         teamCtx.onSessionEnd();
       }
@@ -225,6 +229,7 @@ export default function (pi: ExtensionAPI) {
         const isDynamic = teamCtx.isDynamicSession;
 
         endSession();
+        resetGoal();
         if (teamCtx.onSessionEnd) {
           teamCtx.onSessionEnd();
         }
@@ -577,14 +582,15 @@ ${workflowText}
 
 ### 流程
 1. 先与用户充分讨论需求，直到和用户对齐细节
-2. 拆解任务，制定计划
-3. 编写 Shared Context（共享上下文），记录：团队成员、项目背景和目标、协作规则、术语表
-4. 用 start_member 启动各 Member
-5. 将 Shared Context 随首次任务消息一起发送给各 Member。**在消息中明确告知 Member 任务完成后必须回复 TL，并指示 Member：输出报告/方案/设计文档时写入文件，不要在消息通道中塞入大量内容。**
-6. 通过消息通道与 Member 交流，监控进展（可使用 team_send_and_wait 等待成员回复）
-7. 根据需要更新 Shared Context，通知所有 Member 重新阅读
-8. 任务完成后向用户汇报结果
-9. 让用户决定是否 /team stop
+2. **主动询问用户是否要设定目标**（\`set_goal\`）—— 如果用户同意，使用 \`set_goal\` 设定清晰的可验证完成条件；如果用户说不需要，跳过即可。目标可以让系统在任务中途自动提醒你继续执行，避免不必要的中断。
+3. 拆解任务，制定计划
+4. 编写 Shared Context（共享上下文），记录：团队成员、项目背景和目标、协作规则、术语表
+5. 用 start_member 启动各 Member
+6. 将 Shared Context 随首次任务消息一起发送给各 Member。**在消息中明确告知 Member 任务完成后必须回复 TL，并指示 Member：输出报告/方案/设计文档时写入文件，不要在消息通道中塞入大量内容。**
+7. 通过消息通道与 Member 交流，监控进展（可使用 team_send_and_wait 等待成员回复）
+8. 根据需要更新 Shared Context，通知所有 Member 重新阅读
+9. 任务完成后向用户汇报结果
+10. 让用户决定是否 /team stop
 `;
     }
 
