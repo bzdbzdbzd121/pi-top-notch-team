@@ -17,6 +17,8 @@ export interface MessageChannelDeps {
   memberOpsStates: Map<string, MemberOperationalState>;
   lastPendingCorrId: Map<string, string>;
   memberHandles: Map<string, MemberProcessHandle>;
+  /** UI-only notification callback for successful message routing. */
+  onRouteNotification?: (target: string) => void;
 }
 
 export interface MessageChannel {
@@ -78,13 +80,9 @@ export function createMessageChannel(deps: MessageChannelDeps): MessageChannel {
   // 3. Create message queue (handler captures router)
   const messageQueue = createMessageQueue(
     async (msg: TeamMessage) => {
-      // Show routing notification for messages from TL
+      // UI-only routing notification for messages from TL
       if (msg.from === "tl") {
-        pi.sendMessage({
-          customType: "team-route",
-          content: `[消息已路由给 ${msg.to}]`,
-          display: true,
-        });
+        deps.onRouteNotification?.(msg.to);
       }
       router.route(msg);
     },

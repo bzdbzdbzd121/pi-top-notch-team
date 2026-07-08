@@ -76,12 +76,18 @@ export default function (pi: ExtensionAPI) {
 
   // waitWithAllIdleCheck is defined in src/tools/tl-tools.ts
 
+  // Capture ctx.ui.notify for UI-only routing notifications
+  let uiNotify: ((msg: string, type?: "info" | "warning" | "error") => void) | null = null;
+
   // ── Message channel: queue → router (extracted to src/setup/message-channel.ts) ──
   const { router, messageQueue, responseWaiter } = createMessageChannel({
     pi,
     memberOpsStates,
     lastPendingCorrId,
     memberHandles,
+    onRouteNotification: (target: string) => {
+      uiNotify?.(`[消息已路由给 ${target}]`, "info");
+    },
   });
 
   teamCtx.router = router;
@@ -249,6 +255,8 @@ export default function (pi: ExtensionAPI) {
     // Part 2: Register autocomplete + editor component
     // Store UI ref for session end cleanup
     sessionUiRef = ctx.ui;
+    // Capture ctx.ui.notify for UI-only route notifications
+    uiNotify = ctx.ui.notify;
 
     ctx.ui.addAutocompleteProvider((current) => ({
       async getSuggestions(lines, line, col, options) {
@@ -572,13 +580,13 @@ ${workflowText}
 
 1. **先写 Shared Context** — 用 \`write\` 工具写入 \`${sharedCtxPath}\`
 2. **start_member(name)** — 启动一个 Member 进程
-3. **team_send_and_wait(to, content, nextSteps)** — 给 Member 发任务并等待回复（阻塞），直到收到回复或所有成员空闲。必须传入 nextSteps（下一步计划），wait 结束后该信息会随结果返回，用于强调工作流程方向
+3. **team_send_and_wait({tasks: [{to, content}], nextSteps})** — 给 Member 发任务并等待回复。tasks 支持多个任务并发发送（如多个独立检视任务可同时发出）。等待所有任务完成或有成员空闲后返回。必须传入 nextSteps（下一步计划），wait 结束后该信息会随结果返回
 4. **list_members** — 查看各 Member 的运行状态
 5. **wait_and_get_member_status()** — **优先使用**。等待所有成员空闲后查看操作状态（idle/working/crashed/stopped）。如有成员在工作则阻塞，和 team_send_and_wait 检测 all-idle 的方式相同
 6. **get_member_log(name, lines?)** — 查看 Member 最近的详细对话记录，负担较重，仅当需要了解具体内容时才使用
 7. **stop_member(name)** — 终止 Member 进程
 
-> 提示：team_send_and_wait 发送的消息包含 <corr:...> 标签。其他成员回复时需在内容中包含此标签，这样即使任务经过多次转交（A->B->TL），最终的回复也能正确匹配等待器。消息通道中的 Team Lead 名称是 tl。
+> 提示：team_send_and_wait 的 tasks 参数支持传入多个任务同时发送给不同 Member（如 [{to:"a", content:"..."}, {to:"b", content:"..."}]），实现并发执行。发送的消息包含 <corr:...> 标签。其他成员回复时需在内容中包含此标签。消息通道中的 Team Lead 名称是 tl。
 
 ### 流程
 1. 先与用户充分讨论需求，直到和用户对齐细节

@@ -27,6 +27,8 @@ pi install ./pi-top-notch-team
 User's pi session (TL extension)
   ├── 11 subcommands (/team create, dynamic, edit, cancel, start, stop, list, show, delete, status, help)
   ├── 9 TL tools (start_member, stop_member, list_members, get_member_log, wait_and_get_member_status, team_send_and_wait, add_dynamic_member, set_goal, finish_goal)
+
+Batch send: team_send_and_wait now supports tasks array for concurrent dispatch to multiple members. Previously single-target to/content/nextSteps; now unified tasks:[{to, content}] + nextSteps.
   ├── Message channel (queue → router → responseWaiter)
   ├── Member Process Manager
   │     ├── Member A (pi --mode rpc, member.ts)
@@ -146,7 +148,7 @@ The codebase uses an explicit Dependency Injection (DI) pattern to decouple modu
 |-------------|--------|-------------|
 | `TlToolsDeps` | `tools/tl-tools.ts` | `pi`, `manager`, `responseWaiter`, `memberOpsStates`, `lastPendingCorrId`, `messageQueue`, `createMember?`, `buildMemberConfig?`, `getMemberLog?`, `isDynamicSession?`, `addMemberToSession?`, `onDynamicMemberAdded?`, `onDynamicPhaseTransition?` |
 | `MemberLifecycleDeps` | `setup/member-lifecycle.ts` | `pi`, `memberOpsStates`, `messageQueue`, `responseWaiter`, `lastPendingCorrId`, `recentlyProcessedMessages`, `processManager?` |
-| `MessageChannelDeps` | `setup/message-channel.ts` | `pi`, `memberOpsStates`, `lastPendingCorrId`, `memberHandles` |
+| `MessageChannelDeps` | `setup/message-channel.ts` | `pi`, `memberOpsStates`, `lastPendingCorrId`, `memberHandles`, `onRouteNotification?` |
 | `EventHandlerDeps` | `channel/event-handler.ts` | `pi`, `memberOpsStates`, `messageQueue`, `responseWaiter`, `lastPendingCorrId`, `recentlyProcessedMessages`, `processManager?` |
 | `SendToMemberDeps` | `channel/event-handler.ts` | `pi`, `memberOpsStates`, `memberHandles` |
 
@@ -188,7 +190,7 @@ Backup path: assistant text outputs matching
 are also parsed via parseTeamMessageTag() (non-greedy regex, length guard) and enqueued.
 
 team_send_and_wait flow:
-  TL calls team_send_and_wait(to, content, nextSteps) →
+  TL calls team_send_and_wait({tasks: [{to, content}], nextSteps}) →
     → responseWaiter.waitForResponse(corrId)
     → Message enqueued with <corr:...> tag
     → Member replies → responseWaiter.resolveIfWaiting(corrId, ...) → TL continues
@@ -290,7 +292,7 @@ npm run test:watch  # Watch mode
 | `list_members()` | Show all member statuses |
 | `get_member_log(name, lines?, maxContentLength?)` | Query Member's recent session via RPC. `maxContentLength` truncates each message content (default 200 chars). Truncation uses `slice(0, max-3) + "..."` so total length = maxContentLength. |
 | `wait_and_get_member_status()` | 等待所有 member 空闲后查看所有 Member 的运行状态 (idle/working/crashed/stopped)。No parameters. 如果任何 member 仍在工作中会阻塞，和 team_send_and_wait 检测 all-idle 的方式相同。 |
-| `team_send_and_wait(to, content, nextSteps)` | Send message and wait for response. Blocks until member replies or all members become idle. nextSteps（下一步计划）在 wait 结束后随结果返回，用于强调工作流程方向。Response content returned as tool result. |
+| `team_send_and_wait({tasks: [{to, content}], nextSteps})` | Send message(s) to **one or more** team members and wait for ALL responses. tasks 支持批量发送到不同 member 实现并发执行。Waits until all targeted members reply or all become idle. Returns partial results if some members fail. nextSteps 在 wait 结束后随结果返回。 |
 
 ## Design Time Tools (create/edit team)
 

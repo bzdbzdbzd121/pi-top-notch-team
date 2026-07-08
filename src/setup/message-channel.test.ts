@@ -293,9 +293,10 @@ describe("createMessageChannel", () => {
     expect(messageArg.content).toContain("worker");
   });
 
-  it("messageQueue handler should route message and notify TL for TL-sent messages", async () => {
+  it("messageQueue handler should call onRouteNotification for TL-sent messages", async () => {
     const mockRouter = { route: vi.fn(), updateMembers: vi.fn() };
     mockCreateRouter.mockReturnValue(mockRouter);
+    const onRouteNotification = vi.fn();
 
     const { createMessageChannel } = await loadModule();
     const deps = {
@@ -303,6 +304,7 @@ describe("createMessageChannel", () => {
       memberOpsStates,
       lastPendingCorrId,
       memberHandles,
+      onRouteNotification,
     };
 
     createMessageChannel(deps as any);
@@ -317,13 +319,9 @@ describe("createMessageChannel", () => {
       timestamp: Date.now(),
     });
 
-    // Should notify TL about routing
-    expect(pi.sendMessage).toHaveBeenCalledWith(
-      expect.objectContaining({
-        customType: "team-route",
-        display: true,
-      })
-    );
+    // Should notify via UI-only callback, not pi.sendMessage
+    expect(onRouteNotification).toHaveBeenCalledWith("worker");
+    expect(pi.sendMessage).not.toHaveBeenCalled();
     // Should route the message
     expect(mockRouter.route).toHaveBeenCalledWith(
       expect.objectContaining({ id: "msg-4" })
@@ -333,6 +331,7 @@ describe("createMessageChannel", () => {
   it("messageQueue handler should route message without notification for non-TL messages", async () => {
     const mockRouter = { route: vi.fn(), updateMembers: vi.fn() };
     mockCreateRouter.mockReturnValue(mockRouter);
+    const onRouteNotification = vi.fn();
 
     const { createMessageChannel } = await loadModule();
     const deps = {
@@ -340,6 +339,7 @@ describe("createMessageChannel", () => {
       memberOpsStates,
       lastPendingCorrId,
       memberHandles,
+      onRouteNotification,
     };
 
     createMessageChannel(deps as any);
@@ -353,7 +353,8 @@ describe("createMessageChannel", () => {
       timestamp: Date.now(),
     });
 
-    // Should NOT notify TL for non-TL messages
+    // Should NOT notify for non-TL messages
+    expect(onRouteNotification).not.toHaveBeenCalled();
     expect(pi.sendMessage).not.toHaveBeenCalled();
   });
 
