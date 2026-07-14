@@ -7,7 +7,8 @@ import { getRootDir } from "./src/config";
 import { join } from "node:path";
 import { rmSync } from "node:fs";
 import { registerTlTools } from "./src/tools/tl-tools";
-import { registerGoalTools, resetGoal } from "./src/tools/goal-tools";
+import { registerGoalTools, registerGoalAgentHandler, resetGoal, GOAL_TOOL_NAMES } from "./src/tools/goal-tools";
+import { ensureToolRegistered } from "./src/commands/shared/ensure-tool";
 import { createProcessManager } from "./src/process/manager";
 import { createTeamStatusWidget } from "./src/ui/team-status-widget";
 import { createEditModeWidget } from "./src/ui/edit-mode-widget";
@@ -46,6 +47,7 @@ export default function (pi: ExtensionAPI) {
     setHandle: (name, handle) => { memberHandles.set(name, handle); },
     clearHandles: () => { memberHandles.clear(); },
     tlToolNames: ["start_member", "stop_member", "list_members", "get_member_log", "team_send_and_wait", "wait_and_get_member_status", "set_goal", "finish_goal"],
+
     router: null,
     messageQueue: null,
     responseWaiter: null,
@@ -73,6 +75,13 @@ export default function (pi: ExtensionAPI) {
   const lastPendingCorrId = new Map<string, string>();
   // Track recently processed tool_execution_end message fingerprints for de-duplication
   const recentlyProcessedMessages = new Map<string, number>();
+
+  // Auto-reply tracking: last assistant text per member (populated at message_end)
+  const lastAssistantTexts = new Map<string, string>();
+  // Auto-reply tracking: members that replied via team_send_message in current turn
+  const perTurnReplied = new Set<string>();
+  // Auto-reply tracking: pending setTimeout refs for scheduled auto-replies
+  const pendingAutoReplies = new Map<string, NodeJS.Timeout>();
 
   // waitWithAllIdleCheck is defined in src/tools/tl-tools.ts
 
@@ -105,9 +114,14 @@ export default function (pi: ExtensionAPI) {
     lastPendingCorrId,
     recentlyProcessedMessages,
     processManager: manager,
+    lastAssistantTexts,
+    perTurnReplied,
+    pendingAutoReplies,
   };
 
-  registerGoalTools(pi);
+  // Only register the agent_end reminder handler at module init (safe, guards itself).
+  // Goal tools (set_goal/finish_goal) are registered on-demand when a session starts.
+  registerGoalAgentHandler(pi);
 
   registerTlTools({
     pi,
@@ -195,6 +209,31 @@ export default function (pi: ExtensionAPI) {
     };
   });
 
+  // ── agent_settled: detect Escape-interrupt during team session with running members ──
+  // When the user presses Escape during a team session, pi cancels the TL's turn
+  // but member processes keep running. This handler notifies the user.
+  pi.on("agent_settled", async (_event, ctx) => {
+    const session = getSessionState();
+    if (!session.active) return;
+
+    // Check if any member processes are still running
+    const runningMembers = Array.from(memberOpsStates.entries())
+      .filter(([, state]) => state === "working" || state === "idle");
+
+    if (runningMembers.length > 0 && ctx.signal?.aborted) {
+      // User interrupted via Escape — notify that members are still running
+      ctx.ui.setStatus("team-members-running", `\u26a0\ufe0f ${runningMembers.length} \u4e2a\u6210\u5458\u4ecd\u5728\u8fd0\u884c \u2014 \u4f7f\u7528 /team stop \u7ed3\u675f\u4f1a\u8bdd`);
+      ctx.ui.notify(`\u6309 Esc \u53d6\u6d88\u4e86 TL\uff0c\u4f46\u6210\u5458\u8fdb\u7a0b\u4ecd\u5728\u8fd0\u884c\u3002\u4f7f\u7528 /team stop \u7ed3\u675f\u56e2\u961f\u4f1a\u8bdd\u3002`, "warning");
+    }
+
+    // Show a subtle persistent status if members are running (even without abort)
+    if (runningMembers.length > 0 && !ctx.signal?.aborted) {
+      ctx.ui.setStatus("team-members-running", `\u56e2\u961f\u6210\u5458\u8fd0\u884c\u4e2d \u2014 \u4f7f\u7528 /team stop \u7ed3\u675f\u4f1a\u8bdd`);
+    } else if (runningMembers.length === 0) {
+      ctx.ui.setStatus("team-members-running", undefined);
+    }
+  });
+
   // ── session_shutdown: clean up team state on /new, /resume, /fork ──
   pi.on("session_shutdown", () => {
     const _session = getSessionState();
@@ -210,6 +249,11 @@ export default function (pi: ExtensionAPI) {
       }
       teamCtx.onEditEnd?.();
       teamCtx.onCreateEnd?.();
+
+      // Deactivate team tools on session shutdown
+      const _shutdownActive = pi.getActiveTools();
+      const _shutdownToRemove = new Set([...teamCtx.tlToolNames, "add_dynamic_member", "create_team_definition", "update_team_definition"]);
+      pi.setActiveTools(_shutdownActive.filter((t: string) => !_shutdownToRemove.has(t)));
 
       // Best-effort cleanup of session directory
       if (isDynamic && teamName) {
@@ -241,6 +285,11 @@ export default function (pi: ExtensionAPI) {
         }
         teamCtx.onEditEnd?.();
         teamCtx.onCreateEnd?.();
+
+        // Deactivate team tools on stale session cleanup
+        const _freshActive = pi.getActiveTools();
+        const _freshToRemove = new Set([...teamCtx.tlToolNames, "add_dynamic_member", "create_team_definition", "update_team_definition"]);
+        pi.setActiveTools(_freshActive.filter((t: string) => !_freshToRemove.has(t)));
 
         if (isDynamic && teamName) {
           try { rmSync(join(getRootDir(), "sessions", teamName), { recursive: true, force: true }); } catch (e) { console.warn('[top-notch-team] Failed to clean up dynamic session dir:', e); }
@@ -316,6 +365,12 @@ export default function (pi: ExtensionAPI) {
     if (teamStatusWidget) return;
     const session = getSessionState();
     if (!session.teamDefinition) return;
+
+    // Register goal tools on-demand when a team session starts
+    for (const toolName of GOAL_TOOL_NAMES) {
+      ensureToolRegistered(pi, toolName, () => registerGoalTools(pi));
+    }
+
     teamStatusWidget = createTeamStatusWidget({
       teamName: session.teamDefinition.name,
       getMembers: () => getSessionState().teamDefinition?.members ?? [],
@@ -580,13 +635,19 @@ ${workflowText}
 
 1. **先写 Shared Context** — 用 \`write\` 工具写入 \`${sharedCtxPath}\`
 2. **start_member(name)** — 启动一个 Member 进程
-3. **team_send_and_wait({tasks: [{to, content}], nextSteps})** — 给 Member 发任务并等待回复。tasks 支持多个任务并发发送（如多个独立检视任务可同时发出）。等待所有任务完成或有成员空闲后返回。必须传入 nextSteps（下一步计划），wait 结束后该信息会随结果返回
+3. **team_send_and_wait({tasks: [{to, content}], nextSteps})** — 给 Member 发任务并等待回复。tasks 支持多个任务并发发送（如多个独立检视任务可同时发出）。等待所有任务完成或有成员空闲后返回。必须传入 nextSteps（下一步计划），wait结束后该信息会随结果返回。**batch vs sequential 决策规则见下方提示**
 4. **list_members** — 查看各 Member 的运行状态
 5. **wait_and_get_member_status()** — **优先使用**。等待所有成员空闲后查看操作状态（idle/working/crashed/stopped）。如有成员在工作则阻塞，和 team_send_and_wait 检测 all-idle 的方式相同
 6. **get_member_log(name, lines?)** — 查看 Member 最近的详细对话记录，负担较重，仅当需要了解具体内容时才使用
 7. **stop_member(name)** — 终止 Member 进程
 
 > 提示：team_send_and_wait 的 tasks 参数支持传入多个任务同时发送给不同 Member（如 [{to:"a", content:"..."}, {to:"b", content:"..."}]），实现并发执行。发送的消息包含 <corr:...> 标签。其他成员回复时需在内容中包含此标签。消息通道中的 Team Lead 名称是 tl。
+>
+> ⚡ **Batch vs Sequential 决策规则：**
+>   - **批量（Batch）**：当多个任务**相互独立**时放入同一个 tasks 数组，各 Member 同时工作。适用场景：同时派发不同文件的分析/审查任务。
+>   - **逐个（Sequential）**：当任务 B 的指令**依赖**任务 A 的输出时，先发 A 等结果，再用结果构造 B 的任务。适用场景：分析员输出报告后，编码员才能开始重构。
+>   - **混合策略**：先 batch A+B 做并行分析，拿到结果后再逐个派发 C（依赖 A+B 结果的任务）。这是最高效的模式。
+>   - Batch 模式下单个成员失败，其他成员的结果仍然可用（返回 partial results）。
 
 ### 流程
 1. 先与用户充分讨论需求，直到和用户对齐细节

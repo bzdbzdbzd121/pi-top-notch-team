@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, type Mock } from "vitest";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { transitionState } from "./session/state-machine";
 import type { MemberOperationalState } from "./session/context";
@@ -11,6 +11,8 @@ function createMockUi() {
       fg: (_style: string, text: string) => text,
     },
     setWidget: vi.fn(),
+    setStatus: vi.fn(),
+    notify: vi.fn(),
     requestRender: vi.fn(),
   };
 }
@@ -310,5 +312,61 @@ describe("MemberOperationalState type (imported from context)", () => {
     const crashed: MemberOperationalState = "crashed";
     const stopped: MemberOperationalState = "stopped";
     expect([idle, working, crashed, stopped]).toHaveLength(4);
+  });
+});
+
+// ── agent_settled handler tests ───────────────────────────
+
+describe("agent_settled handler", () => {
+  let pi: ExtensionAPI;
+
+  beforeEach(() => {
+    vi.resetModules();
+    delete process.env.TEAM_ROLE;
+  });
+
+  it("registers pi.on for agent_settled", async () => {
+    pi = createMockPi();
+    const mod = await import("../index");
+    mod.default(pi);
+
+    const onCalls = (pi.on as ReturnType<typeof vi.fn>).mock.calls;
+    const eventNames = onCalls.map((c: any) => c[0]);
+    expect(eventNames).toContain("agent_settled");
+  });
+
+  it("returns early when session is not active", async () => {
+    pi = createMockPi();
+    const mod = await import("../index");
+    mod.default(pi);
+
+    const { endSession } = await import("./session/state");
+    endSession();
+
+    const onCalls = (pi.on as ReturnType<typeof vi.fn>).mock.calls;
+    const handler = onCalls.find((c: any) => c[0] === "agent_settled")![1];
+
+    const ui = createMockUi();
+    await handler({}, { ui, signal: {} });
+
+    expect(ui.setStatus).not.toHaveBeenCalled();
+  });
+
+  it("clears status when no members are running", async () => {
+    pi = createMockPi();
+    const mod = await import("../index");
+    mod.default(pi);
+
+    const { startSession, endSession } = await import("./session/state");
+    endSession();
+    startSession({ name: "test", description: "", members: [] });
+
+    const onCalls = (pi.on as ReturnType<typeof vi.fn>).mock.calls;
+    const handler = onCalls.find((c: any) => c[0] === "agent_settled")![1];
+
+    const ui = createMockUi();
+    await handler({}, { ui, signal: { aborted: false } });
+
+    expect(ui.setStatus).toHaveBeenCalledWith("team-members-running", undefined);
   });
 });

@@ -28,7 +28,7 @@ User's pi session (TL extension)
   ├── 11 subcommands (/team create, dynamic, edit, cancel, start, stop, list, show, delete, status, help)
   ├── 9 TL tools (start_member, stop_member, list_members, get_member_log, wait_and_get_member_status, team_send_and_wait, add_dynamic_member, set_goal, finish_goal)
 
-Batch send: team_send_and_wait now supports tasks array for concurrent dispatch to multiple members. Previously single-target to/content/nextSteps; now unified tasks:[{to, content}] + nextSteps.
+Batch send: team_send_and_wait now supports tasks array for concurrent dispatch to multiple members. Previously single-target to/content/nextSteps; now unified tasks:[{to, content}] + nextSteps. **Batch when tasks are independent (parallel execution); sequential when task B depends on task A's output. See TL Tools table for decision rules.**
   ├── Message channel (queue → router → responseWaiter)
   ├── Member Process Manager
   │     ├── Member A (pi --mode rpc, member.ts)
@@ -41,7 +41,7 @@ Batch send: team_send_and_wait now supports tasks array for concurrent dispatch 
 
 | File | Role |
 |------|------|
-| `index.ts` (~400 lines) | TL extension entry point. Registers `/team` command, wires DI dependencies, `before_agent_start` injection, team-status + edit-mode widget lifecycle, autocomplete provider. Refactored from ~800 lines via modular extraction. |
+| `index.ts` (~400 lines) | TL extension entry point. Registers `/team` command, wires DI dependencies, `before_agent_start` injection, team-status + edit-mode widget lifecycle, autocomplete provider, `agent_settled` interrupt handler (Esc detection with member-running notification). Refactored from ~800 lines via modular extraction. |
 | `member.ts` | Member extension entry point. Registers `team_send_message` tool, injects team awareness via env vars. Uses `JSON.parse` for TEAM_MEMBERS (no longer comma-delimited). |
 | `package.json` | pi package manifest with `pi.extensions` pointing to `["./index.ts", "./member.ts"]` |
 
@@ -292,7 +292,12 @@ npm run test:watch  # Watch mode
 | `list_members()` | Show all member statuses |
 | `get_member_log(name, lines?, maxContentLength?)` | Query Member's recent session via RPC. `maxContentLength` truncates each message content (default 200 chars). Truncation uses `slice(0, max-3) + "..."` so total length = maxContentLength. |
 | `wait_and_get_member_status()` | 等待所有 member 空闲后查看所有 Member 的运行状态 (idle/working/crashed/stopped)。No parameters. 如果任何 member 仍在工作中会阻塞，和 team_send_and_wait 检测 all-idle 的方式相同。 |
-| `team_send_and_wait({tasks: [{to, content}], nextSteps})` | Send message(s) to **one or more** team members and wait for ALL responses. tasks 支持批量发送到不同 member 实现并发执行。Waits until all targeted members reply or all become idle. Returns partial results if some members fail. nextSteps 在 wait 结束后随结果返回。 |
+| `team_send_and_wait({tasks: [{to, content}], nextSteps})` | Send message(s) to **one or more** team members and wait for ALL responses. tasks 支持批量发送到不同 member 实现并发执行。Waits until all targeted members reply or all become idle. Returns partial results if some members fail. nextSteps 在 wait 结束后随结果返回。
+>
+> **Batch vs Sequential 决策规则：**
+> - **Batch**（多个 tasks[] 条目）→ 任务相互独立时使用。各 Member 同时工作，耗时 ≈ 最慢的单任务。
+> - **Sequential**（逐个调用）→ 任务 B 依赖任务 A 的输出时使用。耗时 = 所有任务时间之和。
+> - **混合策略**：先 batch A+B 并行，再 sequential C（依赖前序结果）。最高效。 |
 
 ## Design Time Tools (create/edit team)
 
@@ -363,6 +368,29 @@ TL: 监控进展、协调异常、更新 shared-context
   → stopAll() → rm -rf sessions/_dynamic_<ts>/ → endSession() → dynamicPhase = "design"
 ```
 
+
+### Escape (中断) 处理
+
+当用户在团队会话期间按下 Escape（`app.interrupt`），pi 会取消 TL 当前的 LLM 回合。但成员进程（独立的 `pi --mode rpc` 子进程）会继续在后台运行。
+
+`agent_settled` 事件处理器（位于 `index.ts`）负责检测这种情况并提醒用户：
+
+1. **Escape 按下 + 成员仍在运行**（`ctx.signal?.aborted === true`）：
+   - 在 TUI 底部状态栏设置醒目的警告：`⚠️ N 个成员仍在运行 — 使用 /team stop 结束会话`
+   - 通过 `ctx.ui.notify()` 显示一条浮动通知
+   - 不会自动停止成员进程（避免中断正在进行的工作）
+
+2. **TL 正常结束 + 成员仍在运行**：
+   - 在状态栏显示一条柔和的提示：`团队成员运行中 — 使用 /team stop 结束会话`
+   - 不显示弹出通知
+
+3. **所有成员停止后**：
+   - 自动清除状态栏
+
+用户可以在看到提醒后选择：
+- 输入新消息让 TL 继续派发任务
+- 使用 `/team stop` 结束整个团队会话
+- 不处理，让成员在后台自行运行
 
 ## ADRs
 
