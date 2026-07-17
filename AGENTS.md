@@ -135,7 +135,13 @@ src/
 
 10. **Goal system for TL autonomy** — `src/tools/goal-tools.ts` registers `set_goal` and `finish_goal` tools plus an `agent_end` event handler. When the TL sets a goal at session start and later finishes a turn (agent_end), the system checks if the goal is still active and incomplete. If so, it queues a user message (via `setTimeout(0)` to avoid the agent_end lifecycle conflict with `sendUserMessage`) re-triggering the TL with a reminder of the goal and its completion criteria. This prevents the TL from unnecessarily asking the user "should I continue?" mid-task. The goal is stored in module-level memory, has a 10-second cooldown between reminders to prevent loops, checks `ctx.signal?.aborted` to skip reminders when the user pressed Esc or redirected the agent, and is reset on session shutdown.
 
-11. **Two-phase dynamic mode** — `/team dynamic` is split into a **design phase** and an **execution phase**:
+11. **Defensive parsing for `tasks` parameter** — `src/tools/tl-tools.ts` includes a `parseTasks()` function that handles three formats for the `tasks` parameter:
+    - Raw array (correct): `tasks: [{to: "a", content: "..."}]`
+    - String-encoded array (LLM double-encoding): auto-`JSON.parse` recovery
+    - Single object (another LLM hallucination): auto-wraps as single-element array
+    This prevents `"tasks: must be array"` validation failures caused by LLMs incorrectly double-encoding JSON-in-JSON.
+
+12. **Two-phase dynamic mode** — `/team dynamic` is split into a **design phase** and an **execution phase**:
    - **Design phase** (entered on `/team dynamic`): TL is blocked from using `bash`/`read`/`code_search`/`fetch_content`/`edit` entirely. `write` is restricted to `.md` files only. This forces TL to focus on discussing requirements and designing the team rather than exploring or modifying code. The only tools available are `add_dynamic_member`, team management tools, and `.md` writes.
    - **Execution phase** (entered when the first `start_member` succeeds): TL regains access to all tools for monitoring and coordination. The standard team session guard still blocks code file writes.
    - Phase transition is automatic: `start_member` tool calls `onDynamicPhaseTransition`, which flips `teamCtx.dynamicPhase` from `"design"` to `"execution"`. The `before_agent_start` handler injects different prompts depending on the current phase.
@@ -293,6 +299,13 @@ npm run test:watch  # Watch mode
 | `get_member_log(name, lines?, maxContentLength?)` | Query Member's recent session via RPC. `maxContentLength` truncates each message content (default 200 chars). Truncation uses `slice(0, max-3) + "..."` so total length = maxContentLength. |
 | `wait_and_get_member_status()` | 等待所有 member 空闲后查看所有 Member 的运行状态 (idle/working/crashed/stopped)。No parameters. 如果任何 member 仍在工作中会阻塞，和 team_send_and_wait 检测 all-idle 的方式相同。 |
 | `team_send_and_wait({tasks: [{to, content}], nextSteps})` | Send message(s) to **one or more** team members and wait for ALL responses. tasks 支持批量发送到不同 member 实现并发执行。Waits until all targeted members reply or all become idle. Returns partial results if some members fail. nextSteps 在 wait 结束后随结果返回。
+>
+> **⚠️ `tasks` 必须是原始 JSON 数组，不要传 JSON 字符串。** LLM 有时会错误地将数组二次序列化（`"tasks": "[{...}]"`），这会导致框架校验失败。
+> 工具参数 schema 已使用 `oneOf` 同时接受 `array` 和 `string` 类型，框架校验不会拦截。
+> 工具内部已添加 `parseTasks()` 防御性解析，能自动处理字符串编码的数组和单对象包裹情况。
+> - 原始数组 ✓：`"tasks": [{ "to": "planner", "content": "..." }]`
+> - 字符串编码 ✗：`"tasks": "[{"to": "planner", ...}]"`（框架放行 + 自动 JSON.parse 恢复）
+> - 单对象包裹 ✓（自动修正）：`"tasks": { "to": "planner", "content": "..." }`
 >
 > **Batch vs Sequential 决策规则：**
 > - **Batch**（多个 tasks[] 条目）→ 任务相互独立时使用。各 Member 同时工作，耗时 ≈ 最慢的单任务。

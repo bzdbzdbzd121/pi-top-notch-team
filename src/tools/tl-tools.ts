@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { ProcessManager } from "../process/manager";
 import type { MemberProcessHandle, MemberProcessConfig } from "../process/member-process";
-import type { ResponseWaiter } from "../channel/response-waiter";
+import type { ResponseWaiter, WaitResult } from "../channel/response-waiter";
 import type { MessageQueue } from "../channel/message-queue";
 import type { TeamMessage } from "../channel/types";
 import type { MemberOperationalState } from "../session/context";
@@ -297,30 +297,63 @@ export function registerTlTools(deps: TlToolsDeps): void {
     name: "team_send_and_wait",
     label: "Send Message and Wait",
     description:
-      "Send a message to a team member and WAIT for their response. "
+      "Send message(s) to one or more team members and WAIT for their responses. "
       + "Use instead of team_send_message when you need the member result.\n"
-      + "Waits indefinitely until the member replies or all members become idle.\n"
-      + "Params: to (target), content (message body), nextSteps (下一步计划，wait 结束后返回给 TL 以强调工作流程).",
+      + "Waits until ALL targeted members reply or all members become idle.\n"
+      + "Params: tasks (array of {to, content}), nextSteps (下一步计划，wait 结束后返回给 TL 以强调工作流程).\n"
+      + "For a single member: tasks: [{to: \"name\", content: \"...\"}].\n"
+      + "For multiple concurrent members: tasks: [{to: \"a\", content: \"...\"}, {to: \"b\", content: \"...\"}]",
     promptGuidelines: [
       "Use team_send_and_wait when you need a member result before continuing.",
-      "team_send_and_wait returns early with allIdle status when all members become idle.",
-      "If all_idle is returned, check work results. If member is still working, call team_send_and_wait again.",
+      "⚠️ CRITICAL — tasks MUST be a raw JSON array, NOT a JSON-string-encoded array.",
+      '   CORRECT: "tasks": [{ "to": "planner", "content": "..." }]',
+      '   WRONG:   "tasks": "[{\"to\": \"planner\", ...}]"  ← Do NOT stringify. If you do, the system will auto-recover via JSON.parse.',
+      "DECISION RULE — Batch vs Sequential:",
+      "  • BATCH (multiple tasks[] entries) when: tasks are INDEPENDENT — no task's output is needed to craft another task's instructions. Example: concurrent code reviews of different files by different reviewers. Batch = parallel execution: all members work simultaneously.",
+      "  • SEQUENTIAL (one team_send_and_wait per task) when: task B's instructions DEPEND on task A's result. Example: analyzer identifies issues → need that report to construct mover's refactoring task. Sequential = each task waits for the previous one.",
+      "  • MIXED strategy: batch A+B for parallel discovery, then use their combined outputs to craft C's single-thread task. This is often the most efficient pattern.",
+      "BATCH ADVANTAGE: concurrent execution — total wall-clock time ≈ slowest single task rather than sum of all tasks.",
+      "SEQUENTIAL COST: total wall-clock time = sum of all task durations; every pause between tasks adds latency.",
+      "team_send_and_wait waits for ALL tasks to complete. Returns PARTIAL results if some members become idle without replying — in batch mode, one member's failure does not block the other members' results from being returned.",
       "Always fill in nextSteps with what you plan to do after the wait ends — it will be returned to you to keep the workflow on track.",
     ],
     parameters: {
       type: "object",
       properties: {
-        to: { type: "string", description: "Target member name" },
-        content: { type: "string", description: "Message body" },
+        tasks: {
+          oneOf: [
+            {
+              type: "array",
+              description: "正确格式：原始 JSON 数组",
+              items: {
+                type: "object",
+                properties: {
+                  to: { type: "string", description: "目标成员名称" },
+                  content: { type: "string", description: "消息内容" },
+                },
+                required: ["to", "content"],
+              },
+            },
+            {
+              type: "string",
+              description: "自动修复：JSON 字符串编码的数组会被 parseTasks 自动恢复",
+            },
+          ],
+          description:
+            "⚠️ 必须传原始 JSON 数组，不能传 JSON 编码过的字符串。"
+            + "正确示例: tasks: [{to: \"planner\", content: \"...\"}]\n"
+            + "错误示例: tasks: \"[{to: 'planner', content: '...'}]\"（这是字符串，框架会自动放行并修复）\n"
+            + "要发送的任务列表。单个成员也使用 tasks 数组（如 [{to: \"name\", content: \"...\"}]）。多个成员同时发送时并发执行。",
+        },
         nextSteps: { type: "string", description: "基于工作流程，wait 结束后下一步计划是什么。该信息会在工具返回时一并发送给你，用于强调工作流程方向。" },
       },
-      required: ["to", "content", "nextSteps"],
+      required: ["tasks", "nextSteps"],
     },
     async execute(
       _toolCallId: string,
-      params: { to: string; content: string; nextSteps: string }
+      params: { tasks: unknown; nextSteps: string }
     ): Promise<ToolResult> {
-      return sendAndWaitExecute(params, {
+      return sendAndWaitExecute(params as Parameters<typeof sendAndWaitExecute>[0], {
         responseWaiter,
         memberOpsStates,
         lastPendingCorrId,
@@ -414,64 +447,174 @@ interface SendAndWaitCtx {
   messageQueue: MessageQueue;
 }
 
+/** A pending task with its generated correlation ID. */
+interface PendingTask {
+  to: string;
+  content: string;
+  corrId: string;
+}
+
+/**
+ * Generate a unique correlation ID for team_send_and_wait matching.
+ */
+function generateCorrId(): string {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
+/**
+ * Wait for ALL pending tasks to complete, or all members to become idle
+ * (partial completion). Returns combined results.
+ */
 async function waitWithAllIdleCheck(
-  corrId: string,
-  memberName: string,
+  tasks: PendingTask[],
   nextSteps: string,
   ctx: SendAndWaitCtx
 ): Promise<ToolResult> {
   const { responseWaiter, memberOpsStates, lastPendingCorrId } = ctx;
 
-  const waitPromise = responseWaiter.waitForResponse(corrId);
-  const allIdlePromise = waitForAllIdle(memberOpsStates);
-
-  const result = await Promise.race([waitPromise, allIdlePromise]);
-
   const nextStepsFooter = "\n\n---\n下一步计划：" + nextSteps;
 
-  if (result && result.status === "response") {
-    lastPendingCorrId.delete(memberName);
+  // Collect results as they arrive
+  const results = new Map<string, WaitResult>();
+
+  // Create individual wait promises that record results when resolved
+  const waitPromises = tasks.map(async (t) => {
+    const r = await responseWaiter.waitForResponse(t.corrId);
+    results.set(t.to, r);
+    return r;
+  });
+
+  const allDonePromise = Promise.all(waitPromises);
+  const allIdlePromise = waitForAllIdle(memberOpsStates);
+
+  // Race: all tasks done vs all members idle
+  const raceResult = await Promise.race([
+    allDonePromise.then(() => "all_done" as const),
+    allIdlePromise.then(() => "all_idle" as const),
+  ]);
+
+  if (raceResult === "all_done") {
+    // All tasks completed successfully
+    for (const t of tasks) {
+      lastPendingCorrId.delete(t.to);
+    }
+    const parts: string[] = [];
+    for (const t of tasks) {
+      const r = results.get(t.to);
+      if (r && r.status === "response") {
+        parts.push(`[${r.from} reply] ${r.content}`);
+      } else if (r && r.status === "cancelled") {
+        parts.push(`[${t.to}] ⚠️ 等待被取消`);
+      }
+    }
     return {
       details: { nextSteps },
-      content: [{ type: "text" as const, text: "[" + memberName + " reply] " + result.content + nextStepsFooter }],
+      content: [{ type: "text" as const, text: parts.join("\n\n---\n") + nextStepsFooter }],
     };
   }
-  if (result && result.status === "cancelled") {
-    lastPendingCorrId.delete(memberName);
-    return {
-      details: { nextSteps },
-      content: [{ type: "text" as const, text: "Wait for " + memberName + " was cancelled." + nextStepsFooter }],
-    };
+
+  // all_idle — collect partial results
+  for (const t of tasks) {
+    if (!results.has(t.to)) {
+      responseWaiter.cancelByCorrId(t.corrId);
+    } else {
+      lastPendingCorrId.delete(t.to);
+    }
   }
-  // all_idle — cancel the waiter so it doesn't orphan; keep lastPendingCorrId alive
-  // so auto-injection works when the member's reply eventually arrives
-  responseWaiter.cancelByCorrId(corrId);
+
+  const parts: string[] = [];
+  for (const t of tasks) {
+    const r = results.get(t.to);
+    if (r && r.status === "response") {
+      parts.push(`[${r.from} reply] ${r.content}`);
+    } else {
+      parts.push(`[${t.to}] ⚠️ 未收到回复（成员可能已停止或崩溃）`);
+    }
+  }
+
   return {
-    details: { allIdle: true, nextSteps },
-    content: [{ type: "text" as const, text: "所有团队成员均处于空闲状态，" + memberName + " 可能已完成任务。请检查工作成果。" + nextStepsFooter }],
+    details: { allIdle: true, partial: true, nextSteps },
+    content: [{ type: "text" as const, text: parts.join("\n\n---\n") + nextStepsFooter }],
   };
 }
 
+/** Parsed task from LLM input — handles both raw array and string-encoded array. */
+function parseTasks(raw: unknown): Array<{ to: string; content: string }> {
+  // Already an array (correct case)
+  if (Array.isArray(raw)) {
+    return raw as Array<{ to: string; content: string }>;
+  }
+
+  // String-encoded array — LLM sometimes double-encodes JSON-in-JSON
+  if (typeof raw === "string") {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        return parsed as Array<{ to: string; content: string }>;
+      }
+    } catch {
+      // Not parseable; fall through to error
+    }
+  }
+
+  // Single object wrapped outside array — another common LLM hallucination
+  if (typeof raw === "object" && raw !== null && !Array.isArray(raw)) {
+    const obj = raw as Record<string, unknown>;
+    if (typeof obj.to === "string" && typeof obj.content === "string") {
+      return [{ to: obj.to, content: obj.content }];
+    }
+  }
+
+  return [];
+}
+
 async function sendAndWaitExecute(
-  params: { to: string; content: string; nextSteps: string },
+  params: { tasks: unknown; nextSteps: string },
   ctx: SendAndWaitCtx
 ): Promise<ToolResult> {
   const { responseWaiter, lastPendingCorrId, messageQueue } = ctx;
 
-  // Generate corr ID, send message, register waiter
-  const corrId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-  lastPendingCorrId.set(params.to, corrId);
+  const tasks = parseTasks(params.tasks);
 
-  const messagePayload = {
-    id: "msg-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8),
-    from: "tl" as const,
-    to: params.to,
-    content: (params.content ?? "") + "\n\n<corr:" + corrId + ">",
-    timestamp: Date.now(),
-    correlationId: corrId,
-  };
+  // Validate: at least one task
+  if (tasks.length === 0) {
+    const receivedType = typeof params.tasks;
+    const receivedPreview = typeof params.tasks === "string"
+      ? params.tasks.slice(0, 120)
+      : JSON.stringify(params.tasks).slice(0, 120);
+    return {
+      details: {},
+      content: [{
+        type: "text" as const,
+        text: "tasks 无效。需要原始 JSON 数组（如 [{to: \"name\", content: \"...\"}]），"
+          + `但收到了 ${receivedType} 类型的值：${receivedPreview}。\n\n`
+          + "⚠️ 注意：tasks 不能传 JSON 字符串，必须传原始数组。\n"
+          + "正确：\"tasks\": [{ \"to\": \"planner\", \"content\": \"...\" }]\n"
+          + "错误：\"tasks\": \"[{...}]\"  ← 不要额外序列化成字符串",
+      }],
+    };
+  }
 
-  messageQueue.enqueue(messagePayload as TeamMessage);
+  // Generate corr IDs for each task and enqueue messages
+  const pendingTasks: PendingTask[] = [];
+  const now = Date.now();
 
-  return waitWithAllIdleCheck(corrId, params.to, params.nextSteps, ctx);
+  for (const task of tasks) {
+    const corrId = generateCorrId();
+    lastPendingCorrId.set(task.to, corrId);
+
+    pendingTasks.push({ to: task.to, content: task.content, corrId });
+
+    const messagePayload = {
+      id: `msg-${now}-${Math.random().toString(36).slice(2, 8)}`,
+      from: "tl" as const,
+      to: task.to,
+      content: task.content + "\n\n<corr:" + corrId + ">",
+      timestamp: now,
+      correlationId: corrId,
+    };
+    messageQueue.enqueue(messagePayload as TeamMessage);
+  }
+
+  return waitWithAllIdleCheck(pendingTasks, params.nextSteps, ctx);
 }

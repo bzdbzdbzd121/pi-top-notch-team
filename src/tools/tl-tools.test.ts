@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { registerTlTools, WAIT_IDLE_CHECK_INTERVAL_MS, WAIT_IDLE_REQUIRED_CONSECUTIVE } from "./tl-tools";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { ProcessManager } from "../process/manager";
-import type { ResponseWaiter } from "../channel/response-waiter";
+import type { ResponseWaiter, WaitResult } from "../channel/response-waiter";
 import type { MessageQueue } from "../channel/message-queue";
 import type { MemberOperationalState } from "../session/context";
 
@@ -233,7 +233,7 @@ describe("registerTlTools", () => {
   });
 
   describe("team_send_and_wait", () => {
-    it("team_send_and_wait parameters include required content", () => {
+    it("team_send_and_wait parameters include tasks and nextSteps", () => {
       let toolDef: any = null;
       pi.registerTool = vi.fn((def: any) => {
         if (def.name === "team_send_and_wait") {
@@ -243,16 +243,24 @@ describe("registerTlTools", () => {
 
       callRegisterTlTools();
 
-      expect(toolDef.parameters.required).toContain("to");
-      expect(toolDef.parameters.required).toContain("content");
+      expect(toolDef.parameters.required).toContain("tasks");
       expect(toolDef.parameters.required).toContain("nextSteps");
-      expect(toolDef.parameters.properties.content).toBeDefined();
-      expect(toolDef.parameters.properties.content.type).toBe("string");
+      expect(toolDef.parameters.properties.tasks).toBeDefined();
+      expect(toolDef.parameters.properties.tasks.oneOf).toBeDefined();
+      expect(toolDef.parameters.properties.tasks.oneOf[0].type).toBe("array");
+      expect(toolDef.parameters.properties.tasks.oneOf[0].items.properties.to).toBeDefined();
+      expect(toolDef.parameters.properties.tasks.oneOf[0].items.properties.content).toBeDefined();
+      expect(toolDef.parameters.properties.tasks.oneOf[0].items.required).toContain("to");
+      expect(toolDef.parameters.properties.tasks.oneOf[0].items.required).toContain("content");
+      expect(toolDef.parameters.properties.tasks.oneOf[1].type).toBe("string");
       expect(toolDef.parameters.properties.nextSteps).toBeDefined();
       expect(toolDef.parameters.properties.nextSteps.type).toBe("string");
+      // Old fields removed
+      expect(toolDef.parameters.properties.to).toBeUndefined();
+      expect(toolDef.parameters.properties.content).toBeUndefined();
     });
 
-    it("team_send_and_wait execute sends message and waits for response", async () => {
+    it("team_send_and_wait execute sends single task and waits for response", async () => {
       const mockResponseWaiter = createMockResponseWaiter();
       mockResponseWaiter.waitForResponse = vi.fn().mockResolvedValue({
         status: "response",
@@ -276,7 +284,10 @@ describe("registerTlTools", () => {
         messageQueue,
       });
 
-      const result = await executeFn("call-1", { to: "worker", content: "Do the task", nextSteps: "Check the result and assign the next task" });
+      const result = await executeFn("call-1", {
+        tasks: [{ to: "worker", content: "Do the task" }],
+        nextSteps: "Check the result and assign the next task",
+      });
 
       expect(messageQueue.enqueue).toHaveBeenCalledWith(
         expect.objectContaining({ to: "worker" })
@@ -287,13 +298,109 @@ describe("registerTlTools", () => {
       expect(result.details).toEqual({ nextSteps: "Check the result and assign the next task" });
     });
 
-    it("team_send_and_wait returns all_idle when all members become idle", { timeout: 15000 }, async () => {
-      memberOpsStates.set("analyzer", "idle");
-      memberOpsStates.set("worker", "idle");
+    it("team_send_and_wait execute sends batch tasks and waits for all responses", async () => {
+      const mockResponseWaiter = createMockResponseWaiter();
+      // Each waitForResponse call returns a promise; we resolve them in order
+      const resolveFns: Array<(value: WaitResult) => void> = [];
+      mockResponseWaiter.waitForResponse = vi.fn(() => new Promise<WaitResult>((resolve) => {
+        resolveFns.push(resolve);
+      }));
 
-      // Mock waitForResponse to return a never-resolving promise so all_idle wins
-      responseWaiter.waitForResponse = vi.fn(() => new Promise(() => {}));
+      let executeFn: Function = () => {};
+      pi.registerTool = vi.fn((def: any) => {
+        if (def.name === "team_send_and_wait") {
+          executeFn = def.execute;
+        }
+      });
 
+      registerTlTools({
+        pi,
+        manager,
+        responseWaiter: mockResponseWaiter,
+        memberOpsStates,
+        lastPendingCorrId,
+        messageQueue,
+      });
+
+      const resultPromise = executeFn("call-1", {
+        tasks: [
+          { to: "security-reviewer", content: "审查安全" },
+          { to: "perf-reviewer", content: "审查性能" },
+        ],
+        nextSteps: "合并审查意见",
+      });
+
+      // Verify both messages were enqueued
+      expect(messageQueue.enqueue).toHaveBeenCalledTimes(2);
+      expect(messageQueue.enqueue).toHaveBeenCalledWith(
+        expect.objectContaining({ to: "security-reviewer" })
+      );
+      expect(messageQueue.enqueue).toHaveBeenCalledWith(
+        expect.objectContaining({ to: "perf-reviewer" })
+      );
+
+      // Resolve both waiters
+      resolveFns[0]({ status: "response", from: "security-reviewer", content: "安全无问题" });
+      resolveFns[1]({ status: "response", from: "perf-reviewer", content: "发现 O(n²) 循环" });
+
+      const result = await resultPromise;
+
+      expect(result.content[0].text).toContain("security-reviewer");
+      expect(result.content[0].text).toContain("安全无问题");
+      expect(result.content[0].text).toContain("perf-reviewer");
+      expect(result.content[0].text).toContain("发现 O(n²) 循环");
+      expect(result.content[0].text).toContain("下一步计划");
+      expect(result.details).toEqual({ nextSteps: "合并审查意见" });
+    });
+
+    it("team_send_and_wait returns partial results when all members become idle", {"timeout": 15000}, async () => {
+      memberOpsStates.set("security-reviewer", "idle");
+      memberOpsStates.set("perf-reviewer", "idle");
+
+      const mockResponseWaiter = createMockResponseWaiter();
+      // One resolves, one never resolves
+      mockResponseWaiter.waitForResponse = vi.fn((corrId: string) => {
+        if (corrId.includes("resolve")) {
+          return Promise.resolve({ status: "response", from: "security-reviewer", content: "完成" });
+        }
+        return new Promise<WaitResult>(() => {}); // never resolves
+      });
+
+      let executeFn: Function = () => {};
+      pi.registerTool = vi.fn((def: any) => {
+        if (def.name === "team_send_and_wait") {
+          executeFn = def.execute;
+        }
+      });
+
+      // We need to intercept corrId generation. The test uses mock so we can't control it.
+      // Instead, use a different approach: use the existing mock that never resolves
+      // and rely on all-idle detection.
+      // Actually let's use a simpler approach — use the existing responseWaiter mock
+      // with a never-resolving promise for all tasks, then all-idle wins.
+      responseWaiter.waitForResponse = vi.fn(() => new Promise<WaitResult>(() => {}));
+
+      callRegisterTlTools();
+
+      const result = await executeFn("call-2", {
+        tasks: [
+          { to: "security-reviewer", content: "审查安全" },
+          { to: "perf-reviewer", content: "审查性能" },
+        ],
+        nextSteps: "处理检查结果",
+      });
+
+      expect(result.details).toHaveProperty("allIdle");
+      expect(result.details).toHaveProperty("partial");
+      expect(result.details).toHaveProperty("nextSteps");
+      expect(result.details.nextSteps).toBe("处理检查结果");
+      // Should show both members with warning since none resolved
+      expect(result.content[0].text).toContain("security-reviewer");
+      expect(result.content[0].text).toContain("perf-reviewer");
+      expect(result.content[0].text).toContain("⚠️");
+    });
+
+    it("team_send_and_wait returns error for empty tasks array", async () => {
       let executeFn: Function = () => {};
       pi.registerTool = vi.fn((def: any) => {
         if (def.name === "team_send_and_wait") {
@@ -303,11 +410,63 @@ describe("registerTlTools", () => {
 
       callRegisterTlTools();
 
-      const result = await executeFn("call-2", { to: "worker", content: "Hello", nextSteps: "Review output and start next phase" });
+      const result = await executeFn("call-1", {
+        tasks: [],
+        nextSteps: "do something",
+      });
 
-      expect(result.details).toHaveProperty("allIdle");
-      expect(result.details).toHaveProperty("nextSteps");
-      expect(result.details.nextSteps).toBe("Review output and start next phase");
+      expect(result.content[0].text).toContain("无效");
+      expect(messageQueue.enqueue).not.toHaveBeenCalled();
+    });
+
+    it("team_send_and_wait auto-recovers from string-encoded tasks array", async () => {
+      let executeFn: Function = () => {};
+      pi.registerTool = vi.fn((def: any) => {
+        if (def.name === "team_send_and_wait") {
+          executeFn = def.execute;
+        }
+      });
+
+      callRegisterTlTools();
+
+      // Simulate LLM double-encoding: tasks is a JSON string instead of raw array
+      const result = await executeFn("call-1", {
+        tasks: JSON.stringify([{ to: "planner", content: "Do the plan" }]),
+        nextSteps: "review the plan",
+      });
+
+      // Should still have sent the message
+      expect(messageQueue.enqueue).toHaveBeenCalledTimes(1);
+      expect(messageQueue.enqueue).toHaveBeenCalledWith(
+        expect.objectContaining({ to: "planner" })
+      );
+      // Response waiter should have been set up
+      const callArg = messageQueue.enqueue.mock.calls[0][0];
+      expect(callArg.content).toContain("Do the plan");
+      expect(callArg.content).toMatch(/<corr:[a-z0-9]+>/);
+    });
+
+    it("team_send_and_wait auto-recovers from single-object tasks (non-array hallucination)", async () => {
+      let executeFn: Function = () => {};
+      pi.registerTool = vi.fn((def: any) => {
+        if (def.name === "team_send_and_wait") {
+          executeFn = def.execute;
+        }
+      });
+
+      callRegisterTlTools();
+
+      // Simulate LLM sending a single object instead of array
+      const result = await executeFn("call-1", {
+        tasks: { to: "planner", content: "Do the plan" },
+        nextSteps: "review",
+      });
+
+      // Should still have sent the message
+      expect(messageQueue.enqueue).toHaveBeenCalledTimes(1);
+      expect(messageQueue.enqueue).toHaveBeenCalledWith(
+        expect.objectContaining({ to: "planner" })
+      );
     });
   });
 
