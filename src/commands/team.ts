@@ -3,6 +3,7 @@ import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import type { TeamContext } from "../session/context";
 import { listTeams } from "../team/store";
 import { getRootDir } from "../config";
+import { isActive } from "../session/state";
 import type { StatusProvider } from "./status";
 import { workflowSchema } from "./shared/workflow-schema";
 import { handleCreate } from "./handlers/create-handler";
@@ -41,6 +42,25 @@ export function registerTeamCommand(
   pi.registerCommand("team", {
     description: "管理团队（create / start / stop / list / show / delete / status）",
     getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
+      // During active team session: show stop, status, help
+      if (isActive()) {
+        const SESSION_SUBCOMMANDS = [
+          { value: "stop", label: "stop — 终止团队会话" },
+          { value: "status", label: "status — 查看当前团队状态" },
+          { value: "help", label: "help — 显示帮助信息" },
+        ];
+        const parts = prefix.split(/\s+/);
+        const subcommand = parts[0]?.toLowerCase() ?? "";
+        // Empty prefix: show all available session subcommands
+        if (!subcommand) {
+          return SESSION_SUBCOMMANDS;
+        }
+        // Filter subcommands by prefix
+        const filtered = SESSION_SUBCOMMANDS.filter((s) => s.value.startsWith(subcommand));
+        return filtered.length > 0 ? filtered : null;
+      }
+
+      // Outside session: show all subcommands
       const ALL_SUBCOMMANDS = ["create", "dynamic", "edit", "done", "cancel", "start", "stop", "list", "show", "delete", "status", "help"];
       const TEAM_NAME_SUBCOMMANDS = ["start", "show", "delete", "edit"];
 
@@ -97,6 +117,13 @@ export function registerTeamCommand(
       const parts = args.trim().split(/\s+/);
       const subcommand = parts[0]?.toLowerCase() ?? "";
       const subargs = parts.slice(1).join(" ");
+
+      // During active team session: allow stop, status, help (read-only operations)
+      const SESSION_ALLOWED = ["stop", "status", "help"];
+      if (isActive() && !SESSION_ALLOWED.includes(subcommand)) {
+        ctx.ui.notify("团队会话期间仅支持：/team stop、/team status、/team help。请先结束会话。", "warning");
+        return;
+      }
 
       switch (subcommand) {
         case "dynamic":

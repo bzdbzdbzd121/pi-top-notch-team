@@ -84,7 +84,7 @@ describe("/team dynamic", () => {
     ctx.ui.notify.mockClear();
     await cmdHandler.handler("dynamic", ctx);
     expect(ctx.ui.notify).toHaveBeenCalledWith(
-      expect.stringContaining("已有活跃会话"),
+      expect.stringContaining("团队会话期间仅支持"),
       "warning"
     );
 
