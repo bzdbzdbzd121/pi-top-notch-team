@@ -29,6 +29,22 @@ export interface EventHandlerDeps {
   recentlyProcessedMessages: Map<string, number>;
   /** Optional ProcessManager for auto-restart handling on process exit. */
   processManager?: ProcessManager;
+  /**
+   * Track per-member last assistant text for auto-reply fallback.
+   * Populated at message_end, consumed at agent_end auto-reply.
+   */
+  lastAssistantTexts?: Map<string, string>;
+  /**
+   * Members that sent team_send_message to TL in the current turn.
+   * Cleared at agent_start, set at tool_execution_end for team_send_message to "tl".
+   * Used to distinguish "member replied properly" from "member forgot to reply".
+   */
+  perTurnReplied?: Set<string>;
+  /**
+   * Pending auto-reply setTimeout references per member.
+   * Set at agent_end when auto-reply is needed, cleared at agent_start or on tool reply.
+   */
+  pendingAutoReplies?: Map<string, NodeJS.Timeout>;
 }
 
 // ── Dedup helpers ───────────────────────────────────────────
@@ -99,10 +115,71 @@ export function parseTeamMessageTag(
   return { to: m[1], subject: m[2] || undefined, content: m[3].trim() };
 }
 
+// ── Helper: extract assistant text from message_end event ──
+
+function extractAssistantText(message: any): string {
+  if (typeof message.content === "string") return message.content;
+  if (Array.isArray(message.content)) {
+    return message.content
+      .map((c: any) => (typeof c === "object" ? c.text ?? "" : String(c)))
+      .join(" ");
+  }
+  return "";
+}
+
+// ── Auto-reply timeout (ms) ────────────────────────────────
+// Must be long enough to survive inter-turn gaps in multi-turn agent sessions
+// but short enough that team_send_and_wait doesn't hang indefinitely.
+// Tool execution (file reads, simple operations) typically completes well
+// under 3s; LLM-only turns (thinking) may take longer, but agent_start
+// will fire and cancel the pending auto-reply.
+const AUTO_REPLY_TIMEOUT_MS = 3000;
+
+/** Cancel a pending auto-reply timeout for a member, if any. */
+function cancelPendingAutoReply(memberName: string, deps: EventHandlerDeps): void {
+  const timer = deps.pendingAutoReplies?.get(memberName);
+  if (timer) {
+    clearTimeout(timer);
+    deps.pendingAutoReplies?.delete(memberName);
+  }
+}
+
+/**
+ * Schedule an auto-reply for a member that has a pending TL request
+ * but hasn't called team_send_message. The reply uses the last assistant
+ * text captured at message_end.
+ */
+function scheduleAutoReply(memberName: string, deps: EventHandlerDeps): void {
+  // Cancel any existing pending auto-reply first
+  cancelPendingAutoReply(memberName, deps);
+
+  const timer = setTimeout(() => {
+    deps.pendingAutoReplies?.delete(memberName);
+
+    // Re-check: member might have been stopped or the corrId resolved
+    const pendingCorrId = deps.lastPendingCorrId.get(memberName);
+    if (!pendingCorrId) return;
+
+    // Check if responseWaiter still has this corrId pending
+    // resolveIfWaiting returns false if not found (already resolved or never existed)
+    const resolved = deps.responseWaiter.resolveIfWaiting(
+      pendingCorrId,
+      memberName,
+      deps.lastAssistantTexts?.get(memberName) ?? "（任务完成，未生成报告）"
+    );
+    if (resolved) {
+      deps.lastPendingCorrId.delete(memberName);
+    }
+  }, AUTO_REPLY_TIMEOUT_MS);
+
+  deps.pendingAutoReplies?.set(memberName, timer);
+}
+
 // ── createMemberEventHandler ───────────────────────────────
 // Creates the onEvent callback for a member process handle.
 // Handles: agent_start, agent_end, tool_execution_end (team_send_message),
-//          message_end (<team-message> backup), process_exit, process_error.
+//          message_end (<team-message> backup + auto-reply tracking),
+//          process_exit, process_error.
 
 export function createMemberEventHandler(
   memberName: string,
@@ -120,10 +197,28 @@ export function createMemberEventHandler(
     // ── Member operational state tracking (via pure state machine) ──
     if (event.type === "agent_start") {
       states.set(memberName, transitionState(states.get(memberName) ?? "idle", { type: "task_started" }));
+
+      // Cancel any pending auto-reply — more turns are coming
+      cancelPendingAutoReply(memberName, deps);
+      // Clear per-turn reply flag to track fresh for this new turn
+      deps.perTurnReplied?.delete(memberName);
+
       return;
     }
     if (event.type === "agent_end") {
       states.set(memberName, transitionState(states.get(memberName) ?? "idle", { type: "task_completed" }));
+
+      // Agent turn ended. If member has a pending TL request and didn't
+      // call team_send_message this turn, schedule an auto-reply.
+      // The timeout is cancelled by:
+      //   - next agent_start (more turns coming), OR
+      //   - team_send_message tool execution (member replied properly)
+      const pendingCorrId = lpc.get(memberName);
+      const hasReplied = deps.perTurnReplied?.has(memberName);
+      if (pendingCorrId && !hasReplied) {
+        scheduleAutoReply(memberName, deps);
+      }
+
       return;
     }
 
@@ -139,13 +234,25 @@ export function createMemberEventHandler(
       const dedupKey = `${teamMsg.from}:${teamMsg.content?.slice(0, 80) ?? ""}`;
       markDedupProcessed(rpm, dedupKey);
 
-      // Auto-populate correlation ID (only for TL-directed messages)
+      // Auto-populate correlation ID (only for TL-directed messages).
+      // Always use the stored corr from lpc as ground truth — the member's
+      // own corr tag is unreliable and often wrong. Set correlationId on the
+      // TeamMessage object so sendToTl uses it directly (bypassing content parsing).
       let content = teamMsg.content;
-      if (teamMsg.to === "tl" && !/<corr:[a-zA-Z0-9_-]+>/.test(content)) {
+      let correlationId: string | undefined;
+      if (teamMsg.to === "tl") {
         const stored = lpc.get(teamMsg.from);
         if (stored) {
+          correlationId = stored;
+          // Strip any existing wrong corr tag and use the stored one instead
+          content = content.replace(/<corr:[a-zA-Z0-9_-]+>/g, "").trim();
           content = content + `\n\n<corr:${stored}>`;
         }
+
+        // Mark this member as having replied — prevents auto-reply at agent_end
+        deps.perTurnReplied?.add(teamMsg.from);
+        // Cancel any pending auto-reply — member replied properly via tool
+        cancelPendingAutoReply(teamMsg.from, deps);
       }
       mq.enqueue({
         id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -153,6 +260,7 @@ export function createMemberEventHandler(
         to: teamMsg.to,
         subject: teamMsg.subject,
         content,
+        correlationId,
         timestamp: teamMsg.timestamp ?? Date.now(),
       });
       return;
@@ -160,12 +268,11 @@ export function createMemberEventHandler(
 
     // Backup: check assistant text for <team-message> tags
     if (event.type === "message_end" && event.message?.role === "assistant") {
-      const text =
-        typeof event.message.content === "string"
-          ? event.message.content
-          : event.message.content
-              ?.map((c: any) => c.text ?? "")
-              .join(" ") ?? "";
+      const text = extractAssistantText(event.message);
+
+      // Store the last assistant text for potential auto-reply
+      deps.lastAssistantTexts?.set(memberName, text);
+
       const parsed = parseTeamMessageTag(text);
       if (!parsed) return;
 
@@ -173,14 +280,15 @@ export function createMemberEventHandler(
       const dedupKey = `${memberName}:${parsed.content?.slice(0, 80) ?? ""}`;
       if (wasDedupProcessed(rpm, dedupKey)) return;
 
-      // Auto-populate correlation ID for backup path
+      // Auto-populate correlation ID for backup path.
+      // Always use stored corr as ground truth (same logic as tool_execution_end path).
       let backupContent = parsed.content;
-      if (
-        parsed.to === "tl" &&
-        !/<corr:[a-zA-Z0-9_-]+>/.test(backupContent)
-      ) {
+      let correlationId: string | undefined;
+      if (parsed.to === "tl") {
         const stored = lpc.get(memberName);
         if (stored) {
+          correlationId = stored;
+          backupContent = backupContent.replace(/<corr:[a-zA-Z0-9_-]+>/g, "").trim();
           backupContent = backupContent + "\n\n<corr:" + stored + ">";
         }
       }
@@ -190,6 +298,7 @@ export function createMemberEventHandler(
         to: parsed.to,
         subject: parsed.subject,
         content: backupContent,
+        correlationId,
         timestamp: Date.now(),
       });
       return;
@@ -197,63 +306,72 @@ export function createMemberEventHandler(
 
     // Handle process exit
     if (event.type === "process_exit") {
+      const exitMemberName = event.memberName;
+      // Clean up auto-reply tracking for this member
+      cancelPendingAutoReply(exitMemberName, deps);
+      deps.perTurnReplied?.delete(exitMemberName);
+
       const exitCode: number | null = event.exitCode;
       const isNormalExit =
         exitCode === null || exitCode === 0 || exitCode === 143;
 
-      const currentState = states.get(event.memberName) ?? "idle";
-      states.set(event.memberName, transitionState(currentState, {
+      const currentState = states.get(exitMemberName) ?? "idle";
+      states.set(exitMemberName, transitionState(currentState, {
         type: "process_exit",
         isCrashLoop: !isNormalExit,
       }));
       if (!event.wasRunning) return;
 
       if (!isNormalExit) {
-        const pendingCorrId = lpc.get(event.memberName);
+        const pendingCorrId = lpc.get(exitMemberName);
         if (pendingCorrId) {
           rw.resolveIfWaiting(
             pendingCorrId,
-            event.memberName,
+            exitMemberName,
             "[成员进程已崩溃，消息无法送达]"
           );
-          lpc.delete(event.memberName);
+          lpc.delete(exitMemberName);
         }
         deps.pi.sendMessage({
           customType: "team-message",
-          content: `Member "${event.memberName}" 进程异常退出（code: ${exitCode}），需检查崩溃原因。`,
+          content: `Member "${exitMemberName}" 进程异常退出（code: ${exitCode}），需检查崩溃原因。`,
           display: true,
           details: { crashEvent: event },
         });
       } else {
         deps.pi.sendMessage({
           customType: "team-message",
-          content: `Member "${event.memberName}" 进程已正常停止（code: ${exitCode}）。`,
+          content: `Member "${exitMemberName}" 进程已正常停止（code: ${exitCode}）。`,
           display: true,
         });
       }
 
       // Notify ProcessManager for auto-restart handling (only for unexpected exits)
-      deps.processManager?.handleExit(event.memberName, exitCode);
+      deps.processManager?.handleExit(exitMemberName, exitCode);
 
       return;
     }
 
     if (event.type === "process_error") {
-      const memberName = event.memberName;
-      const currentState = states.get(memberName) ?? "idle";
-      states.set(memberName, transitionState(currentState, { type: "process_exit", isCrashLoop: true }));
-      const pendingCorrId = lpc.get(memberName);
+      const errMemberName = event.memberName;
+      // Clean up auto-reply tracking
+      cancelPendingAutoReply(errMemberName, deps);
+      deps.perTurnReplied?.delete(errMemberName);
+
+      const currentState = states.get(errMemberName) ?? "idle";
+      states.set(errMemberName, transitionState(currentState, { type: "process_exit", isCrashLoop: true }));
+      const pendingCorrId = lpc.get(errMemberName);
       if (pendingCorrId) {
         rw.resolveIfWaiting(
           pendingCorrId,
-          memberName,
+          errMemberName,
           "[成员进程错误，消息无法送达]"
         );
-        lpc.delete(memberName);
+        lpc.delete(errMemberName);
       }
       deps.pi.sendMessage({
         customType: "team-message",
-        content: `Member "${memberName}" 进程异常，需检查崩溃原因。`,
+        content: `Member "${errMemberName}" 进程异常，需检查崩溃原因。`,
         display: true,
       });
       return;

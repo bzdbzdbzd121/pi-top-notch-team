@@ -214,7 +214,11 @@ export default function (pi: ExtensionAPI) {
   // but member processes keep running. This handler notifies the user.
   pi.on("agent_settled", async (_event, ctx) => {
     const session = getSessionState();
-    if (!session.active) return;
+    if (!session.active) {
+      // Session already ended (e.g. /team stop) — clear stale status
+      ctx.ui.setStatus("team-members-running", undefined);
+      return;
+    }
 
     // Check if any member processes are still running
     const runningMembers = Array.from(memberOpsStates.entries())
@@ -307,35 +311,11 @@ export default function (pi: ExtensionAPI) {
     // Capture ctx.ui.notify for UI-only route notifications
     uiNotify = ctx.ui.notify;
 
-    ctx.ui.addAutocompleteProvider((current) => ({
-      async getSuggestions(lines, line, col, options) {
-        const beforeCursor = (lines[line] ?? "").slice(0, col);
-        const m = beforeCursor.match(/^\/team\s+(start|show|delete|edit)(\s+)(.*)$/);
-        if (m) {
-          const subCmd = m[1];     // e.g. "show"
-          const spacing = m[2];    // e.g. " "
-          const partial = m[3];    // typed team name (or empty)
-          const { listTeams } = await import("./src/team/store");
-          const { getRootDir } = await import("./src/config");
-          const teams = listTeams(getRootDir());
-          // Replace everything from subcommand onward: "show " -> "show teamname"
-          const prefix = subCmd + spacing + partial;
-          const items = teams
-            .filter((t: string) => t.startsWith(partial))
-            .map((t: string) => ({ value: `${subCmd} ${t}`, label: t }));
-          return { prefix, items };
-        }
-        return current.getSuggestions(lines, line, col, options);
-      },
-      applyCompletion(lines, line, col, item, prefix) {
-        return current.applyCompletion(lines, line, col, item, prefix);
-      },
-      shouldTriggerFileCompletion(lines, line, col) {
-        const beforeCursor = (lines[line] ?? "").slice(0, col);
-        if (/^\/team/.test(beforeCursor)) return false;
-        return current.shouldTriggerFileCompletion?.(lines, line, col) ?? true;
-      },
-    }));
+    // Note: addAutocompleteProvider intentionally NOT registered here.
+    // Command argument completion (subcommands + team names) is handled by
+    // getArgumentCompletions in team.ts → CombinedAutocompleteProvider in pi's TUI.
+    // A separate addAutocompleteProvider wrapper would intercept the TUI's built-in
+    // command autocomplete and could cause empty candidate lists.
 
     // Register team mode editor factory (border color change)
     ctx.ui.setEditorComponent((tui: any, theme: any, kb: any) => {

@@ -335,7 +335,7 @@ describe("agent_settled handler", () => {
     expect(eventNames).toContain("agent_settled");
   });
 
-  it("returns early when session is not active", async () => {
+  it("clears stale status when session is not active (e.g. /team stop)", async () => {
     pi = createMockPi();
     const mod = await import("../index");
     mod.default(pi);
@@ -349,7 +349,8 @@ describe("agent_settled handler", () => {
     const ui = createMockUi();
     await handler({}, { ui, signal: {} });
 
-    expect(ui.setStatus).not.toHaveBeenCalled();
+    // Should clear the stale status rather than returning silently
+    expect(ui.setStatus).toHaveBeenCalledWith("team-members-running", undefined);
   });
 
   it("clears status when no members are running", async () => {

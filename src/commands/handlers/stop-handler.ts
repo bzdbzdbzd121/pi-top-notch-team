@@ -34,8 +34,7 @@ export async function handleStop(
   const tlToolNames = teamCtx.tlToolNames;
   const currentActive = pi.getActiveTools();
   const toRemove = new Set([...tlToolNames, "add_dynamic_member", "create_team_definition", "update_team_definition"]);
-  const newActive = currentActive.filter((t: string) => !toRemove.has(t));
-  pi.setActiveTools(newActive);
+  pi.setActiveTools(currentActive.filter((t: string) => !toRemove.has(t)));
 
   // Remove team status widget and edit/create-mode widgets immediately
   teamCtx.onSessionEnd?.();
@@ -62,5 +61,7 @@ export async function handleStop(
   }
 
   endSession();
+  // Clear stale "团队成员运行中" status bar (belt-and-suspenders with agent_settled)
+  ctx.ui.setStatus("team-members-running", undefined);
   ctx.ui.notify(`团队 "${teamName}" 会话已结束`, "info");
 }

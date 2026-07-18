@@ -24,6 +24,12 @@ export interface MemberLifecycleDeps {
   lastPendingCorrId: Map<string, string>;
   recentlyProcessedMessages: Map<string, number>;
   processManager?: ProcessManager;
+  /** Auto-reply tracking: last assistant text per member (populated at message_end). */
+  lastAssistantTexts?: Map<string, string>;
+  /** Auto-reply tracking: members that replied via team_send_message in current turn. */
+  perTurnReplied?: Set<string>;
+  /** Auto-reply tracking: pending setTimeout refs for scheduled auto-replies. */
+  pendingAutoReplies?: Map<string, NodeJS.Timeout>;
 }
 
 // ── createAndRegisterMember ────────────────────────────────

@@ -193,6 +193,130 @@ describe("createMemberEventHandler", () => {
     expect(enqueued.content).toContain("<corr:corr-abc>");
   });
 
+  it("should override wrong corr tag with stored corr for TL-directed messages", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const deps = createMockDeps();
+    // Member writes a WRONG corr tag
+    deps.lastPendingCorrId.set("worker", "corr-correct");
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    handler({
+      type: "tool_execution_end",
+      toolName: "team_send_message",
+      result: {
+        details: {
+          teamMessage: {
+            from: "worker",
+            to: "tl",
+            content: "Done\n\n<corr:wrong123>",
+            timestamp: Date.now(),
+          },
+        },
+      },
+    });
+
+    const enqueued = deps.messageQueue.enqueue.mock.calls[0][0];
+    // The wrong corr should be stripped and replaced with the correct one
+    expect(enqueued.content).toContain("<corr:corr-correct>");
+    expect(enqueued.content).not.toContain("<corr:wrong123>");
+  });
+
+  it("should set correlationId field on TeamMessage for TL-directed messages", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const deps = createMockDeps();
+    deps.lastPendingCorrId.set("worker", "corr-abc");
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    handler({
+      type: "tool_execution_end",
+      toolName: "team_send_message",
+      result: {
+        details: {
+          teamMessage: {
+            from: "worker",
+            to: "tl",
+            content: "Done",
+            timestamp: Date.now(),
+          },
+        },
+      },
+    });
+
+    const enqueued = deps.messageQueue.enqueue.mock.calls[0][0];
+    expect(enqueued.correlationId).toBe("corr-abc");
+  });
+
+  it("should set correlationId even when member provides a wrong corr tag", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const deps = createMockDeps();
+    deps.lastPendingCorrId.set("worker", "corr-correct");
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    handler({
+      type: "tool_execution_end",
+      toolName: "team_send_message",
+      result: {
+        details: {
+          teamMessage: {
+            from: "worker",
+            to: "tl",
+            content: "Done\n\n<corr:wrong123>",
+            timestamp: Date.now(),
+          },
+        },
+      },
+    });
+
+    const enqueued = deps.messageQueue.enqueue.mock.calls[0][0];
+    // correlationId should reflect the stored (correct) ID, not the wrong one in content
+    expect(enqueued.correlationId).toBe("corr-correct");
+  });
+
+  it("should NOT set correlationId for non-TL messages", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const deps = createMockDeps();
+    deps.lastPendingCorrId.set("worker", "corr-abc");
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    handler({
+      type: "tool_execution_end",
+      toolName: "team_send_message",
+      result: {
+        details: {
+          teamMessage: {
+            from: "worker",
+            to: "analyzer",
+            content: "Hey check this",
+            timestamp: Date.now(),
+          },
+        },
+      },
+    });
+
+    const enqueued = deps.messageQueue.enqueue.mock.calls[0][0];
+    expect(enqueued.correlationId).toBeUndefined();
+  });
+
+  it("should override wrong corr tag in backup message_end path", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const deps = createMockDeps();
+    deps.lastPendingCorrId.set("worker", "corr-correct-backup");
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    handler({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: '<team-message to="tl" subject="Reply">Done\n\n<corr:wrong456></team-message>',
+      },
+    });
+
+    const enqueued = deps.messageQueue.enqueue.mock.calls[0][0];
+    expect(enqueued.correlationId).toBe("corr-correct-backup");
+    expect(enqueued.content).toContain("<corr:corr-correct-backup>");
+    expect(enqueued.content).not.toContain("<corr:wrong456>");
+  });
+
   it("should parse backup team-message tag in message_end assistant text", async () => {
     const { createMemberEventHandler } = await loadModule();
     const deps = createMockDeps();

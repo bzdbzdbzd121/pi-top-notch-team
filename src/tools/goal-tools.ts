@@ -1,5 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { getSessionState } from "../session/state";
+import { getSessionState, isActive } from "../session/state";
 
 // ── Types ──────────────────────────────────────────────────
 
@@ -42,7 +42,11 @@ export function setGoalForTesting(goal: GoalState): void {
 
 const GOAL_PROMPT_SNIPPET = "Set/finish a session goal to track overall objective";
 
-// ── Register tools + agent_end handler ─────────────────────
+// ── Goal tool names (for setActiveTools lifecycle) ───────
+
+export const GOAL_TOOL_NAMES = ["set_goal", "finish_goal"];
+
+// ── Register goal tools (called on-demand at session start) ─
 
 export function registerGoalTools(pi: ExtensionAPI): void {
   // ── set_goal ────────────────────────────────────────────
@@ -79,6 +83,14 @@ export function registerGoalTools(pi: ExtensionAPI): void {
       _toolCallId: string,
       params: { text: string; criteria: string }
     ): Promise<{ details: Record<string, unknown>; content: Array<{ type: "text"; text: string }> }> {
+      // Guard: only available during active team sessions
+      if (!isActive()) {
+        return {
+          details: {},
+          content: [{ type: "text" as const, text: "set_goal 只能在活跃的团队会话中使用。请先通过 /team start 或 /team dynamic 启动团队会话。" }],
+        };
+      }
+
       activeGoal = {
         text: params.text,
         criteria: params.criteria,
@@ -114,6 +126,14 @@ export function registerGoalTools(pi: ExtensionAPI): void {
       properties: {},
     },
     async execute(): Promise<{ details: Record<string, unknown>; content: Array<{ type: "text"; text: string }> }> {
+      // Guard: only available during active team sessions
+      if (!isActive()) {
+        return {
+          details: {},
+          content: [{ type: "text" as const, text: "finish_goal 只能在活跃的团队会话中使用。" }],
+        };
+      }
+
       const goal = activeGoal;
       if (!goal) {
         return {
@@ -134,7 +154,11 @@ export function registerGoalTools(pi: ExtensionAPI): void {
     },
   });
 
-  // ── agent_end — detect TL idle + send reminder ─────────
+}
+
+// ── agent_end reminder handler (safe to register at module init) ─
+
+export function registerGoalAgentHandler(pi: ExtensionAPI): void {
   pi.on("agent_end", async (event, ctx) => {
     // Guard: only fire if a goal exists and is NOT completed
     if (!activeGoal || activeGoal.completed) return;
