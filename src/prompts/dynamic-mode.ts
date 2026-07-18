@@ -1,6 +1,31 @@
 import type { TeamDefinition } from "../team/definition";
 import { getRootDir } from "../config";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
+/**
+ * Load the orchestration playbook (src/prompts/orchestration-playbook.md).
+ * Resolved relative to this module so it works regardless of install location.
+ * Cached after first read; falls back to a minimal inline summary if missing.
+ */
+let playbookCache: string | null = null;
+function loadOrchestrationPlaybook(): string {
+  if (playbookCache !== null) return playbookCache;
+  try {
+    const playbookPath = join(dirname(fileURLToPath(import.meta.url)), "orchestration-playbook.md");
+    playbookCache = readFileSync(playbookPath, "utf-8");
+  } catch {
+    playbookCache = `
+## TL 编排方法论（摘要 — 完整版 orchestration-playbook.md 缺失）
+1. 需求对齐：一次一个问题并附推荐答案，对齐目标/范围/验收标准/约束/非目标
+2. 任务拆分：按交付物拆，画依赖图，标注输入/输出/验收标准
+3. 质量加固：默认 agent 会犯错，高风险环节用并行交叉验证、对抗辩论、开发-审核循环等模式
+4. 确认门：展示完整计划书，用户明确确认前禁止 add_dynamic_member 和 start_member
+`;
+  }
+  return playbookCache;
+}
 
 /**
  * Build the TL system prompt injection for dynamic team mode (/team dynamic).
@@ -66,51 +91,60 @@ function designPhasePrompt(sharedCtxPath: string, memberLines: string, team: Tea
   ✅ start_member — 启动成员（这会自动进入执行阶段）
   ✅ 其他团队管理工具
 
-### 核心流程
+### 设计流程（六个阶段，按顺序推进，完成判据满足后才进入下一阶段）
 
-#### 第 1 步：与用户对齐需求
+#### 阶段 A：需求对齐（Grilling）
 
-逐个方面与用户深入讨论，每次只讨论一个话题，达成共识后再继续下一个。
+按 Playbook 第一部分与用户深挖需求。一次只问一个问题，每问附推荐答案。
+走完问题树的五个分支：目标 → 范围 → 验收标准 → 约束 → 非目标。
 
-**讨论原则：**
-- **一次只问一个问题** — 等用户回复后再问下一个
-- **挑战模糊语言** — 用户说"优化性能"→ 追问"减少响应时间还是降低资源占用？"
-- **用场景检验边界** — "如果 A 依赖 B 的结果但 B 还没完成怎么办？"
-- **对照实际代码指向** — 你可以请用户在消息中粘贴相关代码片段，但你**不能自己去读**
-- **术语和决策立即记录** — 在讨论中口头确认即可，设计完成后再统一写入 shared-context.md
+- **完成判据**：能一句话复述目标 + 至少一条可验证的验收标准 + 用户确认无遗漏
 
-#### 第 2 步：设计团队方案
+#### 阶段 B：任务拆分
 
-根据需求确定需要的成员角色。
+按 Playbook 第二部分拆分任务：按交付物拆、画依赖图（并行/串行/汇合点）、控制粒度。
+**工作量大（同类子任务数量多）时，必须设计为多轮分批循环**：批次划分 + 试点批次先行 + 批间验证与调整，详见 Playbook。
+此阶段在心中或草稿中完成，不必向用户展示中间过程。
 
-**设计原则：**
-- 简单任务（单文件重构）→ 1-2 个成员；复杂任务（跨模块功能）→ 3-5 个
-- 每个成员职责边界明确，避免角色重叠
+- **完成判据**：每个任务都有四要素（负责角色、输入、输出、验收标准）
+
+#### 阶段 C：工作流编排与质量加固
+
+按 Playbook 第三部分识别薄弱环节并选择加固模式。
+**默认假设 agent 会犯错**——逐个任务问自己："这里做错了代价大吗？"，代价大就必须设防线。
+注意成本观：只对高风险环节加固，低风险环节不过度设计。
+
+- **完成判据**：每个高风险环节都选定了加固模式，且能说明理由
+
+#### 阶段 D：团队设计
+
+按 Playbook 第四部分从工作流推导角色（不是先想角色再塞任务）。
+成员规范：
 - **name** 用英文小写标识符（如 \`reviewer\`、\`coder\`）
 - **label** 用中文（如"审查员"、"编码员"）
 - **systemPrompt** 清晰描述职责、技能、输出规范和行为约束
 
-#### 第 3 步：展示方案并获取确认
+- **完成判据**：每个工作流阶段都有明确的负责成员，角色间无职责重叠
 
-向用户展示你设计的团队方案（成员角色、工作流、阶段划分），获取用户确认后再继续。
+#### 阶段 E：方案确认门（硬性门槛）
 
-#### 第 4 步：注册成员
+按 Playbook 第五部分的计划书模板，向用户展示完整方案：
+目标与验收标准、任务拆分与依赖、工作流（含加固环节及理由）、团队分工、风险与应对。
 
-用 \`add_dynamic_member\` 逐个注册成员。
+⚠️ **硬性规则：用户明确确认（"确认"/"开工"/"没问题"等）之前，禁止调用 \`add_dynamic_member\` 和 \`start_member\`。**
+用户提出修改 → 回到对应阶段调整，更新计划书后重新确认。模糊回复（"嗯"、"看看吧"）→ 追问确认。
 
-#### 第 5 步：编写共享上下文
+- **完成判据**：用户明确确认计划书
 
-将以下内容写入 \`${sharedCtxPath}\`：
-- 团队成员及其职责
-- 项目背景和目标
-- 协作规则
-- 术语表
-- 工作流（任务阶段划分、各阶段负责成员、阶段间依赖、质量标准和验收条件）
-- 关键决策记录
+#### 阶段 F：落地执行
 
-#### 第 6 步：启动成员
-
-调用 \`start_member\` 启动第一个成员。⚠️ **这会自动进入执行阶段**，之后你将获得完整的工具权限。
+1. 用 \`add_dynamic_member\` 逐个注册成员
+2. 将以下内容写入 \`${sharedCtxPath}\`：
+   - 项目背景、目标、验收标准
+   - 团队成员及其职责
+   - 工作流（阶段划分、各阶段负责成员、阶段间依赖、加固环节、质量标准和验收条件、失败回退）
+   - 协作规则、术语表、关键决策记录
+3. 调用 \`start_member\` 启动第一个成员。⚠️ **这会自动进入执行阶段**，之后你将获得完整的工具权限。
 
 ### 当前团队：${team.name}
 ${team.description}
@@ -121,6 +155,12 @@ ${memberLines}
 ### 沟通风格
 - 与用户交流时保持简洁精炼，剔除客套话、语气词与模棱两可的表述
 - 只输出核心内容，全程保持精简风格
+
+---
+
+以下为 TL 编排方法论 Playbook，各阶段引用其对应部分，请完整阅读并遵循：
+
+${loadOrchestrationPlaybook()}
 `;
 
   // Reminder: the tool_call guard in index.ts enforces these blocks at runtime.
@@ -157,22 +197,29 @@ function executionPhasePrompt(sharedCtxPath: string, memberLines: string, team: 
 ### 可用工具
 1. **write** — 编写 .md 文档（共享上下文、ADR 等）
 2. **start_member(name)** — 启动 Member 进程
-3. **team_send_and_wait(to, content, nextSteps)** — 给 Member 发任务并等待回复（阻塞），直到收到回复或所有成员空闲。必须传入 nextSteps（下一步计划），wait 结束后该信息会随结果返回以强调工作流程。\`team_send_and_wait\` 返回的 \`allIdle\` 状态表示所有成员空闲——检查工作成果后继续分配任务
+3. **team_send_and_wait({tasks: [{to, content}], nextSteps})** — 给 Member 发任务并等待回复。tasks 支持多个任务并发发送（如 [{to:"a", content:"..."}, {to:"b", content:"..."}]）。等待所有任务完成或有成员空闲后返回。\`team_send_and_wait\` 返回的 \`allIdle\` 状态表示所有成员空闲——检查工作成果后继续分配任务
 4. **list_members** — 查看各 Member 的运行状态
 5. **wait_and_get_member_status()** — **优先使用**。等待所有成员空闲后查看操作状态（idle/working/crashed/stopped）。如果有成员在工作会阻塞，和 team_send_and_wait 检测 all-idle 的方式相同
 6. **get_member_log(name, lines?)** — 查看 Member 最近的详细对话记录，负担较重，仅当需要了解具体内容时才使用
 7. **stop_member(name)** — 终止 Member 进程
 
-> 提示：team_send_and_wait 发送的消息包含 <corr:...> 标签。其他成员回复时需在内容中包含此标签。消息通道中的 Team Lead 名称是 tl。
+> ⚡ **Batch vs Sequential 决策规则：**
+>   - **批量（Batch）**：多个任务**相互独立**时放入同一个 tasks 数组，各 Member 同时工作（如同时派发不同文件的分析任务）。
+>   - **逐个（Sequential）**：任务 B 的指令**依赖**任务 A 的输出时，先发 A 等结果，再用结果构造 B 的任务。
+>   - **混合策略**：先 batch A+B 做并行分析，拿到结果后再逐个派发后续任务。
+>   - Batch 模式下单个成员失败不影响其他成员的结果（partial results）。
+>
+> 提示：team_send_and_wait 的 tasks 参数支持多个任务同时发送给不同 Member，实现并发执行。发送的消息包含 <corr:...> 标签。其他成员回复时需在内容中包含此标签。消息通道中的 Team Lead 名称是 tl。
 
 ### 流程
 1. 根据工作流和 shared-context.md 拆解当前任务
 2. **主动询问用户是否要设定目标**（\`set_goal\`）—— 如果用户同意，设定清晰的可验证完成条件；如果用户说不需要，跳过即可
 3. 使用 \`team_send_and_wait\` 向负责成员分配任务
-4. 监控进展（\`wait_and_get_member_status\` / \`get_member_log\`）
-5. 根据需要更新 Shared Context，通知所有 Member 重新阅读
-6. 任务完成后向用户汇报结果
-7. 让用户决定是否 \`/team stop\`
+4. **分批执行** — 若工作流中定义了批次（大批量任务），按批次逐轮派发：完成一批 → 验证该批成果 → 根据经验微调 → 再派下一批。不要一次性把所有批次的任务全部铺开。每轮向用户同步进度（如"批次 2/8"）
+5. 监控进展（\`wait_and_get_member_status\` / \`get_member_log\`）
+6. 根据需要更新 Shared Context，通知所有 Member 重新阅读
+7. 任务完成后向用户汇报结果
+8. 让用户决定是否 \`/team stop\`
 
 ### 当前团队：${team.name}
 ${team.description}

@@ -335,10 +335,15 @@ The dynamic mode is split into two phases: **design** and **execution**.
 9. Notify user that dynamic mode is active
 
 **Lifecycle during design phase**
-1. TL discusses requirements with the user (one topic at a time, cannot read/explore code)
-2. TL designs member roles and calls `add_dynamic_member` to register each
-3. TL writes Shared Context (§14) including suggested workflow
-4. TL calls `start_member` to start the first member → **phase transition**
+
+The TL follows the **Orchestration Playbook** (`src/prompts/orchestration-playbook.md`, injected into the design-phase prompt — see §10), a six-stage methodology with explicit completion criteria per stage:
+
+1. **A. Requirements alignment (grilling)** — TL interviews the user one question at a time (with recommended answers), walking a question tree: goal → scope → acceptance criteria → constraints → non-goals. Cannot read/explore code.
+2. **B. Task decomposition** — decompose by deliverables, draw the dependency graph (parallel/sequential/join points). Large workloads must be designed as multi-round batches (pilot batch first, inter-batch verification and adjustment).
+3. **C. Workflow orchestration & quality reinforcement** — assumes agents make mistakes by default; high-risk stages get reinforcement patterns (parallel redundancy + cross-validation, adversarial debate, develop-review loop, spike-first, human checkpoints).
+4. **D. Team design** — roles derived from the workflow.
+5. **E. Plan confirmation gate** — TL presents a full plan document (goal, task DAG, workflow with reinforcement rationale, team roster, risks). **Hard rule: no `add_dynamic_member` / `start_member` calls until the user explicitly confirms** (prompt-enforced, not guard-enforced).
+6. **F. Landing** — register members with `add_dynamic_member`, write structured Shared Context (§14) including workflow definition and failure fallback, then call `start_member` → **phase transition**
 
 **Phase 2: Execution phase** — entered automatically on first `start_member` success
 - `start_member` tool calls `onDynamicPhaseTransition()` callback → `teamCtx.dynamicPhase = "execution"`
@@ -512,17 +517,33 @@ wait_and_get_member_status()
 ### `team_send_and_wait`
 
 ```typescript
+// Single member:
 team_send_and_wait({
-  to: "analyzer",            // target member name
-  content: "分析这段代码",    // message body
-  nextSteps: "收到分析结果后指派 mover 执行重构",  // 下一步计划
+  tasks: [{ to: "analyzer", content: "分析这段代码" }],
+  nextSteps: "收到分析结果后指派 mover 执行重构",
+})
+
+// Batch mode — multiple members concurrently:
+team_send_and_wait({
+  tasks: [
+    { to: "security-reviewer", content: "审查 XSS 风险" },
+    { to: "perf-reviewer", content: "审查性能瓶颈" },
+    { to: "style-reviewer", content: "审查命名规范" },
+  ],
+  nextSteps: "汇总所有审查意见",
 })
 ```
 
-- **Blocks** the tool until a matching response arrives or all members become idle (all-idle early return)
-- **Correlation matching**: scans incoming messages for `<corr:...>` tags matching the original correlation ID. Supports chain workflows: Member A can forward the tag to Member B
+- **Blocks** the tool until ALL targeted members respond or all members become idle (all-idle early return)
+- **Batch mode**: multiple `{to, content}` entries in the `tasks` array are **sent concurrently** via the message queue. The tool waits for ALL to complete before returning combined results
+- **Partial results**: if some members become idle without replying (e.g. crash), the tool returns results from completed members with ⚠️ markers for failures
+- **Batch vs Sequential decision rule**:
+  - **Batch** when tasks are **independent** — no task's output is needed to craft another task's instruction. All members work simultaneously. Wall-clock time ≈ slowest single task.
+  - **Sequential** (one call per task) when task B's instructions **depend** on task A's result. Each task waits for the previous one. Wall-clock time = sum of all task durations.
+  - **Mixed strategy**: batch independent discovery tasks (A+B), then use combined outputs to craft a dependent task (C). This is often the most efficient pattern.
+- **Correlation matching**: each task gets its own `<corr:...>` tag for independent matching. Supports chain workflows: Member A can forward the tag to Member B
 - **Auto-injection**: if a member's reply is directed to `"tl"` but lacks a `<corr:...>` tag, the TL extension automatically appends the most recent pending correlation ID for that member. This ensures responses are matched even if the member AI forgets to include the tag
-- **No timeout**: waits indefinitely. The only exit paths are: member replies, all members become idle, or `/team stop` cancels the wait
+- **No timeout**: waits indefinitely. The only exit paths are: all members respond, all members become idle, or `/team stop` cancels all pending waits
 - **Cancellation**: on `/team stop`, all pending waits are cancelled
 
 **Difference from `team_send_message`:**
@@ -530,7 +551,7 @@ team_send_and_wait({
 | tool | behavior |
 |------|----------|
 | `team_send_message` | Fire-and-forget. Message sent, tool returns immediately. |
-| `team_send_and_wait` | Message sent, tool blocks until response or all idle. Response content is returned as tool result, NOT injected into TL context via `pi.sendMessage()`. |
+| `team_send_and_wait` | Messages sent, tool blocks until all responses or all idle. Combined response content returned as tool result, NOT injected into TL context via `pi.sendMessage()`. |
 
 ## 7. Member Tool: `team_send_message`
 
@@ -638,8 +659,8 @@ The `member.ts` extension reads these in `session_start`, then in `before_agent_
 The `before_agent_start` handler injects different prompts depending on the session type and phase:
 
 - **Normal team session** (`/team start <name>`): Full TL prompt with team info, delegation principles, workflow stages
-- **Dynamic mode — design phase** (`/team dynamic`, phase="design"): A stripped-down prompt that focuses only on requirements discussion and team design. Explicitly lists forbidden actions. TL is told its "code abilities are in sleep mode"
-- **Dynamic mode — execution phase** (after first `start_member`): Similar to the normal team session prompt, with delegation principles and workflow guidance
+- **Dynamic mode — design phase** (`/team dynamic`, phase="design"): A stripped-down prompt that focuses only on requirements discussion and team design. Explicitly lists forbidden actions. TL is told its "code abilities are in sleep mode". Defines a six-stage design process (A–F) with completion criteria, and appends the full **Orchestration Playbook** loaded from `src/prompts/orchestration-playbook.md` (runtime file read relative to the module, cached, with an inline fallback summary if missing). Includes the plan confirmation gate: TL is forbidden from calling `add_dynamic_member`/`start_member` before explicit user confirmation
+- **Dynamic mode — execution phase** (after first `start_member`): Similar to the normal team session prompt, with delegation principles and workflow guidance. Adds batched-dispatch guidance: when the workflow defines batches, TL dispatches batch-by-batch (verify each batch before sending the next) and reports progress as "批次 N/M"
 
 The prompt builder function `buildDynamicModePrompt(team, phase)` in `src/prompts/dynamic-mode.ts` returns different content based on the `phase` parameter.
 

@@ -31,6 +31,10 @@ pi -e ./index.ts
 
 # Or use dynamic mode (TL designs team on the fly)
 /team dynamic
+# → TL interviews you about the goal (grilling), decomposes the task,
+#   designs a workflow with quality reinforcement (cross-validation,
+#   adversarial debate, review loops), then presents a full plan for
+#   your confirmation before launching any member
 
 # Stop when done
 /team stop
@@ -123,7 +127,7 @@ See [DESIGN.md](DESIGN.md) for the full architecture spec and [docs/adr/](docs/a
 | `get_member_log(name, lines?, maxContentLength?)` | Fetch recent member session via RPC. `maxContentLength` truncates each message (default 200 chars). |
 | `wait_and_get_member_status()` | 等待所有 member 空闲后查看运行状态: idle/working/crashed/stopped。如有 member 在工作则阻塞。No parameters. |
 | `add_dynamic_member(name, label, systemPrompt, model?)` | Register a member in /team dynamic mode (name=identifier, label=Chinese display name) |
-| `team_send_and_wait(to, content, nextSteps)` | Send message and block until member replies or all members become idle. nextSteps 在 wait 结束后随结果返回。No timeout. |
+| `team_send_and_wait({tasks: [{to, content}], nextSteps})` | Send message(s) to one or more members and wait for ALL responses. Tasks array supports concurrent dispatch to different members for parallel execution. Returns partial results if some members fail. nextSteps 在 wait 结束后随结果返回。 |
 
 These tools are only available while a team session is active.
 

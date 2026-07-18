@@ -95,7 +95,9 @@ src/
 │   ├── context.ts    ← TeamContext shared mutable state interface (incl. isDynamicSession)
 │   └── state-machine.ts  ← Pure function state machine: MemberOperationalState transitions
 ├── prompts/
-│   └── dynamic-mode.ts  ← TL system prompt template for /team dynamic mode
+│   ├── dynamic-mode.ts  ← TL system prompt template for /team dynamic mode (design/execution phases)
+│   ├── orchestration-playbook.md  ← TL 编排方法论：需求对齐(grilling)/任务拆分/质量加固模式库/确认门，注入设计阶段提示词
+│   └── dynamic-mode.test.ts  ← 动态模式提示词测试
 ├── setup/            ← Modular extracted setup modules
 │   ├── member-lifecycle.ts  ← createAndRegisterMember, buildMemberConfig, getMemberLog
 │   └── message-channel.ts   ← createMessageChannel factory (queue+router+waiter wiring)
@@ -145,6 +147,14 @@ src/
    - **Design phase** (entered on `/team dynamic`): TL is blocked from using `bash`/`read`/`code_search`/`fetch_content`/`edit` entirely. `write` is restricted to `.md` files only. This forces TL to focus on discussing requirements and designing the team rather than exploring or modifying code. The only tools available are `add_dynamic_member`, team management tools, and `.md` writes.
    - **Execution phase** (entered when the first `start_member` succeeds): TL regains access to all tools for monitoring and coordination. The standard team session guard still blocks code file writes.
    - Phase transition is automatic: `start_member` tool calls `onDynamicPhaseTransition`, which flips `teamCtx.dynamicPhase` from `"design"` to `"execution"`. The `before_agent_start` handler injects different prompts depending on the current phase.
+
+13. **Orchestration playbook for the design phase** — `src/prompts/orchestration-playbook.md` is a methodology document injected into the design-phase TL prompt (loaded at runtime relative to `dynamic-mode.ts`, cached, with an inline fallback summary). It turns the design phase from free-form improvisation into a guided six-stage process:
+   - **A. 需求对齐（Grilling）**: one question at a time with recommended answers; walks a question tree (goal → scope → acceptance criteria → constraints → non-goals); facts vs decisions separated.
+   - **B. 任务拆分**: decompose by deliverables, draw the dependency graph (parallel/sequential/join points), annotate each task with role/input/output/acceptance criteria. Large workloads (many similar subtasks) must be designed as multi-round batches — batch partitioning, pilot batch first, inter-batch verification and adjustment.
+   - **C. 工作流编排与质量加固**: assumes agents make mistakes by default; maps risk signals to reinforcement patterns — parallel redundancy + cross-validation, adversarial debate (proposer/opposer/judge), develop-review loop (with exit condition + max rounds), spike-first scouting, human checkpoints for irreversible operations. Only high-risk stages get reinforced (cost-awareness).
+   - **D. 团队设计**: roles derived from the workflow, not the reverse.
+   - **E. 方案确认门 (hard gate)**: TL must present a full plan document (goal, task DAG, workflow with reinforcement rationale, team roster, risks) and is forbidden from calling `add_dynamic_member`/`start_member` until the user explicitly confirms. Enforced by prompt (not the tool_call guard).
+   - **F. 落地执行**: register members, write structured shared-context (including workflow definition with stages/dependencies/failure fallback), then `start_member`.
 
 ## Dependency Injection Pattern
 
@@ -248,7 +258,7 @@ npm test          # Run all tests (vitest)
 npm run test:watch  # Watch mode
 ```
 
-318 tests across 25 files (state-machine, member-process, event-handler, response-waiter, message-channel, member, save-team-definition, config, ui-widget tests included). Tests live alongside source as `*.test.ts`.
+358 tests across 28 files (state-machine, member-process, event-handler, response-waiter, message-channel, member, save-team-definition, config, ui-widget tests included). Tests live alongside source as `*.test.ts`.
 
 | Test Level | What | How |
 |-----------|------|-----|
@@ -351,9 +361,13 @@ The design phase guard is active from the moment `/team dynamic` is entered. It 
 
 ═══ 设计阶段（TL 被阻断：不能 bash/read/code_search/fetch_content/edit，write 仅限 .md）═══
 
-TL ↔ 用户讨论需求（逐个方面，一次只问一个问题）
-  → TL 构思团队角色 + 工作流
-  → TL 向用户展示方案 → 用户确认
+TL 按编排方法论 Playbook（orchestration-playbook.md，注入设计阶段提示词）推进六阶段：
+  A. 需求对齐 — grilling 式逐个问题深挖（目标/范围/验收标准/约束/非目标）
+  B. 任务拆分 — 按交付物拆，画依赖图，标注输入/输出/验收标准
+  C. 工作流编排与质量加固 — 识别薄弱环节，选用交叉验证/对抗辩论/开发-审核循环等模式
+  D. 团队设计 — 从工作流推导角色
+  E. 方案确认门 — 展示完整计划书；用户明确确认前禁止 add_dynamic_member / start_member
+  F. 落地执行 — 注册成员、写 shared-context、启动成员
 
 TL: add_dynamic_member({name, label, systemPrompt, model?})
   → addMemberToSession() 刷新 currentSession

@@ -40,8 +40,12 @@ _Avoid_: Mission brief, team doc, session context
 Each team session gets a unique `sessionId` (timestamp + random suffix). Session data is isolated under `sessions/<team-name>/<sessionId>/` to prevent conflicts when the same pre-defined team is used across multiple sessions. Dynamic mode sessions use timestamp-based team names (`_dynamic_<ts>`) for the same purpose. All session directories are cleaned up on `/team stop`.
 
 **Dynamic Team Mode** (`/team dynamic`):
-A free-form session mode where the Team Definition is built at runtime rather than loaded from YAML. The TL enters a session with 0 members, discusses requirements with the user, and uses `add_dynamic_member` to register each role. Session data lives in `sessions/_dynamic_<ts>/` and is cleaned up on `/team stop`. The session guard blocks code file writes from the moment of entry.
+A free-form session mode where the Team Definition is built at runtime rather than loaded from YAML. The TL enters a session with 0 members, discusses requirements with the user, and uses `add_dynamic_member` to register each role. Session data lives in `sessions/_dynamic_<ts>/` and is cleaned up on `/team stop`. The session guard blocks code file writes from the moment of entry. During the design phase, the TL follows the **Orchestration Playbook** (below).
 _Avoid_: Ad-hoc team, on-the-fly team, temporary team
+
+**Orchestration Playbook**:
+A methodology document (`src/prompts/orchestration-playbook.md`) injected into the Dynamic Team Mode design-phase TL prompt. Guides the TL through six stages: (A) requirements alignment via relentless one-at-a-time questioning (grilling), (B) task decomposition by deliverables with dependency graphs — large workloads split into multi-round batches, (C) workflow orchestration with quality reinforcement patterns for high-risk stages (parallel redundancy + cross-validation, adversarial debate, develop-review loop, spike-first, human checkpoints), (D) team design derived from the workflow, (E) a plan confirmation gate — the TL must not register or start members before the user explicitly approves the full plan, (F) landing via `add_dynamic_member`, Shared Context, and `start_member`.
+_Avoid_: Workflow guide, design checklist
 
 **Goal**:
 A session-scoped objective set by the TL at the start of a task using the `set_goal` tool. Consists of a summary text and verifiable completion criteria. When the TL finishes a turn (`agent_end`) with an active, incomplete goal, the system automatically sends a user message reminding the TL to continue working rather than asking the user for permission. The TL calls `finish_goal` when the goal is met or an unresolvable blocker prevents completion.
