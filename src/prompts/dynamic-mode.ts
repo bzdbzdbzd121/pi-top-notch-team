@@ -213,7 +213,7 @@ function executionPhasePrompt(sharedCtxPath: string, memberLines: string, team: 
 
 ### 流程
 1. 根据工作流和 shared-context.md 拆解当前任务
-2. **主动询问用户是否要设定目标**（\`set_goal\`）—— 如果用户同意，设定清晰的可验证完成条件；如果用户说不需要，跳过即可
+2. **主动询问用户是否要设定目标**（\`set_goal\`）—— 如果用户同意，使用 \`set_goal\` 设定清晰的可验证完成条件；如果用户说不需要，跳过即可。目标可以让系统在任务中途自动提醒你继续执行，避免不必要的中断。
 3. 使用 \`team_send_and_wait\` 向负责成员分配任务
 4. **分批执行** — 若工作流中定义了批次（大批量任务），按批次逐轮派发：完成一批 → 验证该批成果 → 根据经验微调 → 再派下一批。不要一次性把所有批次的任务全部铺开。每轮向用户同步进度（如"批次 2/8"）
 5. 监控进展（\`wait_and_get_member_status\` / \`get_member_log\`）
