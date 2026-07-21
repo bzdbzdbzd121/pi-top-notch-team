@@ -333,18 +333,38 @@ These tools are dynamically registered and only available during their respectiv
 | `create_team_definition` | Creates a new team YAML. Accepts full member data (name, label, systemPrompt, model) + optional workflow. Validates and writes to disk. |
 | `update_team_definition` | Updates an existing team YAML. **Merge mode**: for unchanged members, TL may omit `systemPrompt` — value auto-fills from stored YAML. Omit a member from `members` to delete it. Workflow/defaults not provided preserve existing values. This avoids large payloads that could cause model output truncation. |
 
-### Team Session Guards
+### Team Session Guards (Whitelist-based)
 
-During an active team session (including `/team dynamic`), a `tool_call` event handler enforces tool restrictions:
+During an active team session (including `/team dynamic`), a `tool_call` event handler enforces tool restrictions using a **whitelist** (not a blocklist). Any tool not on the whitelist is blocked at runtime.
 
-**Standard team session / execution phase:**
-- `.md` files (`.shared-context.md`, ADRs, planning docs) — `write`/`edit` allowed
-- Code files (`.ts`, `.js`, `.py`, etc.) — `write`/`edit` blocked with reason "请委派给 Member"
+**Design phase whitelist (`DESIGN_PHASE_WHITELIST`):**
+```
+add_dynamic_member, start_member, stop_member, list_members,
+get_member_log, wait_and_get_member_status, team_send_and_wait,
+set_goal, finish_goal,
+write (only .md files — checked per-call)
+```
 
-**Dynamic mode design phase (stricter):**
-- `bash`, `read`, `code_search`, `fetch_content`, `edit` — **all blocked** (TL cannot explore or modify code)
-- `write` — only `.md` files allowed (for shared-context.md / ADRs)
-- Only management tools + `add_dynamic_member` remain available
+**Execution phase whitelist (`EXECUTION_PHASE_WHITELIST`):**
+```
+start_member, stop_member, list_members, get_member_log,
+wait_and_get_member_status, team_send_and_wait,
+set_goal, finish_goal, add_dynamic_member,
+read, bash, web_search, fetch_content, get_search_content,
+write, edit (both only .md files — checked per-call),
+ctx_search, ctx_stats, ctx_doctor, ctx_insight,
+ctx_index, ctx_fetch_and_index,
+true_sight_search, true_sight_get_facts, true_sight_filter,
+true_sight_related, true_sight_graph_viz, true_sight_report,
+true_sight_coverage, true_sight_validate, true_sight_review,
+true_sight_synthesize, true_sight_ingest,
+true_sight_diff_impact, true_sight_verify_evidence
+```
+
+Key points:
+- **No more blocklist gaps** — tools like `ctx_execute`, `ctx_execute_file`, `ctx_batch_execute`, `mcp`, `ctx_upgrade` are NOT on either whitelist, so they're automatically blocked. No need to manually track every tool that could write files.
+- **`write`/`edit` are on both whitelists** — but an additional per-call check restricts them to `.md` files only.
+- The design phase whitelist lifts to the execution phase whitelist on the first `start_member` call.
 
 The design phase guard is active from the moment `/team dynamic` is entered. It lifts when the first `start_member` call succeeds, transitioning to the execution phase.
 
@@ -359,7 +379,7 @@ The design phase guard is active from the moment `/team dynamic` is entered. It 
   → 激活 TL 工具 + 设计阶段严格守卫 + widget（显示"设计阶段"）
   → 注入设计阶段提示词
 
-═══ 设计阶段（TL 被阻断：不能 bash/read/code_search/fetch_content/edit，write 仅限 .md）═══
+═══ 设计阶段（TL 被阻断：仅允许管理工具 + .md 写入，其余工具被白名单拦截）═══
 
 TL 按编排方法论 Playbook（orchestration-playbook.md，注入设计阶段提示词）推进六阶段：
   A. 需求对齐 — grilling 式逐个问题深挖（目标/范围/验收标准/约束/非目标）

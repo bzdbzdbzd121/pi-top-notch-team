@@ -319,7 +319,7 @@ The dynamic mode is split into two phases: **design** and **execution**.
 
 **Phase 1: Design phase** — entered on `/team dynamic`
 - `teamCtx.dynamicPhase` is set to `"design"`
-- A stricter tool guard activates: `bash`/`read`/`code_search`/`fetch_content`/`edit` are **all blocked**; `write` is restricted to `.md` files only
+- A **whitelist-based** tool guard activates: only team management tools + `write` (`.md` only) are allowed. All other tools (including `bash`, `read`, `web_search`, `fetch_content`, `edit`, `ctx_*`, `mcp`, etc.) are blocked at runtime.
 - TL can only discuss with the user, register members with `add_dynamic_member`, and write `.shared-context.md`
 - This forces TL to focus on requirements alignment and team design rather than exploring code
 
@@ -347,8 +347,8 @@ The TL follows the **Orchestration Playbook** (`src/prompts/orchestration-playbo
 
 **Phase 2: Execution phase** — entered automatically on first `start_member` success
 - `start_member` tool calls `onDynamicPhaseTransition()` callback → `teamCtx.dynamicPhase = "execution"`
-- The design-phase tool guard lifts; standard team session guard applies (block `write`/`edit` on non-`.md` only)
-- TL regains access to `bash`/`read`/`code_search`/`fetch_content` for monitoring and coordination
+- The design-phase tool guard lifts; execution phase whitelist applies (team management + read-only analysis tools + `write`/`edit` on `.md` only)
+- TL regains access to `bash`/`read`/`web_search`/`fetch_content`/`ctx_search`/`true_sight_*` for monitoring and coordination, but tools like `ctx_execute`/`mcp` remain blocked
 - The `before_agent_start` handler switches to **execution phase** prompt injection
 - TL starts remaining Members, dispatches work via `team_send_and_wait`, monitors progress
 - Shared Context is updated as needed
@@ -712,14 +712,15 @@ When `/team start` creates a team session, the extension sets up a `before_agent
 
 Strict 模式的注入类似，但文案强调"严格按照以下步骤执行，不得跳过或调序"，并在末尾追加规则："完成上一个 stage 前不得开始下一个。Stage 失败时按 onFailure 策略处理。"
 
-此外，扩展注册了一个 `tool_call` 事件拦截器，在不同阶段有不同的限制规则：
+此外，扩展注册了一个 `tool_call` 事件拦截器，使用**白名单**机制限制工具调用。不在白名单上的工具会被直接阻断，不存在黑名单遗漏的风险。
 
-**标准团队会话 / 执行阶段：**
-- TL 的 `write`/`edit` 工具调用会被检查目标文件路径。仅 `.md` 文件允许直接写入，代码文件（`.ts`、`.js`、`.py` 等）会被拦截并提示委派给 Member。
+**设计阶段白名单（`DESIGN_PHASE_WHITELIST`）：**
+- 仅允许：`add_dynamic_member`、`start_member`、`stop_member`、`list_members`、`get_member_log`、`wait_and_get_member_status`、`team_send_and_wait`、`set_goal`、`finish_goal`、`write`（仅 `.md` 文件）
+- 其他工具全部被阻断（包括 `bash`、`read`、`web_search` 等），TL 只能讨论方案和写入共享上下文。
 
-**动态模式设计阶段（更严格）：**
-- `bash`、`read`、`code_search`、`fetch_content`、`edit` 全部被阻断，TL 无法探索代码或修改任何文件
-- `write` 仅允许 `.md` 文件（用于编写 shared-context.md 和 ADR）
+**执行阶段白名单（`EXECUTION_PHASE_WHITELIST`）：**
+- 团队管理工具 + 只读分析工具（`read`、`bash`、`web_search`、`fetch_content`、`ctx_search`、`true_sight_*` 等）+ `write`/`edit`（仅 `.md` 文件）
+- `ctx_execute`、`ctx_execute_file`、`ctx_batch_execute`、`mcp` 等具有文件写入能力的工具不在白名单中，自动被阻断。
 - 设计阶段的阻断在首次 `start_member` 成功后自动解除（同时 `dynamicPhase` 切换至 `"execution"`）
 
 The handler stays registered for the entire pi session but checks `session.active` to decide whether to inject TL instructions. When `/team stop` ends the session, `session.active` becomes `false` and no extra prompt is injected.
@@ -757,8 +758,8 @@ interface TeamContext {
 ```
 
 **`dynamicPhase`** tracks which phase a dynamic session is in:
-- `"design"`: TL is restricted from exploratory tools (bash/read/code_search/fetch_content/edit), can only discuss and design
-- `"execution"`: Full tool access restored (standard team session guard still blocks non-.md write/edit)
+- `"design"`: TL is restricted by the design-phase whitelist (only team management + .md write allowed), all other tools blocked
+- `"execution"`: Execution-phase whitelist applied (team management + read-only analysis tools + .md write/edit); tools like `ctx_execute`/`mcp` remain blocked
 - Transition from `"design"` → `"execution"` happens automatically on first `start_member` success, via the `onDynamicPhaseTransition` callback wired in `index.ts`
 
 Session state (active + team definition) is stored in `session/state.ts` as a module-level variable. Member process handles, message channel, and other runtime objects are in `TeamContext` passed to command handlers. On `/team stop`, all processes are terminated, handles cleared, and state reset.
