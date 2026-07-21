@@ -167,45 +167,77 @@ export default function (pi: ExtensionAPI) {
     return undefined;
   }
 
-  // ── Call-level guard: block code-file writes during team session ───
+  // ── Tool whitelists for team sessions ───────────────────
+  //
+  // Instead of blacklisting specific tools (which always misses something),
+  // we define a whitelist of tools that are safe during team sessions.
+  // Any tool not on the whitelist is blocked.
+
+  /** Tools allowed during design phase (dynamic mode only). */
+  const DESIGN_PHASE_WHITELIST = new Set([
+    // Team management
+    "add_dynamic_member",
+    "start_member", "stop_member", "list_members", "get_member_log",
+    "wait_and_get_member_status", "team_send_and_wait",
+    "set_goal", "finish_goal",
+    // write: restricted to .md files (checked separately)
+    "write",
+  ]);
+
+  /** Tools allowed during execution phase (normal session + dynamic execution). */
+  const EXECUTION_PHASE_WHITELIST = new Set([
+    // Team management
+    "start_member", "stop_member", "list_members", "get_member_log",
+    "wait_and_get_member_status", "team_send_and_wait",
+    "set_goal", "finish_goal", "add_dynamic_member",
+    // Read-only exploration & monitoring
+    "read", "bash",
+    "web_search", "fetch_content", "get_search_content",
+    // write/edit: restricted to .md files (checked separately)
+    "write", "edit",
+    // Context-mode read-only / indexing
+    "ctx_search", "ctx_stats", "ctx_doctor", "ctx_insight",
+    "ctx_index", "ctx_fetch_and_index",
+    // True-sight knowledge base (read-only safe)
+    "true_sight_search", "true_sight_get_facts", "true_sight_filter",
+    "true_sight_related", "true_sight_graph_viz", "true_sight_report",
+    "true_sight_coverage", "true_sight_validate", "true_sight_review",
+    "true_sight_synthesize", "true_sight_ingest",
+    "true_sight_diff_impact", "true_sight_verify_evidence",
+  ]);
+
+  // ── Call-level guard: whitelist-based blocking during team session ───
   pi.on("tool_call", (event) => {
     if (!getSessionState().active) return; // only block during active team session
 
-    // ── Dynamic mode: design phase — block ALL exploratory tools ──
-    if (teamCtx.isDynamicSession && teamCtx.dynamicPhase === "design") {
-      const blockedExploratoryTools = ["bash", "read", "code_search", "fetch_content", "edit"];
-      if (blockedExploratoryTools.includes(event.toolName)) {
-        return {
-          block: true,
-          reason: `动态团队模式设计阶段不得使用 ${event.toolName}。请专注于与用户讨论需求、设计团队方案。`,
-        };
-      }
-      // write: only allow .md files (for shared-context.md / ADRs)
-      if (event.toolName === "write") {
+    // ── Resolve current phase ──
+    const isDesignPhase = teamCtx.isDynamicSession && teamCtx.dynamicPhase === "design";
+    const whitelist = isDesignPhase ? DESIGN_PHASE_WHITELIST : EXECUTION_PHASE_WHITELIST;
+
+    // Quick pass: whitelisted tool?
+    if (whitelist.has(event.toolName)) {
+      // write/edit: additionally check file extension
+      if (event.toolName === "write" || event.toolName === "edit") {
         const filePath = extractPathFromInput(event.input) ?? "";
         if (!filePath.endsWith(".md")) {
+          const phaseLabel = isDesignPhase ? "设计阶段" : "团队会话";
           return {
             block: true,
-            reason: `动态团队模式设计阶段只能编写 .md 文档（如共享上下文文档）。代码文件请委派给 Member 执行。`,
+            reason: `${phaseLabel}期间不得使用 ${event.toolName} 写代码文件。请委派给 Member 执行。你可以编写 .md 文档（如 .shared-context.md、ADR 等）。`,
           };
         }
-        return; // allow .md writes
       }
-      return; // management tools allowed
+      return; // allowed
     }
 
-    // ── Normal team session / execution phase guard: block code file writes ──
-    if (event.toolName !== "write" && event.toolName !== "edit") return;
-
-    const filePath = extractPathFromInput(event.input) ?? "";
-
-    // Allow .md files (shared context, ADRs, planning docs)
-    if (filePath.endsWith(".md")) return;
-
-    // Block everything else (code, config, etc.)
+    // ── Block: tool not in whitelist ──
+    const phaseLabel = isDesignPhase ? "动态团队模式设计阶段" : "团队会话期间";
+    const detail = isDesignPhase
+      ? `请专注于与用户讨论需求、设计团队方案。`
+      : `请使用委派给 Member 的方式完成编码任务。允许的工具：${Array.from(whitelist).filter(t => t !== "write" && t !== "edit").join(", ")}。`;
     return {
       block: true,
-      reason: `团队会话期间不得使用 ${event.toolName} 写代码文件。请委派给 Member 执行。你可以编写 .md 文档（如 .shared-context.md、ADR 等）。`,
+      reason: `${phaseLabel}不得使用 ${event.toolName}。${detail}`,
     };
   });
 
