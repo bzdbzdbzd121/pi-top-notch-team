@@ -53,7 +53,7 @@ src/
 │   ├── team.ts       ← Dispatcher: ~150 lines, registers /team command, delegates to handlers
 │   ├── save-team-definition.ts  ← Pure function: team merge & persist logic
 │   ├── status.ts     ← StatusProvider type for getMemberStatuses
-│   ├── handlers/     ← 11 extracted subcommand handlers (< 120 lines each)
+│   ├── handlers/     ← 12 extracted subcommand handlers (< 120 lines each)
 │   │   ├── create-handler.ts
 │   │   ├── dynamic-handler.ts
 │   │   ├── edit-handler.ts
@@ -63,6 +63,7 @@ src/
 │   │   ├── show-handler.ts
 │   │   ├── delete-handler.ts
 │   │   ├── status-handler.ts
+│   │   ├── setting-handler.ts   ← /team setting 交互式设置菜单（成员默认模型）
 │   │   ├── done-handler.ts
 │   │   └── help-handler.ts
 │   ├── shared/        ← Shared schemas, tool helpers, and extracted pure functions
@@ -101,10 +102,16 @@ src/
 ├── setup/            ← Modular extracted setup modules
 │   ├── member-lifecycle.ts  ← createAndRegisterMember, buildMemberConfig, getMemberLog
 │   └── message-channel.ts   ← createMessageChannel factory (queue+router+waiter wiring)
+├── settings/         ← Global settings (/team setting)
+│   ├── settings.ts        ← TeamSettings type + <rootDir>/settings.yaml read/write
+│   └── resolve-model.ts   ← Pure function: member model precedence resolution
 ├── ui/               ← TUI components for team mode
 │   ├── team-status-widget.ts  ← Bordered widget: live member status + context %
 │   ├── edit-mode-widget.ts   ← Bordered widget: ✏️ EDIT MODE — <team name>
-│   └── create-mode-widget.ts ← Bordered widget: 🆕 CREATE MODE
+│   ├── create-mode-widget.ts ← Bordered widget: 🆕 CREATE MODE
+│   ├── scroll-select.ts      ← Scrollable + filterable select dialog (ctx.ui.custom, maxVisible window + fuzzy search)
+│   ├── member-inspector.ts   ← Member Inspector overlay (alt+t): tabs, conversation view, input box, footer
+│   └── member-inspector-state.ts  ← Inspector pure display state + line building (no TUI deps)
 ├── config.ts         ← getRootDir() via env var or ~/.pi/top-notch-team
 ├── config.test.ts    ← getRootDir() env var tests
 └── test/fixtures/    ← Test YAML files + mock-extension-api.ts
@@ -144,7 +151,7 @@ src/
     This prevents `"tasks: must be array"` validation failures caused by LLMs incorrectly double-encoding JSON-in-JSON.
 
 12. **Two-phase dynamic mode** — `/team dynamic` is split into a **design phase** and an **execution phase**:
-   - **Design phase** (entered on `/team dynamic`): TL is blocked from using `bash`/`read`/`code_search`/`fetch_content`/`edit` entirely. `write` is restricted to `.md` files only. This forces TL to focus on discussing requirements and designing the team rather than exploring or modifying code. The only tools available are `add_dynamic_member`, team management tools, and `.md` writes.
+   - **Design phase** (entered on `/team dynamic`): TL is blocked from using `bash`/`code_search`/`fetch_content`/`edit` entirely. `read` is allowed (for checking docs), `write` is restricted to `.md` files only. This forces TL to focus on discussing requirements and designing the team rather than exploring or modifying code. The only tools available are `add_dynamic_member`, team management tools, `read`, and `.md` writes.
    - **Execution phase** (entered when the first `start_member` succeeds): TL regains access to all tools for monitoring and coordination. The standard team session guard still blocks code file writes.
    - Phase transition is automatic: `start_member` tool calls `onDynamicPhaseTransition`, which flips `teamCtx.dynamicPhase` from `"design"` to `"execution"`. The `before_agent_start` handler injects different prompts depending on the current phase.
 
@@ -156,6 +163,10 @@ src/
    - **E. 方案确认门 (hard gate)**: TL must present a full plan document (goal, task DAG, workflow with reinforcement rationale, team roster, risks) and is forbidden from calling `add_dynamic_member`/`start_member` until the user explicitly confirms. Enforced by prompt (not the tool_call guard).
    - **F. 落地执行**: register members, write structured shared-context (including workflow definition with stages/dependencies/failure fallback), then `start_member`.
 
+13. **Member Inspector (成员检视浮窗)** — During an active Team Session, the user can press `alt+t` to open a full-keyboard overlay (`ctx.ui.custom` with `overlay: true`, 90%×85%) showing a horizontal tab per Member, the selected Member's live conversation, and a footer with operational states + context % + key hints. Refresh is event-driven: `EventHandlerDeps.onMemberActivity` marks a tab dirty and a throttled (500ms) RPC `get_messages` refetch rebuilds display lines. Rendering: user/assistant text in full, tool calls/results as one-line summaries with an `e` expansion toggle, thinking hidden, virtual scroll. The user can message a Member directly (input box: Enter = `prompt`/`follow_up`, `Ctrl+Enter` = `steer`; `/...` sent raw for member-side command resolution) and run control commands (`ctrl+a` abort, `ctrl+o` compact — NOT ctrl+m, which is indistinguishable from Enter in terminals). Direct messages are prefixed `[用户直接指令（非 TL）]:` and mirrored into the TL session so the TL stays aware. `/team stop` auto-closes the overlay. See DESIGN.md §17.
+
+14. **Global settings + model resolution** — `/team setting` opens an interactive `ctx.ui.select` menu for global team settings, persisted to `<rootDir>/settings.yaml`. The first setting, **member default model**, supports `follow` (member spawned later uses the TL's current model, tracked via `session_start`/`model_select`) or `fixed` (one of `ctx.modelRegistry.getAvailable()` logged-in models). Resolution precedence in `src/settings/resolve-model.ts`: member YAML `model` > team YAML `defaults.model` > global fixed > global follow > no override. The resolved model is passed as `--model provider/id` at member spawn — this also wires up the previously inert team-YAML model fields. Only subsequently started members are affected. The model picker uses `src/ui/scroll-select.ts` (a custom `ctx.ui.custom` component with a `maxVisible` scroll window, scroll indicator, and fuzzy-search input) because pi's built-in `ctx.ui.select` renders all options without scrolling — unusable for 100+ models.
+
 ## Dependency Injection Pattern
 
 The codebase uses an explicit Dependency Injection (DI) pattern to decouple modules and enable testability. Every subsystem receives its dependencies through a typed interface, rather than importing them directly.
@@ -165,7 +176,7 @@ The codebase uses an explicit Dependency Injection (DI) pattern to decouple modu
 | `TlToolsDeps` | `tools/tl-tools.ts` | `pi`, `manager`, `responseWaiter`, `memberOpsStates`, `lastPendingCorrId`, `messageQueue`, `createMember?`, `buildMemberConfig?`, `getMemberLog?`, `isDynamicSession?`, `addMemberToSession?`, `onDynamicMemberAdded?`, `onDynamicPhaseTransition?` |
 | `MemberLifecycleDeps` | `setup/member-lifecycle.ts` | `pi`, `memberOpsStates`, `messageQueue`, `responseWaiter`, `lastPendingCorrId`, `recentlyProcessedMessages`, `processManager?` |
 | `MessageChannelDeps` | `setup/message-channel.ts` | `pi`, `memberOpsStates`, `lastPendingCorrId`, `memberHandles`, `onRouteNotification?` |
-| `EventHandlerDeps` | `channel/event-handler.ts` | `pi`, `memberOpsStates`, `messageQueue`, `responseWaiter`, `lastPendingCorrId`, `recentlyProcessedMessages`, `processManager?` |
+| `EventHandlerDeps` | `channel/event-handler.ts` | `pi`, `memberOpsStates`, `messageQueue`, `responseWaiter`, `lastPendingCorrId`, `recentlyProcessedMessages`, `processManager?`, `onMemberActivity?` |
 | `SendToMemberDeps` | `channel/event-handler.ts` | `pi`, `memberOpsStates`, `memberHandles` |
 
 Benefits:
@@ -258,7 +269,7 @@ npm test          # Run all tests (vitest)
 npm run test:watch  # Watch mode
 ```
 
-358 tests across 28 files (state-machine, member-process, event-handler, response-waiter, message-channel, member, save-team-definition, config, ui-widget tests included). Tests live alongside source as `*.test.ts`.
+403 tests across 31 files (state-machine, member-process, event-handler, response-waiter, message-channel, member, save-team-definition, config, ui-widget, member-inspector tests included). Tests live alongside source as `*.test.ts`.
 
 | Test Level | What | How |
 |-----------|------|-----|
@@ -294,6 +305,7 @@ npm run test:watch  # Watch mode
 | `/team cancel`           | Alias for `/team done` (backward compatibility) |
 | `/team delete <name>` | Delete a team definition (with confirmation) |
 | `/team status` | Show active session + member process statuses |
+| `/team setting` | Interactive settings menu — member default model (follow TL current model / fixed available model). Also allowed during a session |
 | `/team help` | Display usage help for all subcommands |
 
 ## TL Tools (active only during team session)
@@ -342,6 +354,7 @@ During an active team session (including `/team dynamic`), a `tool_call` event h
 add_dynamic_member, start_member, stop_member, list_members,
 get_member_log, wait_and_get_member_status, team_send_and_wait,
 set_goal, finish_goal,
+read (unrestricted),
 write (only .md files — checked per-call)
 ```
 

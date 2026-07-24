@@ -51,6 +51,10 @@ _Avoid_: Workflow guide, design checklist
 A session-scoped objective set by the TL at the start of a task using the `set_goal` tool. Consists of a summary text and verifiable completion criteria. When the TL finishes a turn (`agent_end`) with an active, incomplete goal, the system automatically sends a user message reminding the TL to continue working rather than asking the user for permission. The TL calls `finish_goal` when the goal is met or an unresolvable blocker prevents completion.
 _Avoid_: Task objective, milestone, checkpoint
 
+**Member Inspector** (成员检视浮窗):
+A full-keyboard overlay summoned by the user with `alt+t` during an active Team Session. Displays a horizontal tab per Member (including crashed/stopped ones, marked with status icons), the selected Member's conversation content (user/assistant messages rendered in full, tool calls collapsed to one-line summaries with an `e` key toggle, thinking hidden), and a footer with each Member's operational state, context usage %, and key hints. The user can send messages directly to a Member via an input box (`i`/`Enter` to open; Enter sends `prompt` when idle or `follow_up` when busy, `Ctrl+Enter` sends `steer`), and run control commands (`ctrl+a` abort, `ctrl+m` compact). Direct user messages are prefixed with `[用户直接指令（非 TL）]:` so the Member can distinguish the source, and a notification is injected into the TL session so the TL stays aware of all user interventions. Content refresh is event-driven: Member RPC events mark the tab dirty and trigger a throttled `get_messages` refetch. Not available outside a Team Session.
+_Avoid_: 监控面板, 第二终端
+
 **Team Session Lifecycle**:
 1. User runs `/team start <name>` or `/team dynamic`
 2. TL clarifies requirements with the user (possibly multiple rounds)
