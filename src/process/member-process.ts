@@ -22,6 +22,8 @@ export interface MemberProcessConfig {
   sharedContextPath?: string;
   memberExtensionPath: string;
   cwd: string;
+  /** Model override passed to pi via `--model provider/id` (e.g. "anthropic/claude-sonnet-4-5"). */
+  model?: string;
   /** Override the pi command path (for testing or custom installs). */
   piCommand?: string;
 }
@@ -67,6 +69,7 @@ export function createMemberProcess(
     sharedContextPath,
     memberExtensionPath,
     cwd,
+    model,
     piCommand = "pi",
   } = config;
 
@@ -271,12 +274,16 @@ export function createMemberProcess(
       });
 
       try {
-        child = spawnFn(piCommand, [
+        const args = [
           "--mode", "rpc",
           "--session-dir", sessionDir,
           "-e", memberExtensionPath,
           "--no-session", "false",
-        ], {
+        ];
+        if (model) {
+          args.push("--model", model);
+        }
+        child = spawnFn(piCommand, args, {
           cwd,
           env: { ...process.env, ...env },
           stdio: ["pipe", "pipe", "pipe"],

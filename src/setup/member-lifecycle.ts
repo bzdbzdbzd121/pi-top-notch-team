@@ -10,6 +10,8 @@ import type { ResponseWaiter } from "../channel/response-waiter";
 import type { MemberOperationalState } from "../session/context";
 import type { TeamSessionState } from "../session/state";
 import { getRootDir } from "../config";
+import { loadSettings } from "../settings/settings";
+import { resolveMemberModel } from "../settings/resolve-model";
 import { createMemberEventHandler } from "../channel/event-handler";
 import { existsSync, mkdirSync } from "node:fs";
 import { transitionState } from "../session/state-machine";
@@ -30,6 +32,8 @@ export interface MemberLifecycleDeps {
   perTurnReplied?: Set<string>;
   /** Auto-reply tracking: pending setTimeout refs for scheduled auto-replies. */
   pendingAutoReplies?: Map<string, NodeJS.Timeout>;
+  /** Activity hook forwarded to the event handler (Member Inspector). */
+  onMemberActivity?: (memberName: string, eventType: string) => void;
 }
 
 // ── createAndRegisterMember ────────────────────────────────
@@ -60,10 +64,19 @@ export function createAndRegisterMember(
 // ── buildMemberConfig ──────────────────────────────────────
 // Build a MemberProcessConfig from a member name and session state.
 // Uses fileURLToPath (Windows-safe) instead of .pathname.
+//
+// Model resolution precedence (see src/settings/resolve-model.ts):
+//   member.model > team defaults.model > global fixed > global follow (TL model) > none
+
+export interface BuildMemberConfigOptions {
+  /** TL's current model as "provider/id" — used when the global setting is "follow". */
+  tlCurrentModel?: string;
+}
 
 export function buildMemberConfig(
   memberName: string,
-  session: TeamSessionState
+  session: TeamSessionState,
+  options?: BuildMemberConfigOptions
 ): MemberProcessConfig | null {
   const team = session.teamDefinition;
   if (!team) return null;
@@ -100,6 +113,10 @@ export function buildMemberConfig(
     );
   }
 
+  // Resolve the effective model for this member (global settings + team YAML + TL model)
+  const settings = loadSettings(rootDir);
+  const resolved = resolveMemberModel(memberDef, team, settings, options?.tlCurrentModel);
+
   return {
     name: memberName,
     role: memberName,
@@ -113,6 +130,7 @@ export function buildMemberConfig(
       new URL("../../member.ts", import.meta.url)
     ),
     cwd: process.cwd(),
+    ...(resolved.model ? { model: resolved.model } : {}),
   };
 }
 

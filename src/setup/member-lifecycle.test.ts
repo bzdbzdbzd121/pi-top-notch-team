@@ -567,3 +567,101 @@ describe("getMemberLog", () => {
     expect(result).toContain("ok");
   });
 });
+
+describe("buildMemberConfig model resolution", () => {
+  let tmpDir: string;
+  let session: TeamSessionState;
+  const originalRoot = process.env.TOP_NOTCH_TEAM_ROOT;
+
+  function teamWithDefaults(
+    members: TeamDefinition["members"],
+    defaultModel?: string
+  ): TeamDefinition {
+    return {
+      name: "test-team",
+      description: "A test team",
+      defaults: defaultModel ? { model: defaultModel } : undefined,
+      members,
+    };
+  }
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "member-lifecycle-model-test-"));
+    mkdirSync(join(tmpDir, "sessions", "test-team"), { recursive: true });
+    process.env.TOP_NOTCH_TEAM_ROOT = tmpDir;
+    session = {
+      active: true,
+      teamDefinition: teamWithDefaults([
+        { name: "coder", label: "编码员", systemPrompt: "你是一个编码专家" },
+      ]),
+      startedAt: Date.now(),
+      sessionId: "abc123",
+    };
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+    if (originalRoot) {
+      process.env.TOP_NOTCH_TEAM_ROOT = originalRoot;
+    } else {
+      delete process.env.TOP_NOTCH_TEAM_ROOT;
+    }
+  });
+
+  async function loadModule() {
+    return await import("./member-lifecycle");
+  }
+
+  async function saveFixed(model: string) {
+    const { saveSettings } = await import("../settings/settings");
+    saveSettings({ memberModel: { mode: "fixed", model } }, tmpDir);
+  }
+
+  it("follow mode: uses the TL current model at spawn time", async () => {
+    const { buildMemberConfig } = await loadModule();
+    const config = buildMemberConfig("coder", session, {
+      tlCurrentModel: "anthropic/claude-sonnet-4-5",
+    });
+    expect(config?.model).toBe("anthropic/claude-sonnet-4-5");
+  });
+
+  it("follow mode without a TL model: no model override", async () => {
+    const { buildMemberConfig } = await loadModule();
+    const config = buildMemberConfig("coder", session);
+    expect(config?.model).toBeUndefined();
+  });
+
+  it("fixed mode: uses the configured model regardless of TL model", async () => {
+    await saveFixed("openai/gpt-5");
+    const { buildMemberConfig } = await loadModule();
+    const config = buildMemberConfig("coder", session, {
+      tlCurrentModel: "anthropic/claude-sonnet-4-5",
+    });
+    expect(config?.model).toBe("openai/gpt-5");
+  });
+
+  it("team YAML member.model wins over the global setting", async () => {
+    await saveFixed("openai/gpt-5");
+    session.teamDefinition = teamWithDefaults([
+      { name: "coder", systemPrompt: "…", model: "google/gemini-3-pro" },
+    ]);
+    const { buildMemberConfig } = await loadModule();
+    const config = buildMemberConfig("coder", session, {
+      tlCurrentModel: "anthropic/claude-sonnet-4-5",
+    });
+    expect(config?.model).toBe("google/gemini-3-pro");
+  });
+
+  it("team YAML defaults.model wins over the global setting", async () => {
+    await saveFixed("openai/gpt-5");
+    session.teamDefinition = teamWithDefaults(
+      [{ name: "coder", systemPrompt: "…" }],
+      "anthropic/claude-opus-4"
+    );
+    const { buildMemberConfig } = await loadModule();
+    const config = buildMemberConfig("coder", session, {
+      tlCurrentModel: "anthropic/claude-sonnet-4-5",
+    });
+    expect(config?.model).toBe("anthropic/claude-opus-4");
+  });
+});

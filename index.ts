@@ -119,6 +119,11 @@ export default function (pi: ExtensionAPI) {
     pendingAutoReplies,
   };
 
+  // ── TL current model tracking (for /team setting "follow" mode) ──────
+  // Updated on session_start and model_select so buildMemberConfig can pass
+  // the TL's current model to members spawned in "follow" mode.
+  let tlCurrentModel: string | undefined;
+
   // Only register the agent_end reminder handler at module init (safe, guards itself).
   // Goal tools (set_goal/finish_goal) are registered on-demand when a session starts.
   registerGoalAgentHandler(pi);
@@ -135,7 +140,7 @@ export default function (pi: ExtensionAPI) {
       teamCtx.setHandle(config.name, handle);
       return handle;
     },
-    buildMemberConfig: (memberName) => buildMemberConfig(memberName, getSessionState()),
+    buildMemberConfig: (memberName) => buildMemberConfig(memberName, getSessionState(), { tlCurrentModel }),
     getMemberLog: async (memberName, maxLines, maxContentLength) => {
       const handle = teamCtx.getHandle(memberName);
       if (!handle) {
@@ -180,7 +185,8 @@ export default function (pi: ExtensionAPI) {
     "start_member", "stop_member", "list_members", "get_member_log",
     "wait_and_get_member_status", "team_send_and_wait",
     "set_goal", "finish_goal",
-    // write: restricted to .md files (checked separately)
+    // read/write: read unrestricted, write restricted to .md files (checked separately)
+    "read",
     "write",
   ]);
 
@@ -304,6 +310,8 @@ export default function (pi: ExtensionAPI) {
 
   // ── session_start: reset stale team state + register autocomplete/editor ──
   pi.on("session_start", (_event, ctx) => {
+    // Track TL current model for /team setting "follow" mode
+    tlCurrentModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
     // Part 1: Clean up stale team state when fresh session detected
     if (ctx.sessionManager) {
       const entries = ctx.sessionManager.getEntries() ?? [];
@@ -357,6 +365,11 @@ export default function (pi: ExtensionAPI) {
       }
       return teamModeEditorInstance;
     });
+  });
+
+  // ── model_select: keep TL current model up to date ──
+  pi.on("model_select", (event) => {
+    tlCurrentModel = `${event.model.provider}/${event.model.id}`;
   });
 
   // ── Register the /team command ────────────────────────────

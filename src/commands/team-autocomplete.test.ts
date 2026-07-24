@@ -113,23 +113,25 @@ describe("/team autocomplete (getArgumentCompletions)", () => {
       expect(isActive()).toBe(true);
     });
 
-    it("returns stop, status, help when prefix is empty", () => {
+    it("returns stop, status, setting, help when prefix is empty", () => {
       const result = getArgCompletions("") as any[];
+      expect(Array.isArray(result)).toBe(true);
+      expect(result.length).toBe(4);
+      const values = result.map((r: any) => r.value);
+      expect(values).toContain("stop");
+      expect(values).toContain("status");
+      expect(values).toContain("setting");
+      expect(values).toContain("help");
+    });
+
+    it("filters to stop+status+setting when prefix is 's'", () => {
+      const result = getArgCompletions("s") as any[];
       expect(Array.isArray(result)).toBe(true);
       expect(result.length).toBe(3);
       const values = result.map((r: any) => r.value);
       expect(values).toContain("stop");
       expect(values).toContain("status");
-      expect(values).toContain("help");
-    });
-
-    it("filters to stop+status when prefix is 's'", () => {
-      const result = getArgCompletions("s") as any[];
-      expect(Array.isArray(result)).toBe(true);
-      expect(result.length).toBe(2);
-      const values = result.map((r: any) => r.value);
-      expect(values).toContain("stop");
-      expect(values).toContain("status");
+      expect(values).toContain("setting");
       expect(values).not.toContain("help");
     });
 
@@ -139,6 +141,13 @@ describe("/team autocomplete (getArgumentCompletions)", () => {
       const values = result.map((r: any) => r.value);
       expect(values).toContain("stop");
       expect(values).toContain("status");
+      expect(values).not.toContain("setting");
+    });
+
+    it("filters to setting when prefix is 'set'", () => {
+      const result = getArgCompletions("set") as any[];
+      expect(result.length).toBe(1);
+      expect(result[0].value).toBe("setting");
     });
 
     it("filters to stop when prefix is 'sto'", () => {

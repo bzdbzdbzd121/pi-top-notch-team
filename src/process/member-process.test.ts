@@ -77,6 +77,31 @@ describe("createMemberProcess", () => {
     );
   });
 
+  it("spawns pi with --model when config.model is set", async () => {
+    const { process: mockProcess, stdout } = createMockSpawn();
+    const spawnMock = vi.fn().mockReturnValue(mockProcess);
+
+    const member = createMemberProcess(
+      { ...defaultConfig, model: "anthropic/claude-sonnet-4-5" },
+      spawnMock
+    );
+    const startPromise = member.start();
+    emitReadyStdout(stdout);
+    await startPromise;
+
+    expect(spawnMock).toHaveBeenCalledWith(
+      "pi",
+      [
+        "--mode", "rpc",
+        "--session-dir", "/tmp/sessions/refactoring/analyzer",
+        "-e", "/path/to/member.ts",
+        "--no-session", "false",
+        "--model", "anthropic/claude-sonnet-4-5",
+      ],
+      expect.objectContaining({ cwd: "/test/project" })
+    );
+  });
+
   it("resolves when started (process ready event)", async () => {
     const { process: mockProcess, stdout } = createMockSpawn();
     const spawnMock = vi.fn().mockReturnValue(mockProcess);

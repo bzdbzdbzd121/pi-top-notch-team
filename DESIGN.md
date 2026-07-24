@@ -412,6 +412,17 @@ The TL follows the **Orchestration Playbook** (`src/prompts/orchestration-playbo
 
 - Display usage help listing all subcommands and their descriptions
 
+### `/team setting`
+
+- Interactive settings menu (via `ctx.ui.select`) for global team-session settings. Also available during an active session (affects only subsequently started members).
+- Currently supports: **成员默认模型** (default model for members)
+  - `跟随当前配置` (follow) — a member spawned later uses the TL's current model at spawn time (tracked via `session_start` + `model_select` events in `index.ts`)
+  - `指定模型` (fixed) — pick one of pi's available (logged-in) models from `ctx.modelRegistry.getAvailable()`
+- Persisted to `<rootDir>/settings.yaml` (`src/settings/settings.ts`), e.g. `memberModel: { mode: fixed, model: "anthropic/claude-sonnet-4-5" }`. Missing/corrupt file falls back to `{ mode: follow }`; `fixed` without a model auto-falls back to `follow`.
+- **Model resolution precedence** (`src/settings/resolve-model.ts`, pure function): member YAML `model` > team YAML `defaults.model` > global fixed > global follow (TL current model) > no override (member pi uses its own default).
+- The resolved model is passed to the member process as the `--model provider/id` CLI flag at spawn (`MemberProcessConfig.model` in `member-process.ts`). This also wires up the previously inert team-YAML `defaults.model` / `member.model` fields. Already-running members keep the model they were spawned with.
+- The model picker uses `src/ui/scroll-select.ts` — a reusable `ctx.ui.custom` component with a `maxVisible` scroll window (default 10, same as pi's `/model` selector), `(n/total)` scroll indicator, PgUp/PgDn support, and a fuzzy-search input (`fuzzyFilter` from pi-tui). pi's built-in `ctx.ui.select` renders ALL options without scrolling, which is unusable for 100+ available models. Small menus (top-level, mode picker) still use `ctx.ui.select`.
+
 ## 6. TL Process Management Tools
 
 Seven tools are registered when a team session is active. They are **not** available outside a team session.
