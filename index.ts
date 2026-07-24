@@ -20,6 +20,7 @@ import {
 } from "./src/setup/member-lifecycle";
 import { createMessageChannel } from "./src/setup/message-channel";
 import { buildDynamicModePrompt } from "./src/prompts/dynamic-mode";
+import { openMemberInspector, type MemberInspectorHandle } from "./src/ui/member-inspector";
 
 export default function (pi: ExtensionAPI) {
   // If running as a member process (TEAM_ROLE is set), skip TL-only tools
@@ -83,6 +84,25 @@ export default function (pi: ExtensionAPI) {
   // Auto-reply tracking: pending setTimeout refs for scheduled auto-replies
   const pendingAutoReplies = new Map<string, NodeJS.Timeout>();
 
+  // ── Member Inspector (成员检视浮窗) ───────────────────────
+  // Handle for the currently-open inspector overlay; null when closed.
+  let inspectorHandle: MemberInspectorHandle | null = null;
+
+  pi.registerShortcut("alt+t", {
+    description: "Member Inspector（成员检视浮窗）",
+    handler: async (ctx) => {
+      // Only during an active team session (decision #7: no reaction otherwise)
+      if (!getSessionState().active) return;
+      if (inspectorHandle?.isOpen()) return;
+      inspectorHandle = openMemberInspector(ctx, {
+        pi,
+        getMembers: () => getSessionState().teamDefinition?.members ?? [],
+        getHandle: (name: string) => teamCtx.getHandle(name),
+        memberOpsStates,
+      });
+    },
+  });
+
   // waitWithAllIdleCheck is defined in src/tools/tl-tools.ts
 
   // Capture ctx.ui.notify for UI-only routing notifications
@@ -117,6 +137,9 @@ export default function (pi: ExtensionAPI) {
     lastAssistantTexts,
     perTurnReplied,
     pendingAutoReplies,
+    onMemberActivity: (memberName: string, _eventType: string) => {
+      inspectorHandle?.markDirty(memberName);
+    },
   };
 
   // ── TL current model tracking (for /team setting "follow" mode) ──────
@@ -404,6 +427,9 @@ export default function (pi: ExtensionAPI) {
     });
     teamStatusWidget.install(ui, ui.theme);
 
+    // Hint: Member Inspector shortcut
+    ui.setStatus("team-inspector-hint", "alt+t 打开成员检视浮窗");
+
     // Activate team mode editor border
     if (teamModeEditorInstance) {
       teamModeEditorInstance.setTeamMode(true);
@@ -415,6 +441,13 @@ export default function (pi: ExtensionAPI) {
       teamStatusWidget.uninstall();
       teamStatusWidget = null;
     }
+
+    // Close the Member Inspector if open
+    inspectorHandle?.close();
+    inspectorHandle = null;
+
+    // Clear the inspector shortcut hint
+    sessionUiRef?.setStatus("team-inspector-hint", undefined);
 
     // Restore default editor border
     if (teamModeEditorInstance) {
@@ -473,10 +506,12 @@ export default function (pi: ExtensionAPI) {
         memberOpsStates,
       });
       teamStatusWidget.install(_ctx.ui, _ctx.ui.theme);
+      _ctx.ui.setStatus("team-inspector-hint", "alt+t 打开成员检视浮窗");
     }
     if (!session.active && teamStatusWidget) {
       teamStatusWidget.uninstall();
       teamStatusWidget = null;
+      _ctx.ui.setStatus("team-inspector-hint", undefined);
     }
 
     // Edit mode widget safety net

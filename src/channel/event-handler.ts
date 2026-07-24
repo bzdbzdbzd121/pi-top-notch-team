@@ -45,6 +45,13 @@ export interface EventHandlerDeps {
    * Set at agent_end when auto-reply is needed, cleared at agent_start or on tool reply.
    */
   pendingAutoReplies?: Map<string, NodeJS.Timeout>;
+  /**
+   * Optional activity hook for the Member Inspector (成员检视浮窗).
+   * Called at the top of every member RPC event so UI observers can mark
+   * tabs dirty and throttle a get_messages refetch. Must be cheap — it
+   * fires on high-frequency events like message_update.
+   */
+  onMemberActivity?: (memberName: string, eventType: string) => void;
 }
 
 // ── Dedup helpers ───────────────────────────────────────────
@@ -193,6 +200,12 @@ export function createMemberEventHandler(
       lastPendingCorrId: lpc,
       recentlyProcessedMessages: rpm,
     } = deps;
+
+    // Notify activity observers (Member Inspector dirty-marking). Cheap and
+    // synchronous; the observer is responsible for throttling any follow-up.
+    if (typeof event?.type === "string") {
+      deps.onMemberActivity?.(memberName, event.type);
+    }
 
     // ── Member operational state tracking (via pure state machine) ──
     if (event.type === "agent_start") {

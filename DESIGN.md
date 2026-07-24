@@ -982,3 +982,91 @@ Every step follows the TDD cycle: **write test → implement → refactor**.
 25. Auto-restart on Member crash + TDD (integration)
 26. `/team status` command — full status display + TDD
 27. E2E test: full team session lifecycle
+
+## 17. Member Inspector (成员检视浮窗)
+
+A full-keyboard overlay that lets the **user** inspect each Member's live conversation and directly intervene during an active Team Session. Summoned with `alt+t` (registered via `pi.registerShortcut`; `ctrl+shift+<letter>` is unusable because legacy terminals without the Kitty keyboard protocol send the same bytes as `ctrl+<letter>`, colliding with pi's `ctrl+t` thinking toggle); no reaction outside a team session. See the `Member Inspector` term in CONTEXT.md.
+
+### Layout
+
+```
+╭─ Member Inspector ─────────────────────────╮
+│ ❰分析员❱  编码员  测试员                    │  ← horizontal member tabs
+├────────────────────────────────────────────┤
+│  ● user                                    │
+│  任务内容...                                │
+│  ● assistant                               │
+│  回复内容...                                │
+│  🔧 read src/index.ts                       │  ← tool call one-line summary
+│  ✓ read file contents...                   │  ← tool result one-line summary
+├────────────────────────────────────────────┤
+│  ✅ 分析员 12%  │  🔧 编码员 45%            │  ← ops state + context %
+│  ←→ 切换成员 ↑↓ 滚动会话 End 跳至底部 …    │  ← navigation hints / input box
+│  ctrl+a 中断成员 ctrl+o 压缩上下文 Esc 关闭 │  ← action hints / input hints
+╰────────────────────────────────────────────┘
+```
+
+Overlay: `ctx.ui.custom(component, { overlay: true, overlayOptions: { width: "90%", maxHeight: "85%", anchor: "center" } })`.
+
+### Key Map
+
+| Key | Action |
+|-----|--------|
+| `←` / `→` | Switch member tab (wraps around) |
+| `↑` / `↓` / `PgUp` / `PgDn` | Scroll conversation |
+| `End` | Jump to bottom + resume tail-following |
+| `i` / `Enter` | Open input box |
+| `Enter` (in input) | Send: `prompt` when idle, `follow_up` when busy |
+| `Ctrl+Enter` (in input) | Send `steer` (immediate redirect) |
+| `e` | Toggle tool call/result detail expansion for the active tab |
+| `ctrl+a` | `abort` the active tab's member |
+| `ctrl+o` | `compact` the active tab's member (NOT ctrl+m — indistinguishable from Enter in terminals) |
+| `Esc` | Layered exit: input box → overlay |
+
+### Rendering Granularity
+
+- user/assistant text rendered in full (wrapped, thinking blocks hidden)
+- tool calls collapsed to one-line summaries (`🔧 name arg-summary`), expandable with `e`
+- tool results collapsed to `✓/✗ toolName first-line`, expandable with `e`
+- virtual scroll: full message history kept in memory, only the visible slice is rendered
+- unknown/custom AgentMessage roles fall back to a truncated `[role] json` line
+
+### Data Flow (event-driven refresh)
+
+```
+Member RPC event (message_end / tool_execution_end / ...)
+  → event-handler.ts onMemberActivity(memberName, eventType) hook
+  → inspectorHandle.markDirty(memberName)          (cheap, no I/O)
+  → throttled flush (500ms): RPC get_messages
+  → buildBodyLines(messages, {width, expanded})    (pure function)
+  → setTabLines (tail-follow or scroll-preserve + "↓ 有更新")
+  → tui.requestRender()
+
+Context usage (footer %): separate 5s poll via RPC get_session_stats.
+```
+
+### Direct Intervention Semantics
+
+Messages typed into the input box bypass the TL. To keep the team consistent:
+
+- Non-slash text is prefixed with `[用户直接指令（非 TL）]:` so the Member can distinguish the source
+- `/...` text is sent raw — the member's agent-session resolves it as an extension command / skill / prompt-template expansion (verified in pi `dist/core/agent-session.js` `prompt()`)
+- Every direct message and every abort/compact is mirrored into the TL session via `pi.sendMessage` (`[Member Inspector] 用户...`) so the TL stays aware
+- crashed/stopped members reject sends with a footer notice
+
+### Files
+
+| File | Role |
+|------|------|
+| `src/ui/member-inspector-state.ts` | Pure display state + line building (no TUI deps, fully unit-tested) |
+| `src/ui/member-inspector.ts` | TUI glue: overlay component, key dispatch, refresh engine, send/control logic |
+| `src/channel/event-handler.ts` | `onMemberActivity` hook in `EventHandlerDeps` |
+| `index.ts` | `registerShortcut("alt+t")`, hook wiring, `/team stop` auto-close |
+
+### Auto-close
+
+`/team stop` (via `teamCtx.onSessionEnd`) closes the overlay if open.
+
+### Shortcut hint
+
+On session start (`teamCtx.onSessionStart` + the `before_agent_start` safety net), a persistent footer status is set via `ctx.ui.setStatus("team-inspector-hint", "alt+t 打开成员检视浮窗")` — same footer area as the "团队成员运行中" status but a separate key, so the two coexist. Cleared on session end.
