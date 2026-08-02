@@ -84,6 +84,7 @@ export function createTeamStatusWidget(options: {
 
       const icon =
         state === "working" ? "🔧"
+        : state === "compacting" ? "🗜️"
         : state === "idle" ? "✅"
         : state === "crashed" ? "💥"
         : "⏹️";
@@ -91,6 +92,7 @@ export function createTeamStatusWidget(options: {
       const label = m.label ?? m.name;
       const stateColor =
         state === "working" ? "warning"
+        : state === "compacting" ? "accent"
         : state === "idle" ? "success"
         : "muted";
 
@@ -163,7 +165,7 @@ export function createTeamStatusWidget(options: {
   // ── Schedule next poll with adaptive interval ─────────
   function scheduleNextPoll(): void {
     const hasActiveMember = Array.from(memberOpsStates.values()).some(
-      (state) => state === "working"
+      (state) => state === "working" || state === "compacting"
     );
     const interval = hasActiveMember ? ACTIVE_POLL_INTERVAL : IDLE_POLL_INTERVAL;
     pollingTimer = setTimeout(() => {

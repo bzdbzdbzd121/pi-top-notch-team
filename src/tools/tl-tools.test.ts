@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { registerTlTools, WAIT_IDLE_CHECK_INTERVAL_MS, WAIT_IDLE_REQUIRED_CONSECUTIVE } from "./tl-tools";
+import { startSession, endSession, markSharedContextWritten } from "../session/state";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { ProcessManager } from "../process/manager";
 import type { ResponseWaiter, WaitResult } from "../channel/response-waiter";
@@ -87,6 +88,17 @@ describe("registerTlTools", () => {
     });
   }
 
+  /** Open the start_member gate: an active session whose shared context was written. */
+  function openStartMemberGate() {
+    endSession();
+    startSession({
+      name: "test-team",
+      description: "Test",
+      members: [{ name: "analyzer", systemPrompt: "analyze" }],
+    });
+    markSharedContextWritten();
+  }
+
   it("registers 6 tools (add_dynamic_member is registered dynamically in /team dynamic)", () => {
     callRegisterTlTools();
     expect(pi.registerTool).toHaveBeenCalledTimes(6);
@@ -100,6 +112,7 @@ describe("registerTlTools", () => {
   });
 
   it("start_member execute calls createMember when buildMemberConfig returns a config", async () => {
+    openStartMemberGate();
     const createMember = vi.fn().mockReturnValue({
       name: "analyzer",
       start: vi.fn().mockResolvedValue(undefined),
@@ -131,6 +144,7 @@ describe("registerTlTools", () => {
   });
 
   it("start_member returns error when buildMemberConfig returns null", async () => {
+    openStartMemberGate();
     const buildConfig = vi.fn().mockReturnValue(null);
 
     let executeFn: Function = () => {};
@@ -146,11 +160,70 @@ describe("registerTlTools", () => {
     expect(result.content[0].text).toContain("无法启动");
   });
 
+  it("start_member is BLOCKED when the shared context has not been written", async () => {
+    // Session active but write_shared_context never called → gate closed
+    endSession();
+    startSession({
+      name: "test-team",
+      description: "Test",
+      members: [{ name: "analyzer", systemPrompt: "analyze" }],
+    });
+
+    const createMember = vi.fn();
+    const buildConfig = vi.fn().mockReturnValue({ name: "analyzer", role: "analyzer", teamName: "test" });
+
+    let executeFn: Function = () => {};
+    pi.registerTool = vi.fn((def: any) => {
+      if (def.name === "start_member") {
+        executeFn = def.execute;
+      }
+    });
+
+    callRegisterTlTools({ createMember, buildMemberConfig: buildConfig });
+
+    const result = await executeFn("call-1", { name: "analyzer" });
+    expect(result.content[0].text).toContain("共享上下文尚未写入");
+    expect(result.content[0].text).toContain("write_shared_context");
+    // Must NOT proceed to member creation
+    expect(buildConfig).not.toHaveBeenCalled();
+    expect(createMember).not.toHaveBeenCalled();
+  });
+
+  it("start_member is BLOCKED outside an active session even if the flag was set", async () => {
+    // Flag was set in a previous session, then the session ended
+    endSession();
+    startSession({
+      name: "test-team",
+      description: "Test",
+      members: [{ name: "analyzer", systemPrompt: "analyze" }],
+    });
+    markSharedContextWritten();
+    endSession();
+
+    let executeFn: Function = () => {};
+    pi.registerTool = vi.fn((def: any) => {
+      if (def.name === "start_member") {
+        executeFn = def.execute;
+      }
+    });
+
+    callRegisterTlTools({ buildMemberConfig: vi.fn() });
+
+    const result = await executeFn("call-2", { name: "analyzer" });
+    expect(result.content[0].text).toContain("共享上下文尚未写入");
+  });
+
   it("registers stop_member tool", () => {
     callRegisterTlTools();
     expect(pi.registerTool).toHaveBeenCalledWith(
       expect.objectContaining({ name: "stop_member" })
     );
+  });
+
+  it("registers start_member with promptGuidelines mentioning the shared context gate", () => {
+    callRegisterTlTools();
+    const def = pi.registerTool.mock.calls.find((c: any[]) => c[0].name === "start_member")![0];
+    expect(def.promptGuidelines.join("\n")).toContain("Shared Context");
   });
 
   it("registers list_members tool", () => {
@@ -261,6 +334,8 @@ describe("registerTlTools", () => {
     });
 
     it("team_send_and_wait execute sends single task and waits for response", async () => {
+      memberOpsStates.set("worker", "idle");
+
       const mockResponseWaiter = createMockResponseWaiter();
       mockResponseWaiter.waitForResponse = vi.fn().mockResolvedValue({
         status: "response",
@@ -299,6 +374,9 @@ describe("registerTlTools", () => {
     });
 
     it("team_send_and_wait execute sends batch tasks and waits for all responses", async () => {
+      memberOpsStates.set("security-reviewer", "idle");
+      memberOpsStates.set("perf-reviewer", "idle");
+
       const mockResponseWaiter = createMockResponseWaiter();
       // Each waitForResponse call returns a promise; we resolve them in order
       const resolveFns: Array<(value: WaitResult) => void> = [];
@@ -420,6 +498,8 @@ describe("registerTlTools", () => {
     });
 
     it("team_send_and_wait auto-recovers from string-encoded tasks array", async () => {
+      memberOpsStates.set("planner", "idle");
+
       let executeFn: Function = () => {};
       pi.registerTool = vi.fn((def: any) => {
         if (def.name === "team_send_and_wait") {
@@ -447,6 +527,8 @@ describe("registerTlTools", () => {
     });
 
     it("team_send_and_wait auto-recovers from single-object tasks (non-array hallucination)", async () => {
+      memberOpsStates.set("planner", "idle");
+
       let executeFn: Function = () => {};
       pi.registerTool = vi.fn((def: any) => {
         if (def.name === "team_send_and_wait") {
@@ -467,6 +549,155 @@ describe("registerTlTools", () => {
       expect(messageQueue.enqueue).toHaveBeenCalledWith(
         expect.objectContaining({ to: "planner" })
       );
+    });
+
+    it("team_send_and_wait salvages complete tasks from a truncated string-encoded array", async () => {
+      memberOpsStates.set("planner", "idle");
+
+      let executeFn: Function = () => {};
+      pi.registerTool = vi.fn((def: any) => {
+        if (def.name === "team_send_and_wait") {
+          executeFn = def.execute;
+        }
+      });
+
+      callRegisterTlTools();
+
+      // Simulate LLM output truncation: first task complete, second task cut off mid-string
+      const truncated =
+        '[{"to": "planner", "content": "Do the plan"}, {"to": "analyst", "content": "现在kanban界面，全局视图和项目视图分成了两';
+
+      const result = await executeFn("call-1", {
+        tasks: truncated,
+        nextSteps: "continue",
+      });
+
+      // The complete task should still be dispatched
+      expect(messageQueue.enqueue).toHaveBeenCalledTimes(1);
+      expect(messageQueue.enqueue).toHaveBeenCalledWith(
+        expect.objectContaining({ to: "planner" })
+      );
+      // The TL must be told about the salvage + the dropped truncated entry
+      expect(result.content[0].text).toContain("已尽力恢复 1 个任务");
+      expect(result.content[0].text).toContain("丢弃 1 个不完整条目");
+    });
+
+    it("team_send_and_wait salvages content containing raw newlines from string-encoded tasks", async () => {
+      memberOpsStates.set("planner", "idle");
+
+      let executeFn: Function = () => {};
+      pi.registerTool = vi.fn((def: any) => {
+        if (def.name === "team_send_and_wait") {
+          executeFn = def.execute;
+        }
+      });
+
+      callRegisterTlTools();
+
+      // Strict JSON forbids raw control chars in strings, but LLMs emit them when double-encoding
+      const withRawNewline = '[{"to": "planner", "content": "line1\nline2"}]';
+      expect(() => JSON.parse(withRawNewline)).toThrow(); // confirm strict parse really fails
+
+      await executeFn("call-1", {
+        tasks: withRawNewline,
+        nextSteps: "continue",
+      });
+
+      expect(messageQueue.enqueue).toHaveBeenCalledTimes(1);
+      const callArg = messageQueue.enqueue.mock.calls[0][0];
+      expect(callArg.to).toBe("planner");
+      expect(callArg.content).toContain("line1\nline2");
+    });
+
+    it("team_send_and_wait drops invalid entries from a raw array and warns", async () => {
+      memberOpsStates.set("planner", "idle");
+
+      let executeFn: Function = () => {};
+      pi.registerTool = vi.fn((def: any) => {
+        if (def.name === "team_send_and_wait") {
+          executeFn = def.execute;
+        }
+      });
+
+      callRegisterTlTools();
+
+      const result = await executeFn("call-1", {
+        tasks: [{ to: "planner", content: "ok" }, { to: 123 }, "junk", {}],
+        nextSteps: "continue",
+      });
+
+      expect(messageQueue.enqueue).toHaveBeenCalledTimes(1);
+      expect(messageQueue.enqueue).toHaveBeenCalledWith(
+        expect.objectContaining({ to: "planner" })
+      );
+      expect(result.content[0].text).toContain("3 个条目");
+    });
+
+    it("team_send_and_wait error for unrecoverable string includes JSON.parse failure detail", async () => {
+      memberOpsStates.set("planner", "idle");
+
+      let executeFn: Function = () => {};
+      pi.registerTool = vi.fn((def: any) => {
+        if (def.name === "team_send_and_wait") {
+          executeFn = def.execute;
+        }
+      });
+
+      callRegisterTlTools();
+
+      const result = await executeFn("call-1", {
+        tasks: "not json at all",
+        nextSteps: "continue",
+      });
+
+      expect(result.content[0].text).toContain("无效");
+      expect(result.content[0].text).toContain("JSON.parse 失败原因");
+      expect(messageQueue.enqueue).not.toHaveBeenCalled();
+    });
+
+    it("team_send_and_wait returns error when no members are started", async () => {
+      // memberOpsStates is empty — no members started
+
+      let executeFn: Function = () => {};
+      pi.registerTool = vi.fn((def: any) => {
+        if (def.name === "team_send_and_wait") {
+          executeFn = def.execute;
+        }
+      });
+
+      callRegisterTlTools();
+
+      const result = await executeFn("call-1", {
+        tasks: [{ to: "worker", content: "Do something" }],
+        nextSteps: "next",
+      });
+
+      expect(result.content[0].text).toContain("还没有启动任何团队成员");
+      expect(result.content[0].text).toContain("start_member");
+      expect(messageQueue.enqueue).not.toHaveBeenCalled();
+    });
+
+    it("team_send_and_wait returns error when target member does not exist", async () => {
+      memberOpsStates.set("existing-member", "idle");
+
+      let executeFn: Function = () => {};
+      pi.registerTool = vi.fn((def: any) => {
+        if (def.name === "team_send_and_wait") {
+          executeFn = def.execute;
+        }
+      });
+
+      callRegisterTlTools();
+
+      const result = await executeFn("call-1", {
+        tasks: [{ to: "nonexistent-member", content: "Do something" }],
+        nextSteps: "next",
+      });
+
+      expect(result.content[0].text).toContain("不存在或未启动");
+      expect(result.content[0].text).toContain("nonexistent-member");
+      expect(result.content[0].text).toContain("existing-member");
+      expect(messageQueue.enqueue).not.toHaveBeenCalled();
     });
   });
 
@@ -539,6 +770,62 @@ describe("registerTlTools", () => {
       expect(result.content[0].text).toContain("analyzer");
       expect(result.content[0].text).toContain("worker");
       expect(result.content[0].text).toContain("idle");
+    });
+
+    it("wait_and_get_member_status does NOT hang when members are stopped", async () => {
+      memberOpsStates.set("analyzer", "stopped");
+      memberOpsStates.set("worker", "stopped");
+
+      let executeFn: Function = () => {};
+      pi.registerTool = vi.fn((def: any) => {
+        if (def.name === "wait_and_get_member_status") {
+          executeFn = def.execute;
+        }
+      });
+
+      callRegisterTlTools();
+
+      // Should return immediately without waiting — "stopped" is not an active state
+      const result = await executeFn("call-1");
+      expect(result.content[0].text).toContain("analyzer");
+      expect(result.content[0].text).toContain("worker");
+      expect(result.content[0].text).toContain("stopped");
+    });
+
+    it("wait_and_get_member_status does NOT hang when some members are stopped and some idle", async () => {
+      memberOpsStates.set("analyzer", "stopped");
+      memberOpsStates.set("worker", "idle");
+
+      let executeFn: Function = () => {};
+      pi.registerTool = vi.fn((def: any) => {
+        if (def.name === "wait_and_get_member_status") {
+          executeFn = def.execute;
+        }
+      });
+
+      callRegisterTlTools();
+
+      const result = await executeFn("call-2");
+      expect(result.content[0].text).toContain("analyzer");
+      expect(result.content[0].text).toContain("worker");
+    });
+
+    it("wait_and_get_member_status does NOT hang when members are crashed", async () => {
+      memberOpsStates.set("analyzer", "crashed");
+
+      let executeFn: Function = () => {};
+      pi.registerTool = vi.fn((def: any) => {
+        if (def.name === "wait_and_get_member_status") {
+          executeFn = def.execute;
+        }
+      });
+
+      callRegisterTlTools();
+
+      // Should return immediately without waiting — "crashed" is not an active state
+      const result = await executeFn("call-3");
+      expect(result.content[0].text).toContain("analyzer");
+      expect(result.content[0].text).toContain("crashed");
     });
   });
 });
@@ -641,7 +928,19 @@ describe("start_member error injection", () => {
     manager = createMockManager();
   });
 
+  /** Open the start_member gate: an active session whose shared context was written. */
+  function openStartMemberGate() {
+    endSession();
+    startSession({
+      name: "test-team",
+      description: "Test",
+      members: [{ name: "worker", systemPrompt: "work" }],
+    });
+    markSharedContextWritten();
+  }
+
   it("returns error when createMember throws", async () => {
+    openStartMemberGate();
     const createMember = vi.fn().mockImplementation(() => {
       throw new Error("Failed to spawn");
     });
@@ -669,6 +968,7 @@ describe("start_member error injection", () => {
   });
 
   it("returns error when handle.start() throws", async () => {
+    openStartMemberGate();
     const createMember = vi.fn().mockReturnValue({
       name: "worker",
       start: vi.fn().mockRejectedValue(new Error("Connection refused")),

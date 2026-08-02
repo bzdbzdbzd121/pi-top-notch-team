@@ -2,9 +2,11 @@ import { describe, it, expect } from "vitest";
 import { resolveMemberModel, splitModelRef } from "./resolve-model";
 import type { TeamDefinition, TeamMember } from "../team/definition";
 import type { TeamSettings } from "./settings";
+import { DEFAULT_SETTINGS } from "./settings";
 
-const FOLLOW: TeamSettings = { memberModel: { mode: "follow" } };
+const FOLLOW: TeamSettings = { ...structuredClone(DEFAULT_SETTINGS), memberModel: { mode: "follow" } };
 const FIXED: TeamSettings = {
+  ...structuredClone(DEFAULT_SETTINGS),
   memberModel: { mode: "fixed", model: "openai/gpt-5" },
 };
 
@@ -48,7 +50,7 @@ describe("resolveMemberModel precedence", () => {
   });
 
   it("fixed mode without a model → falls through to follow/none", () => {
-    const broken: TeamSettings = { memberModel: { mode: "fixed" } };
+    const broken: TeamSettings = { ...structuredClone(DEFAULT_SETTINGS), memberModel: { mode: "fixed" } };
     expect(resolveMemberModel(member(), team(), broken, "openai/gpt-5.1"))
       .toEqual({ model: "openai/gpt-5.1", source: "global-follow" });
     expect(resolveMemberModel(member(), team(), broken, undefined))

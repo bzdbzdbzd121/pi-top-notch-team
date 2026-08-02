@@ -418,6 +418,9 @@ The TL follows the **Orchestration Playbook** (`src/prompts/orchestration-playbo
 - Currently supports: **成员默认模型** (default model for members)
   - `跟随当前配置` (follow) — a member spawned later uses the TL's current model at spawn time (tracked via `session_start` + `model_select` events in `index.ts`)
   - `指定模型` (fixed) — pick one of pi's available (logged-in) models from `ctx.modelRegistry.getAvailable()`
+- Also supports: **自动压缩** (Auto-Compaction, see §8 Message Channel → Auto-Compaction on dispatch)
+  - Second-level menu: `开关切换` / `设置百分比阈值` / `设置 token 阈值` / `清除百分比阈值` / `清除 token 阈值` / `设置超时（分钟）`; loops until Esc
+  - The top-level menu label shows the effective configuration summary (e.g. `开启 · 阈值 80%（默认）· 超时 10 分钟`); clearing all thresholds while enabled triggers a one-time notice that the 80% default fallback applies
 - Persisted to `<rootDir>/settings.yaml` (`src/settings/settings.ts`), e.g. `memberModel: { mode: fixed, model: "anthropic/claude-sonnet-4-5" }`. Missing/corrupt file falls back to `{ mode: follow }`; `fixed` without a model auto-falls back to `follow`.
 - **Model resolution precedence** (`src/settings/resolve-model.ts`, pure function): member YAML `model` > team YAML `defaults.model` > global fixed > global follow (TL current model) > no override (member pi uses its own default).
 - The resolved model is passed to the member process as the `--model provider/id` CLI flag at spawn (`MemberProcessConfig.model` in `member-process.ts`). This also wires up the previously inert team-YAML `defaults.model` / `member.model` fields. Already-running members keep the model they were spawned with.
@@ -425,7 +428,20 @@ The TL follows the **Orchestration Playbook** (`src/prompts/orchestration-playbo
 
 ## 6. TL Process Management Tools
 
-Seven tools are registered when a team session is active. They are **not** available outside a team session.
+Eight tools are registered when a team session is active. They are **not** available outside a team session.
+
+### `write_shared_context`
+
+```typescript
+write_shared_context({ content: "# Shared Context\n..." })
+```
+
+- **The only sanctioned way to write the team shared context** (`.shared-context.md`)
+- Writes `content` (full Markdown, overwrite semantics) to the session's shared-context path via `src/tools/shared-context-tool.ts`
+- On success calls `markSharedContextWritten()` — the session flag that **gates `start_member`**: until this tool has been called at least once, every `start_member` call returns an error telling the TL to write the shared context first
+- fs write failure → error returned, flag **not** set (fail-open, gate stays closed)
+- Direct `write`/`edit` calls targeting `.shared-context.md` are intercepted by the `tool_call` guard and redirected here (keeps the flag accurate)
+- Registered eagerly at extension init, activated during team sessions via `teamCtx.tlToolNames`; on both phase whitelists
 
 ### `add_dynamic_member` (dynamic mode only)
 
@@ -519,7 +535,7 @@ get_member_log({ name: "analyzer", lines: 10, maxContentLength: 200 })
 wait_and_get_member_status()
 ```
 
-- Returns the operational status (idle/working/crashed/stopped) of all members
+- Returns the operational status (idle/working/compacting/crashed/stopped) of all members
 - **Blocks** until all members are idle before returning (same all-idle detection as `team_send_and_wait`: 4 consecutive checks, 3s interval)
 - Quick path: if all members are already idle, returns immediately without polling
 - If no members have been started, returns immediately
@@ -633,9 +649,36 @@ interface TeamMessage {
 }
 ```
 
+### Routing to a Member
+
+Messages addressed to a member are written to the member's RPC stdin as a `prompt` command carrying `streamingBehavior: "followUp"`. The TL-side operational state (`memberOpsStates`) is derived from `agent_start`/`agent_end` events and cannot exactly track pi's streaming window: pi keeps `isStreaming` true through the post-`agent_end` settlement phase (listener drain, auto-retry, auto-compaction continuation — potentially tens of seconds), while the state machine already shows `idle`. With `followUp`, a prompt that arrives while the member is still streaming is queued by pi itself (the ground truth) and delivered when the current run finishes, instead of being rejected with `Agent is already processing` and silently lost. When the member is idle the flag has no effect.
+
+Channel prompts are sent fire-and-forget (`sendCommand`, no RPC id attached). If the member's RPC layer still rejects a prompt (e.g. member model/auth failure), the error response arrives as a plain event with no id. `createMemberEventHandler` matches `{type:"response", command:"prompt", success:false, id:undefined}`: it resolves any pending `team_send_and_wait` for that member with a `[消息未送达]` reason and notifies the TL via a `team-route` message. Responses carrying an id belong to `sendCommandAndWait` callers (stats / compact / Member Inspector), which consume their own errors and are skipped.
+
 ### Routing to TL
 
 The TL is the user's pi session, not an RPC process. Messages addressed to `"tl"` are injected into the TL's session using `pi.sendMessage()` with a custom message type, so the TL sees the incoming message in its conversation context.
+
+### Auto-Compaction on dispatch
+
+When the router delivers a message to a member (`createSendToMember` in `channel/event-handler.ts`) and the member is currently `idle`, Auto-Compaction runs before the prompt is sent:
+
+```
+dispatch to idle member
+  → transitionState(compaction_started)          [synchronous — closes double-dispatch race]
+  → get_session_stats (3s timeout)
+  → shouldCompact(usage, cfg)?                   [percent OR tokens, either configured one triggers]
+      → yes: compact RPC (await up to timeoutMinutes, default 10)
+  → transitionState(compaction_completed) → send prompt → working
+  → flush messages queued during compaction
+```
+
+- **Fail-open**: stats query failure, compaction failure, or timeout all end with the prompt dispatched anyway + a TL notification. Success is silent — the TL is only notified when a configured compaction did *not* happen.
+- **At most one compaction per dispatch** — no post-compaction re-check loop.
+- **`compacting` operational state** (`idle`/`working`/`compacting`/`crashed`/`stopped`): the compaction turn's own RPC `agent_start`/`agent_end` events are shielded in the state machine (`task_started`/`task_completed` on `compacting` are no-ops), so the all-idle wait logic treats compacting as busy with no changes to the wait code. Shown as 🗜️ in the team status widget and Member Inspector (with a `（压缩中）` footer hint); the widget polls context usage at the active interval while any member is compacting.
+- **Queueing**: messages routed to a member while it is compacting are held in a per-member pending list and flushed (in order, via the normal prompt path) after compaction completes. Member Inspector direct input during compaction is sent as `follow_up`/`steer` (busy semantics).
+- **Scope**: only the message-channel dispatch path is covered — Member Inspector direct `prompt` messages bypass Auto-Compaction (the user can compact manually via the inspector's compact control).
+- **Configuration** (global `/team setting`, no team-YAML override): `autoCompact: { enabled (default true), thresholdPercent? (1–100), thresholdTokens? (positive int), timeoutMinutes (default 10, ≥1) }` in `<rootDir>/settings.yaml`. Enabled-but-no-thresholds falls back to 80% (flagged `percentIsDefaultFallback` so the settings menu shows `80%（默认）`). Resolution + threshold check are pure functions in `src/settings/resolve-auto-compact.ts` (`resolveAutoCompact` / `shouldCompact` / `describeAutoCompactSetting`); the config is re-read from disk on every dispatch so mid-session changes take effect immediately.
 
 ### Detecting Member-to-Member Messages
 
@@ -684,44 +727,55 @@ When `/team start` creates a team session, the extension sets up a `before_agent
 - **沟通风格**: 与用户交流简洁精炼，剔除客套话、语气词、多余铺垫
 - **可用工具**: 6 个团队管理工具（start_member、stop_member、list_members、get_member_log、wait_and_get_member_status、team_send_and_wait）的介绍和使用指引
 - **工作流程**: 从需求讨论→拆解任务→编写共享上下文→启动 Member→分配任务（注明完成后必须回复TL）→监控进展→汇报结果的 9 个步骤
-- **默认工作流（可选）**: 如果团队配置了 `workflow` 字段，注入工作流阶段序列和循环段。Strict 模式注入强制顺序执行规则（"严格按照以下步骤执行，不得跳过或调序"），Reference 模式注入参考指引（"作为工作流程参考，尽可能遵循步骤顺序"）
+- **默认工作流（可选）**: 如果团队配置了 `workflow` 字段，由 `src/prompts/workflow-prompt.ts` 的 `buildWorkflowPrompt()` 注入**操作型**工作流提示词（非纯描述性）：包含激活条件、逐 stage 派发协议、执行者醒目标注、串行/并行语义、失败回退与循环处理、进度汇报要求。Strict 模式强调"不得跳过/调序/合并 stage、TL 不得亲自执行"；Reference 模式默认按序执行、偏离须向用户说明理由。团队有 workflow 时还会在第一动作协议下方注入 `WORKFLOW_ACTIVATION_BANNER` 横幅指针，防止工作流段在长提示词中部被稀释
 
 完整的注入提示词代码见 `index.ts` 中的 `before_agent_start` 处理器。
 
 ### 工作流注入示例（Reference 模式）
 
-当团队配置了 workflow 时，`before_agent_start` 会在团队信息之后注入如下内容：
+当团队配置了 workflow 时，`before_agent_start` 会先注入激活横幅（第一动作协议下方），再在团队信息之后注入操作型工作流段：
 
 ```markdown
-### 默认工作流（参考模式 📋）
-作为工作流程参考，尽可能遵循步骤顺序。
+> 🚨 本团队定义了「团队工作流」（见下方）：收到任务型诉求时，先检查是否命中工作流激活条件；命中则严格按「工作流执行协议」逐 stage 派发，不得自己开工分析。
 
-**描述：** 标准开发流程：设计 → 编码 → 审查 → 循环
+### 团队工作流（参考模式 📋）
+默认按以下步骤顺序执行；确需偏离（跳过/调序/并行化）时，必须先向用户说明理由再执行。
+
+**流程描述：** 标准开发流程：设计 → 编码 → 审查 → 循环
 
 **步骤序列：**
-  【需求对齐】与用户对齐需求和方案 (tl)
+  【需求对齐】→ 执行者：`tl`
+    与用户对齐需求和方案
     输出：需求文档
 
-  【架构设计】架构方案细化设计 (architect)
+  【架构设计】→ 执行者：`architect`
+    架构方案细化设计
     输入：需求文档
     输出：详细设计文档
     约束：考虑可扩展性和技术选型
 
-  【编码开发】实现功能模块 (coder)
+  【编码开发】→ 执行者：`coder`
+    实现功能模块
     输入：设计文档
     输出：代码 + 测试
     约束：TDD，单步提交
     失败处理：如「审查不通过」→ 回退至「编码开发」
 
-  【代码审查】审查代码实现 (reviewer)
-    输入：代码实现
-    输出：审查报告
-
 **循环段：**
   🔁 条件「还有未完成的任务」→ 重复步骤：编码开发、代码审查
+
+**🔄 工作流执行协议（命中即必须遵守）：**
+1. **激活条件** — 用户提到「团队流程 / 按流程 / 按工作流」，或任务与上方流程描述匹配时，激活本工作流。激活后的第一个动作是派发第 1 个 stage —— 禁止先自己 read/bash 分析。
+2. **逐 stage 派发** — 每个 stage 用 team_send_and_wait 派给其「执行者」……TL 绝不亲自执行 stage 的工作。
+3. **串行等待** — 当前 stage 回复并确认产出后才派发下一个；上游产出作为下游输入传递。
+4. **独立 stage 可并行** — 无输入依赖的多个 stage 放入同一个 team_send_and_wait 的 tasks 批量派发。
+5. **失败与循环** — 按 onFailure 回退重派；loops 条件成立时重复对应 stage 组。
+6. **进度可见** — 每完成一个 stage 向用户汇报「stage N/M【名称】已完成」。
 ```
 
-Strict 模式的注入类似，但文案强调"严格按照以下步骤执行，不得跳过或调序"，并在末尾追加规则："完成上一个 stage 前不得开始下一个。Stage 失败时按 onFailure 策略处理。"
+Strict 模式的注入结构相同，但标题为「严格模式 ⚡ — 必须遵守」，强调"不得跳过、调序、合并 stage"，并在末尾追加："完成上一个 stage 前不得开始下一个；所有 stage 必须按序全部执行。"
+
+> 背景：旧版注入是纯描述性的（"尽可能遵循步骤顺序"、执行者以行尾括号标注），无激活规则与执行协议，导致 TL 收到"根据团队流程进行 xxx 分析"时仍自由发挥、自己分析。修复见 `src/prompts/workflow-prompt.ts` 头部注释。
 
 此外，扩展注册了一个 `tool_call` 事件拦截器，使用**白名单**机制限制工具调用。不在白名单上的工具会被直接阻断，不存在黑名单遗漏的风险。
 
@@ -734,6 +788,14 @@ Strict 模式的注入类似，但文案强调"严格按照以下步骤执行，
 - `ctx_execute`、`ctx_execute_file`、`ctx_batch_execute`、`mcp` 等具有文件写入能力的工具不在白名单中，自动被阻断。
 - 设计阶段的阻断在首次 `start_member` 成功后自动解除（同时 `dynamicPhase` 切换至 `"execution"`）
 
+**TL 亲自分析的运行时软纠偏（`src/session/tl-read-guard.ts`）：**
+- 问题：执行阶段白名单放行了 `read`/`bash`（TL 监控协调所需），提示词中的"铁律"是纯软约束，TL 仍可能亲自埋头分析代码而不派发任务。
+- 机制：以 `agent_start` 为 turn 边界重置计数；每个 turn 内未发生 `team_send_and_wait` 派发时，TL 对**所有非管理工具**（read、bash、web_search、ctx_execute 等——不只 `read`，否则可用 bash grep/rg/cat 绕过）的调用计数，超过阈值（默认 3）即进入**持续拦截模式**：派发前每次非管理工具调用都会被 block，reason 中包含纠偏指引。
+- 设计属性：
+  - **持续拦截（sticky）**：阈值触发后不是 block 一次就放行——一次性的软提醒实测可被模型无视（看到一次错误后继续用下一个工具分析）。现在派发前所有非管理工具调用持续被拦截，TL 唯一出路是 `team_send_and_wait` 派发任务或直接回复用户。首次拦截带 `firstBlock` 标记，供 UI 弹通知/状态栏警示；派发（`team_send_and_wait`）后立即解锁，后续工具调用全部放行。
+  - **fail-open**：`.md` 读取不计数（文档工作是 TL 本职）；管理工具（start/stop/list_members、team_send_and_wait、write/edit 等）永不拦截（解锁通道永远畅通）；派发后不再拦截（派发后的 read 视为协调/审阅）；设计阶段不启用（无 Member 可派发，读代码是合法设计工作）。
+  - 提示词层（`src/prompts/tl-first-action.ts` 的"第一动作协议"，注入预定义团队与动态模式执行阶段提示词顶部）与运行时层（本守卫）配对，模型能预知规则被强制执行。
+
 The handler stays registered for the entire pi session but checks `session.active` to decide whether to inject TL instructions. When `/team stop` ends the session, `session.active` becomes `false` and no extra prompt is injected.
 
 ## 11. Team Session State
@@ -744,6 +806,8 @@ interface TeamSessionState {
   active: boolean;
   teamDefinition: TeamDefinition | null;
   startedAt: number | null;
+  sessionId: string | null;
+  sharedContextWritten: boolean;  // set by write_shared_context; gates start_member
 }
 
 // src/session/context.ts — shared mutable references for the extension
@@ -776,6 +840,8 @@ interface TeamContext {
 Session state (active + team definition) is stored in `session/state.ts` as a module-level variable. Member process handles, message channel, and other runtime objects are in `TeamContext` passed to command handlers. On `/team stop`, all processes are terminated, handles cleared, and state reset.
 
 **`addMemberToSession(member: TeamMember): TeamDefinition`** — Adds a member to the active session's team definition and refreshes the session state. Used by the `add_dynamic_member` tool during `/team dynamic`. Throws if no active session.
+
+**`sharedContextWritten` + `markSharedContextWritten()`** — The session flag backing the shared-context gate. Starts `false` on `startSession`, reset to `false` on `endSession`/new session. Only the `write_shared_context` tool sets it (successful fs write only). `start_member` refuses to launch any member while it is `false`.
 
 ## 12. Error Handling
 
@@ -881,12 +947,13 @@ When creating or updating the Shared Context, the TL includes:
 
 ### Lifecycle
 
-1. **Creation**: After TL clarifies requirements with the user and before spawning Members, the TL writes the Shared Context as a Markdown file
-2. **Initial delivery**: When TL sends the first task to a Member, the Shared Context is included as part of the task message
-3. **Updates**: When TL determines the Shared Context needs updating (e.g., goal refined, glossary term added, progress checkpoint), TL:
-   - Rewrites the file
+1. **Creation**: The system guarantees the file always exists — `ensureSharedContextFile()` (`src/session/shared-context.ts`) auto-creates a minimal stub at session start (`/team start`, `/team dynamic`) and defensively inside `buildMemberConfig` (in case it was deleted mid-session). The stub contains the team roster and placeholder sections, and is never overwritten once it exists. The TL is still expected to enrich it with real content after clarifying requirements with the user; this removes the old failure mode where starting a Member before the TL wrote the file emitted "Shared context file not found" and spawned the Member with a dangling `TEAM_SHARED_CONTEXT_PATH`.
+2. **Gate (start_member 硬门控)**: The TL must write the real shared context via the **`write_shared_context` tool** before the first `start_member` — until the tool has been called successfully (session flag `sharedContextWritten`), `start_member` refuses to launch. Direct `write`/`edit` of `.shared-context.md` is intercepted by the tool_call guard and redirected to the tool. The stub alone never satisfies the gate; it exists only so a started member can always read a valid file.
+3. **Initial delivery**: When TL sends the first task to a Member, the Shared Context is included as part of the task message
+4. **Updates**: When TL determines the Shared Context needs updating (e.g., goal refined, glossary term added, progress checkpoint), TL:
+   - Calls `write_shared_context` again (overwrite semantics)
    - Sends a message to all Members via the message channel: "共享上下文已更新，请重新阅读 .shared-context.md"
-4. **Member behavior**: Members are instructed via system prompt to read the Shared Context when starting a new task, and to re-read it upon receiving an update notification
+5. **Member behavior**: Members are instructed via system prompt to read the Shared Context when starting a new task, and to re-read it upon receiving an update notification
 
 ### File path convention
 
@@ -999,10 +1066,11 @@ A full-keyboard overlay that lets the **user** inspect each Member's live conver
 │  回复内容...                                │
 │  🔧 read src/index.ts                       │  ← tool call one-line summary
 │  ✓ read file contents...                   │  ← tool result one-line summary
+│  💭 思考（默认隐藏，t 切换）                 │  ← thinking block (toggled with `t`)
 ├────────────────────────────────────────────┤
 │  ✅ 分析员 12%  │  🔧 编码员 45%            │  ← ops state + context %
 │  ←→ 切换成员 ↑↓ 滚动会话 End 跳至底部 …    │  ← navigation hints / input box
-│  ctrl+a 中断成员 ctrl+o 压缩上下文 Esc 关闭 │  ← action hints / input hints
+│  ctrl+a 中断 ctrl+shift+a 全中断 ctrl+o 压缩 │  ← action hints / input hints
 ╰────────────────────────────────────────────┘
 ```
 
@@ -1019,13 +1087,16 @@ Overlay: `ctx.ui.custom(component, { overlay: true, overlayOptions: { width: "90
 | `Enter` (in input) | Send: `prompt` when idle, `follow_up` when busy |
 | `Ctrl+Enter` (in input) | Send `steer` (immediate redirect) |
 | `e` | Toggle tool call/result detail expansion for the active tab |
+| `t` | Toggle thinking block visibility for the active tab (hidden by default) |
 | `ctrl+a` | `abort` the active tab's member |
+| `ctrl+b` / `ctrl+shift+a` | `abort` ALL executing members (working/compacting) in one shot; idle/stopped/crashed are skipped; one TL notification covers the batch. `ctrl+shift+a` requires Kitty keyboard protocol — legacy terminals send the same byte as `ctrl+a` (single abort), so `ctrl+b` remains the all-terminal key |
 | `ctrl+o` | `compact` the active tab's member (NOT ctrl+m — indistinguishable from Enter in terminals) |
 | `Esc` | Layered exit: input box → overlay |
 
 ### Rendering Granularity
 
-- user/assistant text rendered in full (wrapped, thinking blocks hidden)
+- user/assistant text rendered in full (wrapped)
+- thinking blocks hidden by default, toggleable per tab with `t` (rendered as dim `💭 思考` + wrapped content)
 - tool calls collapsed to one-line summaries (`🔧 name arg-summary`), expandable with `e`
 - tool results collapsed to `✓/✗ toolName first-line`, expandable with `e`
 - virtual scroll: full message history kept in memory, only the visible slice is rendered
@@ -1051,7 +1122,8 @@ Messages typed into the input box bypass the TL. To keep the team consistent:
 
 - Non-slash text is prefixed with `[用户直接指令（非 TL）]:` so the Member can distinguish the source
 - `/...` text is sent raw — the member's agent-session resolves it as an extension command / skill / prompt-template expansion (verified in pi `dist/core/agent-session.js` `prompt()`)
-- Every direct message and every abort/compact is mirrored into the TL session via `pi.sendMessage` (`[Member Inspector] 用户...`) so the TL stays aware
+- Every direct message and every abort/compact (single or all-at-once) is mirrored into the TL session via `pi.sendMessage` (`[Member Inspector] 用户...`) so the TL stays aware
+- **TL notifications use pi's `deliverAs: "nextTurn"` mechanism, batched by TL processing state — no time window**: every intervention (abort/compact/direct message) is sent as an independent `pi.sendMessage(..., {deliverAs: "nextTurn"})` — pi holds it for the NEXT turn instead of starting a turn per notification. While the TL is busy (tracked via `agent_start`/`agent_settled`), reminders keep queueing; the moment the TL's current turn settles, ONE `{triggerTurn: true, deliverAs: "followUp"}` message starts a turn in which ALL still-unprocessed notifications are injected together. If the TL is idle at intervention time, the unified turn starts immediately. Nothing is ever split by a timer — batching is purely "everything the TL hasn't processed yet, delivered in the next turn". Verified against pi `dist/core/agent-session.js` `sendCustomMessage()` + `_runAgentPrompt()` (`_pendingNextTurnMessages` injection).
 - crashed/stopped members reject sends with a footer notice
 
 ### Files

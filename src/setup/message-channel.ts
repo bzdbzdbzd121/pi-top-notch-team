@@ -9,6 +9,7 @@ import { createResponseWaiter, extractCorrelationId } from "../channel/response-
 import type { ResponseWaiter } from "../channel/response-waiter";
 import type { TeamMessage } from "../channel/types";
 import { createSendToMember } from "../channel/event-handler";
+import type { ResolvedAutoCompact } from "../settings/resolve-auto-compact";
 
 // ── Dependency Injection Interface ─────────────────────────
 
@@ -19,6 +20,8 @@ export interface MessageChannelDeps {
   memberHandles: Map<string, MemberProcessHandle>;
   /** UI-only notification callback for successful message routing. */
   onRouteNotification?: (target: string) => void;
+  /** Resolve the effective Auto-Compaction config (per dispatch). Absent = disabled. */
+  getAutoCompact?: () => ResolvedAutoCompact;
 }
 
 export interface MessageChannel {
@@ -45,6 +48,9 @@ export function createMessageChannel(deps: MessageChannelDeps): MessageChannel {
       pi,
       memberOpsStates,
       memberHandles,
+      responseWaiter,
+      lastPendingCorrId,
+      getAutoCompact: deps.getAutoCompact,
     }),
 
     sendToTl: (msg: TeamMessage) => {

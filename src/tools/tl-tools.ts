@@ -5,6 +5,7 @@ import type { ResponseWaiter, WaitResult } from "../channel/response-waiter";
 import type { MessageQueue } from "../channel/message-queue";
 import type { TeamMessage } from "../channel/types";
 import type { MemberOperationalState } from "../session/context";
+import { getSessionState } from "../session/state";
 import { createMemberProcess } from "../process/member-process";
 import { spawn } from "node:child_process";
 
@@ -93,6 +94,25 @@ export function registerTlTools(deps: TlToolsDeps): void {
       required: ["name"],
     },
     async execute(_toolCallId: string, params: { name: string }): Promise<ToolResult> {
+      // ── Shared context gate ──
+      // A member must never start before the TL has written the shared context
+      // (members read .shared-context.md at startup). Only the
+      // write_shared_context tool lifts this gate.
+      const sessionState = getSessionState();
+      if (!sessionState.active || !sessionState.sharedContextWritten) {
+        return {
+          details: {},
+          content: [
+            {
+              type: "text" as const,
+              text:
+                `无法启动成员 "${params.name}"：共享上下文尚未写入。\n\n` +
+                `请先调用 \`write_shared_context\` 工具，将团队共享上下文（项目背景与目标、成员分工、工作流、协作规则、术语表与关键决策）写入 .shared-context.md，然后再调用 start_member。`,
+            },
+          ],
+        };
+      }
+
       const config = buildMemberConfig?.(params.name);
       if (!config) {
         return {
@@ -386,14 +406,17 @@ export function registerTlTools(deps: TlToolsDeps): void {
         };
       }
 
-      // Quick check: if all members are already idle, skip waiting
-      if (!entries.every(([, s]) => s === "idle")) {
+      // Quick check: if no member is actively working, skip waiting.
+      // "stopped" and "crashed" members won't transition to "idle" on their own.
+      const anyActive = entries.some(([, s]) => s === "working" || s === "compacting");
+      if (anyActive) {
         // Wait until all members are idle (same mechanism as team_send_and_wait)
         await waitForAllIdle(memberOpsStates);
       }
 
       const lines = entries.map(([name, state]) => {
         const icon = state === "working" ? "🔧"
+                   : state === "compacting" ? "🗜️"
                    : state === "idle" ? "✅"
                    : state === "crashed" ? "💥"
                    : "⏹️";
@@ -414,8 +437,12 @@ export function registerTlTools(deps: TlToolsDeps): void {
  export const WAIT_IDLE_CHECK_INTERVAL_MS = 3000;
 
 /**
- * Wait until all members are in "idle" operational state.
- * Uses the same consecutive-idle-count mechanism as team_send_and_wait.
+ * Wait until all members are no longer actively working.
+ * "Active" means "working" or "compacting" — these states indicate
+ * a member is processing a task. Members in "idle", "stopped", or
+ * "crashed" state are considered done (they won't transition on their own).
+ *
+ * Uses the same consecutive-count mechanism as the original waitForAllIdle.
  * NOTE: Does NOT do a quick-start check — always polls for at least
  * WAIT_IDLE_REQUIRED_CONSECUTIVE checks. Callers that want a fast path
  * (e.g. wait_and_get_member_status) should do their own pre-check before calling.
@@ -427,7 +454,14 @@ async function waitForAllIdle(
     let consecutiveIdleCount = 0;
     const pollTimer = setInterval(() => {
       const currentEntries = Array.from(memberOpsStates.entries());
-      if (currentEntries.length > 0 && currentEntries.every(([, s]) => s === "idle")) {
+
+      // Check if any member is actively working (won't resolve on its own).
+      // Empty map = trivially no active members.
+      const anyActive = currentEntries.some(
+        ([, s]) => s === "working" || s === "compacting"
+      );
+
+      if (!anyActive) {
         consecutiveIdleCount++;
         if (consecutiveIdleCount >= WAIT_IDLE_REQUIRED_CONSECUTIVE) {
           clearInterval(pollTimer);
@@ -468,11 +502,13 @@ function generateCorrId(): string {
 async function waitWithAllIdleCheck(
   tasks: PendingTask[],
   nextSteps: string,
-  ctx: SendAndWaitCtx
+  ctx: SendAndWaitCtx,
+  preamble = ""
 ): Promise<ToolResult> {
   const { responseWaiter, memberOpsStates, lastPendingCorrId } = ctx;
 
   const nextStepsFooter = "\n\n---\n下一步计划：" + nextSteps;
+  const preambleBlock = preamble ? preamble + "\n\n---\n" : "";
 
   // Collect results as they arrive
   const results = new Map<string, WaitResult>();
@@ -509,7 +545,7 @@ async function waitWithAllIdleCheck(
     }
     return {
       details: { nextSteps },
-      content: [{ type: "text" as const, text: parts.join("\n\n---\n") + nextStepsFooter }],
+      content: [{ type: "text" as const, text: preambleBlock + parts.join("\n\n---\n") + nextStepsFooter }],
     };
   }
 
@@ -534,63 +570,215 @@ async function waitWithAllIdleCheck(
 
   return {
     details: { allIdle: true, partial: true, nextSteps },
-    content: [{ type: "text" as const, text: parts.join("\n\n---\n") + nextStepsFooter }],
+    content: [{ type: "text" as const, text: preambleBlock + parts.join("\n\n---\n") + nextStepsFooter }],
   };
 }
 
-/** Parsed task from LLM input — handles both raw array and string-encoded array. */
-function parseTasks(raw: unknown): Array<{ to: string; content: string }> {
+interface ParsedTasks {
+  tasks: Array<{ to: string; content: string }>;
+  /** 非空时表示输入不规范（salvage 恢复 / 条目被丢弃），需要在结果中提醒 TL。 */
+  recoveryNote: string;
+}
+
+function isValidTask(t: unknown): t is { to: string; content: string } {
+  return (
+    typeof t === "object" && t !== null &&
+    typeof (t as Record<string, unknown>).to === "string" && (t as Record<string, unknown>).to !== "" &&
+    typeof (t as Record<string, unknown>).content === "string" && (t as Record<string, unknown>).content !== ""
+  );
+}
+
+/** Extract a string field from a broken JSON object snippet. Tolerates raw control chars and key order. */
+function extractStringField(snippet: string, key: string): string | undefined {
+  const re = new RegExp(`"${key}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`, "s");
+  const m = snippet.match(re);
+  if (!m) return undefined;
+  // Re-escape raw control characters so JSON.parse accepts the string literal
+  const repaired = m[1]
+    .replace(/\n/g, "\\n")
+    .replace(/\r/g, "\\r")
+    .replace(/\t/g, "\\t");
+  try {
+    return JSON.parse(`"${repaired}"`) as string;
+  } catch {
+    return m[1];
+  }
+}
+
+/** Find top-level {...} spans in a (possibly broken) JSON array string. Unterminated tail is included as a candidate. */
+function extractObjectSpans(raw: string): string[] {
+  const spans: string[] = [];
+  let i = 0;
+  const n = raw.length;
+  while (i < n) {
+    if (raw[i] !== "{") { i++; continue; }
+    let depth = 0;
+    let inStr = false;
+    let escaped = false;
+    let j = i;
+    let closed = false;
+    for (; j < n; j++) {
+      const ch = raw[j];
+      if (inStr) {
+        if (escaped) escaped = false;
+        else if (ch === "\\") escaped = true;
+        else if (ch === '"') inStr = false;
+      } else {
+        if (ch === '"') inStr = true;
+        else if (ch === "{") depth++;
+        else if (ch === "}") {
+          depth--;
+          if (depth === 0) { closed = true; j++; break; }
+        }
+      }
+    }
+    if (closed) {
+      spans.push(raw.slice(i, j));
+      i = j;
+    } else {
+      // Unterminated tail (e.g. truncated LLM output) — keep as salvage candidate, then stop
+      spans.push(raw.slice(i));
+      break;
+    }
+  }
+  return spans;
+}
+
+/** Salvage tasks from a string that failed strict JSON.parse (truncation, raw newlines, ...). */
+function salvageFromString(raw: string): { tasks: Array<{ to: string; content: string }>; dropped: number } {
+  const tasks: Array<{ to: string; content: string }> = [];
+  let dropped = 0;
+  for (const span of extractObjectSpans(raw)) {
+    let obj: unknown;
+    try { obj = JSON.parse(span); } catch { obj = undefined; }
+    if (isValidTask(obj)) {
+      tasks.push({ to: obj.to, content: obj.content });
+      continue;
+    }
+    // Regex fallback tolerates raw control characters inside the string values
+    const to = extractStringField(span, "to");
+    const content = extractStringField(span, "content");
+    if (to && content) {
+      tasks.push({ to, content });
+      continue;
+    }
+    dropped++;
+  }
+  return { tasks, dropped };
+}
+
+function validateTaskArray(arr: unknown[]): ParsedTasks {
+  const valid = arr.filter(isValidTask).map(t => ({ to: t.to, content: t.content }));
+  const dropped = arr.length - valid.length;
+  return {
+    tasks: valid,
+    recoveryNote: dropped > 0
+      ? `⚠️ tasks 中有 ${dropped} 个条目缺少有效的 to/content 字段，已被丢弃。`
+      : "",
+  };
+}
+
+/** Parsed tasks from LLM input — handles raw array, string-encoded array, single object, and broken JSON salvage. */
+function parseTasks(raw: unknown): ParsedTasks {
   // Already an array (correct case)
   if (Array.isArray(raw)) {
-    return raw as Array<{ to: string; content: string }>;
+    return validateTaskArray(raw);
   }
 
   // String-encoded array — LLM sometimes double-encodes JSON-in-JSON
   if (typeof raw === "string") {
+    let strictFailed = false;
     try {
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed)) {
-        return parsed as Array<{ to: string; content: string }>;
+        return validateTaskArray(parsed);
+      }
+      if (isValidTask(parsed)) {
+        return { tasks: [{ to: parsed.to, content: parsed.content }], recoveryNote: "" };
       }
     } catch {
-      // Not parseable; fall through to error
+      strictFailed = true;
     }
+    // Salvage mode: strict parse failed (truncated output, raw newlines in content, ...)
+    // or parsed to something unusable. Recover complete task objects best-effort.
+    const { tasks, dropped } = salvageFromString(raw);
+    if (tasks.length > 0) {
+      return {
+        tasks,
+        recoveryNote:
+          `⚠️ tasks 以字符串传入且不是合法 JSON${strictFailed ? "（解析失败）" : ""}，已尽力恢复 ${tasks.length} 个任务` +
+          (dropped > 0 ? `，丢弃 ${dropped} 个不完整条目` : "") +
+          "。请核对恢复出的任务是否完整；下次直接传原始数组可避免信息丢失。",
+      };
+    }
+    return { tasks: [], recoveryNote: "" };
   }
 
   // Single object wrapped outside array — another common LLM hallucination
-  if (typeof raw === "object" && raw !== null && !Array.isArray(raw)) {
-    const obj = raw as Record<string, unknown>;
-    if (typeof obj.to === "string" && typeof obj.content === "string") {
-      return [{ to: obj.to, content: obj.content }];
-    }
+  if (isValidTask(raw)) {
+    return { tasks: [{ to: raw.to, content: raw.content }], recoveryNote: "" };
   }
 
-  return [];
+  return { tasks: [], recoveryNote: "" };
 }
 
 async function sendAndWaitExecute(
   params: { tasks: unknown; nextSteps: string },
   ctx: SendAndWaitCtx
 ): Promise<ToolResult> {
-  const { responseWaiter, lastPendingCorrId, messageQueue } = ctx;
+  const { responseWaiter, lastPendingCorrId, messageQueue, memberOpsStates } = ctx;
 
-  const tasks = parseTasks(params.tasks);
+  const { tasks, recoveryNote } = parseTasks(params.tasks);
 
   // Validate: at least one task
   if (tasks.length === 0) {
     const receivedType = typeof params.tasks;
     const receivedPreview = typeof params.tasks === "string"
-      ? params.tasks.slice(0, 120)
-      : JSON.stringify(params.tasks).slice(0, 120);
+      ? params.tasks.slice(0, 300)
+      : JSON.stringify(params.tasks)?.slice(0, 300);
+    let parseHint = "";
+    if (receivedType === "string") {
+      try {
+        JSON.parse(params.tasks as string);
+      } catch (e) {
+        parseHint = `\nJSON.parse 失败原因：${e instanceof Error ? e.message : String(e)}`;
+      }
+    }
     return {
       details: {},
       content: [{
         type: "text" as const,
         text: "tasks 无效。需要原始 JSON 数组（如 [{to: \"name\", content: \"...\"}]），"
-          + `但收到了 ${receivedType} 类型的值：${receivedPreview}。\n\n`
-          + "⚠️ 注意：tasks 不能传 JSON 字符串，必须传原始数组。\n"
+          + `但收到了 ${receivedType} 类型的值：${receivedPreview}${parseHint}。\n\n`
+          + "💡 提示：content 很长或包含换行时，二次序列化成字符串容易出错（超长输出还可能被截断导致 JSON 未闭合）。"
+          + "请直接传原始数组，或拆分为多次调用。\n"
           + "正确：\"tasks\": [{ \"to\": \"planner\", \"content\": \"...\" }]\n"
           + "错误：\"tasks\": \"[{...}]\"  ← 不要额外序列化成字符串",
+      }],
+    };
+  }
+
+  // Validate: at least one member is started
+  if (memberOpsStates.size === 0) {
+    return {
+      details: {},
+      content: [{
+        type: "text" as const,
+        text: "还没有启动任何团队成员。请先使用 start_member 启动成员后再发送任务。",
+      }],
+    };
+  }
+
+  // Validate: all target members exist in memberOpsStates
+  const unknownTargets = tasks.filter(t => !memberOpsStates.has(t.to));
+  if (unknownTargets.length > 0) {
+    const names = unknownTargets.map(t => `"${t.to}"`).join(", ");
+    const validNames = Array.from(memberOpsStates.keys()).join(", ");
+    return {
+      details: {},
+      content: [{
+        type: "text" as const,
+        text: `目标成员 ${names} 不存在或未启动。请先使用 start_member 启动这些成员。\n有效成员：${validNames}。`,
       }],
     };
   }
@@ -616,5 +804,5 @@ async function sendAndWaitExecute(
     messageQueue.enqueue(messagePayload as TeamMessage);
   }
 
-  return waitWithAllIdleCheck(pendingTasks, params.nextSteps, ctx);
+  return waitWithAllIdleCheck(pendingTasks, params.nextSteps, ctx, recoveryNote);
 }

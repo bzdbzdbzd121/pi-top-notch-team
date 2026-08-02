@@ -542,6 +542,95 @@ describe("createMemberEventHandler", () => {
   });
 });
 
+describe("createMemberEventHandler prompt rejection surfacing", () => {
+  // Channel prompts are sent fire-and-forget via sendCommand (no id attached,
+  // no response consumer). If the member's pi RPC layer rejects the prompt
+  // (e.g. agent busy in its post-agent_end settlement window), the error
+  // response arrives as a plain event. Without explicit handling it would be
+  // silently swallowed and the TL's team_send_and_wait would hang.
+  const rejection = (error: string) => ({
+    type: "response",
+    command: "prompt",
+    success: false,
+    error,
+  });
+
+  it("should resolve the pending wait and notify TL when a channel prompt is rejected", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const deps = createMockDeps();
+    deps.lastPendingCorrId.set("worker", "corr-rej-1");
+    deps.responseWaiter.resolveIfWaiting.mockReturnValue(true);
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    handler(rejection("Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message."));
+
+    expect(deps.responseWaiter.resolveIfWaiting).toHaveBeenCalledWith(
+      "corr-rej-1",
+      "worker",
+      expect.stringContaining("already processing")
+    );
+    expect(deps.lastPendingCorrId.has("worker")).toBe(false);
+    expect(deps.pi.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customType: "team-route",
+        display: true,
+        content: expect.stringContaining("worker"),
+      })
+    );
+  });
+
+  it("should notify TL even when no pending wait exists for the member", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const deps = createMockDeps();
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    handler(rejection("boom"));
+
+    expect(deps.responseWaiter.resolveIfWaiting).not.toHaveBeenCalled();
+    expect(deps.pi.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customType: "team-route",
+        content: expect.stringContaining("boom"),
+      })
+    );
+  });
+
+  it("should ignore rejections that carry an id (sendCommandAndWait callers handle their own errors)", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const deps = createMockDeps();
+    deps.lastPendingCorrId.set("worker", "corr-rej-2");
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    handler({ ...rejection("boom"), id: "req-123" });
+
+    expect(deps.responseWaiter.resolveIfWaiting).not.toHaveBeenCalled();
+    expect(deps.pi.sendMessage).not.toHaveBeenCalled();
+    expect(deps.lastPendingCorrId.get("worker")).toBe("corr-rej-2");
+  });
+
+  it("should ignore successful prompt responses", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const deps = createMockDeps();
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    handler({ type: "response", command: "prompt", success: true });
+
+    expect(deps.responseWaiter.resolveIfWaiting).not.toHaveBeenCalled();
+    expect(deps.pi.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("should ignore error responses for non-prompt commands", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const deps = createMockDeps();
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    handler({ type: "response", command: "get_session_stats", success: false, error: "boom" });
+
+    expect(deps.responseWaiter.resolveIfWaiting).not.toHaveBeenCalled();
+    expect(deps.pi.sendMessage).not.toHaveBeenCalled();
+  });
+});
+
 describe("createSendToMember", () => {
   it("should return a function", async () => {
     const { createSendToMember } = await loadModule();
@@ -571,6 +660,35 @@ describe("createSendToMember", () => {
     expect(mockHandle.sendCommand).toHaveBeenCalledWith({
       type: "prompt",
       message: expect.stringContaining("Hello"),
+      streamingBehavior: "followUp",
+    });
+  });
+
+  it("should include streamingBehavior followUp so a busy member queues instead of rejecting", async () => {
+    const { createSendToMember } = await loadModule();
+    const deps = createMockDeps() as any;
+    const mockHandle = {
+      sendCommand: vi.fn(),
+    };
+    deps.memberHandles.set("worker", mockHandle);
+    // Member is busy (or in its post-agent_end settlement window — TL cannot
+    // distinguish). Without streamingBehavior, pi RPC rejects the prompt and
+    // the message is lost.
+    deps.memberOpsStates.set("worker", "working");
+
+    const fn = createSendToMember(deps);
+    fn("worker", {
+      id: "msg-busy-1",
+      from: "tl",
+      to: "worker",
+      content: "Follow-up task",
+      timestamp: Date.now(),
+    });
+
+    expect(mockHandle.sendCommand).toHaveBeenCalledWith({
+      type: "prompt",
+      message: expect.stringContaining("Follow-up task"),
+      streamingBehavior: "followUp",
     });
   });
 
@@ -620,5 +738,205 @@ describe("createSendToMember", () => {
         display: true,
       })
     );
+  });
+});
+
+// ── Auto-Compaction on dispatch ────────────────────────────
+
+describe("createSendToMember auto-compaction", () => {
+  const enabledCfg = {
+    enabled: true,
+    thresholdPercent: 80,
+    thresholdTokens: undefined,
+    timeoutMinutes: 10,
+    percentIsDefaultFallback: false,
+  };
+
+  function makeMsg(id = "msg-ac-1") {
+    return { id, from: "tl", to: "worker", content: "Do work", timestamp: Date.now() };
+  }
+
+  function makeHandle(statsResponse?: any, compactResponse?: any) {
+    return {
+      sendCommand: vi.fn(),
+      sendCommandAndWait: vi.fn().mockImplementation((cmd: any) => {
+        if (cmd.type === "get_session_stats") return Promise.resolve(statsResponse);
+        if (cmd.type === "compact") return Promise.resolve(compactResponse);
+        return Promise.reject(new Error("unexpected command"));
+      }),
+    };
+  }
+
+  function usageResponse(percent: number, tokens: number) {
+    return { type: "response", command: "get_session_stats", success: true, data: { contextUsage: { percent, tokens, contextWindow: 200000 } } };
+  }
+
+  it("sends directly without stats query when getAutoCompact is not provided", async () => {
+    const { createSendToMember } = await loadModule();
+    const deps = createMockDeps() as any;
+    const handle = makeHandle(usageResponse(95, 190000), { success: true });
+    deps.memberHandles.set("worker", handle);
+    deps.memberOpsStates.set("worker", "idle");
+
+    createSendToMember(deps)("worker", makeMsg());
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(handle.sendCommandAndWait).not.toHaveBeenCalled();
+    expect(handle.sendCommand).toHaveBeenCalledWith(expect.objectContaining({ type: "prompt" }));
+    expect(deps.memberOpsStates.get("worker")).toBe("working");
+  });
+
+  it("sends directly when usage is below threshold", async () => {
+    const { createSendToMember } = await loadModule();
+    const deps = createMockDeps({ getAutoCompact: () => enabledCfg }) as any;
+    const handle = makeHandle(usageResponse(50, 100000), { success: true });
+    deps.memberHandles.set("worker", handle);
+    deps.memberOpsStates.set("worker", "idle");
+
+    createSendToMember(deps)("worker", makeMsg());
+    await vi.waitFor(() => expect(handle.sendCommand).toHaveBeenCalled());
+
+    expect(handle.sendCommandAndWait).toHaveBeenCalledTimes(1); // stats only
+    expect(deps.memberOpsStates.get("worker")).toBe("working");
+    expect(deps.pi.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("compacts before dispatching when usage exceeds threshold (success is silent)", async () => {
+    const { createSendToMember } = await loadModule();
+    const deps = createMockDeps({ getAutoCompact: () => enabledCfg }) as any;
+    const handle = makeHandle(usageResponse(92, 184000), { type: "response", command: "compact", success: true, data: {} });
+    deps.memberHandles.set("worker", handle);
+    deps.memberOpsStates.set("worker", "idle");
+
+    createSendToMember(deps)("worker", makeMsg());
+
+    // Prompt must not be sent before compaction completes
+    expect(handle.sendCommand).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(handle.sendCommand).toHaveBeenCalled());
+
+    const commands = handle.sendCommandAndWait.mock.calls.map((c: any[]) => c[0].type);
+    expect(commands).toEqual(["get_session_stats", "compact"]);
+    expect(handle.sendCommand).toHaveBeenCalledWith(expect.objectContaining({ type: "prompt" }));
+    expect(deps.memberOpsStates.get("worker")).toBe("working");
+    // Success is silent — no TL notification
+    expect(deps.pi.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("skips compaction entirely when member is not idle", async () => {
+    const { createSendToMember } = await loadModule();
+    const deps = createMockDeps({ getAutoCompact: () => enabledCfg }) as any;
+    const handle = makeHandle(usageResponse(95, 190000), { success: true });
+    deps.memberHandles.set("worker", handle);
+    deps.memberOpsStates.set("worker", "working");
+
+    createSendToMember(deps)("worker", makeMsg());
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(handle.sendCommandAndWait).not.toHaveBeenCalled();
+    expect(handle.sendCommand).toHaveBeenCalledWith(expect.objectContaining({ type: "prompt" }));
+  });
+
+  it("fails open and notifies TL when stats query fails", async () => {
+    const { createSendToMember } = await loadModule();
+    const deps = createMockDeps({ getAutoCompact: () => enabledCfg }) as any;
+    const handle = {
+      sendCommand: vi.fn(),
+      sendCommandAndWait: vi.fn().mockRejectedValue(new Error("timeout")),
+    };
+    deps.memberHandles.set("worker", handle);
+    deps.memberOpsStates.set("worker", "idle");
+
+    createSendToMember(deps)("worker", makeMsg());
+    await vi.waitFor(() => expect(handle.sendCommand).toHaveBeenCalled());
+
+    expect(handle.sendCommand).toHaveBeenCalledWith(expect.objectContaining({ type: "prompt" }));
+    expect(deps.pi.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ customType: "team-message", content: expect.stringContaining("无法查询") })
+    );
+    expect(deps.memberOpsStates.get("worker")).toBe("working");
+  });
+
+  it("fails open and notifies TL when compaction fails", async () => {
+    const { createSendToMember } = await loadModule();
+    const deps = createMockDeps({ getAutoCompact: () => enabledCfg }) as any;
+    const handle = makeHandle(usageResponse(92, 184000), { type: "response", command: "compact", success: false, error: "boom" });
+    deps.memberHandles.set("worker", handle);
+    deps.memberOpsStates.set("worker", "idle");
+
+    createSendToMember(deps)("worker", makeMsg());
+    await vi.waitFor(() => expect(handle.sendCommand).toHaveBeenCalled());
+
+    expect(handle.sendCommand).toHaveBeenCalledWith(expect.objectContaining({ type: "prompt" }));
+    expect(deps.pi.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ customType: "team-message", content: expect.stringContaining("自动压缩") })
+    );
+    expect(deps.memberOpsStates.get("worker")).toBe("working");
+  });
+
+  it("fails open and notifies TL when compaction times out", async () => {
+    const { createSendToMember } = await loadModule();
+    const deps = createMockDeps({ getAutoCompact: () => ({ ...enabledCfg, timeoutMinutes: 1 }) }) as any;
+    const handle = {
+      sendCommand: vi.fn(),
+      sendCommandAndWait: vi.fn().mockImplementation((cmd: any) => {
+        if (cmd.type === "get_session_stats") return Promise.resolve(usageResponse(92, 184000));
+        return new Promise((_, reject) => setTimeout(() => reject(new Error("timed out")), 10));
+      }),
+    };
+    deps.memberHandles.set("worker", handle);
+    deps.memberOpsStates.set("worker", "idle");
+
+    createSendToMember(deps)("worker", makeMsg());
+    await vi.waitFor(() => expect(handle.sendCommand).toHaveBeenCalled());
+
+    expect(deps.pi.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ customType: "team-message", content: expect.stringContaining("自动压缩") })
+    );
+    expect(deps.memberOpsStates.get("worker")).toBe("working");
+  });
+
+  it("queues messages arriving during compaction and flushes them after", async () => {
+    const { createSendToMember } = await loadModule();
+    const deps = createMockDeps({ getAutoCompact: () => enabledCfg }) as any;
+    let resolveCompact: (v: any) => void;
+    const compactPromise = new Promise((r) => { resolveCompact = r; });
+    const handle = {
+      sendCommand: vi.fn(),
+      sendCommandAndWait: vi.fn().mockImplementation((cmd: any) => {
+        if (cmd.type === "get_session_stats") return Promise.resolve(usageResponse(92, 184000));
+        return compactPromise;
+      }),
+    };
+    deps.memberHandles.set("worker", handle);
+    deps.memberOpsStates.set("worker", "idle");
+
+    const send = createSendToMember(deps);
+    send("worker", { ...makeMsg("msg-1"), content: "First task" });
+    // Wait until compaction has started (state visible synchronously after stats resolves)
+    await vi.waitFor(() => expect(deps.memberOpsStates.get("worker")).toBe("compacting"));
+
+    // Second message arrives mid-compaction — must be queued, not sent
+    send("worker", { ...makeMsg("msg-2"), content: "Second task" });
+    expect(handle.sendCommand).not.toHaveBeenCalled();
+
+    resolveCompact!({ type: "response", command: "compact", success: true, data: {} });
+    await vi.waitFor(() => expect(handle.sendCommand).toHaveBeenCalledTimes(2));
+
+    const prompts = handle.sendCommand.mock.calls.map((c: any[]) => c[0].message as string);
+    expect(prompts[0]).toContain("First task");
+    expect(prompts[1]).toContain("Second task");
+    expect(deps.memberOpsStates.get("worker")).toBe("working");
+  });
+
+  it("sets compacting state synchronously to close the dispatch race", async () => {
+    const { createSendToMember } = await loadModule();
+    const deps = createMockDeps({ getAutoCompact: () => enabledCfg }) as any;
+    const handle = makeHandle(usageResponse(92, 184000), { success: true });
+    deps.memberHandles.set("worker", handle);
+    deps.memberOpsStates.set("worker", "idle");
+
+    createSendToMember(deps)("worker", makeMsg());
+    // Synchronously after dispatch decision, the member must not appear idle
+    expect(deps.memberOpsStates.get("worker")).toBe("compacting");
   });
 });

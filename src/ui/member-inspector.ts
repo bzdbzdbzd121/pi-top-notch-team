@@ -31,12 +31,19 @@ export interface MemberInspectorDeps {
   getMembers: () => { name: string; label?: string }[];
   getHandle: (name: string) => MemberProcessHandle | undefined;
   memberOpsStates: Map<string, MemberOperationalState>;
+  /** Whether the TL agent is currently processing a turn (agent_start..agent_settled). */
+  isTlBusy: () => boolean;
 }
 
 /** Handle exposed to index.ts for event-hook + lifecycle integration. */
 export interface MemberInspectorHandle {
   /** Mark a member's tab dirty (called from the RPC event hook). */
   markDirty(memberName: string): void;
+  /**
+   * Called when the TL's turn settled (agent_settled): if notifications
+   * queued while the TL was busy, start one unified turn for all of them.
+   */
+  onTlSettled(): void;
   /** Close the overlay programmatically (e.g. /team stop). */
   close(): void;
   isOpen(): boolean;
@@ -100,6 +107,9 @@ export function openMemberInspector(
     markDirty(name: string) {
       component?.markDirty(name);
     },
+    onTlSettled() {
+      component?.onTlSettled();
+    },
     close() {
       closed = true;
       component?.close();
@@ -149,6 +159,10 @@ export class MemberInspectorComponent {
   private statsTimer: ReturnType<typeof setTimeout> | null = null;
   /** In-flight refetch guard per member. */
   private fetching = new Set<string>();
+  /** Queued nextTurn notifications awaiting the TL's unified turn. */
+  private pendingNotifications: string[] = [];
+  /** True while a trigger turn has been sent but not yet settled. */
+  private triggerPending = false;
 
   constructor(
     private tui: any,
@@ -173,6 +187,14 @@ export class MemberInspectorComponent {
     if (this.statsTimer) clearTimeout(this.statsTimer);
     this.refreshTimer = null;
     this.statsTimer = null;
+    // Deliver any queued notifications before the overlay closes,
+    // otherwise the TL never learns about the last interventions.
+    // Force past triggerPending: a trigger turn may already be in flight
+    // (TL idle at first intervention) while later interventions were only
+    // queued — they must still reach the TL (pi queues the followUp trigger
+    // behind the in-flight turn).
+    this.triggerPending = false;
+    this.triggerTlTurn();
     this.done(null);
   }
 
@@ -235,6 +257,7 @@ export class MemberInspectorComponent {
           const lines = buildBodyLines(messages, {
             width: Math.max(20, width),
             expanded: tab.expanded,
+            showThinking: tab.showThinking,
             theme: this.inspectorTheme,
           });
           this.state.setTabLines(tab.name, lines, bh);
@@ -296,6 +319,81 @@ export class MemberInspectorComponent {
     }
   }
 
+  /**
+   * Queue a TL notification via deliverAs:"nextTurn" — pi holds it for the
+   * NEXT turn without starting a turn per notification (the cause of the
+   * TL answering one reminder at a time).
+   *
+   * NO time window: batching is driven purely by the TL's processing state.
+   * - TL idle: start one unified turn right away — it consumes everything
+   *   queued so far.
+   * - TL busy: keep queuing; when the current turn settles (onTlSettled)
+   *   one unified turn delivers ALL still-unprocessed notifications.
+   * Local footer notices stay immediate.
+   */
+  private queueTlNotification(content: string): void {
+    this.pendingNotifications.push(content);
+    try {
+      this.deps.pi.sendMessage(
+        {
+          customType: "team-message",
+          content,
+          display: true,
+        },
+        { deliverAs: "nextTurn" }
+      );
+    } catch {
+      // TL channel gone — drop
+    }
+    if (this.disposed) {
+      // Overlay is closing — start the unified turn right away.
+      this.triggerTlTurn();
+      return;
+    }
+    if (!this.deps.isTlBusy() && !this.triggerPending) {
+      this.triggerTlTurn();
+    }
+  }
+
+  /**
+   * TL turn settled (agent_settled): a unified turn now starts if any
+   * notifications were queued while the TL was busy. Also re-arms the
+   * trigger so the next idle-time intervention starts a fresh turn.
+   */
+  onTlSettled(): void {
+    if (this.disposed) return;
+    this.triggerPending = false;
+    if (this.pendingNotifications.length > 0) {
+      this.triggerTlTurn();
+    }
+  }
+
+  /**
+   * Start ONE TL turn that consumes all queued nextTurn notifications.
+   * triggerTurn (with followUp fallback while streaming) makes the TL
+   * handle the whole burst in a single turn.
+   */
+  private triggerTlTurn(): void {
+    if (this.pendingNotifications.length === 0 || this.triggerPending) return;
+    const n = this.pendingNotifications.length;
+    // Hand the queued messages to pi — the turn about to start injects them.
+    this.pendingNotifications = [];
+    this.triggerPending = true;
+    try {
+      this.deps.pi.sendMessage(
+        {
+          customType: "team-message",
+          content: `[Member Inspector] 以上 ${n} 条为用户在检视浮窗中的操作提醒（中断/压缩/直发消息），请统一查看并处理。`,
+          display: true,
+        },
+        { triggerTurn: true, deliverAs: "followUp" }
+      );
+    } catch {
+      // TL channel gone — drop
+      this.triggerPending = false;
+    }
+  }
+
   // ── Send logic ─────────────────────────────────────────
 
   /**
@@ -328,7 +426,8 @@ export class MemberInspectorComponent {
     const payload = isSlash ? text : `${USER_DIRECT_PREFIX}\n${text}`;
 
     try {
-      if (opState === "working") {
+      const busy = opState === "working" || opState === "compacting";
+      if (busy) {
         handle.sendCommand({
           type: mode === "steer" ? "steer" : "follow_up",
           message: payload,
@@ -337,7 +436,9 @@ export class MemberInspectorComponent {
         handle.sendCommand({ type: "prompt", message: payload });
       }
       this.state.notice =
-        opState === "working"
+        opState === "compacting"
+          ? `✓ 已排队给 "${tab.label}"（压缩中，将在完成后消化）`
+          : busy
           ? mode === "steer"
             ? `✓ 已 steer 给 "${tab.label}"（立即转向）`
             : `✓ 已排队给 "${tab.label}"（follow_up）`
@@ -345,11 +446,9 @@ export class MemberInspectorComponent {
 
       // Notify TL about the direct intervention (decision #5)
       const truncated = text.length > 120 ? text.slice(0, 117) + "..." : text;
-      this.deps.pi.sendMessage({
-        customType: "team-message",
-        content: `[Member Inspector] 用户通过检视浮窗直接向成员 "${tab.label}"（${tab.name}）发送了消息：\n${truncated}`,
-        display: true,
-      });
+      this.queueTlNotification(
+        `[Member Inspector] 用户通过检视浮窗直接向成员 "${tab.label}"（${tab.name}）发送了消息：\n${truncated}`
+      );
     } catch (err) {
       this.state.notice = `✗ 发送失败：${err instanceof Error ? err.message : String(err)}`;
     }
@@ -373,14 +472,50 @@ export class MemberInspectorComponent {
     try {
       handle.sendCommand({ type });
       this.state.notice = `✓ 已向 "${tab.label}" 发送 ${type}`;
-      this.deps.pi.sendMessage({
-        customType: "team-message",
-        content: `[Member Inspector] 用户通过检视浮窗向成员 "${tab.label}"（${tab.name}）执行了 ${type}。`,
-        display: true,
-      });
+      this.queueTlNotification(
+        `[Member Inspector] 用户通过检视浮窗向成员 "${tab.label}"（${tab.name}）执行了 ${type}。`
+      );
     } catch (err) {
       this.state.notice = `✗ ${type} 失败：${err instanceof Error ? err.message : String(err)}`;
     }
+    this.requestRenderSafe();
+  }
+
+  /**
+   * Abort ALL members that are currently executing (working / compacting).
+   * Idle / stopped / crashed members are skipped. A single TL notification
+   * covers the whole batch.
+   */
+  private sendAbortAll(): void {
+    const targets = this.state.tabs.filter((tab) => {
+      const opState = this.deps.memberOpsStates.get(tab.name);
+      const handle = this.deps.getHandle(tab.name);
+      return !!handle && (opState === "working" || opState === "compacting");
+    });
+
+    if (targets.length === 0) {
+      this.state.notice = "✗ 没有正在执行的成员可中断";
+      this.requestRenderSafe();
+      return;
+    }
+
+    let failed = 0;
+    for (const tab of targets) {
+      const handle = this.deps.getHandle(tab.name)!;
+      try {
+        handle.sendCommand({ type: "abort" });
+      } catch {
+        failed++;
+      }
+    }
+    const labels = targets.map((t) => `"${t.label}"`).join("、");
+    this.state.notice =
+      failed === 0
+        ? `✓ 已中断 ${targets.length} 个成员：${labels}`
+        : `✓ 已中断 ${targets.length - failed}/${targets.length} 个成员：${labels}`;
+    this.queueTlNotification(
+      `[Member Inspector] 用户通过检视浮窗一次性中断了 ${targets.length} 个正在执行的成员：${labels}。`
+    );
     this.requestRenderSafe();
   }
 
@@ -403,6 +538,18 @@ export class MemberInspectorComponent {
         this.state.backspaceInput();
       } else if (matchesKey(data, "ctrl+u")) {
         this.state.clearInput();
+      } else if (matchesKey(data, "ctrl+a")) {
+        this.state.closeInput();
+        this.sendControl("abort");
+        return;
+      } else if (matchesKey(data, "ctrl+b") || matchesKey(data, "ctrl+shift+a")) {
+        this.state.closeInput();
+        this.sendAbortAll();
+        return;
+      } else if (matchesKey(data, "ctrl+o")) {
+        this.state.closeInput();
+        this.sendControl("compact");
+        return;
       } else if (data.length >= 1 && !isControlSequence(data)) {
         this.state.insertInput(data);
       }
@@ -420,9 +567,9 @@ export class MemberInspectorComponent {
     } else if (matchesKey(data, Key.right)) {
       this.state.switchTab(1);
     } else if (matchesKey(data, Key.up)) {
-      this.state.scrollBy(-1, bh);
+      this.state.scrollBy(-3, bh);
     } else if (matchesKey(data, Key.down)) {
-      this.state.scrollBy(1, bh);
+      this.state.scrollBy(3, bh);
     } else if (matchesKey(data, Key.pageUp)) {
       this.state.scrollBy(-(bh - 1), bh);
     } else if (matchesKey(data, Key.pageDown)) {
@@ -434,8 +581,14 @@ export class MemberInspectorComponent {
     } else if (matchesKey(data, "e")) {
       this.state.toggleExpand();
       this.scheduleFlush();
+    } else if (matchesKey(data, "t")) {
+      this.state.toggleThinking();
+      this.scheduleFlush();
     } else if (matchesKey(data, "ctrl+a")) {
       this.sendControl("abort");
+      return;
+    } else if (matchesKey(data, "ctrl+b") || matchesKey(data, "ctrl+shift+a")) {
+      this.sendAbortAll();
       return;
     } else if (matchesKey(data, "ctrl+o")) {
       this.sendControl("compact");
@@ -530,7 +683,7 @@ export class MemberInspectorComponent {
       const label = `> ${this.state.inputBuffer}`;
       footer2 = theme.fg("accent", "✎ ") + truncateLine(label, inner - 4) + "▌";
     } else {
-      footer2 = " " + buildNavHints(tab?.expanded ?? false);
+      footer2 = " " + buildNavHints(tab?.expanded ?? false, tab?.showThinking ?? false);
     }
     const footer2Line = border("│ ") + padVisible(truncateLine(footer2, inner - 2), inner - 2) + border(" │");
 

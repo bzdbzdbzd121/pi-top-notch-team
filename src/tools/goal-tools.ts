@@ -186,7 +186,12 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
     if (content.includes("finish_goal")) return;
 
     // Defer sending to next tick — agent_end fires while agent is still in a
-    // processing lifecycle state; sendUserMessage would throw if called synchronously.
+    // processing lifecycle state (pi's isStreaming stays true through the
+    // post-agent_end settlement window: listener drain, auto-retry,
+    // auto-compaction). deliverAs: "followUp" makes the reminder queue instead
+    // of throwing "Agent is already processing..." if the TL agent is still
+    // streaming (or already streaming again) when the timer fires; it is
+    // ignored when the agent is idle, so the reminder triggers a turn normally.
     setTimeout(() => {
       pi.sendUserMessage(
         `## ⚡ 目标提醒\n\n` +
@@ -196,7 +201,8 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
         `请检查当前进度：\n\n` +
         `1. **如果目标尚未完成** — 继续调度成员执行下一轮任务，直到所有条件满足\n` +
         `2. **如果目标已完成** — 调用 \`finish_goal\` 工具清理此目标\n` +
-        `3. **如果遇到不可解决的阻塞问题** — 也调用 \`finish_goal\` 并告知用户情况`
+        `3. **如果遇到不可解决的阻塞问题** — 也调用 \`finish_goal\` 并告知用户情况`,
+        { deliverAs: "followUp" }
       );
     }, 0);
   });

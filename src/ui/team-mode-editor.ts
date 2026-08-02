@@ -51,19 +51,32 @@ export class TeamModeEditor extends CustomEditor {
       lines[0] = theme.fg("accent", indicatorText) + buildRainbow(dashLen);
     }
 
-    // Rebuild bottom border line
-    const last = lines[lines.length - 1]!;
-    const plainLast = last.replace(/\x1b\[[\d;]*m/g, "");
-    if (!plainLast.includes("more") && !plainLast.includes("[")) {
-      // Pure border
-      lines[lines.length - 1] = buildRainbow(width);
-    } else if (plainLast.includes("more")) {
-      const plain = plainLast;
-      const indicatorMatch = plain.match(/^([─↑↓\s\dmore]+)/);
-      const indicatorText = indicatorMatch?.[1] ?? "";
-      const indicatorLen = visibleWidth(indicatorText);
-      const dashLen = Math.max(0, width - indicatorLen);
-      lines[lines.length - 1] = theme.fg("accent", indicatorText) + buildRainbow(dashLen);
+    // Rebuild bottom border line.
+    // NOTE: when autocomplete suggestions are visible, the base Editor appends
+    // suggestion rows AFTER the bottom border (see pi-tui editor render), so the
+    // last line is then a candidate row — not the border. Blindly rewriting
+    // lines[last] destroys the last autocomplete item on every keystroke
+    // (observed: candidates vanish one by one while typing "/team s" → "/team st").
+    // Instead, scan upward for the first line made solely of border glyphs and
+    // treat only that line as the bottom border.
+    for (let i = lines.length - 1; i >= 1; i--) {
+      const plain = lines[i]!.replace(/\x1b\[[\d;]*m/g, "");
+      const isPureBorder = /^[─\s]+$/.test(plain);
+      const isScrollIndicator = plain.includes("more") && /^[─↑↓\s\dmore]+$/.test(plain);
+      if (isPureBorder) {
+        lines[i] = buildRainbow(width);
+        break;
+      }
+      if (isScrollIndicator) {
+        // Scroll indicator: color text with accent, dashes with rainbow
+        const indicatorMatch = plain.match(/^([─↑↓\s\dmore]+)/);
+        const indicatorText = indicatorMatch?.[1] ?? "";
+        const indicatorLen = visibleWidth(indicatorText);
+        const dashLen = Math.max(0, width - indicatorLen);
+        lines[i] = theme.fg("accent", indicatorText) + buildRainbow(dashLen);
+        break;
+      }
+      // Non-border content line (autocomplete row or text): keep scanning up.
     }
 
     return lines;

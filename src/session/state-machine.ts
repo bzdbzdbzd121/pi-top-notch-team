@@ -7,6 +7,10 @@ export type MemberEvent =
   | { type: "task_started" }
   | { type: "task_completed" }
   | { type: "process_exit"; isCrashLoop: boolean }
+  /** Emitted when Auto-Compaction begins for an idle member (before dispatching a new prompt). */
+  | { type: "compaction_started" }
+  /** Emitted when Auto-Compaction ends (success, failure, or timeout) — the pending prompt is dispatched right after. */
+  | { type: "compaction_completed" }
   /** Emitted after a member process has been spawned and its RPC is ready (ready promise resolved). */
   | { type: "started" }
   | { type: "stopped" };
@@ -21,12 +25,27 @@ export function transitionState(
 ): MemberOperationalState {
   switch (event.type) {
     case "task_started":
-      // A crashed member must be explicitly restarted before running tasks
-      return current === "crashed" ? "crashed" : "working";
+      // A crashed member must be explicitly restarted before running tasks.
+      // A compacting member stays compacting — the compaction turn's own
+      // RPC events are shielded so they don't corrupt the display state;
+      // the dispatch logic exits compacting explicitly via compaction_completed.
+      if (current === "crashed") return "crashed";
+      if (current === "compacting") return "compacting";
+      return "working";
 
     case "task_completed":
-      // Only working → idle; other states stay unchanged
-      return current === "working" ? "idle" : current;
+      // Only working → idle; compacting is shielded (see task_started).
+      if (current === "working") return "idle";
+      return current;
+
+    case "compaction_started":
+      // Only an idle member can enter compaction (checked before dispatch).
+      return current === "idle" ? "compacting" : current;
+
+    case "compaction_completed":
+      // Compaction finished — member is back to idle; the pending prompt
+      // dispatch immediately follows with task_started → working.
+      return current === "compacting" ? "idle" : current;
 
     case "process_exit":
       // process_exit only applies to non-crashed/stopped members

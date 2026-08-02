@@ -13,8 +13,9 @@ import { getRootDir } from "../config";
 import { loadSettings } from "../settings/settings";
 import { resolveMemberModel } from "../settings/resolve-model";
 import { createMemberEventHandler } from "../channel/event-handler";
-import { existsSync, mkdirSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { transitionState } from "../session/state-machine";
+import { ensureSharedContextFile } from "../session/shared-context";
 
 // ── Dependency Injection Interface ─────────────────────────
 
@@ -95,23 +96,13 @@ export function buildMemberConfig(
   // This prevents conflicts when the same team is used across multiple sessions.
   const sessionSubDir = sessionId ? join(team.name, sessionId) : team.name;
   const sessionDir = join(rootDir, "sessions", sessionSubDir, memberName);
-  const sharedContextPath = join(
-    rootDir,
-    "sessions",
-    sessionSubDir,
-    ".shared-context.md"
-  );
 
   // Create session directory before starting the member
   mkdirSync(sessionDir, { recursive: true });
 
-  // Validate shared context path
-  if (!existsSync(sharedContextPath)) {
-    console.warn(
-      `[team] Shared context file not found: ${sharedContextPath}. ` +
-      "The member will start without a shared context."
-    );
-  }
+  // Guarantee the shared context file exists — auto-create a minimal stub
+  // when the TL hasn't written one yet (instead of only warning).
+  const sharedContextPath = ensureSharedContextFile(team, sessionId);
 
   // Resolve the effective model for this member (global settings + team YAML + TL model)
   const settings = loadSettings(rootDir);

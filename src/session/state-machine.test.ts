@@ -8,9 +8,10 @@ describe("MemberOperationalState type", () => {
   it("accepts valid state values", () => {
     const idle: MemberOperationalState = "idle";
     const working: MemberOperationalState = "working";
+    const compacting: MemberOperationalState = "compacting";
     const crashed: MemberOperationalState = "crashed";
     const stopped: MemberOperationalState = "stopped";
-    expect([idle, working, crashed, stopped]).toHaveLength(4);
+    expect([idle, working, compacting, crashed, stopped]).toHaveLength(5);
   });
 });
 
@@ -30,6 +31,37 @@ describe("transitionState", () => {
 
   it("stays crashed on task_started (cannot start a crashed member)", () => {
     expect(transitionState("crashed", { type: "task_started" })).toBe("crashed");
+  });
+
+  // ── compacting: shielded from task events ──
+  it("stays compacting on task_started (compaction turn's own events are shielded)", () => {
+    expect(transitionState("compacting", { type: "task_started" })).toBe("compacting");
+  });
+
+  it("stays compacting on task_completed (compaction turn's own events are shielded)", () => {
+    expect(transitionState("compacting", { type: "task_completed" })).toBe("compacting");
+  });
+
+  // ── compaction_started / compaction_completed ──
+  it("transitions idle to compacting on compaction_started", () => {
+    expect(transitionState("idle", { type: "compaction_started" })).toBe("compacting");
+  });
+
+  it("ignores compaction_started from non-idle states", () => {
+    expect(transitionState("working", { type: "compaction_started" })).toBe("working");
+    expect(transitionState("compacting", { type: "compaction_started" })).toBe("compacting");
+    expect(transitionState("crashed", { type: "compaction_started" })).toBe("crashed");
+    expect(transitionState("stopped", { type: "compaction_started" })).toBe("stopped");
+  });
+
+  it("transitions compacting to idle on compaction_completed", () => {
+    expect(transitionState("compacting", { type: "compaction_completed" })).toBe("idle");
+  });
+
+  it("ignores compaction_completed from non-compacting states", () => {
+    expect(transitionState("idle", { type: "compaction_completed" })).toBe("idle");
+    expect(transitionState("working", { type: "compaction_completed" })).toBe("working");
+    expect(transitionState("crashed", { type: "compaction_completed" })).toBe("crashed");
   });
 
   // ── task_completed → idle ──

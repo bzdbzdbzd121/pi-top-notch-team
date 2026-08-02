@@ -5,7 +5,7 @@ import type { ProcessManager } from "../process/manager";
 import type { MemberProcessHandle } from "../process/member-process";
 
 /** Member operational state, tracked in TL side. */
-export type MemberOperationalState = "idle" | "working" | "crashed" | "stopped";
+export type MemberOperationalState = "idle" | "working" | "compacting" | "crashed" | "stopped";
 
 /** UI object shape expected by onSessionStart (compatible with ExtensionUIContext at runtime). */
 export interface SessionUI {

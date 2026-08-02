@@ -164,6 +164,7 @@ describe("createMessageChannel", () => {
     expect(handle.sendCommand).toHaveBeenCalledWith({
       type: "prompt",
       message: expect.stringContaining("Hello"),
+      streamingBehavior: "followUp",
     });
   });
 

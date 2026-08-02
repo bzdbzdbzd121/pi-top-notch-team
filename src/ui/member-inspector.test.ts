@@ -25,6 +25,8 @@ const K = {
   end: "\x1b[F",
   backspace: "\x7f",
   ctrlA: "\x01",
+  ctrlB: "\x02",
+  ctrlShiftA: "\x1b[65;6u", // kitty CSI-u: 'A' + ctrl+shift
   ctrlO: "\x0f",
 };
 
@@ -53,6 +55,7 @@ function makeHandle() {
 function makeDeps(opts: {
   handles?: Record<string, any>;
   opStates?: Record<string, "idle" | "working" | "crashed" | "stopped">;
+  tlBusy?: boolean;
 }) {
   const handles = new Map(Object.entries(opts.handles ?? {}));
   const opStates = new Map(Object.entries(opts.opStates ?? {}));
@@ -64,6 +67,7 @@ function makeDeps(opts: {
     ],
     getHandle: (name: string) => handles.get(name),
     memberOpsStates: opStates,
+    isTlBusy: () => opts.tlBusy ?? false,
   } as any;
 }
 
@@ -110,9 +114,12 @@ describe("MemberInspectorComponent — input & send", () => {
     expect(cmd.message).toBe(`${USER_DIRECT_PREFIX}\n请停下手中的活`);
     expect(state.inputOpen).toBe(false);
     expect(state.notice).toContain("已发送");
-    // TL notified about the direct intervention
-    expect(deps.pi.sendMessage).toHaveBeenCalledTimes(1);
+    // TL idle → notification queued via nextTurn AND one trigger turn starts
+    // immediately, so the TL handles it in a single turn.
+    expect(deps.pi.sendMessage).toHaveBeenCalledTimes(2);
     expect(deps.pi.sendMessage.mock.calls[0][0].content).toContain("分析员");
+    expect(deps.pi.sendMessage.mock.calls[0][1]).toEqual({ deliverAs: "nextTurn" });
+    expect(deps.pi.sendMessage.mock.calls[1][1]).toMatchObject({ triggerTurn: true });
   });
 
   it("sends follow_up when member is working (Enter)", () => {
@@ -151,8 +158,8 @@ describe("MemberInspectorComponent — input & send", () => {
     comp.handleInput(K.enter);
     const cmd = handleA.sendCommand.mock.calls[0][0];
     expect(cmd.message).toBe("/fix-tests");
-    // TL still notified
-    expect(deps.pi.sendMessage).toHaveBeenCalledTimes(1);
+    // TL still notified (nextTurn + immediate trigger turn)
+    expect(deps.pi.sendMessage).toHaveBeenCalledTimes(2);
   });
 
   it("backspace edits the buffer (unicode-safe)", () => {
@@ -183,6 +190,10 @@ describe("MemberInspectorComponent — control commands", () => {
     comp.handleInput(K.ctrlA);
     expect(handleA.sendCommand).toHaveBeenCalledWith({ type: "abort" });
     expect(state.notice).toContain("abort");
+    // Queued via nextTurn, then ONE trigger turn — both immediate (TL idle)
+    expect(deps.pi.sendMessage).toHaveBeenCalledTimes(2);
+    expect(deps.pi.sendMessage.mock.calls[0][1]).toEqual({ deliverAs: "nextTurn" });
+    expect(deps.pi.sendMessage.mock.calls[1][1]).toMatchObject({ triggerTurn: true });
     expect(deps.pi.sendMessage.mock.calls[0][0].content).toContain("abort");
   });
 
@@ -201,6 +212,227 @@ describe("MemberInspectorComponent — control commands", () => {
     comp.handleInput(K.ctrlA);
     expect(handleA.sendCommand).not.toHaveBeenCalled();
     expect(state.notice).toContain("未运行");
+  });
+
+  it("ctrl+a works even when input box is open", () => {
+    const handleA = makeHandle();
+    const deps = makeDeps({ handles: { a: handleA }, opStates: { a: "working" } });
+    const { comp, state } = makeComponent(deps);
+    // Open input box first
+    comp.handleInput("i");
+    expect(state.inputOpen).toBe(true);
+    // Type some text
+    comp.handleInput("h");
+    // Now press ctrl+a — should abort even though input is open
+    comp.handleInput(K.ctrlA);
+    expect(handleA.sendCommand).toHaveBeenCalledWith({ type: "abort" });
+    expect(state.notice).toContain("abort");
+    // Input box should NOT be open (sendControl returns immediately, no input-mode return)
+    expect(state.inputOpen).toBe(false);
+  });
+
+  it("ctrl+o works even when input box is open", () => {
+    const handleA = makeHandle();
+    const deps = makeDeps({ handles: { a: handleA }, opStates: { a: "working" } });
+    const { comp, state } = makeComponent(deps);
+    // Open input box
+    comp.handleInput("i");
+    expect(state.inputOpen).toBe(true);
+    // Press ctrl+o — should compact even though input is open
+    comp.handleInput(K.ctrlO);
+    expect(handleA.sendCommand).toHaveBeenCalledWith({ type: "compact" });
+    expect(state.notice).toContain("compact");
+    // Input box should NOT be open
+    expect(state.inputOpen).toBe(false);
+  });
+
+  it("ctrl+b aborts ALL executing members + one TL notification", () => {
+    const handleA = makeHandle();
+    const handleB = makeHandle();
+    const deps = makeDeps({
+      handles: { a: handleA, b: handleB },
+      opStates: { a: "working", b: "compacting" },
+    });
+    const { comp, state } = makeComponent(deps);
+    comp.handleInput(K.ctrlB);
+    expect(handleA.sendCommand).toHaveBeenCalledWith({ type: "abort" });
+    expect(handleB.sendCommand).toHaveBeenCalledWith({ type: "abort" });
+    expect(state.notice).toContain("2 个成员");
+    expect(state.notice).toContain("分析员");
+    expect(state.notice).toContain("编码员");
+    // One trigger turn covers the whole batch (TL idle → immediate)
+    expect(deps.pi.sendMessage).toHaveBeenCalledTimes(2);
+    expect(deps.pi.sendMessage.mock.calls[0][0].content).toContain("2 个");
+    expect(deps.pi.sendMessage.mock.calls[1][1]).toMatchObject({ triggerTurn: true });
+  });
+
+  it("ctrl+b skips idle/stopped/crashed members", () => {
+    const handleA = makeHandle();
+    const handleB = makeHandle();
+    const handleC = makeHandle();
+    const deps = makeDeps({
+      handles: { a: handleA, b: handleB, c: handleC },
+      opStates: { a: "working", b: "idle", c: "crashed" },
+    });
+    const { comp, state } = makeComponent(deps);
+    comp.handleInput(K.ctrlB);
+    expect(handleA.sendCommand).toHaveBeenCalledWith({ type: "abort" });
+    expect(handleB.sendCommand).not.toHaveBeenCalled();
+    expect(handleC.sendCommand).not.toHaveBeenCalled();
+    expect(state.notice).toContain("1 个成员");
+  });
+
+  it("ctrl+shift+a (kitty CSI-u) also aborts ALL executing members", () => {
+    const handleA = makeHandle();
+    const handleB = makeHandle();
+    const deps = makeDeps({
+      handles: { a: handleA, b: handleB },
+      opStates: { a: "working", b: "working" },
+    });
+    const { comp, state } = makeComponent(deps);
+    comp.handleInput(K.ctrlShiftA);
+    expect(handleA.sendCommand).toHaveBeenCalledWith({ type: "abort" });
+    expect(handleB.sendCommand).toHaveBeenCalledWith({ type: "abort" });
+    expect(state.notice).toContain("2 个成员");
+    expect(deps.pi.sendMessage).toHaveBeenCalledTimes(2);
+    expect(deps.pi.sendMessage.mock.calls[1][1]).toMatchObject({ triggerTurn: true });
+  });
+
+  it("ctrl+shift+a in legacy terminals degrades to ctrl+a (single abort) — guarded by ctrl+b", () => {
+    // Legacy terminals send the SAME byte for ctrl+shift+a and ctrl+a (\x01).
+    // The inspector must NOT match it as abort-all; it falls through to the
+    // single-member abort branch. ctrl+b remains the reliable all-terminal key.
+    const handleA = makeHandle();
+    const handleB = makeHandle();
+    const deps = makeDeps({
+      handles: { a: handleA, b: handleB },
+      opStates: { a: "working", b: "working" },
+    });
+    const { comp } = makeComponent(deps);
+    comp.handleInput(K.ctrlA); // legacy ctrl+shift+a arrives as ctrl+a
+    expect(handleA.sendCommand).toHaveBeenCalledWith({ type: "abort" });
+    expect(handleB.sendCommand).not.toHaveBeenCalled();
+  });
+
+  it("ctrl+b with no executing members shows notice, sends nothing", () => {
+    const handleA = makeHandle();
+    const deps = makeDeps({ handles: { a: handleA }, opStates: { a: "idle" } });
+    const { comp, state } = makeComponent(deps);
+    comp.handleInput(K.ctrlB);
+    expect(handleA.sendCommand).not.toHaveBeenCalled();
+    expect(state.notice).toContain("没有正在执行");
+    expect(deps.pi.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("TL busy: interventions queue without a turn; onTlSettled delivers ALL in one turn", () => {
+    const handleA = makeHandle();
+    const handleB = makeHandle();
+    const deps = makeDeps({
+      handles: { a: handleA, b: handleB },
+      opStates: { a: "working", b: "working" },
+      tlBusy: true,
+    });
+    const { comp } = makeComponent(deps);
+    // Abort member a, switch to member b, abort it too — TL busy, so NO turn
+    comp.handleInput(K.ctrlA);
+    comp.handleInput(K.right);
+    comp.handleInput(K.ctrlA);
+    // 2 independent nextTurn messages queued, no trigger turn yet
+    expect(deps.pi.sendMessage).toHaveBeenCalledTimes(2);
+    for (const call of deps.pi.sendMessage.mock.calls) {
+      expect(call[1]).toEqual({ deliverAs: "nextTurn" });
+    }
+    const contents = deps.pi.sendMessage.mock.calls.map((c: any) => c[0].content);
+    expect(contents.filter((c: string) => c.includes("分析员")).length).toBeGreaterThanOrEqual(1);
+    expect(contents.filter((c: string) => c.includes("编码员")).length).toBeGreaterThanOrEqual(1);
+    // TL settles: ONE trigger turn consumes ALL queued notifications
+    comp.onTlSettled();
+    expect(deps.pi.sendMessage).toHaveBeenCalledTimes(3);
+    const last = deps.pi.sendMessage.mock.calls[2];
+    expect(last[1]).toMatchObject({ triggerTurn: true });
+    expect(last[0].content).toContain("2 条");
+  });
+
+  it("intervention while TL idle starts a turn immediately; new ones wait for the next settle", () => {
+    const handleA = makeHandle();
+    const deps = makeDeps({ handles: { a: handleA }, opStates: { a: "working" } });
+    const { comp } = makeComponent(deps);
+    // TL idle: first intervention queues + triggers immediately
+    comp.handleInput(K.ctrlA);
+    expect(deps.pi.sendMessage).toHaveBeenCalledTimes(2); // nextTurn + trigger
+    // More interventions before the turn settles: only queued, no re-trigger
+    comp.handleInput(K.ctrlA);
+    expect(deps.pi.sendMessage).toHaveBeenCalledTimes(3); // +1 nextTurn only
+    expect(deps.pi.sendMessage.mock.calls[2][1]).toEqual({ deliverAs: "nextTurn" });
+    // Turn settles: the queued one gets its own unified turn
+    comp.onTlSettled();
+    expect(deps.pi.sendMessage).toHaveBeenCalledTimes(4);
+    expect(deps.pi.sendMessage.mock.calls[3][1]).toMatchObject({ triggerTurn: true });
+    expect(deps.pi.sendMessage.mock.calls[3][0].content).toContain("1 条");
+  });
+
+  it("onTlSettled with nothing queued starts no turn", () => {
+    const handleA = makeHandle();
+    const deps = makeDeps({ handles: { a: handleA }, opStates: { a: "idle" } });
+    const { comp } = makeComponent(deps);
+    comp.onTlSettled();
+    expect(deps.pi.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("close() triggers the unified turn immediately (not lost)", () => {
+    const handleA = makeHandle();
+    const deps = makeDeps({
+      handles: { a: handleA },
+      opStates: { a: "working" },
+      tlBusy: true, // TL busy: notification only queued so far
+    });
+    const { comp } = makeComponent(deps);
+    comp.handleInput(K.ctrlA);
+    expect(deps.pi.sendMessage).toHaveBeenCalledTimes(1); // nextTurn queued
+    // Close while the TL is still busy — the queued notification must still
+    // reach the TL via an immediate trigger turn
+    comp.close();
+    expect(deps.pi.sendMessage).toHaveBeenCalledTimes(2);
+    expect(deps.pi.sendMessage.mock.calls[1][1]).toMatchObject({ triggerTurn: true });
+    expect(deps.pi.sendMessage.mock.calls[0][0].content).toContain("abort");
+  });
+
+  it("close() while a trigger turn is in flight still delivers later queued notifications", () => {
+    const handleA = makeHandle();
+    const deps = makeDeps({ handles: { a: handleA }, opStates: { a: "working" } });
+    const { comp } = makeComponent(deps);
+    // TL idle: first intervention queues + triggers a turn immediately
+    comp.handleInput(K.ctrlA);
+    expect(deps.pi.sendMessage).toHaveBeenCalledTimes(2); // nextTurn + trigger
+    // Second intervention before the turn settles: queued only (no re-trigger)
+    comp.handleInput(K.ctrlA);
+    expect(deps.pi.sendMessage).toHaveBeenCalledTimes(3); // +1 nextTurn
+    // Close the overlay while the first trigger turn is still in flight —
+    // the queued notification must still be delivered (pi queues the
+    // followUp trigger behind the in-flight turn)
+    comp.close();
+    expect(deps.pi.sendMessage).toHaveBeenCalledTimes(4);
+    const last = deps.pi.sendMessage.mock.calls[3];
+    expect(last[1]).toMatchObject({ triggerTurn: true });
+    expect(last[0].content).toContain("1 条");
+  });
+
+  it("ctrl+b works even when input box is open", () => {
+    const handleA = makeHandle();
+    const handleB = makeHandle();
+    const deps = makeDeps({
+      handles: { a: handleA, b: handleB },
+      opStates: { a: "working", b: "working" },
+    });
+    const { comp, state } = makeComponent(deps);
+    // Open input box first
+    comp.handleInput("i");
+    expect(state.inputOpen).toBe(true);
+    // Press ctrl+b — should abort all even though input is open
+    comp.handleInput(K.ctrlB);
+    expect(handleA.sendCommand).toHaveBeenCalledWith({ type: "abort" });
+    expect(handleB.sendCommand).toHaveBeenCalledWith({ type: "abort" });
+    expect(state.inputOpen).toBe(false);
   });
 });
 
@@ -268,6 +500,45 @@ describe("MemberInspectorComponent — navigation & refresh", () => {
     await vi.advanceTimersByTimeAsync(600);
     expect(state.tabs[0].lines.join("\n")).toContain('"path"');
   });
+
+  it("'t' toggles thinking visibility and refetches with thinking rendered", async () => {
+    const handleA = makeHandle();
+    handleA.sendCommandAndWait.mockResolvedValue({
+      data: {
+        messages: [
+          {
+            role: "assistant",
+            content: [
+              { type: "thinking", thinking: "让我先分析一下需求" },
+              { type: "text", text: "好的" },
+            ],
+            timestamp: 1,
+          },
+        ],
+      },
+    });
+    const deps = makeDeps({ handles: { a: handleA }, opStates: { a: "working" } });
+    const { comp, state } = makeComponent(deps);
+
+    // Default: thinking hidden — fetch and verify
+    state.tabs[0].dirty = false;
+    comp.markDirty("a");
+    await vi.advanceTimersByTimeAsync(600);
+    expect(state.tabs[0].lines.join("\n")).not.toContain("让我先分析一下需求");
+
+    // Toggle on → refetch renders the thinking block
+    comp.handleInput("t");
+    expect(state.tabs[0].showThinking).toBe(true);
+    await vi.advanceTimersByTimeAsync(600);
+    expect(state.tabs[0].lines.join("\n")).toContain("💭 思考");
+    expect(state.tabs[0].lines.join("\n")).toContain("让我先分析一下需求");
+
+    // Toggle off again → thinking hidden
+    comp.handleInput("t");
+    expect(state.tabs[0].showThinking).toBe(false);
+    await vi.advanceTimersByTimeAsync(600);
+    expect(state.tabs[0].lines.join("\n")).not.toContain("让我先分析一下需求");
+  });
 });
 
 describe("MemberInspectorComponent — render", () => {
@@ -283,12 +554,14 @@ describe("MemberInspectorComponent — render", () => {
     expect(joined).toContain("hello body");
     // Clear footer hints: every action names its target, full key names
     expect(joined).toContain("切换成员");
-    expect(joined).toContain("滚动会话");
+    expect(joined).toContain("三行滚动");
     expect(joined).toContain("跳至底部");
-    expect(joined).toContain("e 展开工具详情");
-    expect(joined).toContain("ctrl+a 中断成员");
-    expect(joined).toContain("ctrl+o 压缩上下文");
-    expect(joined).toContain("Esc 关闭窗口");
+    expect(joined).toContain("e 展开详情");
+    expect(joined).toContain("t 显示思考");
+    expect(joined).toContain("ctrl+a 中断");
+    expect(joined).toContain("ctrl+b/ctrl+shift+a 全中断");
+    expect(joined).toContain("ctrl+o 压缩");
+    expect(joined).toContain("Esc 关闭");
     // Frame shape: top + header + sep + body + sep + footer×3 + bottom
     expect(lines[0]).toMatch(/^╭/);
     expect(lines[0]).toMatch(/╮$/); // rounded top-right corner
@@ -332,8 +605,17 @@ describe("MemberInspectorComponent — render", () => {
     const { comp, state } = makeComponent(deps);
     state.tabs[0].expanded = true;
     const joined = comp.render(80).join("\n");
-    expect(joined).toContain("e 折叠工具详情");
-    expect(joined).not.toContain("e 展开工具详情");
+    expect(joined).toContain("e 折叠详情");
+    expect(joined).not.toContain("e 展开详情");
+  });
+
+  it("thinking hint flips to 隐藏 while thinking is shown", () => {
+    const deps = makeDeps({ handles: {}, opStates: {} });
+    const { comp, state } = makeComponent(deps);
+    state.tabs[0].showThinking = true;
+    const joined = comp.render(80).join("\n");
+    expect(joined).toContain("t 隐藏思考");
+    expect(joined).not.toContain("t 显示思考");
   });
 
   it("input box replaces key hints while input is open", () => {
@@ -349,6 +631,6 @@ describe("MemberInspectorComponent — render", () => {
     expect(joined).toContain("Enter 发送");
     expect(joined).toContain("ctrl+Enter 立即转向");
     expect(joined).toContain("Esc 取消");
-    expect(joined).not.toContain("Esc 关闭窗口");
+    expect(joined).not.toContain("Esc 关闭");
   });
 });

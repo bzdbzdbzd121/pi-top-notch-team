@@ -86,6 +86,7 @@ describe("index.ts default export (integration)", () => {
     expect(toolNames).toContain("wait_and_get_member_status");
     expect(toolNames).toContain("start_member");
     expect(toolNames).toContain("stop_member");
+    expect(toolNames).toContain("write_shared_context");
   });
 
   it("registers pi.on for tool_call handler", async () => {
@@ -160,7 +161,8 @@ describe("index.ts default export (integration)", () => {
 
       const handler = getBeforeAgentStartHandler();
       const result = await handler({ systemPrompt: "BASE" }, { ui: createMockUi() });
-      expect(result.systemPrompt).toContain("严格按照以下步骤执行");
+      expect(result.systemPrompt).toContain("严格模式");
+      expect(result.systemPrompt).toContain("不得跳过、调序、合并 stage");
       expect(result.systemPrompt).toContain("【build】");
       expect(result.systemPrompt).toContain("Build the thing");
     });
@@ -180,8 +182,32 @@ describe("index.ts default export (integration)", () => {
 
       const handler = getBeforeAgentStartHandler();
       const result = await handler({ systemPrompt: "BASE" }, { ui: createMockUi() });
-      expect(result.systemPrompt).toContain("作为工作流程参考");
+      expect(result.systemPrompt).toContain("参考模式");
+      expect(result.systemPrompt).toContain("默认按以下步骤顺序执行");
       expect(result.systemPrompt).toContain("【build】");
+    });
+
+    it("injects the activation banner near the top when the team has a workflow", async () => {
+      const { startSession, endSession } = await import("./session/state");
+      endSession();
+      startSession({
+        name: "test-team",
+        description: "Test",
+        members: [{ name: "worker", systemPrompt: "do work" }],
+        workflow: {
+          strictness: "strict",
+          stages: [{ member: "worker", name: "build", description: "Build the thing" }],
+        },
+      });
+
+      const handler = getBeforeAgentStartHandler();
+      const result = await handler({ systemPrompt: "BASE" }, { ui: createMockUi() });
+      // Banner appears above the team section (before the workflow detail)
+      const bannerIdx = result.systemPrompt.indexOf("本团队定义了「团队工作流」");
+      const workflowIdx = result.systemPrompt.indexOf("### 团队工作流");
+      expect(bannerIdx).toBeGreaterThanOrEqual(0);
+      expect(workflowIdx).toBeGreaterThan(bannerIdx);
+      expect(result.systemPrompt).toContain("不得自己开工分析");
     });
 
     it("does not inject workflow prompt when team has no workflow", async () => {
@@ -197,6 +223,7 @@ describe("index.ts default export (integration)", () => {
       const result = await handler({ systemPrompt: "BASE" }, { ui: createMockUi() });
       expect(result.systemPrompt).not.toContain("严格");
       expect(result.systemPrompt).not.toContain("参考");
+      expect(result.systemPrompt).not.toContain("本团队定义了「团队工作流」");
       expect(result.systemPrompt).toContain("Team Lead");
     });
 
@@ -369,5 +396,295 @@ describe("agent_settled handler", () => {
     await handler({}, { ui, signal: { aborted: false } });
 
     expect(ui.setStatus).toHaveBeenCalledWith("team-members-running", undefined);
+  });
+});
+
+// ── TL first-action protocol prompt injection ─────────────
+
+describe("TL first-action protocol prompt injection", () => {
+  let pi: ExtensionAPI;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    delete process.env.TEAM_ROLE;
+    pi = createMockPi();
+    const mod = await import("../index");
+    mod.default(pi);
+  });
+
+  function getHandler(name: string): Function {
+    const onCalls = (pi.on as ReturnType<typeof vi.fn>).mock.calls;
+    return onCalls.find((c: any) => c[0] === name)![1];
+  }
+
+  it("injects first-action protocol above the detailed iron-rule section", async () => {
+    const { startSession, endSession } = await import("./session/state");
+    endSession();
+    startSession({
+      name: "test-team",
+      description: "Test",
+      members: [{ name: "worker", systemPrompt: "do work" }],
+    });
+
+    const handler = getHandler("before_agent_start");
+    const result = await handler({ systemPrompt: "BASE" }, { ui: createMockUi() });
+    expect(result.systemPrompt).toContain("第一动作协议");
+
+    // protocol must appear before the detailed 铁律 section
+    const idxProtocol = result.systemPrompt.indexOf("第一动作协议");
+    const idxIronRule = result.systemPrompt.indexOf("铁律：你绝不能自己做");
+    expect(idxProtocol).toBeGreaterThan(-1);
+    expect(idxIronRule).toBeGreaterThan(-1);
+    expect(idxProtocol).toBeLessThan(idxIronRule);
+    endSession();
+  });
+
+  it("bounds the 'verify with code' rule to 1-2 files (removes contradiction with delegation)", async () => {
+    const { startSession, endSession } = await import("./session/state");
+    endSession();
+    startSession({
+      name: "test-team",
+      description: "Test",
+      members: [{ name: "worker", systemPrompt: "do work" }],
+    });
+
+    const handler = getHandler("before_agent_start");
+    const result = await handler({ systemPrompt: "BASE" }, { ui: createMockUi() });
+    expect(result.systemPrompt).toContain("允许读取 1-2 个文件");
+    // old wording gave the model a loophole to analyze code itself
+    expect(result.systemPrompt).not.toContain("先查阅代码再给出结论");
+    endSession();
+  });
+});
+
+// ── TL pre-dispatch guard in tool_call handler ────────────────────
+
+describe("TL pre-dispatch guard in tool_call handler", () => {
+  let pi: ExtensionAPI;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    delete process.env.TEAM_ROLE;
+    pi = createMockPi();
+    const mod = await import("../index");
+    mod.default(pi);
+  });
+
+  function getHandler(name: string): Function {
+    const onCalls = (pi.on as ReturnType<typeof vi.fn>).mock.calls;
+    return onCalls.find((c: any) => c[0] === name)![1];
+  }
+
+  async function startActiveSession() {
+    const { startSession, endSession } = await import("./session/state");
+    endSession();
+    startSession({
+      name: "test-team",
+      description: "Test",
+      members: [{ name: "worker", systemPrompt: "do work" }],
+    });
+  }
+
+  it("sticky-blocks after the 4th code read until dispatch happens", async () => {
+    await startActiveSession();
+    const toolCall = getHandler("tool_call");
+    const read = (p: string) => toolCall({ toolName: "read", input: { path: p } });
+
+    expect(read("src/a.ts")).toBeUndefined();
+    expect(read("src/b.ts")).toBeUndefined();
+    expect(read("src/c.ts")).toBeUndefined();
+
+    const blocked = read("src/d.ts");
+    expect(blocked).toEqual(expect.objectContaining({ block: true }));
+    expect(blocked.reason).toContain("team_send_and_wait");
+
+    // sticky: no escape hatch before dispatch — subsequent calls stay blocked
+    expect(read("src/e.ts")).toEqual(expect.objectContaining({ block: true }));
+    expect(read("src/f.ts")).toEqual(expect.objectContaining({ block: true }));
+    expect(read("src/g.ts")).toEqual(expect.objectContaining({ block: true }));
+  });
+
+  it("unlocks after a dispatch: reads pass again", async () => {
+    await startActiveSession();
+    const toolCall = getHandler("tool_call");
+    toolCall({ toolName: "read", input: { path: "src/a.ts" } });
+    toolCall({ toolName: "read", input: { path: "src/b.ts" } });
+    toolCall({ toolName: "read", input: { path: "src/c.ts" } });
+    expect(toolCall({ toolName: "read", input: { path: "src/d.ts" } })).toEqual(
+      expect.objectContaining({ block: true })
+    );
+
+    toolCall({ toolName: "team_send_and_wait", input: { tasks: [{ to: "worker", content: "go" }] } });
+    expect(toolCall({ toolName: "read", input: { path: "src/e.ts" } })).toBeUndefined();
+    expect(toolCall({ toolName: "bash", input: { command: "grep foo src/" } })).toBeUndefined();
+  });
+
+  it("notifies the user on the first block via ctx.ui", async () => {
+    await startActiveSession();
+    const toolCall = getHandler("tool_call");
+    const ui = createMockUi();
+    const ctx = { ui };
+
+    toolCall({ toolName: "read", input: { path: "src/a.ts" } }, ctx);
+    toolCall({ toolName: "read", input: { path: "src/b.ts" } }, ctx);
+    toolCall({ toolName: "read", input: { path: "src/c.ts" } }, ctx);
+    toolCall({ toolName: "read", input: { path: "src/d.ts" } }, ctx);
+
+    expect(ui.notify).toHaveBeenCalledWith(expect.stringContaining("team_send_and_wait"), "warning");
+    expect(ui.setStatus).toHaveBeenCalledWith(
+      "tl-pre-dispatch-guard",
+      expect.stringContaining("拦截")
+    );
+
+    // after dispatch, status is cleared
+    toolCall({ toolName: "team_send_and_wait", input: { tasks: [{ to: "worker", content: "go" }] } }, ctx);
+    expect(ui.setStatus).toHaveBeenLastCalledWith("tl-pre-dispatch-guard", undefined);
+  });
+
+  it("never blocks .md reads", async () => {
+    await startActiveSession();
+    const toolCall = getHandler("tool_call");
+    for (let i = 0; i < 6; i++) {
+      expect(toolCall({ toolName: "read", input: { path: `doc${i}.md` } })).toBeUndefined();
+    }
+  });
+
+  it("does not block code reads after a team_send_and_wait dispatch", async () => {
+    await startActiveSession();
+    const toolCall = getHandler("tool_call");
+    toolCall({ toolName: "team_send_and_wait", input: { tasks: [{ to: "worker", content: "go" }] } });
+    for (let i = 0; i < 6; i++) {
+      expect(toolCall({ toolName: "read", input: { path: `src/f${i}.ts` } })).toBeUndefined();
+    }
+  });
+
+  it("agent_start resets the per-turn budget", async () => {
+    await startActiveSession();
+    const toolCall = getHandler("tool_call");
+    const agentStart = getHandler("agent_start");
+    const read = (p: string) => toolCall({ toolName: "read", input: { path: p } });
+
+    read("src/a.ts");
+    read("src/b.ts");
+    read("src/c.ts");
+    expect(read("src/d.ts")).toEqual(expect.objectContaining({ block: true }));
+
+    agentStart(); // new user-message turn → fresh budget
+    expect(read("src/e.ts")).toBeUndefined();
+  });
+
+  it("counts bash calls too (not just read) — sticky-blocks when mixed calls exceed threshold", async () => {
+    await startActiveSession();
+    const toolCall = getHandler("tool_call");
+
+    // 2 reads + 1 bash = 3 calls (at threshold), should pass
+    expect(toolCall({ toolName: "read", input: { path: "src/a.ts" } })).toBeUndefined();
+    expect(toolCall({ toolName: "bash", input: { command: "grep foo src/*.ts" } })).toBeUndefined();
+    expect(toolCall({ toolName: "read", input: { path: "src/b.ts" } })).toBeUndefined();
+
+    // 4th non-management call → block, and stays sticky
+    const blocked = toolCall({ toolName: "bash", input: { command: "cat src/c.ts" } });
+    expect(blocked).toEqual(expect.objectContaining({ block: true }));
+    expect(blocked.reason).toContain("team_send_and_wait");
+    expect(toolCall({ toolName: "bash", input: { command: "rg foo src/" } })).toEqual(
+      expect.objectContaining({ block: true })
+    );
+  });
+
+  it("never blocks management tools (write, edit, team_send_and_wait, etc.)", async () => {
+    await startActiveSession();
+    const toolCall = getHandler("tool_call");
+
+    // Many management calls should never trigger the guard
+    for (let i = 0; i < 10; i++) {
+      expect(toolCall({ toolName: "write", input: { path: "doc.md", content: "# test" } })).toBeUndefined();
+      expect(toolCall({ toolName: "edit", input: { path: "doc.md", edits: [] } })).toBeUndefined();
+      expect(toolCall({ toolName: "list_members", input: {} })).toBeUndefined();
+      expect(toolCall({ toolName: "get_member_log", input: { name: "w" } })).toBeUndefined();
+      expect(toolCall({ toolName: "wait_and_get_member_status", input: {} })).toBeUndefined();
+    }
+  });
+
+  it("does nothing when no team session is active", async () => {
+    const { endSession } = await import("./session/state");
+    endSession();
+    const toolCall = getHandler("tool_call");
+    for (let i = 0; i < 6; i++) {
+      expect(toolCall({ toolName: "read", input: { path: `src/f${i}.ts` } })).toBeUndefined();
+    }
+  });
+});
+
+// ── write_shared_context gate: whitelist + direct-write interception ────
+
+describe("write_shared_context in tool_call guard", () => {
+  let pi: ExtensionAPI;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    delete process.env.TEAM_ROLE;
+    pi = createMockPi();
+    const mod = await import("../index");
+    mod.default(pi);
+  });
+
+  function getHandler(name: string): Function {
+    const onCalls = (pi.on as ReturnType<typeof vi.fn>).mock.calls;
+    return onCalls.find((c: any) => c[0] === name)![1];
+  }
+
+  async function startActiveSession() {
+    const { startSession, endSession } = await import("./session/state");
+    endSession();
+    startSession({
+      name: "test-team",
+      description: "Test",
+      members: [{ name: "worker", systemPrompt: "do work" }],
+    });
+  }
+
+  it("write_shared_context is whitelisted during an active session", async () => {
+    await startActiveSession();
+    const toolCall = getHandler("tool_call");
+    const verdict = toolCall({ toolName: "write_shared_context", input: { content: "# doc" } });
+    expect(verdict).toBeUndefined(); // not blocked
+  });
+
+  it("blocks write to .shared-context.md and redirects to write_shared_context", async () => {
+    await startActiveSession();
+    const toolCall = getHandler("tool_call");
+
+    const blocked = toolCall({
+      toolName: "write",
+      input: { path: "/tmp/sessions/test-team/abc/.shared-context.md", content: "# doc" },
+    });
+    expect(blocked).toEqual(expect.objectContaining({ block: true }));
+    expect(blocked.reason).toContain("write_shared_context");
+  });
+
+  it("blocks edit to .shared-context.md as well", async () => {
+    await startActiveSession();
+    const toolCall = getHandler("tool_call");
+
+    const blocked = toolCall({
+      toolName: "edit",
+      input: { path: "sessions/test-team/abc/.shared-context.md", edits: [] },
+    });
+    expect(blocked).toEqual(expect.objectContaining({ block: true }));
+    expect(blocked.reason).toContain("write_shared_context");
+  });
+
+  it("still allows write to other .md files", async () => {
+    await startActiveSession();
+    const toolCall = getHandler("tool_call");
+    expect(toolCall({ toolName: "write", input: { path: "/tmp/docs/adr-001.md", content: "# ADR" } })).toBeUndefined();
+  });
+
+  it("still blocks write to code files", async () => {
+    await startActiveSession();
+    const toolCall = getHandler("tool_call");
+    const blocked = toolCall({ toolName: "write", input: { path: "/tmp/src/a.ts", content: "code" } });
+    expect(blocked).toEqual(expect.objectContaining({ block: true }));
+    expect(blocked.reason).toContain("代码文件");
   });
 });

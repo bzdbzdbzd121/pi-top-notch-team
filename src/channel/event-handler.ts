@@ -6,6 +6,7 @@ import type { MessageQueue } from "../channel/message-queue";
 import type { ResponseWaiter } from "../channel/response-waiter";
 import type { TeamMessage } from "../channel/types";
 import type { ProcessManager } from "../process/manager";
+import { shouldCompact, type ResolvedAutoCompact } from "../settings/resolve-auto-compact";
 
 // ── Constants ──────────────────────────────────────────────
 
@@ -207,6 +208,38 @@ export function createMemberEventHandler(
       deps.onMemberActivity?.(memberName, event.type);
     }
 
+    // ── Surface fire-and-forget prompt rejections from the member's RPC layer ──
+    // Channel prompts go through sendCommand (no id attached, no response
+    // consumer). If the member's pi rejects the prompt, the error response
+    // arrives here as a plain event — without this branch it is silently
+    // swallowed: the member never receives the message and team_send_and_wait
+    // hangs until the all-idle fallback. Responses WITH an id belong to
+    // sendCommandAndWait callers (stats / compact / Member Inspector), which
+    // consume their own errors — skip those.
+    if (
+      event.type === "response" &&
+      event.command === "prompt" &&
+      event.success === false &&
+      event.id === undefined
+    ) {
+      const reason = typeof event.error === "string" ? event.error : "未知原因";
+      const pendingCorrId = lpc.get(memberName);
+      if (pendingCorrId) {
+        rw.resolveIfWaiting(
+          pendingCorrId,
+          memberName,
+          `[消息未送达] 成员 "${memberName}" 的 pi 进程拒收了任务消息：${reason}`
+        );
+        lpc.delete(memberName);
+      }
+      deps.pi.sendMessage({
+        customType: "team-route",
+        content: `⚠️ 成员 "${memberName}" 拒收了消息通道下发的 prompt，消息未送达。\n原因：${reason}\n（成员繁忙时 prompt 应自动排队为 followUp；出现此错误说明存在其他问题，如成员模型/鉴权失效。）`,
+        display: true,
+      });
+      return;
+    }
+
     // ── Member operational state tracking (via pure state machine) ──
     if (event.type === "agent_start") {
       states.set(memberName, transitionState(states.get(memberName) ?? "idle", { type: "task_started" }));
@@ -399,16 +432,134 @@ export interface SendToMemberDeps {
   pi: ExtensionAPI;
   memberOpsStates: Map<string, MemberOperationalState>;
   memberHandles: Map<string, MemberProcessHandle>;
+  /** ResponseWaiter for resolving pending team_send_and_wait when routing fails. */
+  responseWaiter: ResponseWaiter;
+  /** Correlation IDs for pending team_send_and_wait requests. */
+  lastPendingCorrId: Map<string, string>;
+  /**
+   * Resolve the effective Auto-Compaction config. Called on every dispatch
+   * so settings changes mid-session take effect. Absent = feature disabled.
+   */
+  getAutoCompact?: () => ResolvedAutoCompact;
 }
+
+/** Timeout for the pre-dispatch stats query (same as the status widget). */
+const STATS_QUERY_TIMEOUT_MS = 3000;
 
 export function createSendToMember(
   deps: SendToMemberDeps
 ): (memberName: string, msg: TeamMessage) => void {
   const { pi, memberOpsStates, memberHandles } = deps;
 
+  /** Messages that arrive while a member is compacting, held until compaction ends. */
+  const pendingDuringCompaction = new Map<string, TeamMessage[]>();
+
+  /** Auto-compaction notices go to the TL session as team messages. */
+  function notify(content: string): void {
+    pi.sendMessage({ customType: "team-message", content, display: true });
+  }
+
+  function sendPrompt(memberName: string, msg: TeamMessage): void {
+    const handle = memberHandles.get(memberName);
+    if (!handle) return;
+    // Mark member as working when we send a prompt
+    memberOpsStates.set(memberName, transitionState(memberOpsStates.get(memberName) ?? "idle", { type: "task_started" }));
+    try {
+      handle.sendCommand({
+        type: "prompt",
+        message: `[消息通道 - 来自 ${msg.from}]\n${msg.subject ? `主题：${msg.subject}\n` : ""}${msg.content}`,
+        // If the member's agent is still streaming (working, or inside its
+        // post-agent_end settlement window — auto-retry / auto-compaction /
+        // listener drain), pi queues this prompt as a followUp instead of
+        // rejecting it. Without this the prompt is refused with
+        // "Agent is already processing" and the message is silently lost.
+        // No effect when the member is idle.
+        streamingBehavior: "followUp",
+      });
+    } catch (err) {
+      resolvePendingWaitIfAny(memberName, `发送消息给成员 "${memberName}" 失败：${err instanceof Error ? err.message : String(err)}`);
+      pi.sendMessage({
+        customType: "team-route",
+        content: `发送消息给成员 "${memberName}" 失败：${err instanceof Error ? err.message : String(err)}`,
+        display: true,
+      });
+    }
+  }
+
+  function flushPending(memberName: string): void {
+    const pending = pendingDuringCompaction.get(memberName);
+    if (!pending || pending.length === 0) return;
+    pendingDuringCompaction.delete(memberName);
+    for (const pendingMsg of pending) {
+      sendPrompt(memberName, pendingMsg);
+    }
+  }
+
+  /**
+   * Auto-Compaction flow: check usage → compact if over threshold → dispatch.
+   * Fail-open everywhere: any failure ends with the prompt dispatched anyway
+   * plus a TL notification. Success is silent. At most one compaction per
+   * dispatch — no re-check loop afterwards.
+   */
+  async function runAutoCompactAndDispatch(
+    memberName: string,
+    msg: TeamMessage,
+    handle: MemberProcessHandle,
+    cfg: ResolvedAutoCompact
+  ): Promise<void> {
+    // Phase tracking for honest failure notifications.
+    let phase: "stats" | "compact" = "stats";
+    try {
+      const statsResp = await handle.sendCommandAndWait(
+        { type: "get_session_stats" },
+        (event: any) => event.type === "response" && event.command === "get_session_stats",
+        STATS_QUERY_TIMEOUT_MS
+      );
+      const usage = statsResp?.data?.contextUsage;
+      if (!usage || typeof usage.percent !== "number") {
+        throw new Error("成员未返回上下文用量数据");
+      }
+
+      if (shouldCompact({ percent: usage.percent, tokens: usage.tokens ?? 0 }, cfg)) {
+        phase = "compact";
+        const compactResp = await handle.sendCommandAndWait(
+          { type: "compact" },
+          (event: any) => event.type === "response" && event.command === "compact",
+          cfg.timeoutMinutes * 60_000
+        );
+        if (!compactResp || compactResp.success === false) {
+          throw new Error(compactResp?.error ?? "压缩命令未成功");
+        }
+        // Success is silent — the TL does not need to perceive the process.
+      }
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      if (phase === "stats") {
+        notify(`[自动压缩] 无法查询成员 "${memberName}" 的上下文用量（${reason}），已跳过压缩检查并直接派发任务。`);
+      } else {
+        notify(`[自动压缩] 成员 "${memberName}" 自动压缩未完成（${reason}），已直接派发任务。`);
+      }
+    } finally {
+      // Exit compacting and dispatch — fail-open regardless of outcome above.
+      memberOpsStates.set(memberName, transitionState(memberOpsStates.get(memberName) ?? "idle", { type: "compaction_completed" }));
+      sendPrompt(memberName, msg);
+      flushPending(memberName);
+    }
+  }
+
+  /** Resolve any pending team_send_and_wait for a member that can't be reached. */
+  function resolvePendingWaitIfAny(memberName: string, reason: string): void {
+    const pendingCorrId = deps.lastPendingCorrId.get(memberName);
+    if (pendingCorrId) {
+      deps.responseWaiter.resolveIfWaiting(pendingCorrId, memberName, reason);
+      deps.lastPendingCorrId.delete(memberName);
+    }
+  }
+
   return (memberName: string, msg: TeamMessage) => {
     const handle = memberHandles.get(memberName);
     if (!handle) {
+      resolvePendingWaitIfAny(memberName, `消息目标 "${memberName}" 不存在或未启动。请先使用 start_member 启动该成员。`);
       pi.sendMessage({
         customType: "team-route",
         content: `无法路由消息到未知成员 "${memberName}"（该成员可能未启动）`,
@@ -417,20 +568,26 @@ export function createSendToMember(
       return;
     }
 
-    // Mark member as working when we send a prompt
-    memberOpsStates.set(memberName, transitionState(memberOpsStates.get(memberName) ?? "idle", { type: "task_started" }));
+    const state = memberOpsStates.get(memberName) ?? "idle";
 
-    try {
-      handle.sendCommand({
-        type: "prompt",
-        message: `[消息通道 - 来自 ${msg.from}]\n${msg.subject ? `主题：${msg.subject}\n` : ""}${msg.content}`,
-      });
-    } catch (err) {
-      pi.sendMessage({
-        customType: "team-route",
-        content: `发送消息给成员 "${memberName}" 失败：${err instanceof Error ? err.message : String(err)}`,
-        display: true,
-      });
+    // A compaction is already in progress for this member — queue the message
+    // and let the in-flight flow flush it after compaction completes.
+    if (state === "compacting") {
+      const pending = pendingDuringCompaction.get(memberName) ?? [];
+      pending.push(msg);
+      pendingDuringCompaction.set(memberName, pending);
+      return;
     }
+
+    const cfg = deps.getAutoCompact?.();
+    if (cfg?.enabled && state === "idle") {
+      // Mark compacting synchronously (before any await) to close the race
+      // where a second dispatch to the same idle member would double-compact.
+      memberOpsStates.set(memberName, transitionState(state, { type: "compaction_started" }));
+      void runAutoCompactAndDispatch(memberName, msg, handle, cfg);
+      return;
+    }
+
+    sendPrompt(memberName, msg);
   };
 }

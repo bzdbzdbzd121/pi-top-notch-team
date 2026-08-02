@@ -63,7 +63,7 @@ src/
 │   │   ├── show-handler.ts
 │   │   ├── delete-handler.ts
 │   │   ├── status-handler.ts
-│   │   ├── setting-handler.ts   ← /team setting 交互式设置菜单（成员默认模型）
+│   │   ├── setting-handler.ts   ← /team setting 交互式设置菜单（成员默认模型 + 自动压缩）
 │   │   ├── done-handler.ts
 │   │   └── help-handler.ts
 │   ├── shared/        ← Shared schemas, tool helpers, and extracted pure functions
@@ -85,6 +85,7 @@ src/
 ├── tools/
 │   ├── tl-tools.ts   ← 7 TL process management tools (Deps-based DI)
 │   ├── goal-tools.ts  ← Goal system: set_goal/finish_goal tools + agent_end reminder
+│   ├── shared-context-tool.ts ← write_shared_context 工具：唯一合法的共享上下文写入入口，成功后标记会话状态（start_member 门控依赖）
 │   └── tl-tools-add-dynamic.test.ts  ← add_dynamic_member tool tests
 ├── team/
 │   ├── definition.ts ← TeamDefinition / TeamMember types
@@ -92,11 +93,17 @@ src/
 │   └── store.ts      ← Read/write/delete team YAML files
 ├── session/
 │   ├── state.ts      ← TeamSessionState (structuredClone deep copy), addMemberToSession()
+│   ├── shared-context.ts ← Shared context path 单一来源 + ensureSharedContextFile() 自愈创建（缺 stub 则自动生成）
 │   ├── state.test.ts ← addMemberToSession tests
+│   ├── tl-read-guard.ts  ← TL 亲自分析的运行时软纠偏（turn 内未派发且非管理工具调用超阀值 → 持续拦截直到派发）
+│   ├── tl-read-guard.test.ts ← read guard 单元测试
 │   ├── context.ts    ← TeamContext shared mutable state interface (incl. isDynamicSession)
 │   └── state-machine.ts  ← Pure function state machine: MemberOperationalState transitions
 ├── prompts/
 │   ├── dynamic-mode.ts  ← TL system prompt template for /team dynamic mode (design/execution phases)
+│   ├── tl-first-action.ts ← 共享「第一动作协议」提示词片段，注入两种模式 TL 提示词顶部
+│   ├── workflow-prompt.ts ← 预定义团队的工作流提示词构建（纯函数）：激活横幅 + 操作型执行协议，替代旧内联描述性注入
+│   ├── workflow-prompt.test.ts ← 工作流提示词测试
 │   ├── orchestration-playbook.md  ← TL 编排方法论：需求对齐(grilling)/任务拆分/质量加固模式库/确认门，注入设计阶段提示词
 │   └── dynamic-mode.test.ts  ← 动态模式提示词测试
 ├── setup/            ← Modular extracted setup modules
@@ -104,7 +111,8 @@ src/
 │   └── message-channel.ts   ← createMessageChannel factory (queue+router+waiter wiring)
 ├── settings/         ← Global settings (/team setting)
 │   ├── settings.ts        ← TeamSettings type + <rootDir>/settings.yaml read/write
-│   └── resolve-model.ts   ← Pure function: member model precedence resolution
+│   ├── resolve-model.ts   ← Pure function: member model precedence resolution
+│   └── resolve-auto-compact.ts ← Pure functions: auto-compaction resolution + threshold check + menu label
 ├── ui/               ← TUI components for team mode
 │   ├── team-status-widget.ts  ← Bordered widget: live member status + context %
 │   ├── edit-mode-widget.ts   ← Bordered widget: ✏️ EDIT MODE — <team name>
@@ -129,7 +137,7 @@ src/
 
 5. **Dependency Injection for testability** — five DI interfaces (`TlToolsDeps`, `MemberLifecycleDeps`, `MessageChannelDeps`, `EventHandlerDeps`, `SendToMemberDeps`) explicitly document each module's dependencies, enabling isolated testing with mocked dependencies. See the Dependency Injection Pattern section below.
 
-6. **Pure function state machine** — `src/session/state-machine.ts` implements `transitionState(current, event)` as a pure function with no side effects. Member operational states (`idle`/`working`/`crashed`/`stopped`) are derived deterministically from events (`task_started`/`task_completed`/`process_exit`/`started`/`stopped`).
+6. **Pure function state machine** — `src/session/state-machine.ts` implements `transitionState(current, event)` as a pure function with no side effects. Member operational states (`idle`/`working`/`compacting`/`crashed`/`stopped`) are derived deterministically from events (`task_started`/`task_completed`/`compaction_started`/`compaction_completed`/`process_exit`/`started`/`stopped`).
 
 7. **Modular extraction** — `index.ts` was reduced from ~800 to ~341 lines by extracting:
    - `setup/member-lifecycle.ts` — member creation, config building, log querying
@@ -142,13 +150,14 @@ src/
 
 9. **Session isolation via sessionId** — Each team session generates a unique `sessionId` in `TeamSessionState`. `buildMemberConfig` uses this ID to nest session data under `sessions/<team-name>/<sessionId>/` instead of the flat `sessions/<team-name>/`. This prevents conflicts when the same pre-defined team is used across multiple sessions. On `/team stop`, the session subdirectory is cleaned up. Dynamic mode sessions (`_dynamic_<ts>`) use their unique team name for the same purpose — the entire team directory is removed on stop.
 
-10. **Goal system for TL autonomy** — `src/tools/goal-tools.ts` registers `set_goal` and `finish_goal` tools plus an `agent_end` event handler. When the TL sets a goal at session start and later finishes a turn (agent_end), the system checks if the goal is still active and incomplete. If so, it queues a user message (via `setTimeout(0)` to avoid the agent_end lifecycle conflict with `sendUserMessage`) re-triggering the TL with a reminder of the goal and its completion criteria. This prevents the TL from unnecessarily asking the user "should I continue?" mid-task. The goal is stored in module-level memory, has a 10-second cooldown between reminders to prevent loops, checks `ctx.signal?.aborted` to skip reminders when the user pressed Esc or redirected the agent, and is reset on session shutdown.
+10. **Goal system for TL autonomy** — `src/tools/goal-tools.ts` registers `set_goal` and `finish_goal` tools plus an `agent_end` event handler. When the TL sets a goal at session start and later finishes a turn (agent_end), the system checks if the goal is still active and incomplete. If so, it queues a user message (via `setTimeout(0)` to avoid the agent_end lifecycle conflict with `sendUserMessage`, plus `deliverAs: "followUp"` so the reminder queues instead of throwing `Agent is already processing` if the TL agent is still inside the post-agent_end settlement window or already streaming again when the timer fires) re-triggering the TL with a reminder of the goal and its completion criteria. This prevents the TL from unnecessarily asking the user "should I continue?" mid-task. The goal is stored in module-level memory, has a 10-second cooldown between reminders to prevent loops, checks `ctx.signal?.aborted` to skip reminders when the user pressed Esc or redirected the agent, and is reset on session shutdown.
 
-11. **Defensive parsing for `tasks` parameter** — `src/tools/tl-tools.ts` includes a `parseTasks()` function that handles three formats for the `tasks` parameter:
-    - Raw array (correct): `tasks: [{to: "a", content: "..."}]`
+11. **Defensive parsing for `tasks` parameter** — `src/tools/tl-tools.ts` includes a `parseTasks()` function that handles four formats for the `tasks` parameter:
+    - Raw array (correct): `tasks: [{to: "a", content: "..."}]` (invalid entries missing string `to`/`content` are dropped with a warning)
     - String-encoded array (LLM double-encoding): auto-`JSON.parse` recovery
     - Single object (another LLM hallucination): auto-wraps as single-element array
-    This prevents `"tasks: must be array"` validation failures caused by LLMs incorrectly double-encoding JSON-in-JSON.
+    - **Broken string salvage**: when strict `JSON.parse` fails (truncated LLM output, raw newlines/control chars inside `content`), a brace-matching scanner extracts complete `{...}` objects, parses each (with a regex field-extraction fallback that tolerates raw control chars), dispatches the recovered tasks, and drops the incomplete tail. The result is prefixed with a recovery note ("已尽力恢复 N 个任务，丢弃 M 个不完整条目") so the TL knows to verify. The hard-failure error message includes the `JSON.parse` failure reason to aid debugging.
+    This prevents `"tasks: must be array"` validation failures caused by LLMs incorrectly double-encoding JSON-in-JSON, and salvages as much work as possible when the double-encoded string is itself malformed.
 
 12. **Two-phase dynamic mode** — `/team dynamic` is split into a **design phase** and an **execution phase**:
    - **Design phase** (entered on `/team dynamic`): TL is blocked from using `bash`/`code_search`/`fetch_content`/`edit` entirely. `read` is allowed (for checking docs), `write` is restricted to `.md` files only. This forces TL to focus on discussing requirements and designing the team rather than exploring or modifying code. The only tools available are `add_dynamic_member`, team management tools, `read`, and `.md` writes.
@@ -163,9 +172,31 @@ src/
    - **E. 方案确认门 (hard gate)**: TL must present a full plan document (goal, task DAG, workflow with reinforcement rationale, team roster, risks) and is forbidden from calling `add_dynamic_member`/`start_member` until the user explicitly confirms. Enforced by prompt (not the tool_call guard).
    - **F. 落地执行**: register members, write structured shared-context (including workflow definition with stages/dependencies/failure fallback), then `start_member`.
 
-13. **Member Inspector (成员检视浮窗)** — During an active Team Session, the user can press `alt+t` to open a full-keyboard overlay (`ctx.ui.custom` with `overlay: true`, 90%×85%) showing a horizontal tab per Member, the selected Member's live conversation, and a footer with operational states + context % + key hints. Refresh is event-driven: `EventHandlerDeps.onMemberActivity` marks a tab dirty and a throttled (500ms) RPC `get_messages` refetch rebuilds display lines. Rendering: user/assistant text in full, tool calls/results as one-line summaries with an `e` expansion toggle, thinking hidden, virtual scroll. The user can message a Member directly (input box: Enter = `prompt`/`follow_up`, `Ctrl+Enter` = `steer`; `/...` sent raw for member-side command resolution) and run control commands (`ctrl+a` abort, `ctrl+o` compact — NOT ctrl+m, which is indistinguishable from Enter in terminals). Direct messages are prefixed `[用户直接指令（非 TL）]:` and mirrored into the TL session so the TL stays aware. `/team stop` auto-closes the overlay. See DESIGN.md §17.
+14. **Member Inspector (成员检视浮窗)** — During an active Team Session, the user can press `alt+t` to open a full-keyboard overlay (`ctx.ui.custom` with `overlay: true`, 90%×85%) showing a horizontal tab per Member, the selected Member's live conversation, and a footer with operational states + context % + key hints. Refresh is event-driven: `EventHandlerDeps.onMemberActivity` marks a tab dirty and a throttled (500ms) RPC `get_messages` refetch rebuilds display lines. Rendering: user/assistant text in full, tool calls/results as one-line summaries with an `e` expansion toggle, thinking blocks hidden by default with a `t` visibility toggle, virtual scroll. The user can message a Member directly (input box: Enter = `prompt`/`follow_up`, `Ctrl+Enter` = `steer`; `/...` sent raw for member-side command resolution) and run control commands (`ctrl+a` abort active member, `ctrl+b`/`ctrl+shift+a` abort ALL executing members in one shot — `ctrl+shift+a` needs Kitty keyboard protocol, `ctrl+b` works on all terminals; `ctrl+o` compact — NOT ctrl+m, which is indistinguishable from Enter in terminals). Direct messages are prefixed `[用户直接指令（非 TL）]:` and mirrored into the TL session so the TL stays aware. **TL notifications use pi's `deliverAs: "nextTurn"` mechanism, batched by TL processing state — no time window**: each intervention is queued independently (no turn per notification); while the TL is busy (tracked via `agent_start`/`agent_settled`) reminders accumulate, and when the current turn settles one `triggerTurn: true` message starts a single turn that delivers ALL unprocessed reminders together (immediately, if the TL was idle). `/team stop` auto-closes the overlay. See DESIGN.md §17.
 
-14. **Global settings + model resolution** — `/team setting` opens an interactive `ctx.ui.select` menu for global team settings, persisted to `<rootDir>/settings.yaml`. The first setting, **member default model**, supports `follow` (member spawned later uses the TL's current model, tracked via `session_start`/`model_select`) or `fixed` (one of `ctx.modelRegistry.getAvailable()` logged-in models). Resolution precedence in `src/settings/resolve-model.ts`: member YAML `model` > team YAML `defaults.model` > global fixed > global follow > no override. The resolved model is passed as `--model provider/id` at member spawn — this also wires up the previously inert team-YAML model fields. Only subsequently started members are affected. The model picker uses `src/ui/scroll-select.ts` (a custom `ctx.ui.custom` component with a `maxVisible` scroll window, scroll indicator, and fuzzy-search input) because pi's built-in `ctx.ui.select` renders all options without scrolling — unusable for 100+ models.
+15. **Global settings + model resolution** — `/team setting` opens an interactive `ctx.ui.select` menu for global team settings, persisted to `<rootDir>/settings.yaml`. The first setting, **member default model**, supports `follow` (member spawned later uses the TL's current model, tracked via `session_start`/`model_select`) or `fixed` (one of `ctx.modelRegistry.getAvailable()` logged-in models). Resolution precedence in `src/settings/resolve-model.ts`: member YAML `model` > team YAML `defaults.model` > global fixed > global follow > no override. The resolved model is passed as `--model provider/id` at member spawn — this also wires up the previously inert team-YAML model fields. Only subsequently started members are affected. The model picker uses `src/ui/scroll-select.ts` (a custom `ctx.ui.custom` component with a `maxVisible` scroll window, scroll indicator, and fuzzy-search input) because pi's built-in `ctx.ui.select` renders all options without scrolling — unusable for 100+ models.
+
+16. **Auto-Compaction (自动压缩)** — When a member is `idle` and about to receive a new prompt via the message channel (`createSendToMember`), the TL first queries `get_session_stats` (3s timeout). If usage exceeds the configured threshold (percent and/or absolute tokens, OR semantics, resolved in `src/settings/resolve-auto-compact.ts`), the member enters the new **`compacting`** operational state and a `compact` RPC is awaited (configurable timeout, default 10 min) before the prompt is delivered. Design properties:
+   - **Fail-open everywhere**: stats query failure, compaction failure, or timeout all end with the prompt dispatched anyway. The TL is only notified when a configured compaction did *not* happen — success is silent.
+   - **At most one compaction per dispatch**, no re-check loop afterwards.
+   - **`compacting` state shield**: the compaction turn's own RPC `agent_start`/`agent_end` events do not transition the state machine (`task_started`/`task_completed` on `compacting` are no-ops), so all-idle wait logic (`wait_and_get_member_status`, `team_send_and_wait`) naturally treats compacting as busy with zero changes to the wait code.
+   - **Race-free dispatch**: the `compaction_started` transition happens synchronously before any await; messages arriving mid-compaction are queued and flushed after it ends.
+   - Configured globally via `/team setting` (no team-YAML override): `autoCompact: { enabled, thresholdPercent?, thresholdTokens?, timeoutMinutes }`. Enabled-but-no-thresholds falls back to 80% and the menu surfaces this fallback explicitly.
+   - Member Inspector direct messages bypass auto-compaction (user can compact manually via `ctrl+o`).
+
+17. **First-action protocol + TL read guard（双防亲自分析）** — TL 收到任务型诉求后亲自埋头分析（而不派发）是最常见的角色偏离。纯提示词约束不可靠（基座 coding-assistant 提示词驱动模型自己动手，且提示词中"能用代码验证的不要去问用户"曾与之矛盾、给了模型合规借口）。修复分两层：
+   - **提示词层**：`src/prompts/tl-first-action.ts` 的「第一动作协议」（共享片段，防漂移）注入两种模式 TL 提示词的**顶部**——收到任务型诉求时第一个工具调用必须是 `start_member`/`team_send_and_wait`，派发前禁止 read/bash 代码文件；同时将旧规则限定为"需求对齐阶段允许读取 1-2 个文件查证"以消除矛盾。
+   - **运行时层**：`src/session/tl-read-guard.ts`——`agent_start` 重置 turn 计数；turn 内未发生 `team_send_and_wait` 派发时，**所有非管理工具**（read/bash/web_search/ctx_execute 等，不只 `read`——否则可用 bash grep/rg 绕过）超过阈值（默认 3）即进入**持续拦截模式**：派发前每次非管理工具调用都被 block，reason 含纠偏指引，首次拦截带 `firstBlock` 标记触发用户可见的通知与状态栏警示；`team_send_and_wait` 派发后立即解锁。管理工具（含 write/edit 与派发通道）永不拦截，解锁通道永远畅通。fail-open、设计阶段不启用。
+
+18. **Shared context 自愈创建**——`.shared-context.md` 过去完全依赖 TL（LLM）在 `start_member` 前用 `write` 写入，LLM 不可靠遵守顺序，导致 `buildMemberConfig` 只能打警告且 member 带着悬空路径启动。现在 `src/session/shared-context.ts` 的 `ensureSharedContextFile()` 保证文件恒存在：会话启动时（`/team start` / `/team dynamic`）创建最小 stub（团队名册 + 占位章节），`buildMemberConfig` 内也防御性调用；已存在则绝不覆盖，fs 失败 fail-open。TL 仍负责后续用真实内容覆盖。
+
+19. **操作型工作流注入（workflow-prompt.ts）**——预定义团队 YAML 的 `workflow` 过去以内联描述性文本注入（"尽可能遵循步骤顺序"、执行者标在行尾括号里），无激活规则、无执行协议，TL 收到"根据团队流程进行 xxx 分析"仍自由发挥、自己分析。修复：抽为纯函数 `buildWorkflowPrompt()`，注入内容改为操作型——激活条件（用户提「团队流程/按流程」或任务与流程描述匹配）、逐 stage 用 `team_send_and_wait` 派给「执行者」（stage 执行者为 `tl` 的除外）、串行等待产出传递、独立 stage 批量并行、onFailure/loops 处理、逐 stage 进度汇报；每个 stage 以 `→ 执行者：\`member\`` 醒目标注；团队有 workflow 时另在第一动作协议下方注入 `WORKFLOW_ACTIVATION_BANNER` 横幅指针防稀释。Reference 模式措辞从"尽可能遵循"改为"默认按序执行、偏离须向用户说明理由"。
+
+20. **Shared-context gate（write_shared_context 工具 + start_member 硬门控）** — 过去共享上下文完全依赖 TL 用 `write` 工具按顺序写入，LLM 不遵守顺序导致 member 经常在 TL 写入前启动（只有 stub）。修复：
+   - 新增专用工具 `write_shared_context(content)`（`src/tools/shared-context-tool.ts`），只写会话的 `.shared-context.md`，成功后调用 `markSharedContextWritten()` 置位会话状态 `sharedContextWritten`（`src/session/state.ts`）；fs 失败则 fail-open 且**不置位**。
+   - `start_member` 工具执行前检查 `getSessionState().sharedContextWritten`，未置位则拒绝启动并提示先调用 `write_shared_context`（硬门控，无逃生口——工具本身很轻量，TL 只需先写一次）。
+   - tool_call 守卫拦截 `write`/`edit` 直接写 `.shared-context.md` 的调用，重定向到 `write_shared_context`，保证标记与文件内容一致。
+   - 工具随 `tlToolNames` 在会话期间激活/停用，进入设计与执行阶段白名单；`.shared-context.md` 的 stub 自愈（`ensureSharedContextFile`）保留为兜底（member 启动后仍能读到文件），但不再替代 TL 的显式写入。
 
 ## Dependency Injection Pattern
 
@@ -175,9 +206,9 @@ The codebase uses an explicit Dependency Injection (DI) pattern to decouple modu
 |-------------|--------|-------------|
 | `TlToolsDeps` | `tools/tl-tools.ts` | `pi`, `manager`, `responseWaiter`, `memberOpsStates`, `lastPendingCorrId`, `messageQueue`, `createMember?`, `buildMemberConfig?`, `getMemberLog?`, `isDynamicSession?`, `addMemberToSession?`, `onDynamicMemberAdded?`, `onDynamicPhaseTransition?` |
 | `MemberLifecycleDeps` | `setup/member-lifecycle.ts` | `pi`, `memberOpsStates`, `messageQueue`, `responseWaiter`, `lastPendingCorrId`, `recentlyProcessedMessages`, `processManager?` |
-| `MessageChannelDeps` | `setup/message-channel.ts` | `pi`, `memberOpsStates`, `lastPendingCorrId`, `memberHandles`, `onRouteNotification?` |
+| `MessageChannelDeps` | `setup/message-channel.ts` | `pi`, `memberOpsStates`, `lastPendingCorrId`, `memberHandles`, `onRouteNotification?`, `getAutoCompact?` |
 | `EventHandlerDeps` | `channel/event-handler.ts` | `pi`, `memberOpsStates`, `messageQueue`, `responseWaiter`, `lastPendingCorrId`, `recentlyProcessedMessages`, `processManager?`, `onMemberActivity?` |
-| `SendToMemberDeps` | `channel/event-handler.ts` | `pi`, `memberOpsStates`, `memberHandles` |
+| `SendToMemberDeps` | `channel/event-handler.ts` | `pi`, `memberOpsStates`, `memberHandles`, `getAutoCompact?` |
 
 Benefits:
 - **Testability**: each module can be tested with mocked dependencies
@@ -195,7 +226,7 @@ Member A calls team_send_message({to: "mover", content: "..."})
     → messageQueue.enqueue(TeamMessage)
   → messageQueue (serial FIFO, event-driven drain)
     → router.route(msg)
-      ├── to="mover"  → handle.sendCommand({type:"prompt",...}) on Member B's stdin
+      ├── to="mover"  → handle.sendCommand({type:"prompt", streamingBehavior:"followUp", ...}) on Member B's stdin
       ├── to="tl"     → responseWaiter.resolveIfWaiting(corrId, ...) OR buffer
                           → pi.sendMessage({customType:"team-message", ...})
       ├── to="all"    → broadcast to all (skip self)
@@ -215,6 +246,16 @@ Process exit + auto-restart flow:
 Backup path: assistant text outputs matching
   `<team-message to="..." subject="...">...</team-message>`
 are also parsed via parseTeamMessageTag() (non-greedy regex, length guard) and enqueued.
+
+Prompt delivery semantics:
+  Channel prompts carry streamingBehavior:"followUp" — pi itself queues the
+  prompt when the member is still streaming (incl. the post-agent_end settlement
+  window: listener drain / auto-retry / auto-compaction continuation, during
+  which memberOpsStates already shows "idle"), so dispatches are never lost to
+  "Agent is already processing" rejections. No effect when the member is idle.
+  Fire-and-forget rejections (response events with no RPC id, e.g. member
+  model/auth failure) are surfaced by createMemberEventHandler: any pending
+  team_send_and_wait is resolved with [消息未送达] + TL notified via team-route.
 
 team_send_and_wait flow:
   TL calls team_send_and_wait({tasks: [{to, content}], nextSteps}) →
@@ -269,7 +310,7 @@ npm test          # Run all tests (vitest)
 npm run test:watch  # Watch mode
 ```
 
-403 tests across 31 files (state-machine, member-process, event-handler, response-waiter, message-channel, member, save-team-definition, config, ui-widget, member-inspector tests included). Tests live alongside source as `*.test.ts`.
+522 tests across 38 files (state-machine, member-process, event-handler, response-waiter, message-channel, member, save-team-definition, config, ui-widget, member-inspector tests included). Tests live alongside source as `*.test.ts`.
 
 | Test Level | What | How |
 |-----------|------|-----|
@@ -305,13 +346,14 @@ npm run test:watch  # Watch mode
 | `/team cancel`           | Alias for `/team done` (backward compatibility) |
 | `/team delete <name>` | Delete a team definition (with confirmation) |
 | `/team status` | Show active session + member process statuses |
-| `/team setting` | Interactive settings menu — member default model (follow TL current model / fixed available model). Also allowed during a session |
+| `/team setting` | Interactive settings menu — member default model (follow TL current model / fixed available model) + auto-compaction (toggle / percent & token thresholds / timeout). Also allowed during a session |
 | `/team help` | Display usage help for all subcommands |
 
 ## TL Tools (active only during team session)
 
 | Tool | Description |
 |------|-------------|
+| `write_shared_context(content)` | Write the team shared context to the session's `.shared-context.md` (overwrite). **Must be called before the first `start_member` — start_member is blocked until then.** Sets the session `sharedContextWritten` flag; direct `write`/`edit` of `.shared-context.md` is intercepted and redirected here. Call again to update, then notify members to re-read. |
 | `add_dynamic_member(name, label, systemPrompt, model?)` | Register a member in `/team dynamic` mode. Name is the identifier, label is Chinese display name, systemPrompt is role definition. Only available in dynamic mode. |
 | `set_goal(text, criteria)` | Set a session goal with verifiable completion criteria. The system will automatically re-trigger the TL with a reminder if it stops working before the goal is met. Call at the start of a task to prevent unnecessary mid-task interruptions. |
 | `finish_goal()` | Mark the current goal as completed and stop the reminder system. Call when all goal criteria are met, or when an unresolvable blocker is encountered. |
@@ -324,10 +366,11 @@ npm run test:watch  # Watch mode
 >
 > **⚠️ `tasks` 必须是原始 JSON 数组，不要传 JSON 字符串。** LLM 有时会错误地将数组二次序列化（`"tasks": "[{...}]"`），这会导致框架校验失败。
 > 工具参数 schema 已使用 `oneOf` 同时接受 `array` 和 `string` 类型，框架校验不会拦截。
-> 工具内部已添加 `parseTasks()` 防御性解析，能自动处理字符串编码的数组和单对象包裹情况。
+> 工具内部已添加 `parseTasks()` 防御性解析，能自动处理字符串编码的数组和单对象包裹情况；严格 `JSON.parse` 失败时（输出截断、content 含裸换行）还会逐对象 salvage，恢复完整任务、丢弃截断尾部，并在结果前附恢复提示。
 > - 原始数组 ✓：`"tasks": [{ "to": "planner", "content": "..." }]`
 > - 字符串编码 ✗：`"tasks": "[{"to": "planner", ...}]"`（框架放行 + 自动 JSON.parse 恢复）
 > - 单对象包裹 ✓（自动修正）：`"tasks": { "to": "planner", "content": "..." }`
+> - 截断/含裸换行的字符串 ✓（salvage）：完整任务正常派发，丢弃的尾部会在结果中提醒
 >
 > **Batch vs Sequential 决策规则：**
 > - **Batch**（多个 tasks[] 条目）→ 任务相互独立时使用。各 Member 同时工作，耗时 ≈ 最慢的单任务。
@@ -353,7 +396,7 @@ During an active team session (including `/team dynamic`), a `tool_call` event h
 ```
 add_dynamic_member, start_member, stop_member, list_members,
 get_member_log, wait_and_get_member_status, team_send_and_wait,
-set_goal, finish_goal,
+set_goal, finish_goal, write_shared_context,
 read (unrestricted),
 write (only .md files — checked per-call)
 ```
@@ -362,7 +405,7 @@ write (only .md files — checked per-call)
 ```
 start_member, stop_member, list_members, get_member_log,
 wait_and_get_member_status, team_send_and_wait,
-set_goal, finish_goal, add_dynamic_member,
+set_goal, finish_goal, add_dynamic_member, write_shared_context,
 read, bash, web_search, fetch_content, get_search_content,
 write, edit (both only .md files — checked per-call),
 ctx_search, ctx_stats, ctx_doctor, ctx_insight,
@@ -377,6 +420,8 @@ true_sight_diff_impact, true_sight_verify_evidence
 Key points:
 - **No more blocklist gaps** — tools like `ctx_execute`, `ctx_execute_file`, `ctx_batch_execute`, `mcp`, `ctx_upgrade` are NOT on either whitelist, so they're automatically blocked. No need to manually track every tool that could write files.
 - **`write`/`edit` are on both whitelists** — but an additional per-call check restricts them to `.md` files only.
+- **`.shared-context.md` 专属拦截** — `write`/`edit` 的目标若是 `.shared-context.md`，无论哪个阶段都会被 block 并重定向到 `write_shared_context` 工具（保证 start_member 门控标记准确）。
+- **TL 预派发守卫（执行阶段）** — `read`/`bash`/`web_search` 等虽在白名单中，但 `src/session/tl-read-guard.ts` 会对"turn 内未派发任务且非管理工具调用超过 3 次"的情况**持续拦截**（sticky block）：派发前每次非管理工具调用都被 block（首次含用户可见通知），直到 `team_send_and_wait` 发生。防止 TL 亲自分析代码而不派发，且无法用 grep/rg 绕过。详见 DESIGN.md。
 - The design phase whitelist lifts to the execution phase whitelist on the first `start_member` call.
 
 The design phase guard is active from the moment `/team dynamic` is entered. It lifts when the first `start_member` call succeeds, transitioning to the execution phase.
@@ -406,7 +451,9 @@ TL: add_dynamic_member({name, label, systemPrompt, model?})
   → addMemberToSession() 刷新 currentSession
   → router / widget 更新
 
-TL: write .shared-context.md（团队成员、术语、工作流、协作规则）
+TL: write_shared_context(content)（团队成员、术语、工作流、协作规则）
+  → 写入 .shared-context.md + 置位 sharedContextWritten
+  → 此前调用 start_member 会被工具层拦截
 
 ═══ 阶段门：start_member 首次调用自动进入执行阶段 ═══
 
@@ -422,7 +469,7 @@ TL: start_member("coder")
 TL: team_send_and_wait(...)
   → 消息通道正常流转
 
-TL: 监控进展、协调异常、更新 shared-context
+TL: 监控进展、协调异常、write_shared_context 更新共享上下文（更新后通知成员重新阅读）
 
 /team stop
   → stopAll() → rm -rf sessions/_dynamic_<ts>/ → endSession() → dynamicPhase = "design"

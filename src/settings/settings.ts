@@ -15,13 +15,27 @@ export interface MemberModelSetting {
   model?: string;
 }
 
+/** Auto-compaction setting: compact an idle member's context before dispatching a new task. */
+export interface AutoCompactSetting {
+  /** Master toggle. Default: true. */
+  enabled: boolean;
+  /** Percent of context window (1–100). Undefined = percent unrestricted. */
+  thresholdPercent?: number;
+  /** Absolute token threshold (positive integer). Undefined = tokens unrestricted. */
+  thresholdTokens?: number;
+  /** How long to wait for the compaction RPC before failing open (minutes, >=1). Default: 10. */
+  timeoutMinutes: number;
+}
+
 /** Global top-notch-team settings (apply to all team sessions). */
 export interface TeamSettings {
   memberModel: MemberModelSetting;
+  autoCompact: AutoCompactSetting;
 }
 
 export const DEFAULT_SETTINGS: TeamSettings = {
   memberModel: { mode: "follow" },
+  autoCompact: { enabled: true, thresholdPercent: 80, timeoutMinutes: 10 },
 };
 
 const SETTINGS_FILE = "settings.yaml";
@@ -62,6 +76,46 @@ export function loadSettings(rootDir: string): TeamSettings {
     // A "fixed" mode without a model is meaningless — fall back to follow.
     if (settings.memberModel.mode === "fixed" && !settings.memberModel.model) {
       settings.memberModel.mode = "follow";
+    }
+
+    const ac = (data as Record<string, unknown>).autoCompact;
+    if (typeof ac === "object" && ac !== null) {
+      const acObj = ac as Record<string, unknown>;
+      if (typeof acObj.enabled === "boolean") {
+        settings.autoCompact.enabled = acObj.enabled;
+      }
+      // Thresholds: absent/undefined = unrestricted. Invalid values are dropped
+      // (fall back to unrestricted for that dimension).
+      if (acObj.thresholdPercent === null || acObj.thresholdPercent === undefined) {
+        settings.autoCompact.thresholdPercent = undefined;
+      } else if (
+        typeof acObj.thresholdPercent === "number" &&
+        Number.isInteger(acObj.thresholdPercent) &&
+        acObj.thresholdPercent >= 1 &&
+        acObj.thresholdPercent <= 100
+      ) {
+        settings.autoCompact.thresholdPercent = acObj.thresholdPercent;
+      } else {
+        settings.autoCompact.thresholdPercent = undefined;
+      }
+      if (acObj.thresholdTokens === null || acObj.thresholdTokens === undefined) {
+        settings.autoCompact.thresholdTokens = undefined;
+      } else if (
+        typeof acObj.thresholdTokens === "number" &&
+        Number.isInteger(acObj.thresholdTokens) &&
+        acObj.thresholdTokens > 0
+      ) {
+        settings.autoCompact.thresholdTokens = acObj.thresholdTokens;
+      } else {
+        settings.autoCompact.thresholdTokens = undefined;
+      }
+      if (
+        typeof acObj.timeoutMinutes === "number" &&
+        Number.isInteger(acObj.timeoutMinutes) &&
+        acObj.timeoutMinutes >= 1
+      ) {
+        settings.autoCompact.timeoutMinutes = acObj.timeoutMinutes;
+      }
     }
     return settings;
   } catch (err) {

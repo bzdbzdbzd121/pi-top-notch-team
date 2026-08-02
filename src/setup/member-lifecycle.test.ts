@@ -68,6 +68,7 @@ describe("buildMemberConfig", () => {
       teamDefinition: createMockTeamDefinition(),
       startedAt: Date.now(),
       sessionId: "abc123",
+      sharedContextWritten: true,
     };
   });
 
@@ -146,6 +147,37 @@ describe("buildMemberConfig", () => {
     const { buildMemberConfig } = await loadModule();
     const result = buildMemberConfig("analyzer", session);
     expect(result!.cwd).toBe(process.cwd());
+  });
+
+  it("should auto-create a shared context stub when the file is missing (no warning)", async () => {
+    const { buildMemberConfig } = await loadModule();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const result = buildMemberConfig("analyzer", session);
+      expect(result).not.toBeNull();
+      // File is auto-created instead of merely warning
+      expect(existsSync(result!.sharedContextPath!)).toBe(true);
+      // No "Shared context file not found" warning should be emitted
+      expect(
+        warnSpy.mock.calls.some((args) =>
+          args.some((a) => String(a).includes("Shared context file not found"))
+        )
+      ).toBe(false);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("should not overwrite an existing shared context file", async () => {
+    const { buildMemberConfig } = await loadModule();
+    const dir = join(tmpDir, "sessions", "test-team", "abc123");
+    mkdirSync(dir, { recursive: true });
+    const ctxPath = join(dir, ".shared-context.md");
+    const { writeFileSync, readFileSync } = await import("node:fs");
+    writeFileSync(ctxPath, "# 已有内容", "utf-8");
+
+    buildMemberConfig("analyzer", session);
+    expect(readFileSync(ctxPath, "utf-8")).toBe("# 已有内容");
   });
 });
 
@@ -596,6 +628,7 @@ describe("buildMemberConfig model resolution", () => {
       ]),
       startedAt: Date.now(),
       sessionId: "abc123",
+      sharedContextWritten: true,
     };
   });
 
@@ -613,8 +646,8 @@ describe("buildMemberConfig model resolution", () => {
   }
 
   async function saveFixed(model: string) {
-    const { saveSettings } = await import("../settings/settings");
-    saveSettings({ memberModel: { mode: "fixed", model } }, tmpDir);
+    const { saveSettings, DEFAULT_SETTINGS } = await import("../settings/settings");
+    saveSettings({ ...structuredClone(DEFAULT_SETTINGS), memberModel: { mode: "fixed", model } }, tmpDir);
   }
 
   it("follow mode: uses the TL current model at spawn time", async () => {

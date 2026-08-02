@@ -1,6 +1,7 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { TeamContext, SessionUI } from "../../session/context";
-import { startSession } from "../../session/state";
+import { startSession, getSessionState } from "../../session/state";
+import { ensureSharedContextFile } from "../../session/shared-context";
 import { readTeam } from "../../team/store";
 import { getRootDir } from "../../config";
 
@@ -30,6 +31,11 @@ export async function handleStart(
   teamCtx.onCreateEnd?.();
 
   startSession(team);
+  // Create the shared context stub up front so the file always exists for
+  // members. NOTE: the real content must be written via the
+  // write_shared_context tool — start_member is gated on it — so this stub
+  // is only a defensive fallback (e.g. file deleted mid-session).
+  ensureSharedContextFile(team, getSessionState().sessionId);
   // Install team status widget immediately
   teamCtx.onSessionStart?.(ctx.ui as unknown as SessionUI);
   teamCtx.router!.updateMembers(team.members.map((m) => m.name));

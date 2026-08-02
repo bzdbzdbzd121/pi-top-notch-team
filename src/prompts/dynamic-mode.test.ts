@@ -71,8 +71,19 @@ describe("buildDynamicModePrompt — execution phase", () => {
     expect(prompt).toContain("执行阶段");
   });
 
-  it("包含委派优先原则", () => {
-    expect(prompt).toContain("委派优先");
+  it("包含铁律：不做 Member 能做的事", () => {
+    expect(prompt).toContain("铁律");
+    expect(prompt).toContain("绝不能自己做");
+  });
+
+  it("包含第一动作协议，且位于铁律段落之前", () => {
+    expect(prompt).toContain("第一动作协议");
+    expect(prompt).toContain("start_member` 或 `team_send_and_wait");
+    const idxProtocol = prompt.indexOf("第一动作协议");
+    const idxIronRule = prompt.indexOf("铁律：你绝不能自己做");
+    expect(idxProtocol).toBeGreaterThan(-1);
+    expect(idxIronRule).toBeGreaterThan(-1);
+    expect(idxProtocol).toBeLessThan(idxIronRule);
   });
 
   it("不注入 playbook（playbook 仅设计阶段使用）", () => {

@@ -29,7 +29,7 @@ describe("settings store", () => {
 
   it("round-trips settings through save/load", () => {
     saveSettings(
-      { memberModel: { mode: "fixed", model: "anthropic/claude-sonnet-4-5" } },
+      { ...structuredClone(DEFAULT_SETTINGS), memberModel: { mode: "fixed", model: "anthropic/claude-sonnet-4-5" } },
       tmpDir
     );
     expect(existsSync(getSettingsPath(tmpDir))).toBe(true);
@@ -41,7 +41,7 @@ describe("settings store", () => {
 
   it("creates the root directory when saving", () => {
     const nested = join(tmpDir, "a", "b");
-    saveSettings({ memberModel: { mode: "follow" } }, nested);
+    saveSettings({ ...structuredClone(DEFAULT_SETTINGS), memberModel: { mode: "follow" } }, nested);
     expect(existsSync(getSettingsPath(nested))).toBe(true);
   });
 
@@ -76,8 +76,58 @@ describe("settings store", () => {
     expect(loaded.memberModel.mode).toBe("follow");
   });
 
+  // ── autoCompact parsing ─────────────────────────────────
+
+  it("back-fills autoCompact defaults for old settings files without the key", () => {
+    writeFileSync(getSettingsPath(tmpDir), "memberModel:\n  mode: follow\n", "utf-8");
+    const loaded = loadSettings(tmpDir);
+    expect(loaded.autoCompact).toEqual(DEFAULT_SETTINGS.autoCompact);
+  });
+
+  it("round-trips autoCompact settings", () => {
+    const settings = structuredClone(DEFAULT_SETTINGS);
+    settings.autoCompact = {
+      enabled: false,
+      thresholdPercent: 70,
+      thresholdTokens: 150_000,
+      timeoutMinutes: 15,
+    };
+    saveSettings(settings, tmpDir);
+    const loaded = loadSettings(tmpDir);
+    expect(loaded.autoCompact).toEqual({
+      enabled: false,
+      thresholdPercent: 70,
+      thresholdTokens: 150_000,
+      timeoutMinutes: 15,
+    });
+  });
+
+  it("preserves explicitly cleared thresholds (null → undefined, no default back-fill)", () => {
+    writeFileSync(
+      getSettingsPath(tmpDir),
+      "autoCompact:\n  enabled: true\n  thresholdPercent: null\n  timeoutMinutes: 10\n",
+      "utf-8"
+    );
+    const loaded = loadSettings(tmpDir);
+    expect(loaded.autoCompact.enabled).toBe(true);
+    expect(loaded.autoCompact.thresholdPercent).toBeUndefined();
+    expect(loaded.autoCompact.thresholdTokens).toBeUndefined();
+  });
+
+  it("drops invalid threshold values (out-of-range percent, non-positive tokens)", () => {
+    writeFileSync(
+      getSettingsPath(tmpDir),
+      "autoCompact:\n  enabled: true\n  thresholdPercent: 150\n  thresholdTokens: -5\n  timeoutMinutes: 0\n",
+      "utf-8"
+    );
+    const loaded = loadSettings(tmpDir);
+    expect(loaded.autoCompact.thresholdPercent).toBeUndefined();
+    expect(loaded.autoCompact.thresholdTokens).toBeUndefined();
+    expect(loaded.autoCompact.timeoutMinutes).toBe(DEFAULT_SETTINGS.autoCompact.timeoutMinutes);
+  });
+
   it("save→load does not mutate DEFAULT_SETTINGS", () => {
-    saveSettings({ memberModel: { mode: "fixed", model: "openai/gpt-5" } }, tmpDir);
+    saveSettings({ ...structuredClone(DEFAULT_SETTINGS), memberModel: { mode: "fixed", model: "openai/gpt-5" } }, tmpDir);
     loadSettings(tmpDir);
     expect(DEFAULT_SETTINGS.memberModel.mode).toBe("follow");
     expect(DEFAULT_SETTINGS.memberModel.model).toBeUndefined();
@@ -87,6 +137,7 @@ describe("settings store", () => {
 describe("describeMemberModelSetting", () => {
   it("describes fixed mode", () => {
     const text = describeMemberModelSetting({
+      ...structuredClone(DEFAULT_SETTINGS),
       memberModel: { mode: "fixed", model: "anthropic/claude-sonnet-4-5" },
     });
     expect(text).toContain("anthropic/claude-sonnet-4-5");
@@ -94,7 +145,7 @@ describe("describeMemberModelSetting", () => {
 
   it("describes follow mode with the TL current model", () => {
     const text = describeMemberModelSetting(
-      { memberModel: { mode: "follow" } },
+      { ...structuredClone(DEFAULT_SETTINGS), memberModel: { mode: "follow" } },
       "openai/gpt-5"
     );
     expect(text).toContain("跟随当前配置");
@@ -102,7 +153,7 @@ describe("describeMemberModelSetting", () => {
   });
 
   it("describes follow mode without a TL current model", () => {
-    const text = describeMemberModelSetting({ memberModel: { mode: "follow" } });
+    const text = describeMemberModelSetting({ ...structuredClone(DEFAULT_SETTINGS), memberModel: { mode: "follow" } });
     expect(text).toBe("跟随当前配置");
   });
 });

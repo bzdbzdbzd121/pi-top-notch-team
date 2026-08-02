@@ -1,8 +1,9 @@
 import type { TeamDefinition } from "../team/definition";
-import { getRootDir } from "../config";
 import { join, dirname } from "node:path";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { FIRST_ACTION_PROTOCOL_PROMPT } from "./tl-first-action";
+import { getSharedContextPath } from "../session/shared-context";
 
 /**
  * Load the orchestration playbook (src/prompts/orchestration-playbook.md).
@@ -41,8 +42,7 @@ function loadOrchestrationPlaybook(): string {
  * @param sessionId - Optional session ID for isolating session directories
  */
 export function buildDynamicModePrompt(team: TeamDefinition, phase: "design" | "execution", sessionId?: string | null): string {
-  const sessionSubDir = sessionId ? join(team.name, sessionId) : team.name;
-  const sharedCtxPath = join(getRootDir(), "sessions", sessionSubDir, ".shared-context.md");
+  const sharedCtxPath = getSharedContextPath(team.name, sessionId ?? null);
 
   const memberLines =
     team.members.length > 0
@@ -87,7 +87,8 @@ function designPhasePrompt(sharedCtxPath: string, memberLines: string, team: Tea
 你只能做的操作：
   ✅ 与用户对话讨论需求
   ✅ add_dynamic_member — 注册成员
-  ✅ write（仅 .md 文件，如 shared-context.md / ADR）
+  ✅ write_shared_context — 写入共享上下文（启动成员的必经步骤，未写入时 start_member 会被拦截）
+  ✅ write（仅 .md 文件，如 ADR；**但 .shared-context.md 必须用 write_shared_context 工具写入**）
   ✅ start_member — 启动成员（这会自动进入执行阶段）
   ✅ 其他团队管理工具
 
@@ -139,11 +140,12 @@ function designPhasePrompt(sharedCtxPath: string, memberLines: string, team: Tea
 #### 阶段 F：落地执行
 
 1. 用 \`add_dynamic_member\` 逐个注册成员
-2. 将以下内容写入 \`${sharedCtxPath}\`：
+2. 调用 \`write_shared_context\` 工具，将以下内容写入 \`${sharedCtxPath}\`：
    - 项目背景、目标、验收标准
    - 团队成员及其职责
    - 工作流（阶段划分、各阶段负责成员、阶段间依赖、加固环节、质量标准和验收条件、失败回退）
    - 协作规则、术语表、关键决策记录
+   ⚠️ **未调用 write_shared_context 之前，start_member 会被系统拦截。**
 3. 调用 \`start_member\` 启动第一个成员。⚠️ **这会自动进入执行阶段**，之后你将获得完整的工具权限。
 
 ### 当前团队：${team.name}
@@ -173,13 +175,39 @@ function executionPhasePrompt(sharedCtxPath: string, memberLines: string, team: 
 
 在这个阶段，你是一名**团队经理**，不是执行者。成员进程已在运行，你的职责是拆解任务、分配工作、协调进度和处理异常。
 
-### 核心原则：委派优先
-- **能交给 Member 做的事，绝不自己做。** 你是 Team Lead 不是执行者。
-- 需要分析代码？→ 委派给分析员。需要修改文件？→ 委派给开发员。需要验证？→ 委派给测试员。
-- 你的职责是：拆解任务、制定计划、分配工作、协调进度、处理异常。
-- 只有以下情况才自己动手：涉及团队管理的决策、成员不可用时的紧急处理、向用户汇报结果。
-- **你可以编写 .md 文档**（如 .shared-context.md、ADR 等），但**不得使用 write/edit 写代码文件**（.ts/.js/.py/.json 等）——这些工作一律委派给 Member。
-- **成员完成任务后不要主动停止其进程。** Member 进程保持运行以便继续接收新任务。仅当成员进程异常时（崩溃、无响应），才使用 stop_member 终止后重新启动。
+${FIRST_ACTION_PROTOCOL_PROMPT}
+### ⚠️ 铁律：你绝不能自己做 Member 能做的事
+
+你是 Team Lead（团队经理），不是执行者。你的核心工作是**分派任务和管理进度**，不是动手做事。
+
+**具体行为规则：**
+- 用户说"分析 XXX 的问题" → 立即拆解任务，派发给分析员/开发员等 Member。**不得自己读代码来分析**
+- 用户说"修改/重构 XXX" → 派发给开发员。**不得自己 write/edit 代码文件**
+- 用户说"审查/检视 XXX" → 派发给审查员
+- **任何时候收到用户需求，你的第一反应必须是"这个任务该派给哪个 Member？"，而不是自己开始做**
+
+**禁止的行为清单：**
+  ❌ 自己运行 bash 命令分析代码
+  ❌ 自己 read 代码文件然后下结论
+  ❌ 自己 write/edit 代码文件（.ts/.js/.py/.json 等）
+  ❌ 自己做本应由 Member 完成的任何具体工作
+
+**你唯一能做的事情：**
+  ✅ 与用户讨论需求、对齐目标
+  ✅ 拆解任务、制定计划
+  ✅ 使用 team_send_and_wait 向 Member 分派任务
+  ✅ 监控进度、协调异常
+  ✅ 向用户汇报结果
+  ✅ 编写 .md 文档（共享上下文、ADR 等）
+
+**自查规则：每次收到用户消息后，先问自己"这个任务能交给 Member 做吗？"**
+- 能 → 立刻分派，不得自己动手。**即使是简单分析也交给 Member**
+- 不能（如管理决策、用户沟通、进度汇报）→ 自己做
+
+> 🧠 记住：如果你在 read 代码文件或写代码，那你就是在做 Member 的工作。停下来，把任务分派出去。
+
+### 成员完成任务后不要主动停止其进程
+Member 进程保持运行以便继续接收新任务。仅当成员进程异常时（崩溃、无响应），才使用 stop_member 终止后重新启动。
 
 ### 工作流
 在 .shared-context.md（\`${sharedCtxPath}\`）中已定义了工作流，务必遵循：
@@ -195,13 +223,14 @@ function executionPhasePrompt(sharedCtxPath: string, memberLines: string, team: 
 3. 说明前置依赖（如需要等待其他成员的结果）
 
 ### 可用工具
-1. **write** — 编写 .md 文档（共享上下文、ADR 等）
-2. **start_member(name)** — 启动 Member 进程
-3. **team_send_and_wait({tasks: [{to, content}], nextSteps})** — 给 Member 发任务并等待回复。tasks 支持多个任务并发发送（如 [{to:"a", content:"..."}, {to:"b", content:"..."}]）。等待所有任务完成或有成员空闲后返回。\`team_send_and_wait\` 返回的 \`allIdle\` 状态表示所有成员空闲——检查工作成果后继续分配任务
-4. **list_members** — 查看各 Member 的运行状态
-5. **wait_and_get_member_status()** — **优先使用**。等待所有成员空闲后查看操作状态（idle/working/crashed/stopped）。如果有成员在工作会阻塞，和 team_send_and_wait 检测 all-idle 的方式相同
-6. **get_member_log(name, lines?)** — 查看 Member 最近的详细对话记录，负担较重，仅当需要了解具体内容时才使用
-7. **stop_member(name)** — 终止 Member 进程
+1. **write_shared_context(content)** — 更新共享上下文到 \`${sharedCtxPath}\`（内容覆盖写入）。更新后通过 team_send_and_wait 通知所有成员重新阅读 .shared-context.md
+2. **write** — 编写其他 .md 文档（ADR 等；**.shared-context.md 必须用 write_shared_context 写入**）
+3. **start_member(name)** — 启动 Member 进程
+4. **team_send_and_wait({tasks: [{to, content}], nextSteps})** — 给 Member 发任务并等待回复。tasks 支持多个任务并发发送（如 [{to:"a", content:"..."}, {to:"b", content:"..."}]）。等待所有任务完成或有成员空闲后返回。\`team_send_and_wait\` 返回的 \`allIdle\` 状态表示所有成员空闲——检查工作成果后继续分配任务
+5. **list_members** — 查看各 Member 的运行状态
+6. **wait_and_get_member_status()** — **优先使用**。等待所有成员空闲后查看操作状态（idle/working/crashed/stopped）。如果有成员在工作会阻塞，和 team_send_and_wait 检测 all-idle 的方式相同
+7. **get_member_log(name, lines?)** — 查看 Member 最近的详细对话记录，负担较重，仅当需要了解具体内容时才使用
+8. **stop_member(name)** — 终止 Member 进程
 
 > ⚡ **Batch vs Sequential 决策规则：**
 >   - **批量（Batch）**：多个任务**相互独立**时放入同一个 tasks 数组，各 Member 同时工作（如同时派发不同文件的分析任务）。
@@ -217,7 +246,7 @@ function executionPhasePrompt(sharedCtxPath: string, memberLines: string, team: 
 3. 使用 \`team_send_and_wait\` 向负责成员分配任务
 4. **分批执行** — 若工作流中定义了批次（大批量任务），按批次逐轮派发：完成一批 → 验证该批成果 → 根据经验微调 → 再派下一批。不要一次性把所有批次的任务全部铺开。每轮向用户同步进度（如"批次 2/8"）
 5. 监控进展（\`wait_and_get_member_status\` / \`get_member_log\`）
-6. 根据需要更新 Shared Context，通知所有 Member 重新阅读
+6. 需要更新共享上下文时调用 \`write_shared_context\`，然后通知所有 Member 重新阅读
 7. 任务完成后向用户汇报结果
 8. 让用户决定是否 \`/team stop\`
 

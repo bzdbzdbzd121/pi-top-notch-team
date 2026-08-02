@@ -4,10 +4,13 @@ import { TeamModeEditor } from "./src/ui/team-mode-editor";
 import { getSessionState, endSession } from "./src/session/state";
 import type { TeamContext } from "./src/session/context";
 import { getRootDir } from "./src/config";
+import { loadSettings } from "./src/settings/settings";
+import { resolveAutoCompact } from "./src/settings/resolve-auto-compact";
 import { join } from "node:path";
 import { rmSync } from "node:fs";
 import { registerTlTools } from "./src/tools/tl-tools";
 import { registerGoalTools, registerGoalAgentHandler, resetGoal, GOAL_TOOL_NAMES } from "./src/tools/goal-tools";
+import { registerSharedContextTool, SHARED_CONTEXT_TOOL_NAME } from "./src/tools/shared-context-tool";
 import { ensureToolRegistered } from "./src/commands/shared/ensure-tool";
 import { createProcessManager } from "./src/process/manager";
 import { createTeamStatusWidget } from "./src/ui/team-status-widget";
@@ -20,6 +23,10 @@ import {
 } from "./src/setup/member-lifecycle";
 import { createMessageChannel } from "./src/setup/message-channel";
 import { buildDynamicModePrompt } from "./src/prompts/dynamic-mode";
+import { FIRST_ACTION_PROTOCOL_PROMPT } from "./src/prompts/tl-first-action";
+import { buildWorkflowPrompt, WORKFLOW_ACTIVATION_BANNER } from "./src/prompts/workflow-prompt";
+import { createTlReadGuard } from "./src/session/tl-read-guard";
+import { getSharedContextPath } from "./src/session/shared-context";
 import { openMemberInspector, type MemberInspectorHandle } from "./src/ui/member-inspector";
 
 export default function (pi: ExtensionAPI) {
@@ -47,7 +54,7 @@ export default function (pi: ExtensionAPI) {
     getHandle: (name) => memberHandles.get(name),
     setHandle: (name, handle) => { memberHandles.set(name, handle); },
     clearHandles: () => { memberHandles.clear(); },
-    tlToolNames: ["start_member", "stop_member", "list_members", "get_member_log", "team_send_and_wait", "wait_and_get_member_status", "set_goal", "finish_goal"],
+    tlToolNames: ["start_member", "stop_member", "list_members", "get_member_log", "team_send_and_wait", "wait_and_get_member_status", "set_goal", "finish_goal", SHARED_CONTEXT_TOOL_NAME],
 
     router: null,
     messageQueue: null,
@@ -87,6 +94,10 @@ export default function (pi: ExtensionAPI) {
   // ── Member Inspector (成员检视浮窗) ───────────────────────
   // Handle for the currently-open inspector overlay; null when closed.
   let inspectorHandle: MemberInspectorHandle | null = null;
+  // Whether the TL agent is processing a turn (agent_start..agent_settled).
+  // Drives the inspector's unified notification batching: while busy, all
+  // intervention reminders queue; when settled, they are delivered together.
+  let tlBusy = false;
 
   pi.registerShortcut("alt+t", {
     description: "Member Inspector（成员检视浮窗）",
@@ -99,6 +110,7 @@ export default function (pi: ExtensionAPI) {
         getMembers: () => getSessionState().teamDefinition?.members ?? [],
         getHandle: (name: string) => teamCtx.getHandle(name),
         memberOpsStates,
+        isTlBusy: () => tlBusy,
       });
     },
   });
@@ -117,6 +129,8 @@ export default function (pi: ExtensionAPI) {
     onRouteNotification: (target: string) => {
       uiNotify?.(`[消息已路由给 ${target}]`, "info");
     },
+    // Resolve per dispatch so /team setting changes take effect immediately.
+    getAutoCompact: () => resolveAutoCompact(loadSettings(getRootDir())),
   });
 
   teamCtx.router = router;
@@ -184,6 +198,11 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // write_shared_context — dedicated shared-context write tool. Registered eagerly,
+  // activated via teamCtx.tlToolNames (setActiveTools) during team sessions only.
+  // start_member is gated on its write having happened (see start_member tool).
+  registerSharedContextTool(pi);
+
   // team_send_and_wait and wait_and_get_member_status are registered in src/tools/tl-tools.ts
 
   // ── Helper: safely extract path from tool input ─────────
@@ -207,7 +226,7 @@ export default function (pi: ExtensionAPI) {
     "add_dynamic_member",
     "start_member", "stop_member", "list_members", "get_member_log",
     "wait_and_get_member_status", "team_send_and_wait",
-    "set_goal", "finish_goal",
+    "set_goal", "finish_goal", SHARED_CONTEXT_TOOL_NAME,
     // read/write: read unrestricted, write restricted to .md files (checked separately)
     "read",
     "write",
@@ -218,7 +237,7 @@ export default function (pi: ExtensionAPI) {
     // Team management
     "start_member", "stop_member", "list_members", "get_member_log",
     "wait_and_get_member_status", "team_send_and_wait",
-    "set_goal", "finish_goal", "add_dynamic_member",
+    "set_goal", "finish_goal", "add_dynamic_member", SHARED_CONTEXT_TOOL_NAME,
     // Read-only exploration & monitoring
     "read", "bash",
     "web_search", "fetch_content", "get_search_content",
@@ -235,25 +254,90 @@ export default function (pi: ExtensionAPI) {
     "true_sight_diff_impact", "true_sight_verify_evidence",
   ]);
 
+  // ── TL pre-dispatch guard: sticky block on non-management tools before dispatch ──
+  // Counts all non-management tool calls (read, bash, web_search, etc.) — not just `read` —
+  // because TL can bypass a read-only guard via bash grep/rg/cat or ctx_execute.
+  // Once the threshold is exceeded before any dispatch, every subsequent non-management
+  // call is blocked until team_send_and_wait happens (sticky). Counters reset at the
+  // start of every user-message turn (agent_start). Fail-open: member processes never
+  // reach this (TEAM_ROLE early return above).
+  const tlReadGuard = createTlReadGuard();
+  pi.on("agent_start", (_event, ctx) => {
+    tlBusy = true;
+    tlReadGuard.resetTurn();
+    // Clear any leftover guard status from the previous turn (UI may be absent in RPC mode).
+    try {
+      ctx?.ui?.setStatus?.("tl-pre-dispatch-guard", undefined);
+    } catch { /* fail-open */ }
+  });
+
   // ── Call-level guard: whitelist-based blocking during team session ───
-  pi.on("tool_call", (event) => {
+  pi.on("tool_call", (event, ctx) => {
     if (!getSessionState().active) return; // only block during active team session
 
     // ── Resolve current phase ──
     const isDesignPhase = teamCtx.isDynamicSession && teamCtx.dynamicPhase === "design";
     const whitelist = isDesignPhase ? DESIGN_PHASE_WHITELIST : EXECUTION_PHASE_WHITELIST;
 
+    // Track dispatch for the pre-dispatch guard (team_send_and_wait is whitelisted in both phases)
+    if (event.toolName === "team_send_and_wait") {
+      tlReadGuard.recordDispatch();
+      // Dispatch unlocks the guard — clear any visible warning status.
+      try {
+        ctx?.ui?.setStatus?.("tl-pre-dispatch-guard", undefined);
+      } catch { /* fail-open */ }
+    }
+
     // Quick pass: whitelisted tool?
     if (whitelist.has(event.toolName)) {
       // write/edit: additionally check file extension
       if (event.toolName === "write" || event.toolName === "edit") {
         const filePath = extractPathFromInput(event.input) ?? "";
+        // The shared context must be written via the dedicated tool — the
+        // start_member gate depends on write_shared_context having set the
+        // session flag. Redirect direct write/edit attempts here.
+        if (filePath.endsWith(".shared-context.md")) {
+          return {
+            block: true,
+            reason:
+              `共享上下文必须通过 \`write_shared_context\` 工具写入（该工具会记录写入状态，未写入前 start_member 会被拦截）。` +
+              `请调用 write_shared_context 工具，而不是用 ${event.toolName} 直接写 .shared-context.md。`,
+          };
+        }
         if (!filePath.endsWith(".md")) {
           const phaseLabel = isDesignPhase ? "设计阶段" : "团队会话";
           return {
             block: true,
             reason: `${phaseLabel}期间不得使用 ${event.toolName} 写代码文件。请委派给 Member 执行。你可以编写 .md 文档（如 .shared-context.md、ADR 等）。`,
           };
+        }
+      }
+      // ── Pre-dispatch guard: count non-management tool calls, block once ──
+      // Applies to ALL whitelisted tools (read, bash, web_search, ctx_execute, etc.)
+      // — not just `read` — because TL can bypass a read-only guard via bash grep/rg/cat.
+      // Management tools (start_member, team_send_and_wait, write, edit, etc.) are
+      // exempted inside checkToolCall.
+      // Execution phase only — design phase has no Members to dispatch to.
+      if (!isDesignPhase) {
+        const filePath =
+          event.toolName === "read" || event.toolName === "write" || event.toolName === "edit"
+            ? extractPathFromInput(event.input)
+            : undefined;
+        const verdict = tlReadGuard.checkToolCall(event.toolName, filePath);
+        if (verdict.block) {
+          // First block: surface a user-visible notification + status bar warning so
+          // the reminder cannot be missed (blocked calls otherwise only appear as
+          // a tool error in the transcript).
+          if (verdict.firstBlock) {
+            try {
+              ctx?.ui?.notify?.(
+                `⚠️ 已拦截 TL 在未派发任务情况下的亲自分析（第 ${tlReadGuard.preDispatchCalls} 次工具调用）— 请通过 team_send_and_wait 派发任务给 Member`,
+                "warning"
+              );
+              ctx?.ui?.setStatus?.("tl-pre-dispatch-guard", "⚠️ TL 未派发任务 — 亲自分析已被持续拦截，直到 team_send_and_wait");
+            } catch { /* fail-open */ }
+          }
+          return { block: true, reason: verdict.reason };
         }
       }
       return; // allowed
@@ -274,6 +358,10 @@ export default function (pi: ExtensionAPI) {
   // When the user presses Escape during a team session, pi cancels the TL's turn
   // but member processes keep running. This handler notifies the user.
   pi.on("agent_settled", async (_event, ctx) => {
+    // TL turn finished: inspector delivers any notifications queued while busy.
+    tlBusy = false;
+    inspectorHandle?.onTlSettled();
+
     const session = getSessionState();
     if (!session.active) {
       // Session already ended (e.g. /team stop) — clear stale status
@@ -306,6 +394,11 @@ export default function (pi: ExtensionAPI) {
       const teamName = _session.teamDefinition?.name;
       const sessionId = _session.sessionId;
       const isDynamic = teamCtx.isDynamicSession;
+
+      // Reset the inspector's TL-busy flag so a fresh session does not
+      // inherit stale batching state (queued-while-busy would otherwise
+      // never trigger until the first agent_settled).
+      tlBusy = false;
 
       endSession();
       resetGoal();
@@ -614,59 +707,56 @@ export default function (pi: ExtensionAPI) {
         .map((m) => `  - ${m.name}（${m.label ?? m.name}）— ${m.systemPrompt.slice(0, 80)}`)
         .join("\n");
 
-      // Workflow prompt injection
-      let workflowText = "";
-      if (team.workflow) {
-        const wf = team.workflow;
-        const fmtStage = (s: (typeof wf.stages)[number]): string => {
-          let t = `  【${s.name}】${s.description} (${s.member})`;
-          if (s.input) t += `\n    输入：${s.input}`;
-          if (s.output) t += `\n    输出：${s.output}`;
-          if (s.constraints) t += `\n    约束：${s.constraints}`;
-          if (s.onFailure) t += `\n    失败处理：如「${s.onFailure.condition}」→ 回退至「${s.onFailure.returnToStage}」`;
-          return t;
-        };
-        if (wf.strictness === "strict") {
-          workflowText += `\n### 默认工作流（严格模式 ⚡）\n严格按照以下步骤执行，不得跳过或调序。\n\n`;
-        } else {
-          workflowText += `\n### 默认工作流（参考模式 📋）\n作为工作流程参考，尽可能遵循步骤顺序。\n\n`;
-        }
-        if (wf.description) workflowText += `**描述：** ${wf.description}\n\n`;
-        workflowText += `**步骤序列：**\n`;
-        for (const s of wf.stages) workflowText += fmtStage(s) + "\n\n";
-        if (wf.loops && wf.loops.length > 0) {
-          workflowText += `**循环段：**\n`;
-          for (const loop of wf.loops) {
-            workflowText += `  🔁 条件「${loop.condition}」→ 重复步骤：${loop.stages.join("、")}\n`;
-          }
-          workflowText += "\n";
-        }
-        if (wf.strictness === "strict") {
-          workflowText += `> 规则：完成上一个 stage 前不得开始下一个。Stage 失败时按 onFailure 策略处理。\n`;
-        }
-      }
+      // Workflow prompt injection (operational, not declarative — see workflow-prompt.ts)
+      const workflowText = buildWorkflowPrompt(team.workflow);
 
-      const sessionSubDir = session.sessionId ? join(team.name, session.sessionId) : team.name;
-      const sharedCtxPath = join(getRootDir(), "sessions", sessionSubDir, ".shared-context.md");
+      const sharedCtxPath = getSharedContextPath(team.name, session.sessionId);
 
       extraPrompt = `
 ## 当前任务：Team Lead
 
 你现在是一个 **Team Lead**，负责领导团队完成任务。
 
+${FIRST_ACTION_PROTOCOL_PROMPT}
+${team.workflow ? WORKFLOW_ACTIVATION_BANNER : ""}
 ### 团队：${team.name}
 ${team.description}
 
 ### 团队成员
 ${memberLines}
 ${workflowText}
-### 核心原则：委派优先
-- **能交给 Member 做的事，绝不自己做。** 你是 Team Lead 不是执行者。
-- 需要分析代码？委派给分析员。需要修改文件？委派给开发员。需要验证？委派给测试员。
-- 你的职责是：拆解任务、制定计划、分配工作、协调进度、处理异常。
-- 只有以下情况才自己动手：涉及团队管理的决策、成员不可用时的紧急处理、向用户汇报结果。
-- **你可以编写 .md 文档**（如 .shared-context.md、ADR 等），但**不得使用 write/edit 写代码文件**（.ts/.js/.py/.json 等）——这些工作一律委派给 Member。
-- **成员完成任务后不要主动停止其进程。** Member 进程保持运行以便继续接收新任务。仅当成员进程异常时（崩溃、无响应），才使用 stop_member 终止后重新启动。
+### ⚠️ 铁律：你绝不能自己做 Member 能做的事
+
+你是 Team Lead（团队经理），不是执行者。你的核心工作是**分派任务和管理进度**，不是动手做事。
+
+**具体行为规则：**
+- 用户说"分析 XXX 的问题" → 立即拆解任务，派发给分析员/开发员等 Member。**不得自己读代码来分析**
+- 用户说"修改/重构 XXX" → 派发给开发员。**不得自己 write/edit 代码文件**
+- 用户说"审查/检视 XXX" → 派发给审查员
+- **任何时候收到用户需求，你的第一反应必须是"这个任务该派给哪个 Member？"，而不是自己开始做**
+
+**禁止的行为清单：**
+  ❌ 自己运行 bash 命令分析代码
+  ❌ 自己 read 代码文件然后下结论
+  ❌ 自己 write/edit 代码文件（.ts/.js/.py/.json 等）
+  ❌ 自己做本应由 Member 完成的任何具体工作
+
+**你唯一能做的事情：**
+  ✅ 与用户讨论需求、对齐目标
+  ✅ 拆解任务、制定计划
+  ✅ 使用 team_send_and_wait 向 Member 分派任务
+  ✅ 监控进度、协调异常
+  ✅ 向用户汇报结果
+  ✅ 编写 .md 文档（共享上下文、ADR 等）
+
+**自查规则：每次收到用户消息后，先问自己"这个任务能交给 Member 做吗？"**
+- 能 → 立刻分派，不得自己动手。**即使是简单分析也交给 Member**
+- 不能（如管理决策、用户沟通、进度汇报）→ 自己做
+
+> 🧠 记住：如果你在 read 代码文件或写代码，那你就是在做 Member 的工作。停下来，把任务分派出去。
+
+### 成员完成任务后不要主动停止其进程
+Member 进程保持运行以便继续接收新任务。仅当成员进程异常时（崩溃、无响应），才使用 stop_member 终止后重新启动。
 
 ### 与用户讨论需求的方式
 
@@ -675,11 +765,11 @@ ${workflowText}
 **期间遵循以下原则：**
 
 - **一次只问一个问题** — 等用户回复后再问下一个。不要一次性抛出多个问题让用户选择。
-- **能用代码验证的，不要去问用户** — 如果问题可以通过阅读代码库来回答，先查阅代码再给出结论。
+- **能用代码验证的，不要去问用户** — 为确认某个具体事实，允许读取 1-2 个文件后给出结论。但注意边界：一旦需要连续深入阅读代码才能回答，那就是任务级分析，必须分派给 Member，而不是自己继续。
 - **挑战模糊语言** — 当用户用词不精确时，提出更精确的术语。例如用户说"优化性能"——追问"你指的是减少响应时间还是降低资源占用？"
 - **用场景检验边界** — 提出具体的边界场景来检验需求。例如"如果 A 成员依赖 B 成员的结果，但 B 还没完成怎么办？"
 - **对照实际代码** — 当用户描述现有行为时，检查代码是否一致。发现矛盾时指出来让用户确认。
-- **术语和决策立即固化** — 讨论中确定的关键术语、决策、约定，立即写入 shared-context.md（${sharedCtxPath}）的对应章节，不攒到后面。
+- **术语和决策立即固化** — 讨论中确定的关键术语、决策、约定，立即用 \`write_shared_context\` 工具写入 shared-context.md（${sharedCtxPath}）的对应章节，不攒到后面。
 
 .shared-context.md 应作为术语表和关键决策记录，不包含实现细节。当某个决策满足以下三个条件时，考虑创建 ADR 文档（在 docs/adr 目录下）：逆决策成本高、外人看会觉得意外、是经过真正权衡后选择的。
 
@@ -691,15 +781,16 @@ ${workflowText}
 - 只输出核心内容，全程保持精简风格
 
 ### 可用工具
-你拥有 7 个团队管理工具：
+你拥有 8 个团队管理工具：
 
-1. **先写 Shared Context** — 用 \`write\` 工具写入 \`${sharedCtxPath}\`
+1. **write_shared_context(content)** — 写入团队共享上下文到 \`${sharedCtxPath}\`。**启动任何成员前必须至少调用一次**（未写入时 start_member 会被系统拦截）。内容应包含：项目背景与目标、成员分工、工作流、协作规则、术语表与关键决策。后续更新共享上下文时再次调用，并通知成员重新阅读
 2. **start_member(name)** — 启动一个 Member 进程
 3. **team_send_and_wait({tasks: [{to, content}], nextSteps})** — 给 Member 发任务并等待回复。tasks 支持多个任务并发发送（如多个独立检视任务可同时发出）。等待所有任务完成或有成员空闲后返回。必须传入 nextSteps（下一步计划），wait结束后该信息会随结果返回。**batch vs sequential 决策规则见下方提示**
 4. **list_members** — 查看各 Member 的运行状态
 5. **wait_and_get_member_status()** — **优先使用**。等待所有成员空闲后查看操作状态（idle/working/crashed/stopped）。如有成员在工作则阻塞，和 team_send_and_wait 检测 all-idle 的方式相同
 6. **get_member_log(name, lines?)** — 查看 Member 最近的详细对话记录，负担较重，仅当需要了解具体内容时才使用
 7. **stop_member(name)** — 终止 Member 进程
+8. **set_goal(text, criteria) / finish_goal()** — 设定/结束会话目标（见流程第 2 步）
 
 > 提示：team_send_and_wait 的 tasks 参数支持传入多个任务同时发送给不同 Member（如 [{to:"a", content:"..."}, {to:"b", content:"..."}]），实现并发执行。发送的消息包含 <corr:...> 标签。其他成员回复时需在内容中包含此标签。消息通道中的 Team Lead 名称是 tl。
 >
@@ -713,7 +804,7 @@ ${workflowText}
 1. 先与用户充分讨论需求，直到和用户对齐细节
 2. **主动询问用户是否要设定目标**（\`set_goal\`）—— 如果用户同意，使用 \`set_goal\` 设定清晰的可验证完成条件；如果用户说不需要，跳过即可。目标可以让系统在任务中途自动提醒你继续执行，避免不必要的中断。
 3. 拆解任务，制定计划
-4. 编写 Shared Context（共享上下文），记录：团队成员、项目背景和目标、协作规则、术语表
+4. 调用 \`write_shared_context\` 编写 Shared Context（共享上下文），记录：团队成员、项目背景和目标、协作规则、术语表。**未调用前 start_member 会被系统拦截**
 5. 用 start_member 启动各 Member
 6. 将 Shared Context 随首次任务消息一起发送给各 Member。**在消息中明确告知 Member 任务完成后必须回复 TL，并指示 Member：输出报告/方案/设计文档时写入文件，不要在消息通道中塞入大量内容。**
 7. 通过消息通道与 Member 交流，监控进展（可使用 team_send_and_wait 等待成员回复）

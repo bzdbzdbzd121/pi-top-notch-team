@@ -38,6 +38,8 @@ export interface InspectorTab {
   followTail: boolean;
   /** Tool call / result detail expansion toggle. */
   expanded: boolean;
+  /** Thinking block visibility toggle. */
+  showThinking: boolean;
   /** New content arrived while not following tail. */
   newBelow: boolean;
   /** Dirty flag set by member activity events; cleared after refetch. */
@@ -45,7 +47,7 @@ export interface InspectorTab {
   contextInfo: MemberContextInfo | null;
 }
 
-export type MemberOpState = "idle" | "working" | "crashed" | "stopped";
+export type MemberOpState = "idle" | "working" | "compacting" | "crashed" | "stopped";
 
 // ── Constants ──────────────────────────────────────────────
 
@@ -59,12 +61,13 @@ export const EXPANDED_RESULT_MAX_LINES = 60;
  * Note: ctrl+m is indistinguishable from Enter in terminals, so compact
  * uses ctrl+o.
  */
-export function buildNavHints(expanded: boolean): string {
-  const expandHint = expanded ? "e 折叠工具详情" : "e 展开工具详情";
-  return `←→ 切换成员  ↑↓ 滚动会话  End 跳至底部  i 输入消息  ${expandHint}`;
+export function buildNavHints(expanded: boolean, showThinking: boolean): string {
+  const expandHint = expanded ? "e 折叠详情" : "e 展开详情";
+  const thinkingHint = showThinking ? "t 隐藏思考" : "t 显示思考";
+  return `←→ 切换成员  ↑↓ 三行滚动  End 跳至底部  i 输入消息  ${expandHint}  ${thinkingHint}`;
 }
 export const KEY_HINTS_ACTION =
-  "ctrl+a 中断成员  ctrl+o 压缩上下文  Esc 关闭窗口";
+  "ctrl+a 中断  ctrl+b/ctrl+shift+a 全中断  ctrl+o 压缩  Esc 关闭";
 /** Hints shown while the input box is open. */
 export const INPUT_HINTS =
   "Enter 发送（忙碌时排队）  ctrl+Enter 立即转向  Esc 取消";
@@ -146,6 +149,8 @@ export function summarizeArgs(name: string, args: Record<string, any> | undefine
 export interface BuildBodyOptions {
   width: number;
   expanded: boolean;
+  /** Render thinking blocks (default: hidden). */
+  showThinking?: boolean;
   theme?: InspectorTheme;
 }
 
@@ -173,11 +178,11 @@ export function collapseBlankLines(lines: string[]): string[] {
  * Rendering granularity (decision #4):
  *   - user/assistant text in full (wrapped)
  *   - tool calls / results as one-line summaries, expandable
- *   - thinking blocks hidden
+ *   - thinking blocks hidden by default (toggleable per tab)
  * Layout rule: one blank line before each user/assistant block, none after.
  */
 export function buildBodyLines(messages: any[], opts: BuildBodyOptions): string[] {
-  const { width, expanded } = opts;
+  const { width, expanded, showThinking = false } = opts;
   const theme = opts.theme ?? IDENTITY_THEME;
   const lines: string[] = [];
   const textWidth = Math.max(10, width - 2);
@@ -204,7 +209,16 @@ export function buildBodyLines(messages: any[], opts: BuildBodyOptions): string[
       let wroteHeader = false;
       for (const block of content) {
         if (!block || typeof block !== "object") continue;
-        if (block.type === "thinking") continue; // thinking hidden
+        if (block.type === "thinking") {
+          if (!showThinking) continue; // thinking hidden unless toggled on
+          const thinking = typeof block.thinking === "string" ? block.thinking : "";
+          if (thinking.trim().length === 0) continue;
+          blockLines.push(theme.fg("dim", "  💭 思考"));
+          for (const l of wrapText(thinking, textWidth - 4)) {
+            blockLines.push(theme.fg("dim", `    ${l}`));
+          }
+          continue;
+        }
         if (block.type === "text") {
           if (!wroteHeader) {
             blockLines.push(theme.fg("success", "● assistant"));
@@ -283,7 +297,7 @@ export function buildHeaderLine(
 // ── Footer line building ───────────────────────────────────
 
 export function stateIcon(state: MemberOpState): string {
-  return state === "working" ? "🔧" : state === "idle" ? "✅" : state === "crashed" ? "💥" : "⏹️";
+  return state === "working" ? "🔧" : state === "compacting" ? "🗜️" : state === "idle" ? "✅" : state === "crashed" ? "💥" : "⏹️";
 }
 
 export function buildFooterStatusLine(
@@ -297,6 +311,9 @@ export function buildFooterStatusLine(
     const state = opsStates.get(t.name) ?? "stopped";
     const icon = stateIcon(state);
     let seg = `${icon} ${t.label}`;
+    if (state === "compacting") {
+      seg += "（压缩中）";
+    }
     if (t.contextInfo != null && state !== "stopped" && state !== "crashed") {
       seg += ` ${Math.round(t.contextInfo.percent)}%`;
     } else if (state === "stopped" || state === "crashed") {
@@ -343,6 +360,7 @@ export class MemberInspectorState {
           scrollOffset: 0,
           followTail: true,
           expanded: false,
+          showThinking: false,
           newBelow: false,
           dirty: true, // fetch on first open
           contextInfo: null,
@@ -406,6 +424,13 @@ export class MemberInspectorState {
     if (!tab) return;
     tab.expanded = !tab.expanded;
     tab.dirty = true; // rebuild lines with new expansion state
+  }
+
+  toggleThinking(): void {
+    const tab = this.activeTab;
+    if (!tab) return;
+    tab.showThinking = !tab.showThinking;
+    tab.dirty = true; // rebuild lines with new thinking visibility
   }
 
   openInput(): void {

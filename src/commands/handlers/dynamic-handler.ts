@@ -1,6 +1,7 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { TeamContext, SessionUI } from "../../session/context";
 import { getSessionState, startSession, addMemberToSession } from "../../session/state";
+import { ensureSharedContextFile } from "../../session/shared-context";
 import { getRootDir } from "../../config";
 import type { TeamDefinition, TeamMember } from "../../team/definition";
 import { ensureToolRegistered } from "../shared/ensure-tool";
@@ -34,6 +35,9 @@ export async function handleDynamic(
   };
 
   startSession(emptyTeam);
+  // Create the shared context stub up front (0 members for now — the TL will
+  // overwrite it during phase F). Guarantees members always find a valid file.
+  ensureSharedContextFile(emptyTeam, getSessionState().sessionId);
   teamCtx.isDynamicSession = true;
   teamCtx.dynamicPhase = "design";
 
@@ -48,7 +52,7 @@ export async function handleDynamic(
         "Parameters: name (identifier), label (Chinese display name), systemPrompt (role definition), model (optional).",
       promptGuidelines: [
         "Use add_dynamic_member to register a team member after discussing the role with the user.",
-        "Call once per member role. After all members are added, write .shared-context.md, then start members with start_member.",
+        "Call once per member role. After all members are added, call write_shared_context to write the shared context, then start members with start_member (blocked until the shared context is written).",
       ],
       parameters: {
         type: "object",

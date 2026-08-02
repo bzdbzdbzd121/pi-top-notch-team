@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { startSession, endSession, getSessionState, addMemberToSession, isActive, getFrozenMembers } from "./state";
+import { startSession, endSession, getSessionState, addMemberToSession, isActive, getFrozenMembers, markSharedContextWritten } from "./state";
 import type { TeamDefinition, TeamMember } from "../team/definition";
 
 describe("sessionId", () => {
@@ -75,6 +75,58 @@ describe("sessionId", () => {
     // Only check that it's a regular array — Object.isFrozen would be true
     // for empty arrays even without freeze; just verify it returns members
     expect(getFrozenMembers()).toEqual([]);
+  });
+});
+
+describe("sharedContextWritten", () => {
+  let baseTeam: TeamDefinition;
+
+  beforeEach(() => {
+    endSession();
+    baseTeam = {
+      name: "test-team",
+      description: "A test team",
+      members: [],
+    };
+  });
+
+  it("starts false on startSession (start_member gate closed)", () => {
+    startSession(baseTeam);
+    expect(getSessionState().sharedContextWritten).toBe(false);
+  });
+
+  it("markSharedContextWritten sets it true", () => {
+    startSession(baseTeam);
+    expect(getSessionState().sharedContextWritten).toBe(false);
+    markSharedContextWritten();
+    expect(getSessionState().sharedContextWritten).toBe(true);
+  });
+
+  it("is reset to false on endSession", () => {
+    startSession(baseTeam);
+    markSharedContextWritten();
+    endSession();
+    expect(getSessionState().sharedContextWritten).toBe(false);
+  });
+
+  it("is reset to false when a new session starts", () => {
+    startSession(baseTeam);
+    markSharedContextWritten();
+    startSession(baseTeam);
+    expect(getSessionState().sharedContextWritten).toBe(false);
+  });
+
+  it("markSharedContextWritten is a no-op without an active session", () => {
+    endSession();
+    markSharedContextWritten();
+    expect(getSessionState().sharedContextWritten).toBe(false);
+  });
+
+  it("survives addMemberToSession (dynamic mode)", () => {
+    startSession(baseTeam);
+    markSharedContextWritten();
+    addMemberToSession({ name: "coder", label: "编码员", systemPrompt: "Code" });
+    expect(getSessionState().sharedContextWritten).toBe(true);
   });
 });
 

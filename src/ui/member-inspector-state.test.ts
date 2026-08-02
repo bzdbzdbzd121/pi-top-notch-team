@@ -126,13 +126,43 @@ describe("buildBodyLines", () => {
     expect(lines[lines.length - 1]).toBe("世界");
   });
 
-  it("hides thinking blocks", () => {
+  it("hides thinking blocks by default", () => {
     const lines = buildBodyLines(
       [assistantMsg(thinkingBlock("secret reasoning"), textBlock("answer"))],
       opts
     );
     expect(lines.join("\n")).not.toContain("secret reasoning");
     expect(lines).toContain("answer");
+  });
+
+  it("shows thinking blocks when showThinking=true", () => {
+    const lines = buildBodyLines(
+      [assistantMsg(thinkingBlock("secret reasoning"), textBlock("answer"))],
+      { ...opts, showThinking: true }
+    );
+    expect(lines.join("\n")).toContain("💭 思考");
+    expect(lines.join("\n")).toContain("secret reasoning");
+    expect(lines).toContain("answer");
+  });
+
+  it("skips empty thinking blocks even when showThinking=true", () => {
+    const lines = buildBodyLines(
+      [assistantMsg(thinkingBlock("   "), textBlock("answer"))],
+      { ...opts, showThinking: true }
+    );
+    expect(lines.join("\n")).not.toContain("💭");
+    expect(lines).toContain("answer");
+  });
+
+  it("wraps long thinking text within width when showThinking=true", () => {
+    const lines = buildBodyLines(
+      [assistantMsg(thinkingBlock("x".repeat(200)))],
+      { ...opts, width: 40, showThinking: true }
+    );
+    expect(lines.some((l) => l.includes("💭"))).toBe(true);
+    for (const l of lines) {
+      expect(l.length).toBeLessThanOrEqual(40);
+    }
   });
 
   it("collapses tool calls to one-line summaries by default", () => {
@@ -307,6 +337,30 @@ describe("MemberInspectorState", () => {
     s.toggleExpand();
     expect(s.tabs[0].expanded).toBe(true);
     expect(s.tabs[0].dirty).toBe(true);
+  });
+
+  it("toggleThinking flips showThinking and marks tab dirty for rebuild", () => {
+    const s = makeState();
+    s.tabs[0].dirty = false;
+    expect(s.tabs[0].showThinking).toBe(false);
+    s.toggleThinking();
+    expect(s.tabs[0].showThinking).toBe(true);
+    expect(s.tabs[0].dirty).toBe(true);
+    s.toggleThinking();
+    expect(s.tabs[0].showThinking).toBe(false);
+  });
+
+  it("syncMembers preserves showThinking across member reconciliation", () => {
+    const s = makeState();
+    s.toggleThinking();
+    s.syncMembers([
+      { name: "a", label: "A" },
+      { name: "b", label: "B" },
+      { name: "c", label: "C" },
+      { name: "d", label: "D" },
+    ]);
+    expect(s.tabs[0].showThinking).toBe(true);
+    expect(s.tabs[3].showThinking).toBe(false); // new tabs default off
   });
 
   it("input buffer supports insert/backspace/clear with unicode safety", () => {

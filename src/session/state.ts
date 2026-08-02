@@ -6,6 +6,13 @@ export interface TeamSessionState {
   startedAt: number | null;
   /** Unique session identifier (timestamp-based). Used to isolate session directories. */
   sessionId: string | null;
+  /**
+   * Whether the TL has written the shared context via the write_shared_context tool.
+   * start_member is blocked until this is true (gate: no member starts without a
+   * shared context). Only the dedicated tool sets this — direct write/edit of
+   * .shared-context.md is intercepted by the tool_call guard.
+   */
+  sharedContextWritten: boolean;
 }
 
 let currentSession: TeamSessionState = {
@@ -13,6 +20,7 @@ let currentSession: TeamSessionState = {
   teamDefinition: null,
   startedAt: null,
   sessionId: null,
+  sharedContextWritten: false,
 };
 
 /** Returns a snapshot of the current session state (defensive clone, read-only). */
@@ -43,6 +51,7 @@ export function startSession(team: TeamDefinition, sessionId?: string): void {
     teamDefinition: team,
     startedAt: Date.now(),
     sessionId: sessionId ?? generateSessionId(),
+    sharedContextWritten: false,
   };
 }
 
@@ -52,7 +61,18 @@ export function endSession(): void {
     teamDefinition: null,
     startedAt: null,
     sessionId: null,
+    sharedContextWritten: false,
   };
+}
+
+/**
+ * Mark that the TL has written the shared context via the write_shared_context tool.
+ * No-op when no active session exists (defensive — the tool itself guards with isActive).
+ */
+export function markSharedContextWritten(): void {
+  if (currentSession.active) {
+    currentSession = { ...currentSession, sharedContextWritten: true };
+  }
 }
 
 /**
