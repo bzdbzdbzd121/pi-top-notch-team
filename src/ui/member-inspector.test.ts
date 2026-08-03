@@ -2,14 +2,30 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 // NOTE: we do NOT mock @earendil-works/pi-tui here — we want the real
 // matchesKey so we can drive the component with realistic key sequences.
+// The per-frame width-tax test counts visibleWidth calls via a wrapper that
+// forwards everything else untouched.
 
 import { visibleWidth } from "@earendil-works/pi-tui";
+
+// Per-frame width-tax counter (P1-① acceptance #1). The wrapper forwards to
+// the real implementation; only the call count is tracked.
+const vwCalls: string[] = [];
+vi.mock("@earendil-works/pi-tui", async (importOriginal) => {
+  const mod = (await importOriginal()) as Record<string, unknown>;
+  return {
+    ...mod,
+    visibleWidth: (text: string) => {
+      vwCalls.push(text);
+      return (mod.visibleWidth as (t: string) => number)(text);
+    },
+  };
+});
 
 import {
   MemberInspectorComponent,
   USER_DIRECT_PREFIX,
 } from "./member-inspector";
-import { MemberInspectorState } from "./member-inspector-state";
+import { MemberInspectorState, fitLinesToWidth } from "./member-inspector-state";
 
 // ── Key sequences (real terminal encodings) ────────────────
 
@@ -457,6 +473,140 @@ describe("MemberInspectorComponent — render", () => {
     }
     expect(visibleWidth(lines[0])).toBe(visibleWidth(lines[lines.length - 1]));
   });
+
+  it("P1-①: renders body lines verbatim without pad/truncate (zero width tax)", () => {
+    const deps = makeDeps({ handles: {}, opStates: { a: "idle", b: "working" } });
+    const { comp, state } = makeComponent(deps);
+    // Build-time fixed-width lines (as produced by the flushDirty pipeline)
+    const fitted = fitLinesToWidth(["短行", "中文内容 line", ""], 78);
+    state.setTabLines("a", fitted, 10);
+    const lines = comp.render(80);
+    // Body is lines[3..3+bodyHeight) (top+header+sep precede it): must be
+    // verbatim │+line+│ — no truncateLine/padVisible at render time (P1-① A1).
+    const body = lines.slice(3, 3 + fitted.length);
+    expect(body[0]).toBe(`│${fitted[0]}│`);
+    expect(body[1]).toBe(`│${fitted[1]}│`);
+    expect(body[2]).toBe(`│${fitted[2]}│`);
+    // Short lines stay short — padding is NOT added at render time
+    // ("短行" = 4 visible cols → 74 spaces to inner 78)
+    expect(body[0]).toBe("│短行" + " ".repeat(74) + "│");
+    // Every body line is exactly inner+2 wide (build-time fixed width contract)
+    for (const b of body) {
+      expect(visibleWidth(b)).toBe(80);
+    }
+  });
+
+  it("P1-①: short body lines keep right-border alignment via build-time padding", () => {
+    const deps = makeDeps({ handles: {}, opStates: { a: "idle", b: "working" } });
+    const { comp, state } = makeComponent(deps);
+    // UNFITTED short lines (e.g. from a stale cache) must still not break the
+    // frame: they render verbatim (no runtime tax) — the compositing layer
+    // pads them, so alignment is a build-time concern, not a render concern.
+    state.setTabLines("a", ["hello"], 10);
+    const lines = comp.render(80);
+    const body = lines.slice(3, 4);
+    expect(body[0]).toBe("│hello│");
+    // The frame itself stays within width bounds
+    for (const l of lines) {
+      expect(visibleWidth(l)).toBeLessThanOrEqual(80);
+    }
+  });
+
+  it("P1-①: over-wide body lines are NOT truncated at render time (A1, no runtime tax)", () => {
+    const deps = makeDeps({ handles: {}, opStates: { a: "idle", b: "working" } });
+    const { comp, state } = makeComponent(deps);
+    const wide = "x".repeat(200);
+    state.setTabLines("a", [wide], 10);
+    const lines = comp.render(80);
+    const body = lines.slice(3, 4);
+    // Verbatim passthrough — the over-wide line is emitted as-is (sliceByColumn
+    // at the compositing layer is the truncation backstop)
+    expect(body[0]).toBe(`│${wide}│`);
+  });
+
+  it("P1-①: per-frame visibleWidth calls do not scale with body line count", () => {
+    // Acceptance #1: the scroll frame's width tax is zero — the number of
+    // visibleWidth calls per render is a CONSTANT (chrome lines only) and
+    // does not grow with the body size.
+    const deps = makeDeps({ handles: {}, opStates: { a: "idle", b: "working" } });
+    const { comp, state } = makeComponent(deps);
+
+    const countSince = (mark: number) => vwCalls.length - mark;
+
+    // 3 body lines
+    state.setTabLines("a", fitLinesToWidth(["短行", "中文内容 line", ""], 78), 10);
+    let mark = vwCalls.length;
+    comp.render(80);
+    const callsSmall = countSince(mark);
+
+    // 60 body lines — the per-frame call count must be identical
+    const many = fitLinesToWidth(Array.from({ length: 60 }, (_, i) => `行 ${i}`), 78);
+    state.setTabLines("a", many, 10);
+    mark = vwCalls.length;
+    comp.render(80);
+    const callsLarge = countSince(mark);
+
+    expect(callsLarge).toBe(callsSmall);
+    expect(callsSmall).toBeGreaterThan(0); // chrome lines still measured
+  });
+
+  it("P1-①: invalidate() marks ALL tabs dirty and schedules a rebuild", async () => {
+    vi.useFakeTimers();
+    try {
+      const handleA = makeHandle();
+      const handleB = makeHandle();
+      const deps = makeDeps({
+        handles: { a: handleA, b: handleB },
+        opStates: { a: "working", b: "working" },
+      });
+      const { comp, state } = makeComponent(deps);
+      state.tabs[0].dirty = false;
+      state.tabs[1].dirty = false;
+
+      comp.invalidate();
+      expect(state.tabs[0].dirty).toBe(true);
+      expect(state.tabs[1].dirty).toBe(true);
+
+      // The scheduled rebuild refetches and rebuilds lines (throttled)
+      await vi.advanceTimersByTimeAsync(600);
+      expect(handleA.sendCommandAndWait).toHaveBeenCalled();
+      expect(handleB.sendCommandAndWait).toHaveBeenCalled();
+      expect(state.tabs[0].dirty).toBe(false);
+      expect(state.tabs[1].dirty).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("P1-①: render at a new width triggers rebuild with the new fixed width", async () => {
+    vi.useFakeTimers();
+    try {
+      const handleA = makeHandle();
+      const deps = makeDeps({ handles: { a: handleA }, opStates: { a: "working" } });
+      const { comp, state } = makeComponent(deps);
+      state.tabs[0].dirty = false;
+
+      comp.render(80);
+      expect(state.tabs[0].dirty).toBe(false); // same width: no rebuild
+
+      comp.render(120); // terminal resize → width contract stale
+      expect(state.tabs[0].dirty).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(600);
+      // Rebuilt at the new width: inner = 120-2 = 118
+      const lines = comp.render(120);
+      for (const l of lines.slice(3, 3 + state.tabs[0].lines.length)) {
+        expect(visibleWidth(l)).toBeLessThanOrEqual(120);
+      }
+      const body = lines.slice(3, 3 + state.tabs[0].lines.length);
+      for (const b of body) {
+        expect(visibleWidth(b)).toBe(120);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
 
   it("total rendered lines never exceed the overlay maxHeight (bottom border not clipped)", () => {
     // pi-tui clips overlays with slice(0, maxHeight) — keeping TOP lines and

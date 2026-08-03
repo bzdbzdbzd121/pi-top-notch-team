@@ -13,6 +13,7 @@ import {
   buildFooterStatusLine,
   wrapText,
   truncateLine,
+  fitLinesToWidth,
   extractText,
   summarizeArgs,
   IDENTITY_THEME,
@@ -104,6 +105,44 @@ describe("summarizeArgs", () => {
   it("truncates long values", () => {
     const out = summarizeArgs("bash", { command: "x".repeat(200) });
     expect(out.length).toBeLessThanOrEqual(60);
+  });
+});
+
+// ── fitLinesToWidth (P1-① 构建期定宽契约) ────────────────
+
+describe("fitLinesToWidth", () => {
+  it("pads short lines to exactly the target width", () => {
+    const out = fitLinesToWidth(["hello", ""], 10);
+    expect(out[0]).toBe("hello     ");
+    expect(out[1]).toBe("          ");
+  });
+
+  it("truncates over-wide lines with an ellipsis", () => {
+    const out = fitLinesToWidth(["abcdefghij"], 5);
+    expect(out[0].length).toBe(5);
+    expect(out[0].endsWith("…")).toBe(true);
+  });
+
+  it("leaves exactly-fitting lines untouched", () => {
+    const out = fitLinesToWidth(["12345"], 5);
+    expect(out[0]).toBe("12345");
+  });
+
+  it("handles ANSI-colored lines by visible width", () => {
+    // Mock visibleWidth = text.length — the ANSI codes still count here;
+    // real-width behavior is covered by inspector tests with real pi-tui.
+    const colored = "\x1b[36mhi\x1b[0m";
+    const out = fitLinesToWidth([colored], 6);
+    expect(out[0].length).toBe(6);
+  });
+
+  it("returns empty array for empty input", () => {
+    expect(fitLinesToWidth([], 10)).toEqual([]);
+  });
+
+  it("degenerates to identity when width <= 0", () => {
+    expect(fitLinesToWidth(["a", "bb"], 0)).toEqual(["a", "bb"]);
+    expect(fitLinesToWidth(["a"], -3)).toEqual(["a"]);
   });
 });
 
@@ -212,6 +251,23 @@ describe("buildBodyLines", () => {
     for (const l of lines) {
       expect(l.length).toBeLessThanOrEqual(40);
     }
+  });
+
+  it("expandArgs JSON lines are truncated by fitLinesToWidth (A2 contract)", () => {
+    const long = { path: "x".repeat(300) };
+    const lines = buildBodyLines([assistantMsg(toolCallBlock("read", long))], {
+      ...opts,
+      expanded: true,
+    });
+    const wide = lines.find((l) => l.includes('"path"'));
+    expect(wide).toBeDefined();
+    // Raw build output may exceed textWidth (expandArgs bypasses wrapText)…
+    const fitted = fitLinesToWidth(lines, 40);
+    for (const l of fitted) {
+      expect(l.length).toBeLessThanOrEqual(40);
+    }
+    // …and the truncated line keeps its ellipsis
+    expect(fitted.join("\n")).toContain("…");
   });
 });
 

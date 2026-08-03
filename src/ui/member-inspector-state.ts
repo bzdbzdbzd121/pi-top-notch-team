@@ -86,6 +86,26 @@ export function truncateLine(text: string, width: number): string {
   return out + "…";
 }
 
+/**
+ * P1-① build-time fixed-width contract: pad/truncate every line to exactly
+ * `width` visible columns.
+ *
+ * The inspector's render() emits body lines VERBATIM (zero width tax on the
+ * scroll hot path); this function is the single place where lines are sized
+ * to the frame's inner width when they are built (flushDirty), so the
+ * right border stays aligned when pi-tui composites the overlay. Over-wide
+ * lines (e.g. expandArgs JSON dumps that bypass wrapText) are truncated here
+ * too — that is the A2 fix.
+ */
+export function fitLinesToWidth(lines: string[], width: number): string[] {
+  if (width <= 0) return lines;
+  return lines.map((l) => {
+    const vw = visibleWidth(l);
+    if (vw > width) return truncateLine(l, width);
+    return vw === width ? l : l + " ".repeat(width - vw);
+  });
+}
+
 /** Word/char wrap text to the given visible width. */
 export function wrapText(text: string, width: number): string[] {
   if (width <= 0) return [""];

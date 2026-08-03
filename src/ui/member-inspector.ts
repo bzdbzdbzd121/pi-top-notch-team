@@ -6,6 +6,7 @@ import {
   buildBodyLines,
   buildHeaderLine,
   buildFooterStatusLine,
+  fitLinesToWidth,
   truncateLine,
   KEY_HINTS_ACTION,
   INPUT_HINTS,
@@ -175,7 +176,12 @@ export class MemberInspectorComponent {
   }
 
   invalidate(): void {
-    // Theme changes: lines are rebuilt on next refresh; nothing cached with colors.
+    // P1-①: resize / theme change may have invalidated the build-time fixed
+    // width contract (lines were padded to the old inner width). Mark ALL
+    // tabs dirty so the next throttled flush rebuilds them at the new width.
+    if (this.disposed) return;
+    for (const tab of this.state.tabs) tab.dirty = true;
+    this.scheduleFlush();
   }
 
   // ── Dirty marking (member activity events) ─────────────
@@ -236,7 +242,13 @@ export class MemberInspectorComponent {
             showThinking: tab.showThinking,
             theme: this.inspectorTheme,
           });
-          this.state.setTabLines(tab.name, lines, bh);
+          // P1-①: fixed-width the lines AT BUILD TIME (single pass) — render()
+          // then emits them verbatim with zero per-frame width computation.
+          this.state.setTabLines(
+            tab.name,
+            fitLinesToWidth(lines, Math.max(20, this.lastWidth - 2)),
+            bh
+          );
           this.requestRenderSafe();
         })
         .catch(() => {
@@ -512,7 +524,16 @@ export class MemberInspectorComponent {
   }
 
   render(width: number): string[] {
-    this.lastWidth = width;
+    // P1-①: detect terminal width changes. The build-time fixed-width contract
+    // ties line widths to the last render width — after a resize the cached
+    // lines are padded for the old width, so trigger a rebuild.
+    if (width !== this.lastWidth) {
+      this.lastWidth = width;
+      for (const tab of this.state.tabs) tab.dirty = true;
+      this.scheduleFlush();
+    } else {
+      this.lastWidth = width;
+    }
     const theme = this.inspectorTheme;
     const inner = Math.max(20, width - 2);
     const bh = bodyHeight();
@@ -542,14 +563,15 @@ export class MemberInspectorComponent {
     const sep = border("├" + repeat("─", inner) + "┤");
 
     // ── Body: visible slice of the active tab's lines ──
+    // P1-①: emit VERBATIM. Lines were fixed-widthed at build time
+    // (fitLinesToWidth) so the right border stays aligned; no truncateLine /
+    // padVisible here — the scroll hot path does ZERO width computation.
     const body: string[] = [];
     if (!tab) {
       body.push(padVisible("（无成员）", inner));
     } else {
       const visible = tab.lines.slice(tab.scrollOffset, tab.scrollOffset + bh);
-      for (const l of visible) {
-        body.push(padVisible(truncateLine(l, inner), inner));
-      }
+      body.push(...visible);
     }
     while (body.length < bh) body.push(repeat(" ", inner));
     const bodyLines = body.map((l) => border("│") + l + border("│"));
