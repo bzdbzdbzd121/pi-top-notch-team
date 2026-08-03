@@ -628,6 +628,27 @@ function appendCollapsed(
 }
 
 /**
+ * O(1) decision: can the incremental cache be reused for this refresh?
+ * Boundary fingerprint guard (see buildBodyLinesIncremental docstring for
+ * the exact detection scope). Exported so the component can route large
+ * full rebuilds through the chunked path without building first.
+ */
+export function canIncrementCache(
+  cache: BodyBuildCache,
+  messages: unknown[],
+  opts: BuildBodyOptions
+): boolean {
+  const m = messages.length;
+  return (
+    cache.seenCount > 0 &&
+    sameOpts(cache.opts, optsSignatureOf(opts)) &&
+    m > cache.seenCount &&
+    messages[cache.seenCount - 1] != null &&
+    messageFingerprint(messages[cache.seenCount - 1]) === cache.fingerprint
+  );
+}
+
+/**
  * Incremental body builder. Returns lines byte-identical to
  * buildBodyLines(messages, opts) in every case; `mode` reports whether the
  * cache was reused ("incremental" — only the new tail was built) or a full
@@ -651,12 +672,7 @@ export function buildBodyLinesIncremental(
   const m = messages.length;
   // Boundary fingerprint guard (O(1)): only messages[seenCount-1] is
   // checked. See the function docstring for the exact detection scope.
-  const canIncrement =
-    cache.seenCount > 0 &&
-    sameOpts(cache.opts, optsSig) &&
-    m > cache.seenCount &&
-    messages[cache.seenCount - 1] != null &&
-    messageFingerprint(messages[cache.seenCount - 1]) === cache.fingerprint;
+  const canIncrement = canIncrementCache(cache, messages, opts);
 
   if (!canIncrement) {
     // Full rebuild — also reseed the cache prefix so later refreshes can

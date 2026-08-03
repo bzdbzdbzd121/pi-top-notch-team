@@ -4,6 +4,7 @@ import type { MemberOperationalState } from "../session/context";
 import {
   MemberInspectorState,
   buildBodyLinesIncremental,
+  canIncrementCache,
   createBodyBuildCache,
   buildHeaderLine,
   buildFooterStatusLine,
@@ -14,6 +15,7 @@ import {
   buildNavHints,
   IDENTITY_THEME,
   type BodyBuildCache,
+  type BuildBodyOptions,
   type InspectorTheme,
 } from "./member-inspector-state";
 
@@ -51,6 +53,21 @@ const REFRESH_THROTTLE_MS = 500;
 const STATS_POLL_MS = 5000;
 /** Timeout for a single RPC query from the inspector. */
 const RPC_TIMEOUT_MS = 3000;
+/**
+ * P1-④: interaction window — flushes and background renders are suspended
+ * while the user is scrolling/typing (this long after the last key event)
+ * so rebuilds never fight the user's input; the deferred flush fires once
+ * the window closes.
+ */
+const INTERACTION_GRACE_MS = 800;
+/**
+ * P1-④: full-rebuild slice size. A full rebuild of a huge history is
+ * executed in slices of this many messages, yielding to the event loop
+ * between slices (setTimeout(0)) so key events are never starved by a
+ * long synchronous build. The incremental path is cheap and stays
+ * synchronous.
+ */
+const CHUNK_SIZE = 100;
 /**
  * Chrome lines around the body: top border(1) + header(1) + separator(1)
  * + separator(1) + footer×3(3) + bottom border(1) = 8.
@@ -148,6 +165,8 @@ export class MemberInspectorComponent {
 
   private refreshTimer: ReturnType<typeof setTimeout> | null = null;
   private statsTimer: ReturnType<typeof setTimeout> | null = null;
+  /** P1-④: timestamp of the last key event (interaction window clock). */
+  private lastInteractionAt = 0;
   /** In-flight refetch guard per member. */
   private fetching = new Set<string>();
   /** P1-③ per-tab incremental build caches (append-only prefix reuse). */
@@ -205,17 +224,34 @@ export class MemberInspectorComponent {
     this.scheduleFlush();
   }
 
-  private scheduleFlush(): void {
+  private scheduleFlush(delay: number = REFRESH_THROTTLE_MS): void {
     if (this.refreshTimer || this.disposed) return;
     this.refreshTimer = setTimeout(() => {
       this.refreshTimer = null;
       this.flushDirty();
-    }, REFRESH_THROTTLE_MS);
+    }, delay);
+  }
+
+  /**
+   * P1-④: true while the interaction window is open (a key event happened
+   * less than INTERACTION_GRACE_MS ago). Flushes and background renders are
+   * suspended in this window so rebuilds never interrupt scrolling/typing.
+   */
+  private inInteractionWindow(): boolean {
+    return Date.now() - this.lastInteractionAt < INTERACTION_GRACE_MS;
   }
 
   /** Refetch messages for all dirty tabs with running processes. */
   private flushDirty(): void {
     if (this.disposed) return;
+
+    // P1-④: suspend while the user is interacting. Dirty flags are kept
+    // (markDirty during the window stays pending), and the flush is
+    // re-deferred until the window closes — then it runs exactly once.
+    if (this.inInteractionWindow()) {
+      this.scheduleFlush(INTERACTION_GRACE_MS);
+      return;
+    }
 
     // Reconcile member list (dynamic members may appear mid-session)
     const members = this.deps.getMembers().map((m) => ({
@@ -251,7 +287,7 @@ export class MemberInspectorComponent {
             event.type === "response" && event.command === "get_messages",
           RPC_TIMEOUT_MS
         )
-        .then((response: any) => {
+        .then(async (response: any) => {
           const messages = response?.data?.messages ?? [];
           const width = this.lastWidth - 4;
           // P1-③: incremental body build — reuse the per-tab cache when the
@@ -262,12 +298,20 @@ export class MemberInspectorComponent {
             cache = createBodyBuildCache();
             this.bodyCaches.set(tab.name, cache);
           }
-          const { lines } = buildBodyLinesIncremental(cache, messages, {
+          const opts = {
             width: Math.max(20, width),
             expanded: tab.expanded,
             showThinking: tab.showThinking,
             theme: this.inspectorTheme,
-          });
+          };
+          // P1-④: route large FULL rebuilds through the chunked path — the
+          // build runs in slices of CHUNK_SIZE messages, yielding to the
+          // event loop between slices so key events are never starved by a
+          // long synchronous rebuild. Incremental refreshes (the common
+          // case) stay synchronous: O(增量) is cheap.
+          const lines = canIncrementCache(cache, messages, opts)
+            ? buildBodyLinesIncremental(cache, messages, opts).lines
+            : await this.buildBodyLinesChunked(cache, messages, opts);
           // P1-①: fixed-width the lines AT BUILD TIME (single pass) — render()
           // then emits them verbatim with zero per-frame width computation.
           this.state.setTabLines(
@@ -286,6 +330,35 @@ export class MemberInspectorComponent {
           this.fetching.delete(tab.name);
         });
     }
+  }
+
+  /**
+   * P1-④: chunked full rebuild. Slices of CHUNK_SIZE messages are appended
+   * through the shared incremental builder (slice k covers messages
+   * [0, k·CHUNK_SIZE), growing the per-tab cache), yielding to the event
+   * loop between slices via setTimeout(0) — key events stay responsive
+   * during huge rebuilds. The final slice covers the whole history and
+   * returns lines byte-identical to a single synchronous full build; the
+   * intermediate slices only advance the cache and never reach the UI
+   * (setTabLines runs once, after the last slice). The tab stays in the
+   * fetching set for the whole run, so re-entrant flushes are blocked.
+   */
+  private async buildBodyLinesChunked(
+    cache: BodyBuildCache,
+    messages: any[],
+    opts: BuildBodyOptions
+  ): Promise<string[]> {
+    const total = messages.length;
+    for (let end = CHUNK_SIZE; end < total; end += CHUNK_SIZE) {
+      // Grow the cache to messages[0..end) (first slice = full on a cold
+      // cache, later slices = incremental appends — same builder).
+      buildBodyLinesIncremental(cache, messages.slice(0, end), opts);
+      // Yield to the event loop so key events are not starved.
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      if (this.disposed) return cache.lines; // overlay closed mid-build
+    }
+    // Final slice: whole history, streaming tail included.
+    return buildBodyLinesIncremental(cache, messages, opts).lines;
   }
 
   private scheduleStatsPoll(): void {
@@ -324,8 +397,12 @@ export class MemberInspectorComponent {
     this.requestRenderSafe();
   }
 
-  private requestRenderSafe(): void {
+  private requestRenderSafe(interactive = false): void {
     if (this.disposed) return;
+    // P1-④: background-triggered renders (flush completion, stats poll) are
+    // suspended inside the interaction window — the user's own key-feedback
+    // renders (interactive=true) always pass through.
+    if (!interactive && this.inInteractionWindow()) return;
     try {
       this.tui.requestRender();
     } catch {
@@ -349,7 +426,7 @@ export class MemberInspectorComponent {
     if (!tab) return;
     if (!text) {
       this.state.closeInput();
-      this.requestRenderSafe();
+      this.requestRenderSafe(true);
       return;
     }
 
@@ -358,7 +435,7 @@ export class MemberInspectorComponent {
     if (!handle || opState === "stopped" || opState === "crashed") {
       this.state.notice = `✗ 成员 "${tab.label}" 未运行，无法发送`;
       this.state.closeInput();
-      this.requestRenderSafe();
+      this.requestRenderSafe(true);
       return;
     }
 
@@ -389,7 +466,7 @@ export class MemberInspectorComponent {
 
     this.state.closeInput();
     // The member's subsequent activity events will mark the tab dirty
-    this.requestRenderSafe();
+    this.requestRenderSafe(true);
   }
 
   /** Send a control command (abort / compact) to the active member. */
@@ -400,7 +477,7 @@ export class MemberInspectorComponent {
     const handle = this.deps.getHandle(tab.name);
     if (!handle || opState === "stopped" || opState === "crashed") {
       this.state.notice = `✗ 成员 "${tab.label}" 未运行，无法执行 ${type}`;
-      this.requestRenderSafe();
+      this.requestRenderSafe(true);
       return;
     }
     try {
@@ -409,7 +486,7 @@ export class MemberInspectorComponent {
     } catch (err) {
       this.state.notice = `✗ ${type} 失败：${err instanceof Error ? err.message : String(err)}`;
     }
-    this.requestRenderSafe();
+    this.requestRenderSafe(true);
   }
 
   /**
@@ -425,7 +502,7 @@ export class MemberInspectorComponent {
 
     if (targets.length === 0) {
       this.state.notice = "✗ 没有正在执行的成员可中断";
-      this.requestRenderSafe();
+      this.requestRenderSafe(true);
       return;
     }
 
@@ -443,13 +520,21 @@ export class MemberInspectorComponent {
       failed === 0
         ? `✓ 已中断 ${targets.length} 个成员：${labels}`
         : `✓ 已中断 ${targets.length - failed}/${targets.length} 个成员：${labels}`;
-    this.requestRenderSafe();
+    this.requestRenderSafe(true);
   }
 
   // ── Input handling ─────────────────────────────────────
 
   handleInput(data: string): void {
     const bh = bodyHeight();
+    // P1-④: browsing (scrolling) and typing open the interaction window —
+    // their flushes/renders are suspended so rebuilds never fight the user
+    // mid-scroll or mid-typing. Deliberate view switches (e/t, tab change)
+    // and control commands do NOT open the window: their refresh is the
+    // user's explicit intent and must run immediately.
+    if (this.state.inputOpen || isScrollKey(data)) {
+      this.lastInteractionAt = Date.now();
+    }
 
     // ── Input mode ──
     if (this.state.inputOpen) {
@@ -480,7 +565,7 @@ export class MemberInspectorComponent {
       } else if (data.length >= 1 && !isControlSequence(data)) {
         this.state.insertInput(data);
       }
-      this.requestRenderSafe();
+      this.requestRenderSafe(true);
       return;
     }
 
@@ -522,7 +607,7 @@ export class MemberInspectorComponent {
       return;
     }
     this.state.notice = null; // any other key clears the transient notice
-    this.requestRenderSafe();
+    this.requestRenderSafe(true);
   }
 
   // ── Rendering ──────────────────────────────────────────
@@ -645,4 +730,15 @@ function padVisible(text: string, width: number): string {
 /** Heuristic: printable input is 1+ chars that doesn't start with ESC. */
 function isControlSequence(data: string): boolean {
   return data.startsWith("\x1b") || data.charCodeAt(0) < 32;
+}
+
+/** P1-④: scrolling keys open the interaction window (browsing intent). */
+function isScrollKey(data: string): boolean {
+  return (
+    matchesKey(data, Key.up) ||
+    matchesKey(data, Key.down) ||
+    matchesKey(data, Key.pageUp) ||
+    matchesKey(data, Key.pageDown) ||
+    matchesKey(data, Key.end)
+  );
 }
