@@ -333,13 +333,40 @@ export function collapseBlankLines(lines: string[]): string[] {
  * Layout rule: one blank line before each user/assistant block, none after.
  */
 export function buildBodyLines(messages: any[], opts: BuildBodyOptions): string[] {
+  return collapseBlankLines(buildBodyRaw(messages, opts, false).lines);
+}
+
+/**
+ * Raw body line builder shared by the full path (buildBodyLines) and the
+ * P1-③ incremental path. Appends block lines for every message, tracking
+ * the needSeparator state across messages. No collapsing — the caller
+ * decides how to merge with an existing collapsed prefix.
+ *
+ * `snapshotBeforeIndex` (optional): when > 0, records lines.length and
+ * needSeparator just before processing messages[snapshotBeforeIndex] —
+ * i.e. the state after messages[0..snapshotBeforeIndex). Used by the full
+ * path to seed the incremental cache without a second build pass.
+ */
+function buildBodyRaw(
+  messages: any[],
+  opts: BuildBodyOptions,
+  initialNeedSeparator: boolean,
+  snapshotBeforeIndex = -1
+): { lines: string[]; needSeparator: boolean; snapshotLen?: number; snapshotSep?: boolean } {
   const { width, expanded, showThinking = false } = opts;
   const theme = opts.theme ?? IDENTITY_THEME;
   const lines: string[] = [];
   const textWidth = Math.max(10, width - 2);
-  let needSeparator = false; // blank before next user/assistant block
+  let needSeparator = initialNeedSeparator; // blank before next user/assistant block
+  let snapshotLen: number | undefined;
+  let snapshotSep: boolean | undefined;
 
-  for (const m of messages) {
+  for (let i = 0; i < messages.length; i++) {
+    if (i === snapshotBeforeIndex) {
+      snapshotLen = lines.length;
+      snapshotSep = needSeparator;
+    }
+    const m = messages[i];
     if (!m || typeof m !== "object") continue;
     const blockLines: string[] = [];
 
@@ -424,7 +451,211 @@ export function buildBodyLines(messages: any[], opts: BuildBodyOptions): string[
     needSeparator = true;
   }
 
-  return collapseBlankLines(lines);
+  return { lines, needSeparator, snapshotLen, snapshotSep };
+}
+
+// ── P1-③ incremental body building ─────────────────────────
+//
+// Per-tab cache + boundary fingerprint guard. A refresh is O(history) for
+// a full rebuild; when messages are append-only this becomes O(new tail)
+// by reusing the previously built prefix lines.
+//
+// Design (final summary P1-③):
+//   - cache: seenCount + last-message fingerprint + built lines + tail
+//     block state (needSeparator + trailing-blank state)
+//   - boundary compare: message count grew AND the fingerprint of the
+//     message at the cache boundary is continuous → build only the new
+//     tail and append. Count shrank / fingerprint mismatch (compress,
+//     rewrite) / opts signature change → full rebuild.
+//   - streaming-tail rule: the LAST message (TAIL=1) is always excluded
+//     from the cache and rebuilt every refresh — while streaming, the
+//     final message grows in-place, so caching it would miss updates.
+//   - comparison cost is O(1): one fingerprint of one message + count.
+
+/** Streaming-tail rule: the last N messages are never cached. */
+export const INCREMENTAL_TAIL = 1;
+
+/** Keys whose value never affects rendering (excluded from fingerprints). */
+const FINGERPRINT_IGNORED_KEYS = new Set(["id", "timestamp", "corrId", "sessionId"]);
+
+/** FNV-1a 64-bit (two interleaved 32-bit lanes), hex string. */
+function fnv1a64(s: string): string {
+  let h1 = 0x811c9dc5;
+  let h2 = 0x9e3779b1;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 0x01000193) >>> 0;
+    h2 = Math.imul(h2 ^ c, 0x01000193) >>> 0;
+  }
+  return h1.toString(16).padStart(8, "0") + h2.toString(16).padStart(8, "0");
+}
+
+/** Recursively strip non-render keys from a message for fingerprinting. */
+function renderKey(v: unknown): unknown {
+  if (v === null || typeof v !== "object") return v;
+  if (Array.isArray(v)) return v.map(renderKey);
+  const out: Record<string, unknown> = {};
+  for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+    if (FINGERPRINT_IGNORED_KEYS.has(k)) continue;
+    out[k] = renderKey(val);
+  }
+  return out;
+}
+
+/**
+ * O(content) stable fingerprint of the render-relevant fields of one
+ * message. Same content ⇒ same fingerprint; any render-affecting change
+ * (incl. same-length rewrites) ⇒ different fingerprint. Non-render fields
+ * (id/timestamp/corrId/sessionId) are excluded so refetches that only
+ * bump metadata do not trigger needless full rebuilds.
+ */
+export function messageFingerprint(m: unknown): string {
+  return fnv1a64(JSON.stringify(renderKey(m)));
+}
+
+/** Per-tab incremental build cache (see P1-③ design above). */
+export interface BodyBuildCache {
+  /** Messages covered by `lines` (stable prefix; streaming tail excluded). */
+  seenCount: number;
+  /** Fingerprint of messages[seenCount - 1] (boundary guard). */
+  fingerprint: string;
+  /** Collapsed prefix lines (rendered, ready to display). */
+  lines: string[];
+  /** Separator state after the last cached message. */
+  needSeparator: boolean;
+  /** Whether the RAW prefix ends with a blank line (collapsed away). */
+  prefixEndsWithBlank: boolean;
+  /** Build options the cache was built with (opts signature). */
+  opts: { width: number; expanded: boolean; showThinking: boolean };
+}
+
+/** Create an empty cache (first build is always full). */
+export function createBodyBuildCache(): BodyBuildCache {
+  return {
+    seenCount: 0,
+    fingerprint: "",
+    lines: [],
+    needSeparator: false,
+    prefixEndsWithBlank: false,
+    opts: { width: 0, expanded: false, showThinking: false },
+  };
+}
+
+function optsSignatureOf(opts: BuildBodyOptions): BodyBuildCache["opts"] {
+  return {
+    width: opts.width,
+    expanded: opts.expanded,
+    showThinking: opts.showThinking ?? false,
+  };
+}
+
+function sameOpts(a: BodyBuildCache["opts"], b: BodyBuildCache["opts"]): boolean {
+  return (
+    a.width === b.width &&
+    a.expanded === b.expanded &&
+    a.showThinking === b.showThinking
+  );
+}
+
+/**
+ * Append raw tail lines to a collapsed prefix, preserving the exact
+ * collapsing semantics of collapseBlankLines(prefix ++ tail):
+ *   - a leading blank in the tail is a real separator (prefix non-empty),
+ *     except when the prefix itself ends blank (raw) — then the two merge
+ *   - consecutive blanks collapse to one; trailing blanks are trimmed
+ * Returns the new full lines and the raw trailing-blank state (needed by
+ * the cache for the next append).
+ */
+function appendCollapsed(
+  prefix: string[],
+  tail: string[],
+  prefixEndsWithBlank: boolean
+): { lines: string[]; endsWithBlank: boolean } {
+  const out: string[] = [];
+  let lastBlank = false;
+  const endsWithBlank = tail.length > 0 && tail[tail.length - 1] === "";
+  for (let i = 0; i < tail.length; i++) {
+    const l = tail[i];
+    if (i === 0 && prefix.length > 0 && prefixEndsWithBlank) {
+      // The raw prefix ended with a blank (collapsed away); in the full
+      // build it sits between the last content line and the tail, so it
+      // must be restored here — exactly one blank at the seam.
+      out.push("");
+      lastBlank = true;
+    }
+    if (l === "") {
+      // Leading blank: keep as separator only if the prefix is non-empty
+      // AND the raw prefix did not already end blank (they would merge).
+      if (i === 0 && (prefix.length === 0 || prefixEndsWithBlank)) {
+        lastBlank = true;
+        continue;
+      }
+      if (lastBlank) continue;
+      out.push("");
+      lastBlank = true;
+    } else {
+      out.push(l);
+      lastBlank = false;
+    }
+  }
+  while (out.length > 0 && out[out.length - 1] === "") out.pop();
+  return { lines: prefix.concat(out), endsWithBlank };
+}
+
+/**
+ * Incremental body builder. Returns lines byte-identical to
+ * buildBodyLines(messages, opts) in every case; `mode` reports whether the
+ * cache was reused ("incremental" — only the new tail was built) or a full
+ * rebuild happened (first build / count shrink / fingerprint mismatch /
+ * opts change). The cache is mutated in place (per-tab ownership).
+ */
+export function buildBodyLinesIncremental(
+  cache: BodyBuildCache,
+  messages: any[],
+  opts: BuildBodyOptions
+): { lines: string[]; mode: "full" | "incremental" } {
+  const optsSig = optsSignatureOf(opts);
+  const m = messages.length;
+  const canIncrement =
+    cache.seenCount > 0 &&
+    sameOpts(cache.opts, optsSig) &&
+    m > cache.seenCount &&
+    messages[cache.seenCount - 1] != null &&
+    messageFingerprint(messages[cache.seenCount - 1]) === cache.fingerprint;
+
+  if (!canIncrement) {
+    // Full rebuild — also reseed the cache prefix so later refreshes can
+    // go incremental. snapshotBeforeIndex captures the raw state at the
+    // new prefix boundary in the SAME pass (no second build).
+    const newSeen = Math.max(0, m - INCREMENTAL_TAIL);
+    const raw = buildBodyRaw(messages, opts, false, newSeen);
+    const lines = collapseBlankLines(raw.lines);
+    cache.seenCount = newSeen;
+    cache.fingerprint = newSeen > 0 ? messageFingerprint(messages[newSeen - 1]) : "";
+    cache.lines = newSeen > 0 ? collapseBlankLines(raw.lines.slice(0, raw.snapshotLen ?? 0)) : [];
+    cache.needSeparator = newSeen > 0 ? (raw.snapshotSep ?? false) : false;
+    cache.prefixEndsWithBlank =
+      newSeen > 0 ? (raw.lines[raw.snapshotLen! - 1] ?? "") === "" : false;
+    cache.opts = optsSig;
+    return { lines, mode: "full" };
+  }
+
+  // Incremental: grow the cached prefix to the new boundary, then rebuild
+  // the streaming tail. Both use the shared raw builder, so the output is
+  // byte-identical to a full build by construction.
+  const newSeen = Math.max(0, m - INCREMENTAL_TAIL);
+  if (newSeen > cache.seenCount) {
+    const grown = buildBodyRaw(messages.slice(cache.seenCount, newSeen), opts, cache.needSeparator);
+    const merged = appendCollapsed(cache.lines, grown.lines, cache.prefixEndsWithBlank);
+    cache.lines = merged.lines;
+    cache.prefixEndsWithBlank = merged.endsWithBlank;
+    cache.needSeparator = grown.needSeparator;
+    cache.seenCount = newSeen;
+    cache.fingerprint = messageFingerprint(messages[newSeen - 1]);
+  }
+  const tail = buildBodyRaw(messages.slice(newSeen), opts, cache.needSeparator);
+  const merged = appendCollapsed(cache.lines, tail.lines, cache.prefixEndsWithBlank);
+  return { lines: merged.lines, mode: "incremental" };
 }
 
 // ── Header line building ───────────────────────────────────

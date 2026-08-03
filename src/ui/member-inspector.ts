@@ -3,7 +3,8 @@ import type { MemberProcessHandle } from "../process/member-process";
 import type { MemberOperationalState } from "../session/context";
 import {
   MemberInspectorState,
-  buildBodyLines,
+  buildBodyLinesIncremental,
+  createBodyBuildCache,
   buildHeaderLine,
   buildFooterStatusLine,
   fitLinesToWidth,
@@ -12,6 +13,7 @@ import {
   INPUT_HINTS,
   buildNavHints,
   IDENTITY_THEME,
+  type BodyBuildCache,
   type InspectorTheme,
 } from "./member-inspector-state";
 
@@ -148,6 +150,8 @@ export class MemberInspectorComponent {
   private statsTimer: ReturnType<typeof setTimeout> | null = null;
   /** In-flight refetch guard per member. */
   private fetching = new Set<string>();
+  /** P1-③ per-tab incremental build caches (append-only prefix reuse). */
+  private bodyCaches = new Map<string, BodyBuildCache>();
 
   constructor(
     private tui: any,
@@ -172,6 +176,7 @@ export class MemberInspectorComponent {
     if (this.statsTimer) clearTimeout(this.statsTimer);
     this.refreshTimer = null;
     this.statsTimer = null;
+    this.bodyCaches.clear();
     this.done(null);
   }
 
@@ -215,6 +220,12 @@ export class MemberInspectorComponent {
     if (this.state.tabs.length !== prevCount) {
       // New tabs start dirty — they will be fetched below
     }
+    // Drop incremental caches for tabs whose members no longer exist
+    // (dynamic member removed mid-session).
+    const live = new Set(this.state.tabs.map((t) => t.name));
+    for (const k of this.bodyCaches.keys()) {
+      if (!live.has(k)) this.bodyCaches.delete(k);
+    }
 
     const bh = bodyHeight();
     for (const tab of this.state.tabs) {
@@ -236,7 +247,15 @@ export class MemberInspectorComponent {
         .then((response: any) => {
           const messages = response?.data?.messages ?? [];
           const width = this.lastWidth - 4;
-          const lines = buildBodyLines(messages, {
+          // P1-③: incremental body build — reuse the per-tab cache when the
+          // history is append-only (boundary fingerprint guard inside), else
+          // full rebuild. Byte-identical output in both modes.
+          let cache = this.bodyCaches.get(tab.name);
+          if (!cache) {
+            cache = createBodyBuildCache();
+            this.bodyCaches.set(tab.name, cache);
+          }
+          const { lines } = buildBodyLinesIncremental(cache, messages, {
             width: Math.max(20, width),
             expanded: tab.expanded,
             showThinking: tab.showThinking,

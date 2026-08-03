@@ -608,6 +608,78 @@ describe("MemberInspectorComponent — render", () => {
   });
 
 
+  it("P1-③: flushDirty uses incremental build on message append (tail-only width work)", async () => {
+    vi.useFakeTimers();
+    try {
+      // 200 messages initially, then 5 more appended (typical growth).
+      const buildMsgs = (n: number) =>
+        Array.from({ length: n }, (_, i) => ({
+          role: "user",
+          content: `问题 ${i}: 这是一段较长的用户输入文本，包含中英文与代码片段，`.repeat(3),
+          timestamp: i,
+        }));
+      const handleA = makeHandle();
+      handleA.sendCommandAndWait
+        .mockResolvedValueOnce({ data: { messages: buildMsgs(200) } } as any)
+        .mockResolvedValueOnce({ data: { messages: buildMsgs(205) } } as any);
+      const deps = makeDeps({ handles: { a: handleA }, opStates: { a: "working" } });
+      const { comp, state } = makeComponent(deps);
+      const countSince = (mark: number) => vwCalls.length - mark;
+
+      // Establish the render width first (resize semantics: width change
+      // forces a full rebuild; the incremental path requires a stable width).
+      comp.render(80);
+
+      // First flush: full rebuild (cache cold)
+      const fullMark = vwCalls.length;
+      comp.markDirty("a");
+      await vi.advanceTimersByTimeAsync(600);
+      expect(handleA.sendCommandAndWait).toHaveBeenCalledTimes(1);
+      expect(state.tabs[0].lines.length).toBeGreaterThan(0);
+      const fullCalls = countSince(fullMark);
+
+      // Second flush: 5 appended messages → incremental tail-only build
+      const mark = vwCalls.length;
+      comp.markDirty("a");
+      await vi.advanceTimersByTimeAsync(600);
+      expect(handleA.sendCommandAndWait).toHaveBeenCalledTimes(2);
+      const incCalls = countSince(mark);
+      // The full rebuild of 200 msgs paid for the whole history; the
+      // incremental rebuild of 5 msgs must be far cheaper (tail-only).
+      expect(incCalls).toBeLessThan(fullCalls / 2);
+      // New lines are appended (content reflects the 5 new messages)
+      expect(state.tabs[0].lines.join("\n")).toContain("问题 204");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("P1-③: history rewrite (count shrink) falls back to full rebuild", async () => {
+    vi.useFakeTimers();
+    try {
+      const buildMsgs = (n: number) =>
+        Array.from({ length: n }, (_, i) => ({ role: "user", content: `问题 ${i}`, timestamp: i }));
+      const handleA = makeHandle();
+      handleA.sendCommandAndWait
+        .mockResolvedValueOnce({ data: { messages: buildMsgs(10) } } as any)
+        .mockResolvedValueOnce({ data: { messages: buildMsgs(4) } } as any); // compressed history
+      const deps = makeDeps({ handles: { a: handleA }, opStates: { a: "working" } });
+      const { comp, state } = makeComponent(deps);
+
+      comp.markDirty("a");
+      await vi.advanceTimersByTimeAsync(600);
+      expect(state.tabs[0].lines.join("\n")).toContain("问题 9");
+      comp.markDirty("a");
+      await vi.advanceTimersByTimeAsync(600);
+      // Shrunk history → full rebuild → old tail messages gone
+      const joined = state.tabs[0].lines.join("\n");
+      expect(joined).toContain("问题 3");
+      expect(joined).not.toContain("问题 9");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("total rendered lines never exceed the overlay maxHeight (bottom border not clipped)", () => {
     // pi-tui clips overlays with slice(0, maxHeight) — keeping TOP lines and
     // dropping BOTTOM ones. If our line count is even 1 over floor(rows*0.85),
