@@ -165,6 +165,8 @@ export class MemberInspectorComponent {
 
   private refreshTimer: ReturnType<typeof setTimeout> | null = null;
   private statsTimer: ReturnType<typeof setTimeout> | null = null;
+  /** P1-④/S2: compensation render pending for a suspended background render. */
+  private renderTimer: ReturnType<typeof setTimeout> | null = null;
   /** P1-④: timestamp of the last key event (interaction window clock). */
   private lastInteractionAt = 0;
   /** In-flight refetch guard per member. */
@@ -193,8 +195,10 @@ export class MemberInspectorComponent {
     this.disposed = true;
     if (this.refreshTimer) clearTimeout(this.refreshTimer);
     if (this.statsTimer) clearTimeout(this.statsTimer);
+    if (this.renderTimer) clearTimeout(this.renderTimer);
     this.refreshTimer = null;
     this.statsTimer = null;
+    this.renderTimer = null;
     this.bodyCaches.clear();
     this.done(null);
   }
@@ -280,6 +284,10 @@ export class MemberInspectorComponent {
         continue;
       }
       this.fetching.add(tab.name);
+      // Consume the dirty mark NOW — marks arriving DURING the fetch
+      // (e/t toggle, member activity in the chunked-build yield gaps)
+      // re-set it, and .then can tell "pending" apart from "stale".
+      tab.dirty = false;
       handle
         .sendCommandAndWait(
           { type: "get_messages" },
@@ -288,6 +296,9 @@ export class MemberInspectorComponent {
           RPC_TIMEOUT_MS
         )
         .then(async (response: any) => {
+          // P1-④/S3: the overlay may have been closed while the fetch was
+          // in flight — do not commit or render into a dead component.
+          if (this.disposed) return;
           const messages = response?.data?.messages ?? [];
           const width = this.lastWidth - 4;
           // P1-③: incremental body build — reuse the per-tab cache when the
@@ -312,6 +323,11 @@ export class MemberInspectorComponent {
           const lines = canIncrementCache(cache, messages, opts)
             ? buildBodyLinesIncremental(cache, messages, opts).lines
             : await this.buildBodyLinesChunked(cache, messages, opts);
+          // P1-④/B1: a dirty mark that arrived DURING the fetch (e/t toggle,
+          // member activity while the chunked build yields) must not be
+          // silently consumed by setTabLines — capture it first, then
+          // re-flush once with the fresh opts/messages.
+          const pending = tab.dirty;
           // P1-①: fixed-width the lines AT BUILD TIME (single pass) — render()
           // then emits them verbatim with zero per-frame width computation.
           this.state.setTabLines(
@@ -319,6 +335,13 @@ export class MemberInspectorComponent {
             fitLinesToWidth(lines, Math.max(20, this.lastWidth - 2)),
             bh
           );
+          if (pending) {
+            // Re-enqueue: setTabLines consumed the flag, and flushDirty
+            // only picks up dirty tabs — restore it so the catch-up flush
+            // rebuilds with the fresh opts/messages.
+            tab.dirty = true;
+            this.scheduleFlush();
+          }
           this.requestRenderSafe();
         })
         .catch(() => {
@@ -351,8 +374,9 @@ export class MemberInspectorComponent {
     const total = messages.length;
     for (let end = CHUNK_SIZE; end < total; end += CHUNK_SIZE) {
       // Grow the cache to messages[0..end) (first slice = full on a cold
-      // cache, later slices = incremental appends — same builder).
-      buildBodyLinesIncremental(cache, messages.slice(0, end), opts);
+      // cache, later slices = incremental appends — same builder). The
+      // index bound avoids a per-slice array copy (S4).
+      buildBodyLinesIncremental(cache, messages, opts, end);
       // Yield to the event loop so key events are not starved.
       await new Promise<void>((resolve) => setTimeout(resolve, 0));
       if (this.disposed) return cache.lines; // overlay closed mid-build
@@ -402,12 +426,23 @@ export class MemberInspectorComponent {
     // P1-④: background-triggered renders (flush completion, stats poll) are
     // suspended inside the interaction window — the user's own key-feedback
     // renders (interactive=true) always pass through.
-    if (!interactive && this.inInteractionWindow()) return;
-    try {
-      this.tui.requestRender();
-    } catch {
-      // TUI gone
+    if (interactive || !this.inInteractionWindow()) {
+      try {
+        this.tui.requestRender();
+      } catch {
+        // TUI gone
+      }
+      return;
     }
+    // P1-④/S2: a suspended background render is deferred, not dropped —
+    // schedule a compensation render once the window closes (re-deferred
+    // if the user keeps interacting).
+    if (this.renderTimer) return; // one compensation render suffices
+    this.renderTimer = setTimeout(() => {
+      this.renderTimer = null;
+      if (this.disposed) return;
+      this.requestRenderSafe(); // re-check the window; re-defer if still open
+    }, INTERACTION_GRACE_MS);
   }
 
   // ── Send logic ─────────────────────────────────────────
@@ -592,9 +627,13 @@ export class MemberInspectorComponent {
       this.state.openInput();
     } else if (matchesKey(data, "e")) {
       this.state.toggleExpand();
+      // P1-④/S1: the expand intent is explicit — clear the interaction
+      // window so the refresh runs immediately, even mid-scroll.
+      this.lastInteractionAt = 0;
       this.scheduleFlush();
     } else if (matchesKey(data, "t")) {
       this.state.toggleThinking();
+      this.lastInteractionAt = 0;
       this.scheduleFlush();
     } else if (matchesKey(data, "ctrl+a")) {
       this.sendControl("abort");

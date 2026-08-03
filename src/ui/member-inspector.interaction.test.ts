@@ -135,11 +135,15 @@ describe("P1-④ 交互感知刷新抑制（挂起 + 补刷 + 分片）", () => 
     await vi.advanceTimersByTimeAsync(0);
     expect(tui.requestRender).toHaveBeenCalledTimes(renders + 1);
 
-    // After the window closes, a later flush renders the fresh data.
+    // P1-④/S2: the suspended render is NOT dropped — once the window
+    // closes it gets a compensation render with the fresh data.
     await vi.advanceTimersByTimeAsync(1000);
+    expect(tui.requestRender).toHaveBeenCalledTimes(renders + 2); // compensation
+
+    // A later flush renders again.
     comp.markDirty("a");
     await vi.advanceTimersByTimeAsync(600);
-    expect(tui.requestRender).toHaveBeenCalledTimes(renders + 2);
+    expect(tui.requestRender).toHaveBeenCalledTimes(renders + 3);
   });
 
   it("挂起期间消息增长，补刷后 newBelow 提示不丢", async () => {
@@ -242,5 +246,152 @@ describe("P1-④ 交互感知刷新抑制（挂起 + 补刷 + 分片）", () => 
     const yieldsAfter = yieldSpy.mock.calls.filter(([, d]) => d === 0).length;
     expect(yieldsAfter).toBe(yieldsBefore); // no chunking on the fast path
     yieldSpy.mockRestore();
+  });
+
+  // ── B1 (review): dirty marks arriving DURING a chunked build must not be
+  // consumed by setTabLines — the e/t intent / new activity re-flushes.
+
+  it("B1: 分片构建期间按 e → 补刷重建 expanded 行（意图不丢）", async () => {
+    vi.useRealTimers();
+    const toolMsg = {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "1", name: "read", arguments: { path: "a.ts" } }],
+      timestamp: 0,
+    };
+    const msgs = [toolMsg, ...buildMsgs(249)];
+    const handleA = makeHandle();
+    handleA.sendCommandAndWait.mockResolvedValue({ data: { messages: msgs } } as any);
+    const deps = makeDeps({ handles: { a: handleA } });
+    const { comp, state, tui } = makeComponent(deps);
+    comp.render(80);
+
+    const realSetTimeout = globalThis.setTimeout.bind(globalThis);
+    let held: (() => void) | null = null;
+    const spy = vi.spyOn(globalThis, "setTimeout").mockImplementation(((
+      cb: any,
+      ms?: any,
+      ...args: any[]
+    ) => {
+      if (ms === 0 && held === null) {
+        held = cb;
+        return 0 as any;
+      }
+      return realSetTimeout(cb, ms, ...args);
+    }) as any);
+
+    comp.markDirty("a");
+    await new Promise((r) => realSetTimeout(r, 600)); // fetch#1 → slice 1 → yield HELD
+    expect(handleA.sendCommandAndWait).toHaveBeenCalledTimes(1);
+
+    comp.handleInput("e"); // explicit expand intent DURING the build
+    expect(state.tabs[0].expanded).toBe(true);
+
+    held!(); // release the build
+    await new Promise((r) => realSetTimeout(r, 1200)); // finish #1 → re-flush → fetch#2
+
+    // The e-intent was NOT silently consumed: a second fetch happened and
+    // the final lines are rendered in expanded form.
+    expect(handleA.sendCommandAndWait).toHaveBeenCalledTimes(2);
+    expect(state.tabs[0].dirty).toBe(false); // consumed by the catch-up flush
+    expect(state.tabs[0].lines.join("\n")).toContain('"path"');
+    // Both key feedback and the background renders fired (sanity).
+    expect(tui.requestRender).toHaveBeenCalled();
+    spy.mockRestore();
+  });
+
+  it("B1: 分片构建期间新活动 markDirty → 补刷显示新消息", async () => {
+    vi.useRealTimers();
+    const handleA = makeHandle();
+    handleA.sendCommandAndWait
+      .mockResolvedValueOnce({ data: { messages: buildMsgs(250) } } as any)
+      .mockResolvedValueOnce({ data: { messages: buildMsgs(260) } } as any);
+    const deps = makeDeps({ handles: { a: handleA } });
+    const { comp, state } = makeComponent(deps);
+    comp.render(80);
+
+    const realSetTimeout = globalThis.setTimeout.bind(globalThis);
+    let held: (() => void) | null = null;
+    const spy = vi.spyOn(globalThis, "setTimeout").mockImplementation(((
+      cb: any,
+      ms?: any,
+      ...args: any[]
+    ) => {
+      if (ms === 0 && held === null) {
+        held = cb;
+        return 0 as any;
+      }
+      return realSetTimeout(cb, ms, ...args);
+    }) as any);
+
+    comp.markDirty("a");
+    await new Promise((r) => realSetTimeout(r, 600)); // fetch#1 → slice 1 → yield HELD
+    comp.markDirty("a"); // member activity arrives mid-build
+    held!();
+    await new Promise((r) => realSetTimeout(r, 1200)); // finish #1 → re-flush → fetch#2
+
+    expect(handleA.sendCommandAndWait).toHaveBeenCalledTimes(2);
+    expect(state.tabs[0].dirty).toBe(false);
+    // Messages that arrived during the build are displayed, not lost.
+    expect(state.tabs[0].lines.join("\n")).toContain("问题 259");
+    spy.mockRestore();
+  });
+
+  // ── S1 (review): e/t while the window is open must still refresh
+  // immediately — the explicit intent clears the window.
+
+  it("S1: 窗口已开时按 e → 清窗，刷新不被挂起", async () => {
+    const handleA = makeHandle();
+    handleA.sendCommandAndWait.mockResolvedValue({ data: { messages: buildMsgs(10) } } as any);
+    const deps = makeDeps({ handles: { a: handleA } });
+    const { comp, state } = makeComponent(deps);
+
+    comp.handleInput("\x1b[B"); // scroll opens the window
+    comp.handleInput("e"); // explicit expand intent — must not be deferred
+    expect(state.tabs[0].expanded).toBe(true);
+    await vi.advanceTimersByTimeAsync(600);
+    expect(handleA.sendCommandAndWait).toHaveBeenCalledTimes(1); // immediate flush
+  });
+
+  // ── S2 (review): a background render suspended inside the window gets a
+  // compensation render once the window closes.
+
+  it("S2: 窗口内完成的 flush 渲染挂起 → 窗口关闭后补偿渲染一次", async () => {
+    const handleA = makeHandle();
+    const deferred = makeDeferred<any>();
+    handleA.sendCommandAndWait.mockReturnValueOnce(deferred.promise);
+    const deps = makeDeps({ handles: { a: handleA } });
+    const { comp, tui } = makeComponent(deps);
+
+    comp.markDirty("a");
+    await vi.advanceTimersByTimeAsync(600); // flush starts OUTSIDE the window
+    comp.handleInput("\x1b[B"); // window opens mid-flight (feedback render +1)
+    const before = tui.requestRender.mock.calls.length;
+
+    deferred.resolve({ data: { messages: buildMsgs(5) } });
+    await vi.advanceTimersByTimeAsync(0); // .then completes → render suspended
+    expect(tui.requestRender).toHaveBeenCalledTimes(before); // suspended, not dropped
+
+    await vi.advanceTimersByTimeAsync(900); // window closed → compensation render
+    expect(tui.requestRender).toHaveBeenCalledTimes(before + 1);
+  });
+
+  // ── S3 (review): a fetch resolving after close() must not render/update.
+
+  it("S3: close 后完成的 fetch 不再渲染", async () => {
+    const handleA = makeHandle();
+    const deferred = makeDeferred<any>();
+    handleA.sendCommandAndWait.mockReturnValueOnce(deferred.promise);
+    const deps = makeDeps({ handles: { a: handleA } });
+    const { comp, tui, state } = makeComponent(deps);
+
+    comp.markDirty("a");
+    await vi.advanceTimersByTimeAsync(600); // fetch in flight
+    comp.close();
+    const before = tui.requestRender.mock.calls.length;
+
+    deferred.resolve({ data: { messages: buildMsgs(5) } });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(tui.requestRender).toHaveBeenCalledTimes(before); // no late render
+    expect(state.tabs[0].lines.length).toBe(0); // no late commit
   });
 });

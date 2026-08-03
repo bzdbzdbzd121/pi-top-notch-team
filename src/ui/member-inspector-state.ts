@@ -666,20 +666,30 @@ export function canIncrementCache(
 export function buildBodyLinesIncremental(
   cache: BodyBuildCache,
   messages: any[],
-  opts: BuildBodyOptions
+  opts: BuildBodyOptions,
+  limit?: number
 ): { lines: string[]; mode: "full" | "incremental" } {
   const optsSig = optsSignatureOf(opts);
-  const m = messages.length;
+  // P1-④/S4: an optional index bound lets the chunked path grow the cache
+  // over prefixes [0, limit) without slicing the array per slice. Callers
+  // must pass a monotonically non-decreasing limit (chunked builds do).
+  const m = Math.min(limit ?? messages.length, messages.length);
   // Boundary fingerprint guard (O(1)): only messages[seenCount-1] is
   // checked. See the function docstring for the exact detection scope.
-  const canIncrement = canIncrementCache(cache, messages, opts);
+  const canIncrement =
+    canIncrementCache(cache, messages, opts) && m > cache.seenCount;
 
   if (!canIncrement) {
     // Full rebuild — also reseed the cache prefix so later refreshes can
     // go incremental. snapshotBeforeIndex captures the raw state at the
     // new prefix boundary in the SAME pass (no second build).
     const newSeen = Math.max(0, m - INCREMENTAL_TAIL);
-    const raw = buildBodyRaw(messages, opts, false, newSeen);
+    const raw = buildBodyRaw(
+      limit === undefined ? messages : messages.slice(0, m),
+      opts,
+      false,
+      newSeen
+    );
     const lines = collapseBlankLines(raw.lines);
     cache.seenCount = newSeen;
     cache.fingerprint = newSeen > 0 ? messageFingerprint(messages[newSeen - 1]) : "";
@@ -704,7 +714,7 @@ export function buildBodyLinesIncremental(
     cache.seenCount = newSeen;
     cache.fingerprint = messageFingerprint(messages[newSeen - 1]);
   }
-  const tail = buildBodyRaw(messages.slice(newSeen), opts, cache.needSeparator);
+  const tail = buildBodyRaw(messages.slice(newSeen, m), opts, cache.needSeparator);
   const merged = appendCollapsed(cache.lines, tail.lines, cache.prefixEndsWithBlank);
   return { lines: merged.lines, mode: "incremental" };
 }
