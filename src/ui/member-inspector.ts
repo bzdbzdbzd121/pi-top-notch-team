@@ -184,7 +184,14 @@ export class MemberInspectorComponent {
     // P1-①: resize / theme change may have invalidated the build-time fixed
     // width contract (lines were padded to the old inner width). Mark ALL
     // tabs dirty so the next throttled flush rebuilds them at the new width.
+    // P1-③ (B1): also drop the incremental caches. Theme preview/switch
+    // routes through here (pi-tui overlay invalidate), and the cached prefix
+    // lines have theme colours baked in at build time — reusing them would
+    // leave a stale-colour body next to freshly-themed chrome. The cost is
+    // one full rebuild on the next flush, which happens anyway for width
+    // changes.
     if (this.disposed) return;
+    this.bodyCaches.clear();
     for (const tab of this.state.tabs) tab.dirty = true;
     this.scheduleFlush();
   }

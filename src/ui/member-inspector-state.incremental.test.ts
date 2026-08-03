@@ -207,6 +207,16 @@ describe("P1-③ 增量刷新：边界指纹 + 流式尾部规则", () => {
     expect(messageFingerprint(tc)).not.toBe(messageFingerprint({ ...tc, content: [{ ...tc.content[0], arguments: { path: "b" } }] }));
   });
 
+  it("messageFingerprint(undefined) does not throw (malformed payload defense)", () => {
+    // S2: JSON.stringify(undefined) is undefined → fnv1a64 would read
+    // s.length and throw. buildBodyRaw skips null messages but the
+    // fingerprint path has no such guard; a throw here would be swallowed
+    // by flushDirty's .catch and the tab update would be silently lost.
+    expect(messageFingerprint(undefined)).toBe(messageFingerprint(undefined));
+    expect(messageFingerprint(undefined)).not.toBe(messageFingerprint(null));
+    expect(messageFingerprint(undefined)).not.toBe(messageFingerprint(""));
+  });
+
   it("expanded toggle → full rebuild (opts signature change)", () => {
     const cache = createBodyBuildCache();
     const opts = mkOpts();

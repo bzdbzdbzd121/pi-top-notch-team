@@ -25,7 +25,7 @@ import {
   MemberInspectorComponent,
   USER_DIRECT_PREFIX,
 } from "./member-inspector";
-import { MemberInspectorState, fitLinesToWidth } from "./member-inspector-state";
+import { MemberInspectorState, fitLinesToWidth, buildBodyLines } from "./member-inspector-state";
 
 // ── Key sequences (real terminal encodings) ────────────────
 
@@ -649,6 +649,69 @@ describe("MemberInspectorComponent — render", () => {
       expect(incCalls).toBeLessThan(fullCalls / 2);
       // New lines are appended (content reflects the 5 new messages)
       expect(state.tabs[0].lines.join("\n")).toContain("问题 204");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("P1-③ B1: theme switch via invalidate() clears caches — no stale-colour prefix (byte-identical to full)", async () => {
+    vi.useFakeTimers();
+    try {
+      const buildMsgs = (n: number) =>
+        Array.from({ length: n }, (_, i) => ({
+          role: "user",
+          content: `问题 ${i}: 这是一段较长的用户输入文本，包含中英文与代码片段，`.repeat(3),
+          timestamp: i,
+        }));
+      const handleA = makeHandle();
+      handleA.sendCommandAndWait
+        .mockResolvedValueOnce({ data: { messages: buildMsgs(200) } } as any)
+        .mockResolvedValueOnce({ data: { messages: buildMsgs(205) } } as any);
+      const deps = makeDeps({ handles: { a: handleA }, opStates: { a: "working" } });
+      const tui = makeTui();
+      const done = vi.fn();
+      const state = new MemberInspectorState([
+        { name: "a", label: "分析员" },
+        { name: "b", label: "编码员" },
+      ]);
+      // Simulate pi's live theme mechanism: a Proxy whose reads forward to a
+      // swappable target (pi replaces the theme object under a global key).
+      let themeTarget: any = { fg: (_c: string, t: string) => `\x1b[31m${t}\x1b[0m`, bold: (t: string) => t };
+      const theme = new Proxy({}, { get: (_t, k) => themeTarget[k] });
+      const comp = new MemberInspectorComponent(tui, theme, done, deps, state);
+      comp.render(80);
+
+      // Flush 1: full build under the RED theme — prefix lines bake red ANSI.
+      comp.markDirty("a");
+      await vi.advanceTimersByTimeAsync(600);
+      expect(state.tabs[0].lines.join("\n")).toContain("\x1b[31m");
+
+      // Theme switch: swap the Proxy target + invalidate() (the exact path
+      // pi-tui takes on theme preview/reset). The incremental cache must be
+      // dropped — otherwise the next append reuses red-baked prefix lines.
+      themeTarget = { fg: (_c: string, t: string) => `\x1b[34m${t}\x1b[0m`, bold: (t: string) => t };
+      comp.invalidate();
+
+      // Flush 2: 5 appended messages under the BLUE theme.
+      comp.markDirty("a");
+      await vi.advanceTimersByTimeAsync(600);
+      const joined = state.tabs[0].lines.join("\n");
+      expect(joined).not.toContain("\x1b[31m"); // no stale red
+      expect(joined).toContain("\x1b[34m");
+      // Byte-identical to a fresh full build under the current theme
+      // (build width 76 = lastWidth-4; then fitLinesToWidth pads to 78 =
+      // lastWidth-2, mirroring flushDirty exactly).
+      const blueTheme = { fg: (_c: string, t: string) => `\x1b[34m${t}\x1b[0m`, bold: (t: string) => t };
+      const full = fitLinesToWidth(
+        buildBodyLines(buildMsgs(205), {
+          width: 76,
+          expanded: false,
+          showThinking: false,
+          theme: blueTheme,
+        }),
+        78
+      );
+      expect(state.tabs[0].lines).toEqual(full);
     } finally {
       vi.useRealTimers();
     }

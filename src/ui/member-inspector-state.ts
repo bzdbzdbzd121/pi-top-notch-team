@@ -508,9 +508,15 @@ function renderKey(v: unknown): unknown {
  * (incl. same-length rewrites) ⇒ different fingerprint. Non-render fields
  * (id/timestamp/corrId/sessionId) are excluded so refetches that only
  * bump metadata do not trigger needless full rebuilds.
+ *
+ * Defensive: `undefined` entries (malformed get_messages payloads) yield a
+ * stable "empty" fingerprint instead of throwing — buildBodyRaw skips null
+ * messages, so a fingerprint crash here would only surface as a silent
+ * tab-update loss via the caller's .catch.
  */
 export function messageFingerprint(m: unknown): string {
-  return fnv1a64(JSON.stringify(renderKey(m)));
+  const s = JSON.stringify(renderKey(m));
+  return fnv1a64(s ?? "");
 }
 
 /** Per-tab incremental build cache (see P1-③ design above). */
@@ -565,6 +571,22 @@ function sameOpts(a: BodyBuildCache["opts"], b: BodyBuildCache["opts"]): boolean
  *   - consecutive blanks collapse to one; trailing blanks are trimmed
  * Returns the new full lines and the raw trailing-blank state (needed by
  * the cache for the next append).
+ *
+ * Branch map (i = position in tail; prefix = already-collapsed prefix):
+ *   A. i===0 && prefix非空 && prefixEndsWithBlank — the raw prefix ended
+ *      with a blank that collapseBlankLines trimmed; in the FULL build it
+ *      separates prefix content from the tail, so restore exactly one at
+ *      the seam (then fall through to the normal blank handling).
+ *   B. i===0 && l==="" && (prefix空 || prefixEndsWithBlank) — a leading
+ *      blank adjacent to the prefix end: with an empty prefix it is the
+ *      very first line (no separator semantics yet → drop); with a
+ *      prefixEndsWithBlank it would only duplicate the seam blank in A →
+ *      drop. In both cases mark lastBlank so a following blank also drops.
+ *   C. l==="" && lastBlank — consecutive blanks after a kept one merge
+ *      into the single previous blank → drop.
+ *   D. l==="" otherwise — genuine interior/leading separator → keep.
+ *   E. l!=="" — content line → keep, clear lastBlank.
+ *   F. after the loop: trim trailing blanks (collapseBlankLines contract).
  */
 function appendCollapsed(
   prefix: string[],
@@ -577,27 +599,30 @@ function appendCollapsed(
   for (let i = 0; i < tail.length; i++) {
     const l = tail[i];
     if (i === 0 && prefix.length > 0 && prefixEndsWithBlank) {
-      // The raw prefix ended with a blank (collapsed away); in the full
-      // build it sits between the last content line and the tail, so it
-      // must be restored here — exactly one blank at the seam.
+      // Branch A — restore the seam blank the prefix-collapse trimmed.
       out.push("");
       lastBlank = true;
     }
     if (l === "") {
-      // Leading blank: keep as separator only if the prefix is non-empty
-      // AND the raw prefix did not already end blank (they would merge).
       if (i === 0 && (prefix.length === 0 || prefixEndsWithBlank)) {
+        // Branch B — leading blank absorbed by the prefix edge.
         lastBlank = true;
         continue;
       }
-      if (lastBlank) continue;
+      if (lastBlank) {
+        // Branch C — merge consecutive blanks.
+        continue;
+      }
+      // Branch D — genuine separator.
       out.push("");
       lastBlank = true;
     } else {
+      // Branch E — content line.
       out.push(l);
       lastBlank = false;
     }
   }
+  // Branch F — trailing-blank trim.
   while (out.length > 0 && out[out.length - 1] === "") out.pop();
   return { lines: prefix.concat(out), endsWithBlank };
 }
@@ -608,6 +633,14 @@ function appendCollapsed(
  * cache was reused ("incremental" — only the new tail was built) or a full
  * rebuild happened (first build / count shrink / fingerprint mismatch /
  * opts change). The cache is mutated in place (per-tab ownership).
+ *
+ * Guard scope (precise): the O(1) boundary check verifies ONLY
+ * messages[seenCount-1]. An in-place rewrite of an EARLIER message
+ * (index < seenCount-1) with unchanged count and unchanged boundary
+ * message is NOT detected — the stale prefix would render until some
+ * other guard fires. This is an accepted trade-off: the data source
+ * (member session logs) is append-only, and history compaction shrinks
+ * the count, which the count guard catches.
  */
 export function buildBodyLinesIncremental(
   cache: BodyBuildCache,
@@ -616,6 +649,8 @@ export function buildBodyLinesIncremental(
 ): { lines: string[]; mode: "full" | "incremental" } {
   const optsSig = optsSignatureOf(opts);
   const m = messages.length;
+  // Boundary fingerprint guard (O(1)): only messages[seenCount-1] is
+  // checked. See the function docstring for the exact detection scope.
   const canIncrement =
     cache.seenCount > 0 &&
     sameOpts(cache.opts, optsSig) &&
