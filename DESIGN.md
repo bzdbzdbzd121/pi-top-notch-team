@@ -1089,7 +1089,7 @@ Overlay: `ctx.ui.custom(component, { overlay: true, overlayOptions: { width: "90
 | `e` | Toggle tool call/result detail expansion for the active tab |
 | `t` | Toggle thinking block visibility for the active tab (hidden by default) |
 | `ctrl+a` | `abort` the active tab's member |
-| `ctrl+b` / `ctrl+shift+a` | `abort` ALL executing members (working/compacting) in one shot; idle/stopped/crashed are skipped; one TL notification covers the batch. `ctrl+shift+a` requires Kitty keyboard protocol — legacy terminals send the same byte as `ctrl+a` (single abort), so `ctrl+b` remains the all-terminal key |
+| `ctrl+b` / `ctrl+shift+a` | `abort` ALL executing members (working/compacting) in one shot; idle/stopped/crashed are skipped. `ctrl+shift+a` requires Kitty keyboard protocol — legacy terminals send the same byte as `ctrl+a` (single abort), so `ctrl+b` remains the all-terminal key |
 | `ctrl+o` | `compact` the active tab's member (NOT ctrl+m — indistinguishable from Enter in terminals) |
 | `Esc` | Layered exit: input box → overlay |
 
@@ -1122,8 +1122,7 @@ Messages typed into the input box bypass the TL. To keep the team consistent:
 
 - Non-slash text is prefixed with `[用户直接指令（非 TL）]:` so the Member can distinguish the source
 - `/...` text is sent raw — the member's agent-session resolves it as an extension command / skill / prompt-template expansion (verified in pi `dist/core/agent-session.js` `prompt()`)
-- Every direct message and every abort/compact (single or all-at-once) is mirrored into the TL session via `pi.sendMessage` (`[Member Inspector] 用户...`) so the TL stays aware
-- **TL notifications use pi's `deliverAs: "nextTurn"` mechanism, batched by TL processing state — no time window**: every intervention (abort/compact/direct message) is sent as an independent `pi.sendMessage(..., {deliverAs: "nextTurn"})` — pi holds it for the NEXT turn instead of starting a turn per notification. While the TL is busy (tracked via `agent_start`/`agent_settled`), reminders keep queueing; the moment the TL's current turn settles, ONE `{triggerTurn: true, deliverAs: "followUp"}` message starts a turn in which ALL still-unprocessed notifications are injected together. If the TL is idle at intervention time, the unified turn starts immediately. Nothing is ever split by a timer — batching is purely "everything the TL hasn't processed yet, delivered in the next turn". Verified against pi `dist/core/agent-session.js` `sendCustomMessage()` + `_runAgentPrompt()` (`_pendingNextTurnMessages` injection).
+- **User interventions are NOT mirrored into the TL session** — no `pi.sendMessage` notification is generated for direct messages, aborts, or compacts. The TL only learns about them indirectly (member replies, `get_member_log`). This keeps the user's direct control channel private from the TL's turn flow.
 - crashed/stopped members reject sends with a footer notice
 
 ### Files

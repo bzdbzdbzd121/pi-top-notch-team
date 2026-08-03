@@ -94,10 +94,6 @@ export default function (pi: ExtensionAPI) {
   // ── Member Inspector (成员检视浮窗) ───────────────────────
   // Handle for the currently-open inspector overlay; null when closed.
   let inspectorHandle: MemberInspectorHandle | null = null;
-  // Whether the TL agent is processing a turn (agent_start..agent_settled).
-  // Drives the inspector's unified notification batching: while busy, all
-  // intervention reminders queue; when settled, they are delivered together.
-  let tlBusy = false;
 
   pi.registerShortcut("alt+t", {
     description: "Member Inspector（成员检视浮窗）",
@@ -106,11 +102,9 @@ export default function (pi: ExtensionAPI) {
       if (!getSessionState().active) return;
       if (inspectorHandle?.isOpen()) return;
       inspectorHandle = openMemberInspector(ctx, {
-        pi,
         getMembers: () => getSessionState().teamDefinition?.members ?? [],
         getHandle: (name: string) => teamCtx.getHandle(name),
         memberOpsStates,
-        isTlBusy: () => tlBusy,
       });
     },
   });
@@ -263,7 +257,6 @@ export default function (pi: ExtensionAPI) {
   // reach this (TEAM_ROLE early return above).
   const tlReadGuard = createTlReadGuard();
   pi.on("agent_start", (_event, ctx) => {
-    tlBusy = true;
     tlReadGuard.resetTurn();
     // Clear any leftover guard status from the previous turn (UI may be absent in RPC mode).
     try {
@@ -358,10 +351,6 @@ export default function (pi: ExtensionAPI) {
   // When the user presses Escape during a team session, pi cancels the TL's turn
   // but member processes keep running. This handler notifies the user.
   pi.on("agent_settled", async (_event, ctx) => {
-    // TL turn finished: inspector delivers any notifications queued while busy.
-    tlBusy = false;
-    inspectorHandle?.onTlSettled();
-
     const session = getSessionState();
     if (!session.active) {
       // Session already ended (e.g. /team stop) — clear stale status
@@ -394,11 +383,6 @@ export default function (pi: ExtensionAPI) {
       const teamName = _session.teamDefinition?.name;
       const sessionId = _session.sessionId;
       const isDynamic = teamCtx.isDynamicSession;
-
-      // Reset the inspector's TL-busy flag so a fresh session does not
-      // inherit stale batching state (queued-while-busy would otherwise
-      // never trigger until the first agent_settled).
-      tlBusy = false;
 
       endSession();
       resetGoal();

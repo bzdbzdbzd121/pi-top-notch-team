@@ -55,19 +55,16 @@ function makeHandle() {
 function makeDeps(opts: {
   handles?: Record<string, any>;
   opStates?: Record<string, "idle" | "working" | "crashed" | "stopped">;
-  tlBusy?: boolean;
 }) {
   const handles = new Map(Object.entries(opts.handles ?? {}));
   const opStates = new Map(Object.entries(opts.opStates ?? {}));
   return {
-    pi: { sendMessage: vi.fn() },
     getMembers: () => [
       { name: "a", label: "分析员" },
       { name: "b", label: "编码员" },
     ],
     getHandle: (name: string) => handles.get(name),
     memberOpsStates: opStates,
-    isTlBusy: () => opts.tlBusy ?? false,
   } as any;
 }
 
@@ -101,7 +98,7 @@ describe("MemberInspectorComponent — input & send", () => {
     });
   });
 
-  it("opens input with 'i', sends prompt with prefix + TL notify for idle member", () => {
+  it("opens input with 'i', sends prompt with prefix for idle member", () => {
     const { comp, state } = makeComponent(deps);
     comp.handleInput("i");
     expect(state.inputOpen).toBe(true);
@@ -114,12 +111,6 @@ describe("MemberInspectorComponent — input & send", () => {
     expect(cmd.message).toBe(`${USER_DIRECT_PREFIX}\n请停下手中的活`);
     expect(state.inputOpen).toBe(false);
     expect(state.notice).toContain("已发送");
-    // TL idle → notification queued via nextTurn AND one trigger turn starts
-    // immediately, so the TL handles it in a single turn.
-    expect(deps.pi.sendMessage).toHaveBeenCalledTimes(2);
-    expect(deps.pi.sendMessage.mock.calls[0][0].content).toContain("分析员");
-    expect(deps.pi.sendMessage.mock.calls[0][1]).toEqual({ deliverAs: "nextTurn" });
-    expect(deps.pi.sendMessage.mock.calls[1][1]).toMatchObject({ triggerTurn: true });
   });
 
   it("sends follow_up when member is working (Enter)", () => {
@@ -147,7 +138,6 @@ describe("MemberInspectorComponent — input & send", () => {
     typeText(comp, "hello");
     comp.handleInput(K.enter);
     expect(handleA.sendCommand).not.toHaveBeenCalled();
-    expect(deps.pi.sendMessage).not.toHaveBeenCalled();
     expect(state.notice).toContain("未运行");
   });
 
@@ -158,8 +148,6 @@ describe("MemberInspectorComponent — input & send", () => {
     comp.handleInput(K.enter);
     const cmd = handleA.sendCommand.mock.calls[0][0];
     expect(cmd.message).toBe("/fix-tests");
-    // TL still notified (nextTurn + immediate trigger turn)
-    expect(deps.pi.sendMessage).toHaveBeenCalledTimes(2);
   });
 
   it("backspace edits the buffer (unicode-safe)", () => {
@@ -183,18 +171,13 @@ describe("MemberInspectorComponent — input & send", () => {
 });
 
 describe("MemberInspectorComponent — control commands", () => {
-  it("ctrl+a sends abort to active member + TL notify", () => {
+  it("ctrl+a sends abort to active member", () => {
     const handleA = makeHandle();
     const deps = makeDeps({ handles: { a: handleA }, opStates: { a: "working" } });
     const { comp, state } = makeComponent(deps);
     comp.handleInput(K.ctrlA);
     expect(handleA.sendCommand).toHaveBeenCalledWith({ type: "abort" });
     expect(state.notice).toContain("abort");
-    // Queued via nextTurn, then ONE trigger turn — both immediate (TL idle)
-    expect(deps.pi.sendMessage).toHaveBeenCalledTimes(2);
-    expect(deps.pi.sendMessage.mock.calls[0][1]).toEqual({ deliverAs: "nextTurn" });
-    expect(deps.pi.sendMessage.mock.calls[1][1]).toMatchObject({ triggerTurn: true });
-    expect(deps.pi.sendMessage.mock.calls[0][0].content).toContain("abort");
   });
 
   it("ctrl+o sends compact", () => {
@@ -246,7 +229,7 @@ describe("MemberInspectorComponent — control commands", () => {
     expect(state.inputOpen).toBe(false);
   });
 
-  it("ctrl+b aborts ALL executing members + one TL notification", () => {
+  it("ctrl+b aborts ALL executing members", () => {
     const handleA = makeHandle();
     const handleB = makeHandle();
     const deps = makeDeps({
@@ -260,10 +243,6 @@ describe("MemberInspectorComponent — control commands", () => {
     expect(state.notice).toContain("2 个成员");
     expect(state.notice).toContain("分析员");
     expect(state.notice).toContain("编码员");
-    // One trigger turn covers the whole batch (TL idle → immediate)
-    expect(deps.pi.sendMessage).toHaveBeenCalledTimes(2);
-    expect(deps.pi.sendMessage.mock.calls[0][0].content).toContain("2 个");
-    expect(deps.pi.sendMessage.mock.calls[1][1]).toMatchObject({ triggerTurn: true });
   });
 
   it("ctrl+b skips idle/stopped/crashed members", () => {
@@ -294,8 +273,6 @@ describe("MemberInspectorComponent — control commands", () => {
     expect(handleA.sendCommand).toHaveBeenCalledWith({ type: "abort" });
     expect(handleB.sendCommand).toHaveBeenCalledWith({ type: "abort" });
     expect(state.notice).toContain("2 个成员");
-    expect(deps.pi.sendMessage).toHaveBeenCalledTimes(2);
-    expect(deps.pi.sendMessage.mock.calls[1][1]).toMatchObject({ triggerTurn: true });
   });
 
   it("ctrl+shift+a in legacy terminals degrades to ctrl+a (single abort) — guarded by ctrl+b", () => {
@@ -321,100 +298,6 @@ describe("MemberInspectorComponent — control commands", () => {
     comp.handleInput(K.ctrlB);
     expect(handleA.sendCommand).not.toHaveBeenCalled();
     expect(state.notice).toContain("没有正在执行");
-    expect(deps.pi.sendMessage).not.toHaveBeenCalled();
-  });
-
-  it("TL busy: interventions queue without a turn; onTlSettled delivers ALL in one turn", () => {
-    const handleA = makeHandle();
-    const handleB = makeHandle();
-    const deps = makeDeps({
-      handles: { a: handleA, b: handleB },
-      opStates: { a: "working", b: "working" },
-      tlBusy: true,
-    });
-    const { comp } = makeComponent(deps);
-    // Abort member a, switch to member b, abort it too — TL busy, so NO turn
-    comp.handleInput(K.ctrlA);
-    comp.handleInput(K.right);
-    comp.handleInput(K.ctrlA);
-    // 2 independent nextTurn messages queued, no trigger turn yet
-    expect(deps.pi.sendMessage).toHaveBeenCalledTimes(2);
-    for (const call of deps.pi.sendMessage.mock.calls) {
-      expect(call[1]).toEqual({ deliverAs: "nextTurn" });
-    }
-    const contents = deps.pi.sendMessage.mock.calls.map((c: any) => c[0].content);
-    expect(contents.filter((c: string) => c.includes("分析员")).length).toBeGreaterThanOrEqual(1);
-    expect(contents.filter((c: string) => c.includes("编码员")).length).toBeGreaterThanOrEqual(1);
-    // TL settles: ONE trigger turn consumes ALL queued notifications
-    comp.onTlSettled();
-    expect(deps.pi.sendMessage).toHaveBeenCalledTimes(3);
-    const last = deps.pi.sendMessage.mock.calls[2];
-    expect(last[1]).toMatchObject({ triggerTurn: true });
-    expect(last[0].content).toContain("2 条");
-  });
-
-  it("intervention while TL idle starts a turn immediately; new ones wait for the next settle", () => {
-    const handleA = makeHandle();
-    const deps = makeDeps({ handles: { a: handleA }, opStates: { a: "working" } });
-    const { comp } = makeComponent(deps);
-    // TL idle: first intervention queues + triggers immediately
-    comp.handleInput(K.ctrlA);
-    expect(deps.pi.sendMessage).toHaveBeenCalledTimes(2); // nextTurn + trigger
-    // More interventions before the turn settles: only queued, no re-trigger
-    comp.handleInput(K.ctrlA);
-    expect(deps.pi.sendMessage).toHaveBeenCalledTimes(3); // +1 nextTurn only
-    expect(deps.pi.sendMessage.mock.calls[2][1]).toEqual({ deliverAs: "nextTurn" });
-    // Turn settles: the queued one gets its own unified turn
-    comp.onTlSettled();
-    expect(deps.pi.sendMessage).toHaveBeenCalledTimes(4);
-    expect(deps.pi.sendMessage.mock.calls[3][1]).toMatchObject({ triggerTurn: true });
-    expect(deps.pi.sendMessage.mock.calls[3][0].content).toContain("1 条");
-  });
-
-  it("onTlSettled with nothing queued starts no turn", () => {
-    const handleA = makeHandle();
-    const deps = makeDeps({ handles: { a: handleA }, opStates: { a: "idle" } });
-    const { comp } = makeComponent(deps);
-    comp.onTlSettled();
-    expect(deps.pi.sendMessage).not.toHaveBeenCalled();
-  });
-
-  it("close() triggers the unified turn immediately (not lost)", () => {
-    const handleA = makeHandle();
-    const deps = makeDeps({
-      handles: { a: handleA },
-      opStates: { a: "working" },
-      tlBusy: true, // TL busy: notification only queued so far
-    });
-    const { comp } = makeComponent(deps);
-    comp.handleInput(K.ctrlA);
-    expect(deps.pi.sendMessage).toHaveBeenCalledTimes(1); // nextTurn queued
-    // Close while the TL is still busy — the queued notification must still
-    // reach the TL via an immediate trigger turn
-    comp.close();
-    expect(deps.pi.sendMessage).toHaveBeenCalledTimes(2);
-    expect(deps.pi.sendMessage.mock.calls[1][1]).toMatchObject({ triggerTurn: true });
-    expect(deps.pi.sendMessage.mock.calls[0][0].content).toContain("abort");
-  });
-
-  it("close() while a trigger turn is in flight still delivers later queued notifications", () => {
-    const handleA = makeHandle();
-    const deps = makeDeps({ handles: { a: handleA }, opStates: { a: "working" } });
-    const { comp } = makeComponent(deps);
-    // TL idle: first intervention queues + triggers a turn immediately
-    comp.handleInput(K.ctrlA);
-    expect(deps.pi.sendMessage).toHaveBeenCalledTimes(2); // nextTurn + trigger
-    // Second intervention before the turn settles: queued only (no re-trigger)
-    comp.handleInput(K.ctrlA);
-    expect(deps.pi.sendMessage).toHaveBeenCalledTimes(3); // +1 nextTurn
-    // Close the overlay while the first trigger turn is still in flight —
-    // the queued notification must still be delivered (pi queues the
-    // followUp trigger behind the in-flight turn)
-    comp.close();
-    expect(deps.pi.sendMessage).toHaveBeenCalledTimes(4);
-    const last = deps.pi.sendMessage.mock.calls[3];
-    expect(last[1]).toMatchObject({ triggerTurn: true });
-    expect(last[0].content).toContain("1 条");
   });
 
   it("ctrl+b works even when input box is open", () => {

@@ -1,4 +1,3 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { matchesKey, Key, visibleWidth } from "@earendil-works/pi-tui";
 import type { MemberProcessHandle } from "../process/member-process";
 import type { MemberOperationalState } from "../session/context";
@@ -26,24 +25,16 @@ import {
 // ── Deps ───────────────────────────────────────────────────
 
 export interface MemberInspectorDeps {
-  pi: ExtensionAPI;
   /** Current team members (name + label), re-polled while open. */
   getMembers: () => { name: string; label?: string }[];
   getHandle: (name: string) => MemberProcessHandle | undefined;
   memberOpsStates: Map<string, MemberOperationalState>;
-  /** Whether the TL agent is currently processing a turn (agent_start..agent_settled). */
-  isTlBusy: () => boolean;
 }
 
 /** Handle exposed to index.ts for event-hook + lifecycle integration. */
 export interface MemberInspectorHandle {
   /** Mark a member's tab dirty (called from the RPC event hook). */
   markDirty(memberName: string): void;
-  /**
-   * Called when the TL's turn settled (agent_settled): if notifications
-   * queued while the TL was busy, start one unified turn for all of them.
-   */
-  onTlSettled(): void;
   /** Close the overlay programmatically (e.g. /team stop). */
   close(): void;
   isOpen(): boolean;
@@ -107,9 +98,6 @@ export function openMemberInspector(
     markDirty(name: string) {
       component?.markDirty(name);
     },
-    onTlSettled() {
-      component?.onTlSettled();
-    },
     close() {
       closed = true;
       component?.close();
@@ -159,10 +147,6 @@ export class MemberInspectorComponent {
   private statsTimer: ReturnType<typeof setTimeout> | null = null;
   /** In-flight refetch guard per member. */
   private fetching = new Set<string>();
-  /** Queued nextTurn notifications awaiting the TL's unified turn. */
-  private pendingNotifications: string[] = [];
-  /** True while a trigger turn has been sent but not yet settled. */
-  private triggerPending = false;
 
   constructor(
     private tui: any,
@@ -187,14 +171,6 @@ export class MemberInspectorComponent {
     if (this.statsTimer) clearTimeout(this.statsTimer);
     this.refreshTimer = null;
     this.statsTimer = null;
-    // Deliver any queued notifications before the overlay closes,
-    // otherwise the TL never learns about the last interventions.
-    // Force past triggerPending: a trigger turn may already be in flight
-    // (TL idle at first intervention) while later interventions were only
-    // queued — they must still reach the TL (pi queues the followUp trigger
-    // behind the in-flight turn).
-    this.triggerPending = false;
-    this.triggerTlTurn();
     this.done(null);
   }
 
@@ -319,89 +295,15 @@ export class MemberInspectorComponent {
     }
   }
 
-  /**
-   * Queue a TL notification via deliverAs:"nextTurn" — pi holds it for the
-   * NEXT turn without starting a turn per notification (the cause of the
-   * TL answering one reminder at a time).
-   *
-   * NO time window: batching is driven purely by the TL's processing state.
-   * - TL idle: start one unified turn right away — it consumes everything
-   *   queued so far.
-   * - TL busy: keep queuing; when the current turn settles (onTlSettled)
-   *   one unified turn delivers ALL still-unprocessed notifications.
-   * Local footer notices stay immediate.
-   */
-  private queueTlNotification(content: string): void {
-    this.pendingNotifications.push(content);
-    try {
-      this.deps.pi.sendMessage(
-        {
-          customType: "team-message",
-          content,
-          display: true,
-        },
-        { deliverAs: "nextTurn" }
-      );
-    } catch {
-      // TL channel gone — drop
-    }
-    if (this.disposed) {
-      // Overlay is closing — start the unified turn right away.
-      this.triggerTlTurn();
-      return;
-    }
-    if (!this.deps.isTlBusy() && !this.triggerPending) {
-      this.triggerTlTurn();
-    }
-  }
-
-  /**
-   * TL turn settled (agent_settled): a unified turn now starts if any
-   * notifications were queued while the TL was busy. Also re-arms the
-   * trigger so the next idle-time intervention starts a fresh turn.
-   */
-  onTlSettled(): void {
-    if (this.disposed) return;
-    this.triggerPending = false;
-    if (this.pendingNotifications.length > 0) {
-      this.triggerTlTurn();
-    }
-  }
-
-  /**
-   * Start ONE TL turn that consumes all queued nextTurn notifications.
-   * triggerTurn (with followUp fallback while streaming) makes the TL
-   * handle the whole burst in a single turn.
-   */
-  private triggerTlTurn(): void {
-    if (this.pendingNotifications.length === 0 || this.triggerPending) return;
-    const n = this.pendingNotifications.length;
-    // Hand the queued messages to pi — the turn about to start injects them.
-    this.pendingNotifications = [];
-    this.triggerPending = true;
-    try {
-      this.deps.pi.sendMessage(
-        {
-          customType: "team-message",
-          content: `[Member Inspector] 以上 ${n} 条为用户在检视浮窗中的操作提醒（中断/压缩/直发消息），请统一查看并处理。`,
-          display: true,
-        },
-        { triggerTurn: true, deliverAs: "followUp" }
-      );
-    } catch {
-      // TL channel gone — drop
-      this.triggerPending = false;
-    }
-  }
-
   // ── Send logic ─────────────────────────────────────────
 
   /**
    * Send the input buffer to the active member.
    * Decision #2: plain text → prompt/follow_up; "/..." → sent raw (member-side
-   * command parsing). Decision #5: non-slash messages are prefixed and the TL
-   * is notified. Decision #6: busy members get follow_up (Enter) or steer
-   * (Ctrl+Enter); crashed/stopped members reject sends.
+   * command parsing). Decision #5: non-slash messages are prefixed so the
+   * Member can distinguish the source. Decision #6: busy members get
+   * follow_up (Enter) or steer (Ctrl+Enter); crashed/stopped members reject
+   * sends.
    */
   private sendInput(mode: "auto" | "steer"): void {
     const tab = this.state.activeTab;
@@ -443,12 +345,6 @@ export class MemberInspectorComponent {
             ? `✓ 已 steer 给 "${tab.label}"（立即转向）`
             : `✓ 已排队给 "${tab.label}"（follow_up）`
           : `✓ 已发送给 "${tab.label}"`;
-
-      // Notify TL about the direct intervention (decision #5)
-      const truncated = text.length > 120 ? text.slice(0, 117) + "..." : text;
-      this.queueTlNotification(
-        `[Member Inspector] 用户通过检视浮窗直接向成员 "${tab.label}"（${tab.name}）发送了消息：\n${truncated}`
-      );
     } catch (err) {
       this.state.notice = `✗ 发送失败：${err instanceof Error ? err.message : String(err)}`;
     }
@@ -472,9 +368,6 @@ export class MemberInspectorComponent {
     try {
       handle.sendCommand({ type });
       this.state.notice = `✓ 已向 "${tab.label}" 发送 ${type}`;
-      this.queueTlNotification(
-        `[Member Inspector] 用户通过检视浮窗向成员 "${tab.label}"（${tab.name}）执行了 ${type}。`
-      );
     } catch (err) {
       this.state.notice = `✗ ${type} 失败：${err instanceof Error ? err.message : String(err)}`;
     }
@@ -483,8 +376,7 @@ export class MemberInspectorComponent {
 
   /**
    * Abort ALL members that are currently executing (working / compacting).
-   * Idle / stopped / crashed members are skipped. A single TL notification
-   * covers the whole batch.
+   * Idle / stopped / crashed members are skipped.
    */
   private sendAbortAll(): void {
     const targets = this.state.tabs.filter((tab) => {
@@ -513,9 +405,6 @@ export class MemberInspectorComponent {
       failed === 0
         ? `✓ 已中断 ${targets.length} 个成员：${labels}`
         : `✓ 已中断 ${targets.length - failed}/${targets.length} 个成员：${labels}`;
-    this.queueTlNotification(
-      `[Member Inspector] 用户通过检视浮窗一次性中断了 ${targets.length} 个正在执行的成员：${labels}。`
-    );
     this.requestRenderSafe();
   }
 
