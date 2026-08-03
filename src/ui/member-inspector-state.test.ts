@@ -128,11 +128,13 @@ describe("fitLinesToWidth", () => {
     expect(out[0]).toBe("12345");
   });
 
-  it("handles ANSI-colored lines by visible width", () => {
-    // Mock visibleWidth = text.length — the ANSI codes still count here;
-    // real-width behavior is covered by inspector tests with real pi-tui.
-    const colored = "\x1b[36mhi\x1b[0m";
-    const out = fitLinesToWidth([colored], 6);
+  it("truncates over-wide lines to exactly the target width", () => {
+    // Pure-ASCII over-wide line: single-pass fast path must hit the same
+    // contract (visible width ≤ target, ellipsis appended). ANSI-colored
+    // line behaviour is covered in member-inspector-state.singlepass.test.ts
+    // with the real pi-tui (ANSI sequences count as width 0).
+    const out = fitLinesToWidth(["1234567890"], 6);
+    expect(out[0]).toBe("12345…");
     expect(out[0].length).toBe(6);
   });
 

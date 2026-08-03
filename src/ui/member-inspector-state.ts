@@ -7,6 +7,88 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 // TUI handles so it can be unit-tested in isolation. The TUI glue lives
 // in member-inspector.ts.
 
+// ── P1-② single-pass width tracking ──────────────────────────
+//
+// The original wrapText/truncateLine measured `visibleWidth(prefix)` for
+// every character prefix — O(n²) character scans, dominated by the
+// Intl.Segmenter slow path for CJK content (~2900ms for a 450-message
+// rebuild). Both are now single-pass: one grapheme walk per line with
+// incremental width accumulation, each grapheme measured exactly once.
+// Width rules stay aligned with pi-tui `visibleWidth` (CJK=2, combining
+// marks, emoji ZWJ per-grapheme) because each grapheme's width IS
+// visibleWidth(grapheme) — a short, cache-friendly string.
+//
+// Intentional behaviour change (asserted in the integrity tests): the
+// legacy codepoint loop could split a grapheme (VS16/ZWJ) or an ANSI
+// escape sequence mid-way at narrow widths. The single-pass walk keeps
+// whole graphemes and whole ANSI sequences together.
+
+/** Shared grapheme segmenter (same config as pi-tui). */
+const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
+/**
+ * ANSI/OSC/APC escape sequence at `pos`, or null. Local copy of pi-tui's
+ * extractAnsiCode (utils.js) so we can skip sequences without measuring
+ * their inner characters — kept in sync with the width logic above.
+ */
+function extractAnsiCode(text: string, pos: number): { code: string; length: number } | null {
+  if (pos >= text.length || text[pos] !== "\x1b") return null;
+  const next = text[pos + 1];
+  // CSI: ESC [ ... m/G/K/H/J
+  if (next === "[") {
+    let j = pos + 2;
+    while (j < text.length && !/[mGKHJ]/.test(text[j])) j++;
+    if (j < text.length) return { code: text.substring(pos, j + 1), length: j + 1 - pos };
+    return null;
+  }
+  // OSC: ESC ] ... BEL or ESC ] ... ST (ESC \\)
+  if (next === "]") {
+    let j = pos + 2;
+    while (j < text.length) {
+      if (text[j] === "\x07") return { code: text.substring(pos, j + 1), length: j + 1 - pos };
+      if (text[j] === "\x1b" && text[j + 1] === "\\") return { code: text.substring(pos, j + 2), length: j + 2 - pos };
+      j++;
+    }
+    return null;
+  }
+  // APC: ESC _ ... BEL or ESC _ ... ST
+  if (next === "_") {
+    let j = pos + 2;
+    while (j < text.length) {
+      if (text[j] === "\x07") return { code: text.substring(pos, j + 1), length: j + 1 - pos };
+      if (text[j] === "\x1b" && text[j + 1] === "\\") return { code: text.substring(pos, j + 2), length: j + 2 - pos };
+      j++;
+    }
+    return null;
+  }
+  return null;
+}
+
+/**
+ * Yield graphemes of `text` with their visible widths, skipping ANSI
+ * sequences (kept whole, width 0). Single pass over the text; each
+ * grapheme is measured once via visibleWidth (short string → cheap).
+ */
+function* graphemeTokens(text: string): Generator<{ seg: string; width: number }> {
+  const iter = graphemeSegmenter.segment(text)[Symbol.iterator]();
+  let next = iter.next();
+  while (!next.done) {
+    const seg = next.value.segment;
+    const at = next.value.index;
+    if (seg.startsWith("\x1b")) {
+      const ansi = extractAnsiCode(text, at);
+      if (ansi) {
+        yield { seg: ansi.code, width: 0 };
+        const target = at + ansi.length;
+        while (!next.done && next.value.index < target) next = iter.next();
+        continue;
+      }
+    }
+    yield { seg, width: visibleWidth(seg) };
+    next = iter.next();
+  }
+}
+
 // ── Theme shape (identity-compatible for tests) ────────────
 
 export interface InspectorTheme {
@@ -74,14 +156,36 @@ export const INPUT_HINTS =
 
 // ── Text helpers ───────────────────────────────────────────
 
+/**
+ * True if every char is printable ASCII (0x20-0x7e). Used by the single-pass
+ * fast paths: such lines have width == length and need no segmenter.
+ * Tab/ANSI/control chars (incl. \x1b) fail the check automatically.
+ */
+function isPrintableAscii(text: string): boolean {
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (c < 0x20 || c > 0x7e) return false;
+  }
+  return true;
+}
+
 /** Truncate a single line to a visible width, appending an ellipsis. */
 export function truncateLine(text: string, width: number): string {
   if (width <= 0) return "";
   if (visibleWidth(text) <= width) return text;
+  // P1-② fast path: pure ASCII — width == length, no segmenter needed.
+  const target = Math.max(0, width - 1);
+  if (isPrintableAscii(text)) {
+    return text.length > target ? text.slice(0, target) + "…" : text + "…";
+  }
+  // P1-② single-pass: accumulate grapheme widths until the ellipsis column
+  // (width - 1) is crossed. No per-prefix re-measurement.
   let out = "";
-  for (const ch of text) {
-    if (visibleWidth(out + ch) > Math.max(0, width - 1)) break;
-    out += ch;
+  let outW = 0;
+  for (const { seg, width: w } of graphemeTokens(text)) {
+    if (outW + w > target) break;
+    out += seg;
+    outW += w;
   }
   return out + "…";
 }
@@ -115,13 +219,37 @@ export function wrapText(text: string, width: number): string[] {
       out.push("");
       continue;
     }
+    // P1-② fast path: pure ASCII — each char is one column, no segmenter.
+    if (isPrintableAscii(rawLine)) {
+      let cur = "";
+      let curW = 0;
+      for (let i = 0; i < rawLine.length; i++) {
+        if (curW + 1 > width) {
+          out.push(cur);
+          const ch = rawLine[i];
+          cur = ch === " " ? "" : ch;
+          curW = ch === " " ? 0 : 1;
+        } else {
+          cur += rawLine[i];
+          curW += 1;
+        }
+      }
+      out.push(cur);
+      continue;
+    }
+    // P1-② single-pass: one grapheme walk, incremental width; a leading
+    // space at a wrap point is dropped (legacy semantics), everything else
+    // (incl. over-wide graphemes) starts the next line.
     let cur = "";
-    for (const ch of rawLine) {
-      if (visibleWidth(cur + ch) > width) {
+    let curW = 0;
+    for (const { seg, width: w } of graphemeTokens(rawLine)) {
+      if (curW + w > width) {
         out.push(cur);
-        cur = ch === " " ? "" : ch;
+        cur = seg === " " ? "" : seg;
+        curW = seg === " " ? 0 : w;
       } else {
-        cur += ch;
+        cur += seg;
+        curW += w;
       }
     }
     out.push(cur);
@@ -187,10 +315,13 @@ export function collapseBlankLines(lines: string[]): string[] {
       lastWasBlank = false;
     }
   }
-  // Trim leading/trailing blanks
-  while (out.length > 0 && out[0] === "") out.shift();
-  while (out.length > 0 && out[out.length - 1] === "") out.pop();
-  return out;
+  // P1-②: trim leading blanks via slice instead of shift() (shift is O(n)
+  // per call → O(n²) on long all-blank runs). Trailing pop stays O(1).
+  let start = 0;
+  while (start < out.length && out[start] === "") start++;
+  let end = out.length;
+  while (end > start && out[end - 1] === "") end--;
+  return out.slice(start, end);
 }
 
 /**
