@@ -9,6 +9,8 @@ import { createResponseWaiter, extractCorrelationId } from "../channel/response-
 import type { ResponseWaiter } from "../channel/response-waiter";
 import type { TeamMessage } from "../channel/types";
 import { createSendToMember } from "../channel/event-handler";
+import { createAutoCompactRuntime } from "../channel/auto-compact";
+import type { AutoCompactRuntime } from "../channel/auto-compact";
 import type { ResolvedAutoCompact } from "../settings/resolve-auto-compact";
 
 // ── Dependency Injection Interface ─────────────────────────
@@ -28,6 +30,12 @@ export interface MessageChannel {
   router: Router;
   messageQueue: MessageQueue;
   responseWaiter: ResponseWaiter;
+  /**
+   * The single shared auto-compaction runtime for this channel. Both the
+   * inline dispatch path (sendToMember) and the batch pre-check barrier
+   * (tl-tools) compose it, so pending/flush is shared across paths.
+   */
+  autoCompact: AutoCompactRuntime;
 }
 
 // ── createMessageChannel ───────────────────────────────────
@@ -42,6 +50,12 @@ export function createMessageChannel(deps: MessageChannelDeps): MessageChannel {
   // 1. Create responseWaiter first (no dependencies)
   const responseWaiter = createResponseWaiter();
 
+  // 1b. Create the single shared auto-compaction runtime. One instance per
+  // channel: the inline path below AND the batch pre-check barrier (phase 3)
+  // share the same pending/flush mechanism, so messages queued during a
+  // barrier compaction are never orphaned (D2 structural fix).
+  const autoCompact = createAutoCompactRuntime(memberOpsStates);
+
   // 2. Create router (callbacks capture responseWaiter + other deps)
   const router = createRouter({
     sendToMember: createSendToMember({
@@ -51,6 +65,7 @@ export function createMessageChannel(deps: MessageChannelDeps): MessageChannel {
       responseWaiter,
       lastPendingCorrId,
       getAutoCompact: deps.getAutoCompact,
+      autoCompact,
     }),
 
     sendToTl: (msg: TeamMessage) => {
@@ -103,5 +118,5 @@ export function createMessageChannel(deps: MessageChannelDeps): MessageChannel {
     }
   );
 
-  return { router, messageQueue, responseWaiter };
+  return { router, messageQueue, responseWaiter, autoCompact };
 }

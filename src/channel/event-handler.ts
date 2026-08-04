@@ -6,7 +6,8 @@ import type { MessageQueue } from "../channel/message-queue";
 import type { ResponseWaiter } from "../channel/response-waiter";
 import type { TeamMessage } from "../channel/types";
 import type { ProcessManager } from "../process/manager";
-import { shouldCompact, type ResolvedAutoCompact } from "../settings/resolve-auto-compact";
+import type { ResolvedAutoCompact } from "../settings/resolve-auto-compact";
+import { createAutoCompactRuntime, type AutoCompactRuntime } from "./auto-compact";
 
 // ── Constants ──────────────────────────────────────────────
 
@@ -441,18 +442,25 @@ export interface SendToMemberDeps {
    * so settings changes mid-session take effect. Absent = feature disabled.
    */
   getAutoCompact?: () => ResolvedAutoCompact;
+  /**
+   * Shared auto-compaction runtime. When provided (see createMessageChannel),
+   * the inline dispatch path and the batch pre-check barrier (tl-tools)
+   * share ONE pending/flush mechanism — messages queued during a compaction
+   * started by either path are never orphaned. Absent = a private runtime is
+   * created (behavior unchanged).
+   */
+  autoCompact?: AutoCompactRuntime;
 }
-
-/** Timeout for the pre-dispatch stats query (same as the status widget). */
-const STATS_QUERY_TIMEOUT_MS = 3000;
 
 export function createSendToMember(
   deps: SendToMemberDeps
 ): (memberName: string, msg: TeamMessage) => void {
   const { pi, memberOpsStates, memberHandles } = deps;
 
-  /** Messages that arrive while a member is compacting, held until compaction ends. */
-  const pendingDuringCompaction = new Map<string, TeamMessage[]>();
+  // Shared auto-compaction runtime: all compaction primitives (state
+  // transitions, pending queue, flush) live here so the inline path and the
+  // batch pre-check barrier use the same pending/flush mechanism.
+  const autoCompact = deps.autoCompact ?? createAutoCompactRuntime(memberOpsStates);
 
   /** Auto-compaction notices go to the TL session as team messages. */
   function notify(content: string): void {
@@ -486,20 +494,13 @@ export function createSendToMember(
     }
   }
 
-  function flushPending(memberName: string): void {
-    const pending = pendingDuringCompaction.get(memberName);
-    if (!pending || pending.length === 0) return;
-    pendingDuringCompaction.delete(memberName);
-    for (const pendingMsg of pending) {
-      sendPrompt(memberName, pendingMsg);
-    }
-  }
-
   /**
-   * Auto-Compaction flow: check usage → compact if over threshold → dispatch.
-   * Fail-open everywhere: any failure ends with the prompt dispatched anyway
-   * plus a TL notification. Success is silent. At most one compaction per
-   * dispatch — no re-check loop afterwards.
+   * Auto-Compaction flow — composed from AutoCompactRuntime primitives.
+   * Behavior identical to the pre-refactor inline implementation:
+   * check usage → compact if over threshold → dispatch. Fail-open everywhere:
+   * any failure ends with the prompt dispatched anyway plus a TL notification.
+   * Success is silent. At most one compaction per dispatch — no re-check loop
+   * afterwards (E12 guard arrives with the skipAutoCompact marker in phase 2).
    */
   async function runAutoCompactAndDispatch(
     memberName: string,
@@ -510,25 +511,16 @@ export function createSendToMember(
     // Phase tracking for honest failure notifications.
     let phase: "stats" | "compact" = "stats";
     try {
-      const statsResp = await handle.sendCommandAndWait(
-        { type: "get_session_stats" },
-        (event: any) => event.type === "response" && event.command === "get_session_stats",
-        STATS_QUERY_TIMEOUT_MS
-      );
-      const usage = statsResp?.data?.contextUsage;
-      if (!usage || typeof usage.percent !== "number") {
+      const stats = await autoCompact.queryStats(memberName, handle);
+      if (!stats) {
         throw new Error("成员未返回上下文用量数据");
       }
 
-      if (shouldCompact({ percent: usage.percent, tokens: usage.tokens ?? 0 }, cfg)) {
+      if (autoCompact.shouldCompact(stats, cfg)) {
         phase = "compact";
-        const compactResp = await handle.sendCommandAndWait(
-          { type: "compact" },
-          (event: any) => event.type === "response" && event.command === "compact",
-          cfg.timeoutMinutes * 60_000
-        );
-        if (!compactResp || compactResp.success === false) {
-          throw new Error(compactResp?.error ?? "压缩命令未成功");
+        const ok = await autoCompact.compactNow(memberName, handle, cfg);
+        if (!ok) {
+          throw new Error("压缩命令未成功");
         }
         // Success is silent — the TL does not need to perceive the process.
       }
@@ -541,9 +533,13 @@ export function createSendToMember(
       }
     } finally {
       // Exit compacting and dispatch — fail-open regardless of outcome above.
-      memberOpsStates.set(memberName, transitionState(memberOpsStates.get(memberName) ?? "idle", { type: "compaction_completed" }));
+      // Order is locked by tests: reset state → dispatch current message →
+      // flush messages queued during compaction (FIFO via the runtime).
+      autoCompact.endCompaction(memberName);
       sendPrompt(memberName, msg);
-      flushPending(memberName);
+      for (const pendingMsg of autoCompact.flushPending(memberName)) {
+        sendPrompt(memberName, pendingMsg);
+      }
     }
   }
 
@@ -571,11 +567,10 @@ export function createSendToMember(
     const state = memberOpsStates.get(memberName) ?? "idle";
 
     // A compaction is already in progress for this member — queue the message
-    // and let the in-flight flow flush it after compaction completes.
+    // in the shared runtime and let the in-flight flow flush it after
+    // compaction completes.
     if (state === "compacting") {
-      const pending = pendingDuringCompaction.get(memberName) ?? [];
-      pending.push(msg);
-      pendingDuringCompaction.set(memberName, pending);
+      autoCompact.queueDuringCompaction(memberName, msg);
       return;
     }
 
@@ -583,7 +578,7 @@ export function createSendToMember(
     if (cfg?.enabled && state === "idle") {
       // Mark compacting synchronously (before any await) to close the race
       // where a second dispatch to the same idle member would double-compact.
-      memberOpsStates.set(memberName, transitionState(state, { type: "compaction_started" }));
+      autoCompact.beginCompaction(memberName);
       void runAutoCompactAndDispatch(memberName, msg, handle, cfg);
       return;
     }

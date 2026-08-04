@@ -939,4 +939,85 @@ describe("createSendToMember auto-compaction", () => {
     // Synchronously after dispatch decision, the member must not appear idle
     expect(deps.memberOpsStates.get("worker")).toBe("compacting");
   });
+
+  it("queues mid-compaction messages into the SHARED runtime when one is provided", async () => {
+    // Phase 1 contract: the runtime passed in via deps is the single source
+    // of truth for pending/flush — the inline path must never fall back to a
+    // private closure queue once a shared runtime exists (that would orphan
+    // messages when the pre-check barrier compacts in phase 3).
+    const { createSendToMember } = await loadModule();
+    const { createAutoCompactRuntime } = await import("./auto-compact");
+    const deps = createMockDeps({ getAutoCompact: () => enabledCfg }) as any;
+    const runtime = createAutoCompactRuntime(deps.memberOpsStates);
+    deps.autoCompact = runtime;
+
+    let resolveCompact: (v: any) => void;
+    const compactPromise = new Promise((r) => { resolveCompact = r; });
+    const handle = {
+      sendCommand: vi.fn(),
+      sendCommandAndWait: vi.fn().mockImplementation((cmd: any) => {
+        if (cmd.type === "get_session_stats") return Promise.resolve(usageResponse(92, 184000));
+        return compactPromise;
+      }),
+    };
+    deps.memberHandles.set("worker", handle);
+    deps.memberOpsStates.set("worker", "idle");
+
+    const send = createSendToMember(deps);
+    send("worker", { ...makeMsg("msg-1"), content: "First task" });
+    await vi.waitFor(() => expect(deps.memberOpsStates.get("worker")).toBe("compacting"));
+
+    // Mid-compaction arrival — must land in the shared runtime's queue.
+    // Drain to inspect, then push back so the compaction finally flushes it.
+    send("worker", { ...makeMsg("msg-2"), content: "Second task" });
+    const drained = runtime.flushPending("worker");
+    expect(drained.map((m: any) => m.content)).toEqual(["Second task"]);
+    for (const m of drained) runtime.queueDuringCompaction("worker", m);
+
+    resolveCompact!({ type: "response", command: "compact", success: true, data: {} });
+    await vi.waitFor(() => expect(handle.sendCommand).toHaveBeenCalledTimes(2));
+
+    // Order locked by the existing contract: current message first, then
+    // pending flushed from the runtime (FIFO) — and the runtime queue is now empty.
+    const prompts = handle.sendCommand.mock.calls.map((c: any[]) => c[0].message as string);
+    expect(prompts[0]).toContain("First task");
+    expect(prompts[1]).toContain("Second task");
+    expect(deps.memberOpsStates.get("worker")).toBe("working");
+    expect(runtime.flushPending("worker")).toEqual([]);
+  });
+
+  it("flushes multiple mid-compaction messages in FIFO order via the shared runtime", async () => {
+    const { createSendToMember } = await loadModule();
+    const { createAutoCompactRuntime } = await import("./auto-compact");
+    const deps = createMockDeps({ getAutoCompact: () => enabledCfg }) as any;
+    const runtime = createAutoCompactRuntime(deps.memberOpsStates);
+    deps.autoCompact = runtime;
+
+    let resolveCompact: (v: any) => void;
+    const compactPromise = new Promise((r) => { resolveCompact = r; });
+    const handle = {
+      sendCommand: vi.fn(),
+      sendCommandAndWait: vi.fn().mockImplementation((cmd: any) => {
+        if (cmd.type === "get_session_stats") return Promise.resolve(usageResponse(92, 184000));
+        return compactPromise;
+      }),
+    };
+    deps.memberHandles.set("worker", handle);
+    deps.memberOpsStates.set("worker", "idle");
+
+    const send = createSendToMember(deps);
+    send("worker", { ...makeMsg("msg-1"), content: "First task" });
+    await vi.waitFor(() => expect(deps.memberOpsStates.get("worker")).toBe("compacting"));
+
+    send("worker", { ...makeMsg("msg-2"), content: "Second task" });
+    send("worker", { ...makeMsg("msg-3"), content: "Third task" });
+
+    resolveCompact!({ type: "response", command: "compact", success: true, data: {} });
+    await vi.waitFor(() => expect(handle.sendCommand).toHaveBeenCalledTimes(3));
+
+    const prompts = handle.sendCommand.mock.calls.map((c: any[]) => c[0].message as string);
+    expect(prompts[0]).toContain("First task");
+    expect(prompts[1]).toContain("Second task");
+    expect(prompts[2]).toContain("Third task");
+  });
 });
