@@ -511,16 +511,18 @@ export function createSendToMember(
     // Phase tracking for honest failure notifications.
     let phase: "stats" | "compact" = "stats";
     try {
-      const stats = await autoCompact.queryStats(memberName, handle);
-      if (!stats) {
-        throw new Error("成员未返回上下文用量数据");
+      const statsResult = await autoCompact.queryStats(memberName, handle);
+      if (!statsResult.ok) {
+        // Fail-open: the runtime kept the real failure reason so the
+        // notification below matches the pre-refactor inline behavior.
+        throw new Error(statsResult.error);
       }
 
-      if (autoCompact.shouldCompact(stats, cfg)) {
+      if (autoCompact.shouldCompact(statsResult.stats, cfg)) {
         phase = "compact";
-        const ok = await autoCompact.compactNow(memberName, handle, cfg);
-        if (!ok) {
-          throw new Error("压缩命令未成功");
+        const compactResult = await autoCompact.compactNow(memberName, handle, cfg);
+        if (!compactResult.ok) {
+          throw new Error(compactResult.error);
         }
         // Success is silent — the TL does not need to perceive the process.
       }

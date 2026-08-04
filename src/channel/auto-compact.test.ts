@@ -33,7 +33,7 @@ function makeHandle(
   } as unknown as MemberProcessHandle;
 }
 
-function usageResponse(percent: number, tokens: number): any {
+function usageResponse(percent: number, tokens?: number): any {
   return {
     type: "response",
     command: "get_session_stats",
@@ -58,8 +58,8 @@ describe("auto-compact runtime queryStats", () => {
     const handle = makeHandle(usageResponse(92, 184000));
 
     await expect(rt.queryStats("worker", handle)).resolves.toEqual({
-      percent: 92,
-      tokens: 184000,
+      ok: true,
+      stats: { percent: 92, tokens: 184000 },
     });
   });
 
@@ -77,22 +77,30 @@ describe("auto-compact runtime queryStats", () => {
     );
   });
 
-  it("resolves null when the stats query rejects (timeout) — fail-open", async () => {
+  it("resolves { ok: false, error } with the REAL reason when the stats query rejects (timeout) — fail-open", async () => {
     const rt = makeRuntime();
     const handle = makeHandle() as unknown as MemberProcessHandle;
-    handle.sendCommandAndWait = vi.fn().mockRejectedValue(new Error("timed out"));
+    handle.sendCommandAndWait = vi.fn().mockRejectedValue(new Error("Command to \"worker\" timed out after 3000ms"));
 
-    await expect(rt.queryStats("worker", handle)).resolves.toBeNull();
+    const result = await rt.queryStats("worker", handle);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toBe("Command to \"worker\" timed out after 3000ms");
+    }
   });
 
-  it("resolves null when response has no contextUsage — fail-open", async () => {
+  it("resolves { ok: false } when response has no contextUsage — fail-open", async () => {
     const rt = makeRuntime();
     const handle = makeHandle({ type: "response", command: "get_session_stats", success: true, data: {} });
 
-    await expect(rt.queryStats("worker", handle)).resolves.toBeNull();
+    const result = await rt.queryStats("worker", handle);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toBe("成员未返回上下文用量数据");
+    }
   });
 
-  it("resolves null when usage.percent is not a number — fail-open", async () => {
+  it("resolves { ok: false } when usage.percent is not a number — fail-open", async () => {
     const rt = makeRuntime();
     const handle = makeHandle({
       type: "response",
@@ -101,14 +109,20 @@ describe("auto-compact runtime queryStats", () => {
       data: { contextUsage: { percent: "92", tokens: 1000 } },
     });
 
-    await expect(rt.queryStats("worker", handle)).resolves.toBeNull();
+    await expect(rt.queryStats("worker", handle)).resolves.toEqual({
+      ok: false,
+      error: "成员未返回上下文用量数据",
+    });
   });
 
   it("treats missing tokens as 0", async () => {
     const rt = makeRuntime();
-    const handle = makeHandle(usageResponse(92, undefined));
+    const handle = makeHandle(usageResponse(92));
 
-    await expect(rt.queryStats("worker", handle)).resolves.toEqual({ percent: 92, tokens: 0 });
+    await expect(rt.queryStats("worker", handle)).resolves.toEqual({
+      ok: true,
+      stats: { percent: 92, tokens: 0 },
+    });
   });
 });
 
@@ -149,13 +163,22 @@ describe("auto-compact runtime begin/endCompaction", () => {
     expect(states.get("worker")).toBe("compacting");
   });
 
-  it("beginCompaction does not disturb non-idle states", async () => {
+  it("beginCompaction does not disturb non-idle states (working)", async () => {
     const states = new Map<string, MemberOperationalState>([["worker", "working"]]);
     const rt = makeRuntime(states);
 
     rt.beginCompaction("worker");
 
     expect(states.get("worker")).toBe("working");
+  });
+
+  it("beginCompaction does not disturb non-idle states (crashed)", async () => {
+    const states = new Map<string, MemberOperationalState>([["worker", "crashed"]]);
+    const rt = makeRuntime(states);
+
+    rt.beginCompaction("worker");
+
+    expect(states.get("worker")).toBe("crashed");
   });
 
   it("endCompaction resets compacting → idle (finally reset)", async () => {
@@ -167,7 +190,29 @@ describe("auto-compact runtime begin/endCompaction", () => {
     expect(states.get("worker")).toBe("idle");
   });
 
-  it("endCompaction is a no-op on non-compacting states", async () => {
+  it("endCompaction preserves crashed when the member died mid-compaction", async () => {
+    // E7 scenario: the member process crashed while compacting (process_exit
+    // already moved the state to crashed); the compact RPC only rejects at
+    // timeout, and the finally must NOT wipe crashed back to idle — a crashed
+    // member must stay crashed until explicitly restarted.
+    const states = new Map<string, MemberOperationalState>([["worker", "crashed"]]);
+    const rt = makeRuntime(states);
+
+    rt.endCompaction("worker");
+
+    expect(states.get("worker")).toBe("crashed");
+  });
+
+  it("endCompaction preserves stopped", async () => {
+    const states = new Map<string, MemberOperationalState>([["worker", "stopped"]]);
+    const rt = makeRuntime(states);
+
+    rt.endCompaction("worker");
+
+    expect(states.get("worker")).toBe("stopped");
+  });
+
+  it("endCompaction is a no-op on non-compacting states (idle)", async () => {
     const states = new Map<string, MemberOperationalState>([["worker", "idle"]]);
     const rt = makeRuntime(states);
 
@@ -191,33 +236,44 @@ describe("auto-compact runtime begin/endCompaction", () => {
 // ── compactNow ─────────────────────────────────────────────
 
 describe("auto-compact runtime compactNow", () => {
-  it("resolves true when compaction succeeds", async () => {
+  it("resolves { ok: true } when compaction succeeds", async () => {
     const rt = makeRuntime();
     const handle = makeHandle(undefined, { type: "response", command: "compact", success: true, data: {} });
 
-    await expect(rt.compactNow("worker", handle, enabledCfg)).resolves.toBe(true);
+    await expect(rt.compactNow("worker", handle, enabledCfg)).resolves.toEqual({ ok: true });
   });
 
-  it("resolves false when the member reports compaction failure — fail-open", async () => {
+  it("resolves { ok: false, error } with the RPC's own error when the member reports failure — fail-open", async () => {
     const rt = makeRuntime();
     const handle = makeHandle(undefined, { type: "response", command: "compact", success: false, error: "boom" });
 
-    await expect(rt.compactNow("worker", handle, enabledCfg)).resolves.toBe(false);
+    const result = await rt.compactNow("worker", handle, enabledCfg);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toBe("boom");
+    }
   });
 
-  it("resolves false when the compact RPC rejects (timeout) — fail-open", async () => {
+  it("resolves { ok: false, error } with the real reason when the compact RPC rejects (timeout) — fail-open", async () => {
     const rt = makeRuntime();
     const handle = makeHandle() as unknown as MemberProcessHandle;
-    handle.sendCommandAndWait = vi.fn().mockRejectedValue(new Error("timed out"));
+    handle.sendCommandAndWait = vi.fn().mockRejectedValue(new Error("Command to \"worker\" timed out after 600000ms"));
 
-    await expect(rt.compactNow("worker", handle, enabledCfg)).resolves.toBe(false);
+    const result = await rt.compactNow("worker", handle, enabledCfg);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toBe("Command to \"worker\" timed out after 600000ms");
+    }
   });
 
-  it("resolves false when no response arrives — fail-open", async () => {
+  it("resolves { ok: false } with a generic reason when no response arrives — fail-open", async () => {
     const rt = makeRuntime();
     const handle = makeHandle(undefined, undefined);
 
-    await expect(rt.compactNow("worker", handle, enabledCfg)).resolves.toBe(false);
+    await expect(rt.compactNow("worker", handle, enabledCfg)).resolves.toEqual({
+      ok: false,
+      error: "压缩命令未成功",
+    });
   });
 
   it("waits cfg.timeoutMinutes for the compact RPC", async () => {
@@ -238,8 +294,15 @@ describe("auto-compact runtime compactNow", () => {
 // ── queueDuringCompaction / flushPending ───────────────────
 
 describe("auto-compact runtime queueDuringCompaction + flushPending", () => {
-  it("queues messages and flushes them in FIFO order (backlog before new arrivals)", async () => {
-    const rt = makeRuntime();
+  function compactingRuntime(name = "worker") {
+    const states = new Map<string, MemberOperationalState>([[name, "idle"]]);
+    const rt = makeRuntime(states);
+    rt.beginCompaction(name);
+    return rt;
+  }
+
+  it("queues messages while compacting and flushes them in FIFO order (backlog before new arrivals)", async () => {
+    const rt = compactingRuntime();
     const msg1 = makeMsg("msg-1");
     const msg2 = makeMsg("msg-2");
     const msg3 = makeMsg("msg-3");
@@ -252,8 +315,17 @@ describe("auto-compact runtime queueDuringCompaction + flushPending", () => {
     expect(flushed).toEqual([msg1, msg2, msg3]);
   });
 
+  it("returns false and does NOT queue when the member is not compacting", async () => {
+    // Defensive invariant: queuing on a non-compacting member would orphan
+    // the message — nothing would ever flush it.
+    const rt = makeRuntime(new Map<string, MemberOperationalState>([["worker", "idle"]]));
+
+    expect(rt.queueDuringCompaction("worker", makeMsg("msg-1"))).toBe(false);
+    expect(rt.flushPending("worker")).toEqual([]);
+  });
+
   it("flushPending clears the queue — a second flush returns nothing", async () => {
-    const rt = makeRuntime();
+    const rt = compactingRuntime();
     rt.queueDuringCompaction("worker", makeMsg("msg-1"));
 
     expect(rt.flushPending("worker")).toHaveLength(1);
@@ -266,7 +338,14 @@ describe("auto-compact runtime queueDuringCompaction + flushPending", () => {
   });
 
   it("keeps per-member queues independent", async () => {
-    const rt = makeRuntime();
+    const states = new Map<string, MemberOperationalState>([
+      ["a", "idle"],
+      ["b", "idle"],
+    ]);
+    const rt = makeRuntime(states);
+    rt.beginCompaction("a");
+    rt.beginCompaction("b");
+
     rt.queueDuringCompaction("a", makeMsg("a-1"));
     rt.queueDuringCompaction("b", makeMsg("b-1"));
     rt.queueDuringCompaction("a", makeMsg("a-2"));
