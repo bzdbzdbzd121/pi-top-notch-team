@@ -577,7 +577,11 @@ export function createSendToMember(
     }
 
     const cfg = deps.getAutoCompact?.();
-    if (cfg?.enabled && state === "idle") {
+    // skipAutoCompact = the compaction decision was already made by the batch
+    // pre-check barrier — bypass the inline check entirely (E12: prevents a
+    // second compaction when usage is still over threshold; also enforces
+    // "at most one compaction per dispatch" for barrier-compacted members).
+    if (cfg?.enabled && state === "idle" && !msg.skipAutoCompact) {
       // Mark compacting synchronously (before any await) to close the race
       // where a second dispatch to the same idle member would double-compact.
       autoCompact.beginCompaction(memberName);

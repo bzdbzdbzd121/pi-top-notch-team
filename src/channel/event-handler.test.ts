@@ -1020,4 +1020,92 @@ describe("createSendToMember auto-compaction", () => {
     expect(prompts[1]).toContain("Second task");
     expect(prompts[2]).toContain("Third task");
   });
+
+  // ── skipAutoCompact marker (phase 2) ──────────────────────
+  // The marker is the ONLY signal that the compaction decision was already
+  // made by the batch pre-check barrier (phase 3). It is a correctness
+  // mechanism, not an optimization: it prevents a second compaction when
+  // usage is STILL over threshold after a compact (E12) and prevents a
+  // re-compaction after a failed one (at most one per dispatch).
+
+  it("dispatches directly without ANY stats query when msg.skipAutoCompact is true", async () => {
+    const { createSendToMember } = await loadModule();
+    const deps = createMockDeps({ getAutoCompact: () => enabledCfg }) as any;
+    const handle = makeHandle(usageResponse(95, 190000), { success: true });
+    deps.memberHandles.set("worker", handle);
+    deps.memberOpsStates.set("worker", "idle");
+
+    createSendToMember(deps)("worker", { ...makeMsg(), skipAutoCompact: true });
+    await new Promise((r) => setTimeout(r, 0));
+
+    // No get_session_stats / compact RPC at all — the marker bypasses the
+    // inline auto-compaction check entirely (E12 guard).
+    expect(handle.sendCommandAndWait).not.toHaveBeenCalled();
+    expect(handle.sendCommand).toHaveBeenCalledWith(expect.objectContaining({ type: "prompt" }));
+    expect(deps.memberOpsStates.get("worker")).toBe("working");
+  });
+
+  it("skipAutoCompact does NOT bypass the compacting queue (messages still queue mid-compaction)", async () => {
+    // The marker only disables the *decision* to start a new compaction;
+    // an in-flight compaction still owns the member, so marked messages
+    // must queue like any other and be flushed in order.
+    const { createSendToMember } = await loadModule();
+    const deps = createMockDeps({ getAutoCompact: () => enabledCfg }) as any;
+    let resolveCompact: (v: any) => void;
+    const compactPromise = new Promise((r) => { resolveCompact = r; });
+    const handle = {
+      sendCommand: vi.fn(),
+      sendCommandAndWait: vi.fn().mockImplementation((cmd: any) => {
+        if (cmd.type === "get_session_stats") return Promise.resolve(usageResponse(92, 184000));
+        return compactPromise;
+      }),
+    };
+    deps.memberHandles.set("worker", handle);
+    deps.memberOpsStates.set("worker", "idle");
+
+    const send = createSendToMember(deps);
+    send("worker", { ...makeMsg("msg-1"), content: "Unmarked first task" }); // unmarked → starts compaction
+    await vi.waitFor(() => expect(deps.memberOpsStates.get("worker")).toBe("compacting"));
+
+    // Marked message arrives mid-compaction → must queue, not dispatch
+    send("worker", { ...makeMsg("msg-2"), content: "Marked task", skipAutoCompact: true });
+    expect(handle.sendCommand).not.toHaveBeenCalled();
+
+    resolveCompact!({ type: "response", command: "compact", success: true, data: {} });
+    await vi.waitFor(() => expect(handle.sendCommand).toHaveBeenCalledTimes(2));
+
+    const prompts = handle.sendCommand.mock.calls.map((c: any[]) => c[0].message as string);
+    expect(prompts[0]).toContain("Unmarked first task");
+    expect(prompts[1]).toContain("Marked task");
+  });
+
+  it("explicit skipAutoCompact: false behaves exactly like an unmarked message", async () => {
+    const { createSendToMember } = await loadModule();
+    const deps = createMockDeps({ getAutoCompact: () => enabledCfg }) as any;
+    const handle = makeHandle(usageResponse(50, 100000), { success: true });
+    deps.memberHandles.set("worker", handle);
+    deps.memberOpsStates.set("worker", "idle");
+
+    createSendToMember(deps)("worker", { ...makeMsg(), skipAutoCompact: false });
+    await vi.waitFor(() => expect(handle.sendCommand).toHaveBeenCalled());
+
+    // Below threshold → stats queried, no compact, prompt dispatched.
+    expect(handle.sendCommandAndWait).toHaveBeenCalledTimes(1);
+    expect(handle.sendCommand).toHaveBeenCalledWith(expect.objectContaining({ type: "prompt" }));
+  });
+
+  it("unmarked messages still trigger the auto-compact check (baseline comparison)", async () => {
+    const { createSendToMember } = await loadModule();
+    const deps = createMockDeps({ getAutoCompact: () => enabledCfg }) as any;
+    const handle = makeHandle(usageResponse(95, 190000), { success: true });
+    deps.memberHandles.set("worker", handle);
+    deps.memberOpsStates.set("worker", "idle");
+
+    createSendToMember(deps)("worker", makeMsg());
+    await vi.waitFor(() => expect(handle.sendCommand).toHaveBeenCalled());
+
+    // Unmarked → full inline check: stats + compact + dispatch.
+    const commands = handle.sendCommandAndWait.mock.calls.map((c: any[]) => c[0].type);
+    expect(commands).toEqual(["get_session_stats", "compact"]);
+  });
 });
