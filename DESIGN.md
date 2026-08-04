@@ -678,7 +678,37 @@ dispatch to idle member
 - **`compacting` operational state** (`idle`/`working`/`compacting`/`crashed`/`stopped`): the compaction turn's own RPC `agent_start`/`agent_end` events are shielded in the state machine (`task_started`/`task_completed` on `compacting` are no-ops), so the all-idle wait logic treats compacting as busy with no changes to the wait code. Shown as 🗜️ in the team status widget and Member Inspector (with a `（压缩中）` footer hint); the widget polls context usage at the active interval while any member is compacting.
 - **Queueing**: messages routed to a member while it is compacting are held in a per-member pending list and flushed (in order, via the normal prompt path) after compaction completes. Member Inspector direct input during compaction is sent as `follow_up`/`steer` (busy semantics).
 - **Scope**: only the message-channel dispatch path is covered — Member Inspector direct `prompt` messages bypass Auto-Compaction (the user can compact manually via the inspector's compact control).
-- **Configuration** (global `/team setting`, no team-YAML override): `autoCompact: { enabled (default true), thresholdPercent? (1–100), thresholdTokens? (positive int), timeoutMinutes (default 10, ≥1) }` in `<rootDir>/settings.yaml`. Enabled-but-no-thresholds falls back to 80% (flagged `percentIsDefaultFallback` so the settings menu shows `80%（默认）`). Resolution + threshold check are pure functions in `src/settings/resolve-auto-compact.ts` (`resolveAutoCompact` / `shouldCompact` / `describeAutoCompactSetting`); the config is re-read from disk on every dispatch so mid-session changes take effect immediately.
+- **Configuration** (global `/team setting`, no team-YAML override): `autoCompact: { enabled (default true), thresholdPercent? (1–100), thresholdTokens? (positive int), timeoutMinutes (default 10, ≥1), batchMaxWaitMinutes? (default 15, 0 = unlimited) }` in `<rootDir>/settings.yaml`. Enabled-but-no-thresholds falls back to 80% (flagged `percentIsDefaultFallback` so the settings menu shows `80%（默认）`). Resolution + threshold check are pure functions in `src/settings/resolve-auto-compact.ts` (`resolveAutoCompact` / `shouldCompact` / `describeAutoCompactSetting`); the config is re-read from disk on every dispatch so mid-session changes take effect immediately.
+
+### Shared runtime + skipAutoCompact + batch barrier (阶段 1–3)
+
+**Shared runtime** (`src/channel/auto-compact.ts`): all compaction primitives (`queryStats`/`shouldCompact`/`beginCompaction`/`compactNow`/`endCompaction`/`queueDuringCompaction`/`flushPending`) and the per-member pending queue live in ONE `AutoCompactRuntime` instance created by `createMessageChannel` and injected into both the inline dispatch path (`SendToMemberDeps.autoCompact`) and the batch barrier (`TlToolsDeps.autoCompact`). Results are discriminated unions (`{ ok: true, stats? } | { ok: false, error }`) carrying the real RPC failure reason. `queueDuringCompaction` refuses (returns false) when the member is not `compacting` — a defensive invariant against orphaned messages.
+
+**skipAutoCompact** (`TeamMessage.skipAutoCompact?: boolean`, phase 2): the ONLY signal that the compaction decision was already made elsewhere. When set, the inline path skips its stats/compact check entirely and dispatches directly — prevents a second compaction when usage is still over threshold after a compact (E12) and enforces at most one compaction per dispatch. Only the batch barrier produces marked messages; member inter-sends / Inspector direct / unbatched TL messages never carry the marker.
+
+**Batch barrier** (`sendAndWaitExecute`, phase 3) — unified start for parallel batches: when `tasks.length > 1` and auto-compaction is enabled, ALL prompts of the batch are dispatched only after the LAST needed compaction completes — none may start early. Architecture invariant E1: the whole barrier runs BEFORE corrId registration and enqueue, so no wait detection can fire early (test-locked: messageQueue stays empty until all compactions end).
+
+```
+sendAndWaitExecute(tasks)  [tasks.length > 1 && autoCompact enabled && DI wired]
+  → planBatchCompaction(deduped explicit targets)   [pure: idle→query / compacting→wait / other→skip]
+  → WAIT: compacting members polled to idle (1s; within batch budget)   [E3: never re-compact]
+  → PREPARE: parallel get_session_stats (3s each, per-member fail-open)
+  → S: members over threshold
+  → notify once: 「[批屏障] 本批 N 个成员需自动压缩（名单），其余成员将等待，压缩完成后统一派发」
+  → COMPACT: S serial — beginCompaction (sync) → compactNow → endCompaction (finally reset)
+      per-member fail-open: failure → notify + continue; member still marked (skip)
+      maxWait budget exceeded → stop remaining compactions, notify, dispatch batch as-is
+  → COMMIT: register all corrIds → enqueue all messages
+      skipAutoCompact: true ONLY on members that got a compaction attempt
+      (success or failure); budget-skipped / non-S members carry no marker
+      → inline path gives them a natural second chance
+  → waitWithAllIdleCheck (unchanged)
+```
+
+- **Serial compactions**: at most one compact RPC at a time — without PD separation, concurrent compactions are concurrent prefill bursts, the exact problem this feature solves.
+- **Compacting members** (inline-path compaction already in flight, or a previous batch left running after Esc): counted into the wait set, polled to idle, never re-compacted (D3 — replaces any lock-based approach).
+- **maxWait budget** (`batchMaxWaitMinutes`, default 15 min, 0 = unlimited): total budget shared by the WAIT phase and all compactions. On exhaustion: remaining compactions are skipped, the batch is dispatched as-is, and the TL is notified. Members not yet attempted carry no marker.
+- **Scope**: barrier covers only the tasks[] explicit targets; `to:"all"` is rejected by the existing unknown-target validation (broadcasts are not batch semantics); member inter-sends and Inspector direct messages never participate (manual intervention wins). Single-task batches and disabled auto-compaction take the legacy path with zero pre-check.
 
 ### Detecting Member-to-Member Messages
 

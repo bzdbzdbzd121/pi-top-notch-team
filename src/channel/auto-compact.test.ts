@@ -11,6 +11,7 @@ const enabledCfg: ResolvedAutoCompact = {
   thresholdPercent: 80,
   thresholdTokens: undefined,
   timeoutMinutes: 10,
+  batchMaxWaitMinutes: 15,
   percentIsDefaultFallback: false,
 };
 

@@ -25,6 +25,12 @@ export interface AutoCompactSetting {
   thresholdTokens?: number;
   /** How long to wait for the compaction RPC before failing open (minutes, >=1). Default: 10. */
   timeoutMinutes: number;
+  /**
+   * Total budget for the batch alignment barrier (phase 3), in minutes.
+   * 0 = unlimited. Default: 15. When the budget runs out, remaining
+   * compactions are skipped and the batch is dispatched as-is.
+   */
+  batchMaxWaitMinutes?: number;
 }
 
 /** Global top-notch-team settings (apply to all team sessions). */
@@ -35,7 +41,7 @@ export interface TeamSettings {
 
 export const DEFAULT_SETTINGS: TeamSettings = {
   memberModel: { mode: "follow" },
-  autoCompact: { enabled: true, thresholdPercent: 80, timeoutMinutes: 10 },
+  autoCompact: { enabled: true, thresholdPercent: 80, timeoutMinutes: 10, batchMaxWaitMinutes: 15 },
 };
 
 const SETTINGS_FILE = "settings.yaml";
@@ -115,6 +121,15 @@ export function loadSettings(rootDir: string): TeamSettings {
         acObj.timeoutMinutes >= 1
       ) {
         settings.autoCompact.timeoutMinutes = acObj.timeoutMinutes;
+      }
+      // Batch budget: 0 = unlimited is meaningful; negative / non-integer
+      // values are dropped (default applies).
+      if (
+        typeof acObj.batchMaxWaitMinutes === "number" &&
+        Number.isInteger(acObj.batchMaxWaitMinutes) &&
+        acObj.batchMaxWaitMinutes >= 0
+      ) {
+        settings.autoCompact.batchMaxWaitMinutes = acObj.batchMaxWaitMinutes;
       }
     }
     return settings;

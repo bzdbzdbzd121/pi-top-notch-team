@@ -115,7 +115,7 @@ export default function (pi: ExtensionAPI) {
   let uiNotify: ((msg: string, type?: "info" | "warning" | "error") => void) | null = null;
 
   // ── Message channel: queue → router (extracted to src/setup/message-channel.ts) ──
-  const { router, messageQueue, responseWaiter } = createMessageChannel({
+  const { router, messageQueue, responseWaiter, autoCompact } = createMessageChannel({
     pi,
     memberOpsStates,
     lastPendingCorrId,
@@ -190,6 +190,12 @@ export default function (pi: ExtensionAPI) {
         });
       }
     },
+    // Batch alignment barrier (phase 3) wiring: the shared auto-compaction
+    // runtime + per-call config + handle resolution power the pre-check that
+    // aligns batch prompts behind member compactions.
+    autoCompact,
+    getAutoCompact: () => resolveAutoCompact(loadSettings(getRootDir())),
+    getHandle: (name: string) => teamCtx.getHandle(name),
   });
 
   // write_shared_context — dedicated shared-context write tool. Registered eagerly,

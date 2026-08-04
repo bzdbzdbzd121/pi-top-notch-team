@@ -8,6 +8,7 @@ import {
 } from "../../settings/settings";
 import {
   DEFAULT_THRESHOLD_PERCENT,
+  DEFAULT_BATCH_MAX_WAIT_MINUTES,
   describeAutoCompactSetting,
 } from "../../settings/resolve-auto-compact";
 import { scrollSelect } from "../../ui/scroll-select";
@@ -25,6 +26,7 @@ const AC_SET_TOKENS = "设置 token 阈值";
 const AC_CLEAR_PERCENT = "清除百分比阈值";
 const AC_CLEAR_TOKENS = "清除 token 阈值";
 const AC_SET_TIMEOUT = "设置超时（分钟）";
+const AC_SET_BATCH_WAIT = "设置批等待上限（分钟）";
 
 function formatModel(m: { provider: string; id: string; name?: string }): string {
   return `${m.provider}/${m.id}`;
@@ -74,6 +76,13 @@ function parsePositiveInt(text: string): number | undefined {
   return n;
 }
 
+/** Parse a non-negative integer input (0 = unlimited is meaningful); undefined on invalid. */
+function parseNonNegativeInt(text: string): number | undefined {
+  const n = Number(text.trim());
+  if (!Number.isInteger(n) || n < 0) return undefined;
+  return n;
+}
+
 /**
  * Auto-compaction submenu. Loops until Esc so multiple items can be
  * configured in one visit. Saves after every change and surfaces the
@@ -107,6 +116,10 @@ async function configureAutoCompact(
 
   for (;;) {
     const ac = settings.autoCompact;
+    const batchWaitText =
+      ac.batchMaxWaitMinutes === 0
+        ? "不限"
+        : `${ac.batchMaxWaitMinutes ?? DEFAULT_BATCH_MAX_WAIT_MINUTES} 分钟`;
     const items = [
       `${AC_TOGGLE}（当前：${ac.enabled ? "开启" : "关闭"}）`,
       `${AC_SET_PERCENT}（当前：${ac.thresholdPercent !== undefined ? `${ac.thresholdPercent}%` : "未配置"}）`,
@@ -114,6 +127,7 @@ async function configureAutoCompact(
       `${AC_CLEAR_PERCENT}`,
       `${AC_CLEAR_TOKENS}`,
       `${AC_SET_TIMEOUT}（当前：${ac.timeoutMinutes} 分钟）`,
+      `${AC_SET_BATCH_WAIT}（当前：${batchWaitText}）`,
     ];
     const choice = await ctx.ui.select(
       `自动压缩 — 生效中：${describeAutoCompactSetting(settings)}（Esc 返回）`,
@@ -159,6 +173,19 @@ async function configureAutoCompact(
         continue;
       }
       ac.timeoutMinutes = n;
+      saveAndMaybeNotifyFallback();
+    } else if (choice.startsWith(AC_SET_BATCH_WAIT)) {
+      const text = await ctx.ui.input(
+        "批等待上限（分钟，0 = 不限）",
+        String(ac.batchMaxWaitMinutes ?? DEFAULT_BATCH_MAX_WAIT_MINUTES)
+      );
+      if (text === undefined) continue;
+      const n = parseNonNegativeInt(text);
+      if (n === undefined) {
+        ctx.ui.notify("无效输入：请输入 ≥0 的整数分钟数（0 = 不限）。", "warning");
+        continue;
+      }
+      ac.batchMaxWaitMinutes = n;
       saveAndMaybeNotifyFallback();
     }
   }

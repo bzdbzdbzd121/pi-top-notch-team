@@ -168,6 +168,52 @@ describe("createMemberEventHandler", () => {
     );
   });
 
+  it("member-to-member messages NEVER carry the skipAutoCompact marker", async () => {
+    // Summarizer hard requirement: non-barrier paths (member inter-sends,
+    // Inspector direct) must not produce marked messages — the marker is
+    // exclusively set by the batch pre-check barrier in tl-tools.
+    const { createMemberEventHandler } = await loadModule();
+    const deps = createMockDeps();
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    handler({
+      type: "tool_execution_end",
+      toolName: "team_send_message",
+      result: {
+        details: {
+          teamMessage: {
+            from: "worker",
+            to: "analyzer",
+            content: "Please check this",
+            timestamp: Date.now(),
+          },
+        },
+      },
+    });
+
+    const enqueued = deps.messageQueue.enqueue.mock.calls[0][0];
+    expect(enqueued.to).toBe("analyzer");
+    expect(enqueued.skipAutoCompact).toBeUndefined();
+  });
+
+  it("backup <team-message> parse path NEVER carries the skipAutoCompact marker", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const deps = createMockDeps();
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    handler({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: '<team-message to="analyzer">Backup path message</team-message>',
+      },
+    });
+
+    const enqueued = deps.messageQueue.enqueue.mock.calls[0][0];
+    expect(enqueued.to).toBe("analyzer");
+    expect(enqueued.skipAutoCompact).toBeUndefined();
+  });
+
   it("should auto-populate correlation ID for TL-directed messages", async () => {
     const { createMemberEventHandler } = await loadModule();
     const deps = createMockDeps();

@@ -78,6 +78,7 @@ src/
 │   ├── message-queue.ts  ← Serial FIFO queue (event-driven drain, no polling)
 │   ├── router.ts     ← Routes to member / tl / all / self-skip
 │   ├── response-waiter.ts  ← team_send_and_wait correlation matching + response buffer
+│   ├── auto-compact.ts    ← Shared Auto-Compaction runtime (primitives + pending/flush)
 │   └── event-handler.ts    ← Member RPC event handler (state machine, dedup, routing)
 ├── process/          ← Member process lifecycle
 │   ├── member-process.ts  ← pi --mode rpc spawn wrapper (write queue, size guard)
@@ -183,6 +184,9 @@ src/
    - **Race-free dispatch**: the `compaction_started` transition happens synchronously before any await; messages arriving mid-compaction are queued and flushed after it ends.
    - Configured globally via `/team setting` (no team-YAML override): `autoCompact: { enabled, thresholdPercent?, thresholdTokens?, timeoutMinutes }`. Enabled-but-no-thresholds falls back to 80% and the menu surfaces this fallback explicitly.
    - Member Inspector direct messages bypass auto-compaction (user can compact manually via `ctrl+o`).
+   - **共享压缩运行时（阶段 1）**: `src/channel/auto-compact.ts` 的 `AutoCompactRuntime` 拥有全部压缩原语（queryStats/shouldCompact/beginCompaction/compactNow/endCompaction/queueDuringCompaction/flushPending）与 per-member pending 队列。内联派发路径（`createSendToMember`）与批屏障（tl-tools）共享**同一实例**（`createMessageChannel` 创建并注入），压缩期间到达的消息（Inspector 直发等）统一进 pending、`flushPending` FIFO 释放——预检路径与内联路径共享同一 pending/flush，孤儿消息结构性不可能（D2）。接口为 discriminated union `{ ok: true, stats? } | { ok: false, error }`，错误携带真实 RPC 原因供通知。
+   - **skipAutoCompact 标记（阶段 2）**: `TeamMessage.skipAutoCompact?: boolean`——"本批压缩决策已由预检做出"的唯一信号（正确性机制非优化）。带标记消息在 `createSendToMember` 中跳过内联检查直接派发（防 E12：压缩后 usage 仍超阈值时的二次压缩；同时保证 at most one per dispatch）。非屏障路径（单任务/成员互发/Inspector 直发）永不产生带标记消息。
+   - **批屏障（阶段 3）**: `sendAndWaitExecute` 在 enqueue 之前运行批预检（tasks.length > 1 且 autoCompact 启用才启用）。【不变式 E1】整个屏障（WAIT + stats + 串行压缩）在 corrId 注册与 enqueue **之前**完成——屏障期不存在任何 wait 检测，all-idle 误释放不可能（顺序硬编码 + 测试锁定：压缩完成前 messageQueue 长度为 0）。流程：`planBatchCompaction`（纯函数：idle→查 stats / compacting→待等集合，不重复发 compact / 其他→跳过）→ 并行 stats（本地 RPC）→ 需压缩集合 **串行** compact（同一时刻至多一个 compact RPC，无 PD 分离下并发压缩=并发 prefill）→ per-member fail-open（失败者带 skip 随批派发、其余继续）→ maxWait 批预算（`batchMaxWaitMinutes`，默认 15 分钟，0=不限）超预算停止后续压缩整批派发 → COMMIT 注册全部 corrId 并 enqueue，`skipAutoCompact: true` **仅加给实际执行过压缩尝试的成员**（成功或失败均算）。可见性：压缩开始前通知一次（成功静默哲学不变）、失败/超预算各通知一次。单任务/关闭路径完全原路径零预检（E9）。
 
 17. **First-action protocol + TL read guard（双防亲自分析）** — TL 收到任务型诉求后亲自埋头分析（而不派发）是最常见的角色偏离。纯提示词约束不可靠（基座 coding-assistant 提示词驱动模型自己动手，且提示词中"能用代码验证的不要去问用户"曾与之矛盾、给了模型合规借口）。修复分两层：
    - **提示词层**：`src/prompts/tl-first-action.ts` 的「第一动作协议」（共享片段，防漂移）注入两种模式 TL 提示词的**顶部**——收到任务型诉求时第一个工具调用必须是 `start_member`/`team_send_and_wait`，派发前禁止 read/bash 代码文件；同时将旧规则限定为"需求对齐阶段允许读取 1-2 个文件查证"以消除矛盾。
@@ -204,11 +208,11 @@ The codebase uses an explicit Dependency Injection (DI) pattern to decouple modu
 
 | DI Interface | Module | Dependencies |
 |-------------|--------|-------------|
-| `TlToolsDeps` | `tools/tl-tools.ts` | `pi`, `manager`, `responseWaiter`, `memberOpsStates`, `lastPendingCorrId`, `messageQueue`, `createMember?`, `buildMemberConfig?`, `getMemberLog?`, `isDynamicSession?`, `addMemberToSession?`, `onDynamicMemberAdded?`, `onDynamicPhaseTransition?` |
+| `TlToolsDeps` | `tools/tl-tools.ts` | `pi`, `manager`, `responseWaiter`, `memberOpsStates`, `lastPendingCorrId`, `messageQueue`, `createMember?`, `buildMemberConfig?`, `getMemberLog?`, `isDynamicSession?`, `addMemberToSession?`, `onDynamicMemberAdded?`, `onDynamicPhaseTransition?`, `getAutoCompact?`, `getHandle?`, `autoCompact?` |
 | `MemberLifecycleDeps` | `setup/member-lifecycle.ts` | `pi`, `memberOpsStates`, `messageQueue`, `responseWaiter`, `lastPendingCorrId`, `recentlyProcessedMessages`, `processManager?` |
 | `MessageChannelDeps` | `setup/message-channel.ts` | `pi`, `memberOpsStates`, `lastPendingCorrId`, `memberHandles`, `onRouteNotification?`, `getAutoCompact?` |
 | `EventHandlerDeps` | `channel/event-handler.ts` | `pi`, `memberOpsStates`, `messageQueue`, `responseWaiter`, `lastPendingCorrId`, `recentlyProcessedMessages`, `processManager?`, `onMemberActivity?` |
-| `SendToMemberDeps` | `channel/event-handler.ts` | `pi`, `memberOpsStates`, `memberHandles`, `getAutoCompact?` |
+| `SendToMemberDeps` | `channel/event-handler.ts` | `pi`, `memberOpsStates`, `memberHandles`, `getAutoCompact?`, `autoCompact?` |
 
 Benefits:
 - **Testability**: each module can be tested with mocked dependencies
@@ -363,6 +367,8 @@ npm run test:watch  # Watch mode
 | `get_member_log(name, lines?, maxContentLength?)` | Query Member's recent session via RPC. `maxContentLength` truncates each message content (default 200 chars). Truncation uses `slice(0, max-3) + "..."` so total length = maxContentLength. |
 | `wait_and_get_member_status()` | 等待所有 member 空闲后查看所有 Member 的运行状态 (idle/working/crashed/stopped)。No parameters. 如果任何 member 仍在工作中会阻塞，和 team_send_and_wait 检测 all-idle 的方式相同。 |
 | `team_send_and_wait({tasks: [{to, content}], nextSteps})` | Send message(s) to **one or more** team members and wait for ALL responses. tasks 支持批量发送到不同 member 实现并发执行。Waits until all targeted members reply or all become idle. Returns partial results if some members fail. nextSteps 在 wait 结束后随结果返回。
+>
+> **批屏障（统一开始）**：多 task 批次（tasks.length > 1）中若有成员需自动压缩，整批 prompt 在**最后一个需要的压缩完成后才统一派发**——一个都不先跑（压缩完成后任务间仍并发执行）。等待由 `[批屏障]` 通知告知，受批预算限制（默认 15 分钟，`/team setting` 可调，0=不限）。单任务批次与 autoCompact 关闭时完全走旧路径，零预检。
 >
 > **⚠️ `tasks` 必须是原始 JSON 数组，不要传 JSON 字符串。** LLM 有时会错误地将数组二次序列化（`"tasks": "[{...}]"`），这会导致框架校验失败。
 > 工具参数 schema 已使用 `oneOf` 同时接受 `array` 和 `string` 类型，框架校验不会拦截。

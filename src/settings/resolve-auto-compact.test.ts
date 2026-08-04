@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   DEFAULT_THRESHOLD_PERCENT,
   DEFAULT_TIMEOUT_MINUTES,
+  DEFAULT_BATCH_MAX_WAIT_MINUTES,
   resolveAutoCompact,
   shouldCompact,
   describeAutoCompactSetting,
@@ -22,6 +23,7 @@ describe("resolveAutoCompact", () => {
     expect(r.thresholdPercent).toBe(DEFAULT_THRESHOLD_PERCENT);
     expect(r.thresholdTokens).toBeUndefined();
     expect(r.timeoutMinutes).toBe(DEFAULT_TIMEOUT_MINUTES);
+    expect(r.batchMaxWaitMinutes).toBe(DEFAULT_BATCH_MAX_WAIT_MINUTES);
     expect(r.percentIsDefaultFallback).toBe(false);
   });
 
@@ -65,6 +67,21 @@ describe("resolveAutoCompact", () => {
   it("clamps timeoutMinutes to a sane minimum", () => {
     const r = resolveAutoCompact(makeSettings({ timeoutMinutes: 0 }));
     expect(r.timeoutMinutes).toBe(1);
+  });
+
+  it("keeps batchMaxWaitMinutes = 0 as unlimited (0 is meaningful)", () => {
+    const r = resolveAutoCompact(makeSettings({ batchMaxWaitMinutes: 0 }));
+    expect(r.batchMaxWaitMinutes).toBe(0);
+  });
+
+  it("falls back to the default batch budget when unset", () => {
+    const r = resolveAutoCompact(makeSettings({ batchMaxWaitMinutes: undefined }));
+    expect(r.batchMaxWaitMinutes).toBe(DEFAULT_BATCH_MAX_WAIT_MINUTES);
+  });
+
+  it("clamps negative batch budgets to 0 (unlimited) instead of blocking forever", () => {
+    const r = resolveAutoCompact(makeSettings({ batchMaxWaitMinutes: -5 }));
+    expect(r.batchMaxWaitMinutes).toBe(0);
   });
 });
 
@@ -122,5 +139,15 @@ describe("describeAutoCompactSetting", () => {
     );
     expect(d).toContain("默认");
     expect(d).toContain(`${DEFAULT_THRESHOLD_PERCENT}%`);
+  });
+
+  it("describes the batch budget when enabled", () => {
+    const d = describeAutoCompactSetting(makeSettings({ batchMaxWaitMinutes: 20 }));
+    expect(d).toContain("20 分钟");
+  });
+
+  it("describes unlimited batch budget (0)", () => {
+    const d = describeAutoCompactSetting(makeSettings({ batchMaxWaitMinutes: 0 }));
+    expect(d).toContain("不限");
   });
 });

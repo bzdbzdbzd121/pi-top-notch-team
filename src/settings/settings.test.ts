@@ -91,6 +91,7 @@ describe("settings store", () => {
       thresholdPercent: 70,
       thresholdTokens: 150_000,
       timeoutMinutes: 15,
+      batchMaxWaitMinutes: 20,
     };
     saveSettings(settings, tmpDir);
     const loaded = loadSettings(tmpDir);
@@ -99,7 +100,42 @@ describe("settings store", () => {
       thresholdPercent: 70,
       thresholdTokens: 150_000,
       timeoutMinutes: 15,
+      batchMaxWaitMinutes: 20,
     });
+  });
+
+  it("parses batchMaxWaitMinutes: explicit value, unlimited (0), and invalid → default", () => {
+    // Explicit value
+    writeFileSync(
+      getSettingsPath(tmpDir),
+      "autoCompact:\n  enabled: true\n  timeoutMinutes: 10\n  batchMaxWaitMinutes: 30\n",
+      "utf-8"
+    );
+    expect(loadSettings(tmpDir).autoCompact.batchMaxWaitMinutes).toBe(30);
+
+    // 0 = unlimited (meaningful value, must survive)
+    writeFileSync(
+      getSettingsPath(tmpDir),
+      "autoCompact:\n  enabled: true\n  timeoutMinutes: 10\n  batchMaxWaitMinutes: 0\n",
+      "utf-8"
+    );
+    expect(loadSettings(tmpDir).autoCompact.batchMaxWaitMinutes).toBe(0);
+
+    // Negative / non-integer → dropped, default applies
+    writeFileSync(
+      getSettingsPath(tmpDir),
+      "autoCompact:\n  enabled: true\n  timeoutMinutes: 10\n  batchMaxWaitMinutes: -3\n",
+      "utf-8"
+    );
+    expect(loadSettings(tmpDir).autoCompact.batchMaxWaitMinutes).toBe(DEFAULT_SETTINGS.autoCompact.batchMaxWaitMinutes);
+
+    // Old settings file without the key → default back-filled
+    writeFileSync(
+      getSettingsPath(tmpDir),
+      "autoCompact:\n  enabled: true\n  timeoutMinutes: 10\n",
+      "utf-8"
+    );
+    expect(loadSettings(tmpDir).autoCompact.batchMaxWaitMinutes).toBe(DEFAULT_SETTINGS.autoCompact.batchMaxWaitMinutes);
   });
 
   it("preserves explicitly cleared thresholds (null → undefined, no default back-fill)", () => {

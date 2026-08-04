@@ -4,6 +4,8 @@ import type { MemberProcessHandle, MemberProcessConfig } from "../process/member
 import type { ResponseWaiter, WaitResult } from "../channel/response-waiter";
 import type { MessageQueue } from "../channel/message-queue";
 import type { TeamMessage } from "../channel/types";
+import type { AutoCompactRuntime } from "../channel/auto-compact";
+import type { ResolvedAutoCompact } from "../settings/resolve-auto-compact";
 import type { MemberOperationalState } from "../session/context";
 import { getSessionState } from "../session/state";
 import { createMemberProcess } from "../process/member-process";
@@ -28,6 +30,19 @@ export interface TlToolsDeps {
   getMemberLog?: GetMemberLogFn;
   /** Called after a member is successfully started (for dynamic mode phase transitions). */
   onDynamicPhaseTransition?: () => void;
+  /**
+   * Resolve the effective Auto-Compaction config (per call, so /team setting
+   * changes take effect immediately). Absent = feature disabled.
+   */
+  getAutoCompact?: () => ResolvedAutoCompact;
+  /** Resolve a member's process handle by name (batch barrier compact RPC). */
+  getHandle?: (name: string) => MemberProcessHandle | undefined;
+  /**
+   * Shared auto-compaction runtime (from createMessageChannel). The batch
+   * barrier and the inline dispatch path share one pending/flush mechanism.
+   * Absent = the batch barrier is disabled (legacy path).
+   */
+  autoCompact?: AutoCompactRuntime;
 }
 
 // ── Tool result types ──────────────────────────────────────
@@ -334,6 +349,7 @@ export function registerTlTools(deps: TlToolsDeps): void {
       "  • MIXED strategy: batch A+B for parallel discovery, then use their combined outputs to craft C's single-thread task. This is often the most efficient pattern.",
       "BATCH ADVANTAGE: concurrent execution — total wall-clock time ≈ slowest single task rather than sum of all tasks.",
       "SEQUENTIAL COST: total wall-clock time = sum of all task durations; every pause between tasks adds latency.",
+      "BATCH ALIGNMENT (自动压缩): in a multi-task batch, if a member needs auto-compaction, ALL prompts of the batch wait until the LAST needed compaction finishes, then dispatch together — no member starts early (unified start). The wait is announced via [批屏障] notices and bounded by the batch budget (default 15 min, /team setting).",
       "team_send_and_wait waits for ALL tasks to complete. Returns PARTIAL results if some members become idle without replying — in batch mode, one member's failure does not block the other members' results from being returned.",
       "Always fill in nextSteps with what you plan to do after the wait ends — it will be returned to you to keep the workflow on track.",
     ],
@@ -374,10 +390,14 @@ export function registerTlTools(deps: TlToolsDeps): void {
       params: { tasks: unknown; nextSteps: string }
     ): Promise<ToolResult> {
       return sendAndWaitExecute(params as Parameters<typeof sendAndWaitExecute>[0], {
+        pi,
         responseWaiter,
         memberOpsStates,
         lastPendingCorrId,
         messageQueue,
+        autoCompact: deps.autoCompact,
+        getAutoCompact: deps.getAutoCompact,
+        getHandle: deps.getHandle,
       });
     },
   });
@@ -475,10 +495,207 @@ async function waitForAllIdle(
 }
 
 interface SendAndWaitCtx {
+  pi: ExtensionAPI;
   responseWaiter: ResponseWaiter;
   memberOpsStates: Map<string, MemberOperationalState>;
   lastPendingCorrId: Map<string, string>;
   messageQueue: MessageQueue;
+  /** Shared auto-compaction runtime — required for the batch barrier. Absent = legacy path. */
+  autoCompact?: AutoCompactRuntime;
+  /** Resolve the effective auto-compaction config. Absent = feature disabled. */
+  getAutoCompact?: () => ResolvedAutoCompact;
+  /** Resolve a member's process handle (batch barrier compact RPC). */
+  getHandle?: (name: string) => MemberProcessHandle | undefined;
+}
+
+// ── Batch alignment barrier (phase 3) ──────────────────────
+// Unified-start semantics: when a batch (tasks.length > 1) needs
+// auto-compaction, EVERY prompt in the batch is sent only after the LAST
+// needed compaction completes — none may start early. Compactions run
+// STRICTLY SERIAL (one compact RPC at a time): without PD separation,
+// concurrent compactions are concurrent prefill bursts — the exact problem
+// the user reported.
+//
+// Scope: only the tasks[] explicit targets participate (to:"all" broadcasts
+// are excluded, E13). Member-to-member messages and Inspector direct
+// messages never participate (manual intervention wins).
+//
+// Architecture invariant E1: the WHOLE barrier runs BEFORE any corrId
+// registration / enqueue, so no wait detection can fire early. This order
+// is locked by tests (messageQueue stays empty until all compactions end).
+
+/** Poll interval for waiting on compacting members (WAIT phase). */
+const BARRIER_WAIT_POLL_MS = 1000;
+
+/**
+ * Pure decision for the batch alignment barrier.
+ *
+ * Classifies the deduped explicit target set by operational state:
+ *   - idle → toQuery: stats decide whether compaction is needed
+ *   - compacting → toWait: a compaction is already in flight (inline path /
+ *     previous batch after Esc) — never send a second compact (D3); wait
+ *     until it ends instead
+ *   - working/crashed/stopped → skip: messages go through the existing
+ *     followUp / undeliverable paths, nothing to align (E6/E16)
+ *
+ * `cfg` is retained in the signature for future policy extensions (e.g. a
+ * parallel-compaction switch); classification itself only depends on state.
+ */
+export function planBatchCompaction(
+  targets: string[],
+  getState: (name: string) => MemberOperationalState,
+  _cfg: ResolvedAutoCompact
+): BatchCompactionPlan {
+  const plan: BatchCompactionPlan = { toQuery: [], toWait: [], skip: [] };
+  for (const name of targets) {
+    const state = getState(name);
+    if (state === "idle") {
+      plan.toQuery.push(name);
+    } else if (state === "compacting") {
+      plan.toWait.push(name);
+    } else {
+      plan.skip.push(name);
+    }
+  }
+  return plan;
+}
+
+export interface BatchCompactionPlan {
+  /** Idle members — the barrier queries their stats in parallel. */
+  toQuery: string[];
+  /** Members already compacting — wait for them instead of re-compacting (E3). */
+  toWait: string[];
+  /** working/crashed/stopped members — not part of the barrier. */
+  skip: string[];
+}
+
+/** Send a batch-barrier notice to the TL session (visible, not silent). */
+function notifyBarrier(ctx: SendAndWaitCtx, content: string): void {
+  ctx.pi.sendMessage({ customType: "team-message", content, display: true });
+}
+
+/**
+ * Wait until all given members are idle, or the deadline passes.
+ * 1s poll (BARRIER_WAIT_POLL_MS); deadline = batch budget (0 = unlimited).
+ */
+function waitForMembersIdle(
+  names: string[],
+  memberOpsStates: Map<string, MemberOperationalState>,
+  deadline: number
+): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const poll = setInterval(() => {
+      const allIdle = names.every((n) => memberOpsStates.get(n) === "idle");
+      if (allIdle || Date.now() >= deadline) {
+        clearInterval(poll);
+        resolve();
+      }
+    }, BARRIER_WAIT_POLL_MS);
+  });
+}
+
+/**
+ * Run the batch alignment barrier for the deduped explicit targets.
+ *
+ * Returns the set of members that actually received a compaction ATTEMPT
+ * (success OR failure — "at most one compaction per dispatch"). Only those
+ * members' messages carry skipAutoCompact in the commit phase; members
+ * skipped by maxWait budget, missing handles, or non-S classification get
+ * no marker, so the inline path naturally gives them a second chance.
+ *
+ * Fail-open everywhere: stats failures, compaction failures, timeouts and
+ * budget overruns all end with the batch dispatched as-is.
+ */
+async function runBatchCompactionBarrier(
+  targets: string[],
+  ctx: SendAndWaitCtx
+): Promise<Set<string>> {
+  const cfg = ctx.getAutoCompact?.();
+  const runtime = ctx.autoCompact;
+  const getHandle = ctx.getHandle;
+  if (!cfg?.enabled || !runtime || !getHandle) {
+    return new Set<string>();
+  }
+
+  const plan = planBatchCompaction(
+    targets,
+    (name) => ctx.memberOpsStates.get(name) ?? "idle",
+    cfg
+  );
+
+  // Total batch budget: WAIT phase + all compactions share it (D1 maxWait).
+  const budgetMs =
+    cfg.batchMaxWaitMinutes > 0 ? cfg.batchMaxWaitMinutes * 60_000 : Infinity;
+  const deadline = Date.now() + budgetMs;
+
+  // 1. WAIT: members already compacting (E3 — never re-compact).
+  if (plan.toWait.length > 0) {
+    await waitForMembersIdle(plan.toWait, ctx.memberOpsStates, deadline);
+    if (Date.now() >= deadline) {
+      notifyBarrier(
+        ctx,
+        `[批屏障] 等待超预算（${cfg.batchMaxWaitMinutes > 0 ? `${cfg.batchMaxWaitMinutes} 分钟` : "不限"}），已停止压缩，整批派发`
+      );
+      return new Set<string>();
+    }
+  }
+
+  // 2. PREPARE: parallel stats query (local RPC, no model calls — safe to
+  //    parallelize). Per-member fail-open: failures count as "no compaction".
+  const statsResults = await Promise.all(
+    plan.toQuery.map(async (name): Promise<{ name: string; needs: boolean }> => {
+      const handle = getHandle(name);
+      if (!handle) return { name, needs: false }; // no handle → not part of barrier
+      const result = await runtime.queryStats(name, handle);
+      return { name, needs: result.ok && runtime.shouldCompact(result.stats, cfg) };
+    })
+  );
+  const toCompact = statsResults.filter((r) => r.needs).map((r) => r.name);
+
+  // 3. Notify BEFORE compaction starts (|S| > 0): a user-visible new behavior
+  //    must be announced, otherwise the TL thinks the tool is stuck.
+  if (toCompact.length > 0) {
+    notifyBarrier(
+      ctx,
+      `[批屏障] 本批 ${toCompact.length} 个成员需自动压缩（${toCompact.join("、")}），其余成员将等待，压缩完成后统一派发`
+    );
+  }
+
+  // 4. COMPACT: strictly serial (at most one compact RPC at a time).
+  const attempted = new Set<string>();
+  for (const name of toCompact) {
+    if (Date.now() >= deadline) {
+      // Budget exhausted — stop remaining compactions (D1: maxWait fallback).
+      notifyBarrier(
+        ctx,
+        `[批屏障] 等待超预算（${cfg.batchMaxWaitMinutes > 0 ? `${cfg.batchMaxWaitMinutes} 分钟` : "不限"}），已停止压缩，整批派发`
+      );
+      break;
+    }
+    // Re-check state: the member may have left idle between stats and here
+    // (gap race, E15). Non-idle members are skipped WITHOUT the marker — the
+    // inline path handles them naturally.
+    if (ctx.memberOpsStates.get(name) !== "idle") continue;
+    const handle = getHandle(name);
+    if (!handle) continue;
+
+    // Synchronous state set before any await (race-free, F2 pattern);
+    // finally-reset on every path (F3 / E8: Esc-safe).
+    runtime.beginCompaction(name);
+    const result = await runtime.compactNow(name, handle, cfg);
+    runtime.endCompaction(name);
+
+    // Success or failure both count as an attempt (at most one per dispatch).
+    attempted.add(name);
+    if (!result.ok) {
+      notifyBarrier(
+        ctx,
+        `[批屏障] 成员 "${name}" 压缩失败/超时（${result.error}），将随本批直接派发`
+      );
+    }
+  }
+
+  return attempted;
 }
 
 /** A pending task with its generated correlation ID. */
@@ -783,6 +1000,24 @@ async function sendAndWaitExecute(
     };
   }
 
+  // ── Batch alignment barrier (phase 3) ──
+  // Runs BEFORE corrId registration and enqueue (invariant E1). Only for
+  // batches (tasks.length > 1); to:"all" entries are excluded from the
+  // barrier (E13); single tasks / disabled auto-compaction take the legacy
+  // path unchanged (E9). The barrier returns the set of members that got a
+  // compaction attempt — the commit phase marks exactly those messages.
+  const explicitTargets = tasks
+    .filter((t) => t.to !== "all")
+    .map((t) => t.to);
+  const attempted =
+    tasks.length > 1 &&
+    explicitTargets.length > 0 &&
+    ctx.autoCompact &&
+    ctx.getAutoCompact &&
+    ctx.getHandle
+      ? await runBatchCompactionBarrier([...new Set(explicitTargets)], ctx)
+      : new Set<string>();
+
   // Generate corr IDs for each task and enqueue messages
   const pendingTasks: PendingTask[] = [];
   const now = Date.now();
@@ -800,6 +1035,12 @@ async function sendAndWaitExecute(
       content: task.content + "\n\n<corr:" + corrId + ">",
       timestamp: now,
       correlationId: corrId,
+      // Phase 3 skip rule: the marker is added ONLY to members that actually
+      // received a compaction attempt in this barrier (success or failure —
+      // at most one per dispatch). Members skipped by the maxWait budget or
+      // not over threshold carry NO marker, so the inline path naturally
+      // gets its second chance.
+      ...(attempted.has(task.to) ? { skipAutoCompact: true } : {}),
     };
     messageQueue.enqueue(messagePayload as TeamMessage);
   }

@@ -4,6 +4,8 @@ import type { TeamSettings } from "./settings";
 export const DEFAULT_THRESHOLD_PERCENT = 80;
 /** Default wait time for the compaction RPC to complete, in minutes. */
 export const DEFAULT_TIMEOUT_MINUTES = 10;
+/** Default total budget for the batch alignment barrier, in minutes (0 = unlimited). */
+export const DEFAULT_BATCH_MAX_WAIT_MINUTES = 15;
 
 /** Context usage snapshot of a member (from get_session_stats). */
 export interface ContextUsage {
@@ -20,6 +22,13 @@ export interface ResolvedAutoCompact {
   thresholdTokens?: number;
   /** How long to wait for the compaction RPC before failing open. */
   timeoutMinutes: number;
+  /**
+   * Total budget for the batch alignment barrier (phase 3), in minutes.
+   * 0 = unlimited. When the budget runs out, remaining compactions are
+   * skipped and the whole batch is dispatched as-is (D1 per-member
+   * fail-open + maxWait fallback).
+   */
+  batchMaxWaitMinutes: number;
   /**
    * True when `thresholdPercent` was filled in by the default fallback
    * (enabled but neither threshold configured). UI uses this to display
@@ -42,6 +51,7 @@ export function resolveAutoCompact(settings: TeamSettings): ResolvedAutoCompact 
     thresholdPercent: ac.thresholdPercent,
     thresholdTokens: ac.thresholdTokens,
     timeoutMinutes: Math.max(1, Math.floor(ac.timeoutMinutes)),
+    batchMaxWaitMinutes: Math.max(0, Math.floor(ac.batchMaxWaitMinutes ?? DEFAULT_BATCH_MAX_WAIT_MINUTES)),
     percentIsDefaultFallback: false,
   };
   if (
@@ -102,5 +112,6 @@ export function describeAutoCompactSetting(settings: TeamSettings): string {
     parts.push(`${formatTokens(r.thresholdTokens)} tokens`);
   }
   const thresholdText = parts.length > 0 ? parts.join(" 或 ") : "无";
-  return `开启 · 阈值 ${thresholdText} · 超时 ${r.timeoutMinutes} 分钟`;
+  const batchText = r.batchMaxWaitMinutes > 0 ? `${r.batchMaxWaitMinutes} 分钟` : "不限";
+  return `开启 · 阈值 ${thresholdText} · 超时 ${r.timeoutMinutes} 分钟 · 批等待 ${batchText}`;
 }
