@@ -575,8 +575,16 @@ function notifyBarrier(ctx: SendAndWaitCtx, content: string): void {
 }
 
 /**
- * Wait until all given members are idle, or the deadline passes.
- * 1s poll (BARRIER_WAIT_POLL_MS); deadline = batch budget (0 = unlimited).
+ * Wait until all given members are out of `compacting`, or the deadline
+ * passes. 1s poll (BARRIER_WAIT_POLL_MS); deadline = batch budget
+ * (0 = unlimited).
+ *
+ * Release condition is "not compacting" (idle / crashed / stopped all
+ * release): a toWait member that crashes mid-compaction or is stopped via
+ * /team stop would otherwise never reach idle and the poll would hang until
+ * the deadline (or forever with an unlimited budget). Once the compaction is
+ * no longer running, alignment is meaningless — the batch proceeds and the
+ * member's messages take the existing undeliverable/followUp paths.
  */
 function waitForMembersIdle(
   names: string[],
@@ -585,12 +593,17 @@ function waitForMembersIdle(
 ): Promise<void> {
   return new Promise<void>((resolve) => {
     const poll = setInterval(() => {
-      const allIdle = names.every((n) => memberOpsStates.get(n) === "idle");
-      if (allIdle || Date.now() >= deadline) {
+      const allReleased = names.every((n) => memberOpsStates.get(n) !== "compacting");
+      if (allReleased || Date.now() >= deadline) {
         clearInterval(poll);
         resolve();
       }
     }, BARRIER_WAIT_POLL_MS);
+    // Do not keep the process alive just for the poll if the tool call is
+    // abandoned (e.g. session teardown while the barrier waits).
+    if (typeof (poll as NodeJS.Timeout).unref === "function") {
+      (poll as NodeJS.Timeout).unref();
+    }
   });
 }
 
@@ -628,8 +641,14 @@ async function runBatchCompactionBarrier(
     cfg.batchMaxWaitMinutes > 0 ? cfg.batchMaxWaitMinutes * 60_000 : Infinity;
   const deadline = Date.now() + budgetMs;
 
-  // 1. WAIT: members already compacting (E3 — never re-compact).
+  // 1. WAIT: members already compacting (E3 — never re-compact). Announced
+  //    so the wait is never silent (建议 3); releases as soon as a member is
+  //    out of compacting (crashed/stopped included — no hang).
   if (plan.toWait.length > 0) {
+    notifyBarrier(
+      ctx,
+      `[批屏障] 等待成员 ${plan.toWait.join("、")} 的进行中压缩完成，然后统一派发…`
+    );
     await waitForMembersIdle(plan.toWait, ctx.memberOpsStates, deadline);
     if (Date.now() >= deadline) {
       notifyBarrier(
@@ -661,11 +680,15 @@ async function runBatchCompactionBarrier(
     );
   }
 
-  // 4. COMPACT: strictly serial (at most one compact RPC at a time).
+  // 4. COMPACT: strictly serial (at most one compact RPC at a time). A
+  //    compaction already in flight when the budget runs out is left to run
+  //    to its own timeout — "stop remaining" means stop NOT-YET-STARTED
+  //    compactions only.
   const attempted = new Set<string>();
   for (const name of toCompact) {
     if (Date.now() >= deadline) {
-      // Budget exhausted — stop remaining compactions (D1: maxWait fallback).
+      // Budget exhausted — stop the not-yet-started compactions (D1:
+      // maxWait fallback).
       notifyBarrier(
         ctx,
         `[批屏障] 等待超预算（${cfg.batchMaxWaitMinutes > 0 ? `${cfg.batchMaxWaitMinutes} 分钟` : "不限"}），已停止压缩，整批派发`

@@ -119,6 +119,7 @@ function setupBarrier(opts: SetupOptions = {}) {
   const responseWaiter = createMockResponseWaiter();
   const messageQueue = createMockMessageQueue(order);
   const lastPendingCorrId = new Map<string, string>();
+  const autoCompact = createAutoCompactRuntime(memberOpsStates);
 
   let executeFn: Function = () => {};
   pi.registerTool = vi.fn((def: any) => {
@@ -136,11 +137,11 @@ function setupBarrier(opts: SetupOptions = {}) {
     messageQueue,
     getAutoCompact: () => opts.cfg ?? defaultCfg,
     getHandle: (name: string) => handles.get(name),
-    autoCompact: createAutoCompactRuntime(memberOpsStates),
+    autoCompact,
     ...opts.deps,
   });
 
-  return { executeFn, order, pi, memberOpsStates, messageQueue, lastPendingCorrId, handles };
+  return { executeFn, order, pi, memberOpsStates, messageQueue, lastPendingCorrId, handles, autoCompact, responseWaiter };
 }
 
 function createMockMessageQueue(order: string[]): MessageQueue {
@@ -396,7 +397,7 @@ describe("team_send_and_wait batch barrier (phase 3)", () => {
         states: { a: "compacting", b: "idle" }, // a: inline compaction already in flight
         handles: { b: { stats: () => usageResponse(95, 190000) } },
       });
-      ({ executeFn, order, memberOpsStates, messageQueue } = setup);
+      ({ executeFn, order, pi, memberOpsStates, messageQueue } = setup);
 
       const execPromise = executeFn("call-1", {
         tasks: [
@@ -409,6 +410,12 @@ describe("team_send_and_wait batch barrier (phase 3)", () => {
 
       // a is compacting → NO stats/compact for a; the barrier waits (1s poll)
       expect(order).toEqual([]);
+      // The wait itself is announced (建议 3: no silent waiting)
+      const waitNotices = (pi.sendMessage as ReturnType<typeof vi.fn>).mock.calls
+        .map((c: any[]) => c[0].content as string)
+        .filter((n) => n.includes("[批屏障]") && n.includes("等待成员"));
+      expect(waitNotices).toHaveLength(1);
+      expect(waitNotices[0]).toContain("a");
 
       // a's in-flight compaction finishes (simulated by the inline path resetting state)
       memberOpsStates.set("a", "idle");
@@ -423,6 +430,106 @@ describe("team_send_and_wait batch barrier (phase 3)", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("WAIT releases when a toWait member crashes mid-compaction — no hang, even with unlimited budget", async () => {
+    vi.useFakeTimers();
+    try {
+      setup = setupBarrier({
+        cfg: { ...defaultCfg, batchMaxWaitMinutes: 0 }, // unlimited — must NOT hang forever
+        states: { a: "compacting", b: "idle" },
+        handles: { b: { stats: () => usageResponse(95, 190000) } },
+      });
+      ({ executeFn, order, memberOpsStates, messageQueue } = setup);
+
+      const execPromise = executeFn("call-1", {
+        tasks: [
+          { to: "a", content: "task-a" },
+          { to: "b", content: "task-b" },
+        ],
+        nextSteps: "next",
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(order).toEqual([]); // waiting on a's in-flight compaction
+
+      // a's process dies mid-compaction (process_exit → crashed). The barrier
+      // must release: compaction is meaningless for a crashed member.
+      memberOpsStates.set("a", "crashed");
+      await vi.advanceTimersByTimeAsync(1000);
+      await execPromise;
+
+      expect(order).toEqual(["stats:b", "compact:b", "enqueue:a", "enqueue:b"]);
+      expect(enqueuedFor(messageQueue, "a")[0].skipAutoCompact).toBeUndefined();
+      expect(enqueuedFor(messageQueue, "b")[0].skipAutoCompact).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("member inter-sends queued during a barrier compaction are flushed after it (D2 orphan fix)", async () => {
+    let resolveCompactA: (v: any) => void;
+    const compactAPromise = new Promise((r) => { resolveCompactA = r; });
+    setup = setupBarrier({
+      states: { a: "idle", b: "idle" },
+      handles: {
+        a: { stats: () => usageResponse(95, 190000), compact: () => compactAPromise },
+        b: { stats: () => usageResponse(50, 100000) },
+      },
+    });
+    const {
+      executeFn,
+      order,
+      pi,
+      memberOpsStates,
+      messageQueue,
+      lastPendingCorrId,
+      handles,
+      autoCompact,
+      responseWaiter,
+    } = setup;
+
+    // Build a real sendToMember sharing the SAME runtime + states as the barrier
+    // (this is what the router does for member inter-sends / Inspector direct).
+    const { createSendToMember } = await import("../channel/event-handler");
+    const sendToMember = createSendToMember({
+      pi,
+      memberOpsStates,
+      memberHandles: handles,
+      responseWaiter,
+      lastPendingCorrId,
+      getAutoCompact: () => defaultCfg,
+      autoCompact,
+    });
+
+    const execPromise = executeFn("call-1", {
+      tasks: [
+        { to: "a", content: "task-a" },
+        { to: "b", content: "task-b" },
+      ],
+      nextSteps: "next",
+    });
+    await vi.waitFor(() => expect(order).toContain("compact:a"));
+
+    // Member b → a inter-send arrives while a is compacting inside the barrier:
+    // queued into the shared pending, NOT dispatched.
+    sendToMember("a", { id: "inter-1", from: "b", to: "a", content: "inter-send", timestamp: Date.now() });
+    expect(order.filter((e) => e.startsWith("prompt:"))).toEqual([]);
+
+    // Barrier compaction finishes (endCompaction resets state only) → COMMIT enqueues.
+    resolveCompactA!({ type: "response", command: "compact", success: true, data: {} });
+    await execPromise;
+    expect(enqueuedFor(messageQueue, "a")[0].skipAutoCompact).toBe(true);
+
+    // Simulate the queue drain delivering a's marked batch message to sendToMember.
+    // The direct-dispatch path must flush the queued inter-send FIRST (FIFO),
+    // otherwise it would be silently stranded until a's next compaction cycle.
+    sendToMember("a", { id: "batch-1", from: "tl", to: "a", content: "task-a", timestamp: Date.now(), skipAutoCompact: true });
+
+    const prompts = (handles.get("a")!.sendCommand as ReturnType<typeof vi.fn>).mock.calls
+      .map((c: any[]) => c[0].message as string);
+    expect(prompts[0]).toContain("inter-send");
+    expect(prompts[1]).toContain("task-a");
+    expect(prompts).toHaveLength(2);
   });
 
   it("dedupes same-member multi-tasks: one stats query + one compaction for the member", async () => {

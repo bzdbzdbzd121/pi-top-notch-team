@@ -695,9 +695,13 @@ sendAndWaitExecute(tasks)  [tasks.length > 1 && autoCompact enabled && DI wired]
   → PREPARE: parallel get_session_stats (3s each, per-member fail-open)
   → S: members over threshold
   → notify once: 「[批屏障] 本批 N 个成员需自动压缩（名单），其余成员将等待，压缩完成后统一派发」
+  → WAIT (toWait): announced 「[批屏障] 等待成员 x 的进行中压缩完成…」; releases when
+      every toWait member is OUT of compacting (idle/crashed/stopped — a crashed
+      or stopped member never reaches idle and must not hang the poll)
   → COMPACT: S serial — beginCompaction (sync) → compactNow → endCompaction (finally reset)
       per-member fail-open: failure → notify + continue; member still marked (skip)
-      maxWait budget exceeded → stop remaining compactions, notify, dispatch batch as-is
+      maxWait budget exceeded → stop the NOT-YET-STARTED compactions, notify, dispatch batch as-is
+      (a compaction already in flight runs to its own timeout — expected)
   → COMMIT: register all corrIds → enqueue all messages
       skipAutoCompact: true ONLY on members that got a compaction attempt
       (success or failure); budget-skipped / non-S members carry no marker
@@ -706,8 +710,8 @@ sendAndWaitExecute(tasks)  [tasks.length > 1 && autoCompact enabled && DI wired]
 ```
 
 - **Serial compactions**: at most one compact RPC at a time — without PD separation, concurrent compactions are concurrent prefill bursts, the exact problem this feature solves.
-- **Compacting members** (inline-path compaction already in flight, or a previous batch left running after Esc): counted into the wait set, polled to idle, never re-compacted (D3 — replaces any lock-based approach).
-- **maxWait budget** (`batchMaxWaitMinutes`, default 15 min, 0 = unlimited): total budget shared by the WAIT phase and all compactions. On exhaustion: remaining compactions are skipped, the batch is dispatched as-is, and the TL is notified. Members not yet attempted carry no marker.
+- **Compacting members** (inline-path compaction already in flight, or a previous batch left running after Esc): counted into the wait set, polled out of compacting (idle/crashed/stopped all release — a dead compaction cannot be aligned), never re-compacted (D3 — replaces any lock-based approach).
+- **maxWait budget** (`batchMaxWaitMinutes`, default 15 min, 0 = unlimited): total budget shared by the WAIT phase and all compactions. On exhaustion: the not-yet-started compactions are skipped, the batch is dispatched as-is, and the TL is notified. Members not yet attempted carry no marker.
 - **Scope**: barrier covers only the tasks[] explicit targets; `to:"all"` is rejected by the existing unknown-target validation (broadcasts are not batch semantics); member inter-sends and Inspector direct messages never participate (manual intervention wins). Single-task batches and disabled auto-compaction take the legacy path with zero pre-check.
 
 ### Detecting Member-to-Member Messages

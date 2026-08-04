@@ -589,6 +589,15 @@ export function createSendToMember(
       return;
     }
 
+    // Direct dispatch (working member / marked message / disabled config).
+    // Drain messages queued during a compaction that ended WITHOUT flushing
+    // first — the batch barrier's endCompaction resets state only. FIFO: the
+    // queued messages arrived earlier, so they go out before this one (D2:
+    // messages can never be orphaned in the shared pending). No-op when the
+    // queue is empty.
+    for (const pendingMsg of autoCompact.flushPending(memberName)) {
+      sendPrompt(memberName, pendingMsg);
+    }
     sendPrompt(memberName, msg);
   };
 }

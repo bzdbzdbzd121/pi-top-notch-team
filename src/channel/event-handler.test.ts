@@ -1154,4 +1154,54 @@ describe("createSendToMember auto-compaction", () => {
     const commands = handle.sendCommandAndWait.mock.calls.map((c: any[]) => c[0].type);
     expect(commands).toEqual(["get_session_stats", "compact"]);
   });
+
+  it("direct dispatch drains pending messages FIRST when a compaction ended without flush (D2 orphan fix)", async () => {
+    // Barrier-style compaction lifecycle: beginCompaction → compactNow →
+    // endCompaction (state reset ONLY — the barrier never flushes). Messages
+    // queued during that compaction sit in the shared pending. The next
+    // dispatch to the member (e.g. the marked batch message) must flush them
+    // FIFO before itself — otherwise they are stranded until the member's
+    // next compaction cycle (possibly never).
+    const { createSendToMember } = await loadModule();
+    const { createAutoCompactRuntime } = await import("./auto-compact");
+    const deps = createMockDeps({ getAutoCompact: () => enabledCfg }) as any;
+    const runtime = createAutoCompactRuntime(deps.memberOpsStates);
+    deps.autoCompact = runtime;
+    const handle = { sendCommand: vi.fn(), sendCommandAndWait: vi.fn() };
+    deps.memberHandles.set("worker", handle);
+    deps.memberOpsStates.set("worker", "idle");
+
+    const send = createSendToMember(deps);
+
+    // Simulate the barrier: compaction starts, a message arrives mid-flight,
+    // compaction ends without flushing.
+    runtime.beginCompaction("worker");
+    send("worker", { ...makeMsg("m1"), content: "Queued during barrier compaction" });
+    expect(handle.sendCommand).not.toHaveBeenCalled();
+    runtime.endCompaction("worker");
+
+    // Marked batch message arrives after the barrier → direct dispatch.
+    send("worker", { ...makeMsg("m2"), content: "Marked batch task", skipAutoCompact: true });
+
+    const prompts = (handle.sendCommand as ReturnType<typeof vi.fn>).mock.calls
+      .map((c: any[]) => c[0].message as string);
+    expect(prompts[0]).toContain("Queued during barrier compaction");
+    expect(prompts[1]).toContain("Marked batch task");
+    expect(prompts).toHaveLength(2);
+    expect(runtime.flushPending("worker")).toEqual([]);
+  });
+
+  it("direct dispatch with no pending is unaffected (empty flush is a no-op)", async () => {
+    const { createSendToMember } = await loadModule();
+    const deps = createMockDeps({ getAutoCompact: () => enabledCfg }) as any;
+    const handle = makeHandle(usageResponse(50, 100000), { success: true });
+    deps.memberHandles.set("worker", handle);
+    deps.memberOpsStates.set("worker", "idle");
+
+    createSendToMember(deps)("worker", { ...makeMsg(), skipAutoCompact: true });
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(handle.sendCommand).toHaveBeenCalledTimes(1);
+    expect(handle.sendCommandAndWait).not.toHaveBeenCalled();
+  });
 });
