@@ -2,7 +2,9 @@
   "name": "pi-top-notch-team",
   "version": "0.1.0",
   "description": "Multi-agent team collaboration for pi agent",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "type": "module",
   "pi": {
     "extensions": [
@@ -11,8 +13,8 @@
     ]
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*"
+    "@earendil-works/pi-coding-agent": "^0.83.0",
+    "@earendil-works/pi-tui": "^0.83.0"
   },
   "dependencies": {
     "yaml": "^2.7.0"
