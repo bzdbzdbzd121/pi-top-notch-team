@@ -74,6 +74,95 @@ export interface TlReadGuard {
   readonly preDispatchCalls: number;
 }
 
+// ────────────────────────────────────────────────────────────────
+// Design-phase read limiter (dynamic mode, before any Member exists)
+//
+// In the design phase `read` IS allowed (exploring the project to design
+// the team is legitimate), but the TL must not fall into deep code analysis
+// instead of discussing requirements. Unlike the execution-phase guard
+// (sticky block until dispatch — there is nothing to dispatch to here),
+// this guard applies a SOFT periodic reminder:
+//   - Only non-.md `read` calls are counted (docs/shared-context reads are
+//     legitimate design work and never counted — same rule as the pre-
+//     dispatch guard).
+//   - Every `threshold`-th code read is blocked ONCE with a reminder
+//     ("do you really need to read this?"). The very next read call passes
+//     again — if the read is genuinely needed the TL can simply retry.
+//   - `firstBlock` marks the first block of the turn for UI notification;
+//     later blocks of the same turn skip the notification (no spam).
+//   - `resetTurn()` is called on `agent_start` so each user message gets a
+//     fresh budget. Fail-open: non-read tools are never touched (the design-
+//     phase whitelist already blocks them), .md reads / unknown paths never
+//     count.
+
+export interface DesignReadGuardOptions {
+  /** Code reads allowed between reminders. Every `threshold`-th code read is blocked once. Default: 4 (same rhythm as the pre-dispatch guard's 4th-call block). */
+  threshold?: number;
+}
+
+export interface DesignReadGuard {
+  /** Reset per-turn counters. Call on agent_start (once per user-message turn). */
+  resetTurn(): void;
+  /**
+   * Evaluate a tool call. Only `read` on non-.md files is in scope.
+   * @returns soft block verdict (blocked call is followed by a passing one)
+   */
+  checkToolCall(toolName: string, filePath?: string): TlReadGuardVerdict;
+  /** Non-.md read calls this turn (observability / testing). */
+  readonly readCount: number;
+}
+
+export function createDesignReadGuard(options: DesignReadGuardOptions = {}): DesignReadGuard {
+  const threshold = options.threshold ?? 4;
+
+  let readCount = 0;
+  let firstBlocked = false;
+  let justBlocked = false;
+
+  return {
+    resetTurn() {
+      readCount = 0;
+      firstBlocked = false;
+      justBlocked = false;
+    },
+
+    checkToolCall(toolName, filePath) {
+      // Only `read` is in scope — the design-phase whitelist already blocks
+      // every other non-management tool (bash, edit, web_search, ...).
+      if (toolName !== "read") return { block: false };
+      // .md reads / unknown paths never count — reading docs is legitimate design work.
+      if (!filePath || filePath.endsWith(".md")) return { block: false };
+
+      readCount += 1;
+      // The read immediately after a soft block passes unconditionally —
+      // a genuinely needed read is always retryable ("若确实需要可再次调用").
+      if (justBlocked) {
+        justBlocked = false;
+        return { block: false };
+      }
+      if (readCount % threshold === 0) {
+        justBlocked = true;
+        const first = !firstBlocked;
+        firstBlocked = true;
+        return {
+          block: true,
+          ...(first ? { firstBlock: true } : {}),
+          reason:
+            `⚠️ 设计阶段已累计 ${readCount} 次非文档 read（代码/项目文件读取）。作为团队设计师，反复读取项目文件会偏离设计职责——请确认是否真的需要读取该文件：\n` +
+            `• 若确需查证（如项目结构、需求细节）→ 直接再次调用 read 即可，本次为单次提醒，不会持续拦截；\n` +
+            `• 若已进入代码分析 → 请停止，先与用户对齐需求；代码分析由执行阶段的 Member 完成。\n` +
+            `• 读取 .md 文档（README/ADR/需求文档）不计数、不拦截。`,
+        };
+      }
+      return { block: false };
+    },
+
+    get readCount() {
+      return readCount;
+    },
+  };
+}
+
 export function createTlReadGuard(options: TlReadGuardOptions = {}): TlReadGuard {
   const threshold = options.threshold ?? 3;
 

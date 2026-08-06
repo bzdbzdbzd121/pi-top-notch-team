@@ -815,8 +815,9 @@ Strict 模式的注入结构相同，但标题为「严格模式 ⚡ — 必须�
 此外，扩展注册了一个 `tool_call` 事件拦截器，使用**白名单**机制限制工具调用。不在白名单上的工具会被直接阻断，不存在黑名单遗漏的风险。
 
 **设计阶段白名单（`DESIGN_PHASE_WHITELIST`）：**
-- 仅允许：`add_dynamic_member`、`start_member`、`stop_member`、`list_members`、`get_member_log`、`wait_and_get_member_status`、`team_send_and_wait`、`set_goal`、`finish_goal`、`write`（仅 `.md` 文件）
-- 其他工具全部被阻断（包括 `bash`、`read`、`web_search` 等），TL 只能讨论方案和写入共享上下文。
+- 仅允许：`add_dynamic_member`、`start_member`、`stop_member`、`list_members`、`get_member_log`、`wait_and_get_member_status`、`team_send_and_wait`、`set_goal`、`finish_goal`、`write_shared_context`、`read`（不受限）、`write`（仅 `.md` 文件）
+- 其他工具全部被阻断（包括 `bash`、`edit`、`web_search` 等），TL 只能讨论方案、有限度读取文件、写入共享上下文。
+- **设计阶段 read 软限制**（`src/session/tl-read-guard.ts` 的 `createDesignReadGuard`）：read 是允许的（了解项目以设计方案是合法设计工作），但非 `.md` 读取每 4 次会被**拦截一次并提醒**「是否真的需要 read」——若确实需要，再次调用 read 即可放行（单次提醒、不持续拦截，与执行阶段的 sticky 拦截不同：设计阶段没有可派发的 Member）。`.md` 读取不计数、不拦截；首次拦截带 `firstBlock` 标记触发用户可见通知与状态栏警示；`agent_start` 重置每轮计数。
 
 **执行阶段白名单（`EXECUTION_PHASE_WHITELIST`）：**
 - 团队管理工具 + 只读分析工具（`read`、`bash`、`web_search`、`fetch_content`、`ctx_search`、`true_sight_*` 等）+ `write`/`edit`（仅 `.md` 文件）
@@ -828,7 +829,7 @@ Strict 模式的注入结构相同，但标题为「严格模式 ⚡ — 必须�
 - 机制：以 `agent_start` 为 turn 边界重置计数；每个 turn 内未发生 `team_send_and_wait` 派发时，TL 对**所有非管理工具**（read、bash、web_search、ctx_execute 等——不只 `read`，否则可用 bash grep/rg/cat 绕过）的调用计数，超过阈值（默认 3）即进入**持续拦截模式**：派发前每次非管理工具调用都会被 block，reason 中包含纠偏指引。
 - 设计属性：
   - **持续拦截（sticky）**：阈值触发后不是 block 一次就放行——一次性的软提醒实测可被模型无视（看到一次错误后继续用下一个工具分析）。现在派发前所有非管理工具调用持续被拦截，TL 唯一出路是 `team_send_and_wait` 派发任务或直接回复用户。首次拦截带 `firstBlock` 标记，供 UI 弹通知/状态栏警示；派发（`team_send_and_wait`）后立即解锁，后续工具调用全部放行。
-  - **fail-open**：`.md` 读取不计数（文档工作是 TL 本职）；管理工具（start/stop/list_members、team_send_and_wait、write/edit 等）永不拦截（解锁通道永远畅通）；派发后不再拦截（派发后的 read 视为协调/审阅）；设计阶段不启用（无 Member 可派发，读代码是合法设计工作）。
+  - **fail-open**：`.md` 读取不计数（文档工作是 TL 本职）；管理工具（start/stop/list_members、team_send_and_wait、write/edit 等）永不拦截（解锁通道永远畅通）；派发后不再拦截（派发后的 read 视为协调/审阅）；设计阶段不启用本守卫（无 Member 可派发），取而代之的是**设计阶段 read 软限制**（`createDesignReadGuard`，见上）：非 `.md` read 每 4 次拦截一次提醒，确需读取时再次调用即放行。
   - 提示词层（`src/prompts/tl-first-action.ts` 的"第一动作协议"，注入预定义团队与动态模式执行阶段提示词顶部）与运行时层（本守卫）配对，模型能预知规则被强制执行。
 
 The handler stays registered for the entire pi session but checks `session.active` to decide whether to inject TL instructions. When `/team stop` ends the session, `session.active` becomes `false` and no extra prompt is injected.

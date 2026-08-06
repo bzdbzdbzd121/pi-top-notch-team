@@ -46,10 +46,13 @@ describe("buildDynamicModePrompt — design phase", () => {
     expect(prompt).toContain("分批循环处理");
   });
 
-  it("包含设计阶段铁律（工具硬阻断说明）", () => {
+  it("包含设计阶段铁律（工具硬阻断说明 + read 软限制）", () => {
     expect(prompt).toContain("铁律");
     expect(prompt).toContain("bash");
-    expect(prompt).toContain("read");
+    // read 是允许的（软限制），不再是硬阻断
+    expect(prompt).not.toContain("不能读取任何文件");
+    expect(prompt).toContain("✅ read");
+    expect(prompt).toContain("再次调用 read 即可放行");
   });
 
   it("空团队时提示使用 add_dynamic_member", () => {

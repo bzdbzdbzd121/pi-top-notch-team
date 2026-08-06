@@ -26,7 +26,7 @@ import { createMessageChannel } from "./src/setup/message-channel";
 import { buildDynamicModePrompt } from "./src/prompts/dynamic-mode";
 import { FIRST_ACTION_PROTOCOL_PROMPT } from "./src/prompts/tl-first-action";
 import { buildWorkflowPrompt, WORKFLOW_ACTIVATION_BANNER } from "./src/prompts/workflow-prompt";
-import { createTlReadGuard } from "./src/session/tl-read-guard";
+import { createTlReadGuard, createDesignReadGuard } from "./src/session/tl-read-guard";
 import { getSharedContextPath } from "./src/session/shared-context";
 import { openMemberInspector, type MemberInspectorHandle } from "./src/ui/member-inspector";
 
@@ -263,11 +263,14 @@ export default function (pi: ExtensionAPI) {
   // start of every user-message turn (agent_start). Fail-open: member processes never
   // reach this (TEAM_ROLE early return above).
   const tlReadGuard = createTlReadGuard();
+  const designReadGuard = createDesignReadGuard();
   pi.on("agent_start", (_event, ctx) => {
     tlReadGuard.resetTurn();
+    designReadGuard.resetTurn();
     // Clear any leftover guard status from the previous turn (UI may be absent in RPC mode).
     try {
       ctx?.ui?.setStatus?.("tl-pre-dispatch-guard", undefined);
+      ctx?.ui?.setStatus?.("tl-design-read-guard", undefined);
     } catch { /* fail-open */ }
   });
 
@@ -312,17 +315,39 @@ export default function (pi: ExtensionAPI) {
           };
         }
       }
-      // ── Pre-dispatch guard: count non-management tool calls, block once ──
-      // Applies to ALL whitelisted tools (read, bash, web_search, ctx_execute, etc.)
-      // — not just `read` — because TL can bypass a read-only guard via bash grep/rg/cat.
-      // Management tools (start_member, team_send_and_wait, write, edit, etc.) are
-      // exempted inside checkToolCall.
-      // Execution phase only — design phase has no Members to dispatch to.
-      if (!isDesignPhase) {
-        const filePath =
-          event.toolName === "read" || event.toolName === "write" || event.toolName === "edit"
-            ? extractPathFromInput(event.input)
-            : undefined;
+      // ── Phase-specific runtime guards ──
+      const filePath =
+        event.toolName === "read" || event.toolName === "write" || event.toolName === "edit"
+          ? extractPathFromInput(event.input)
+          : undefined;
+      if (isDesignPhase) {
+        // Design-phase read limiter: read is ALLOWED (exploring the project
+        // to design the team is legitimate), but every `threshold`-th
+        // non-.md read is blocked ONCE as a soft reminder — the next read
+        // call passes again if it is genuinely needed. Not sticky: there is
+        // no Member to dispatch to in the design phase.
+        const verdict = designReadGuard.checkToolCall(event.toolName, filePath);
+        if (verdict.block) {
+          if (verdict.firstBlock) {
+            try {
+              ctx?.ui?.notify?.(
+                `⚠️ 设计阶段已拦截第 ${designReadGuard.readCount} 次非文档 read — 若确需读取可再次调用 read（单次提醒，不持续拦截）`,
+                "warning"
+              );
+              ctx?.ui?.setStatus?.(
+                "tl-design-read-guard",
+                "⚠️ 设计阶段 read 频率提醒 — 确需读取可再次调用 read"
+              );
+            } catch { /* fail-open */ }
+          }
+          return { block: true, reason: verdict.reason };
+        }
+      } else {
+        // ── Pre-dispatch guard: count non-management tool calls, block once ──
+        // Applies to ALL whitelisted tools (read, bash, web_search, ctx_execute, etc.)
+        // — not just `read` — because TL can bypass a read-only guard via bash grep/rg/cat.
+        // Management tools (start_member, team_send_and_wait, write, edit, etc.) are
+        // exempted inside checkToolCall.
         const verdict = tlReadGuard.checkToolCall(event.toolName, filePath);
         if (verdict.block) {
           // First block: surface a user-visible notification + status bar warning so

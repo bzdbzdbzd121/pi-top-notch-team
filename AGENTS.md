@@ -161,7 +161,7 @@ src/
     This prevents `"tasks: must be array"` validation failures caused by LLMs incorrectly double-encoding JSON-in-JSON, and salvages as much work as possible when the double-encoded string is itself malformed.
 
 12. **Two-phase dynamic mode** — `/team dynamic` is split into a **design phase** and an **execution phase**:
-   - **Design phase** (entered on `/team dynamic`): TL is blocked from using `bash`/`code_search`/`fetch_content`/`edit` entirely. `read` is allowed (for checking docs), `write` is restricted to `.md` files only. This forces TL to focus on discussing requirements and designing the team rather than exploring or modifying code. The only tools available are `add_dynamic_member`, team management tools, `read`, and `.md` writes.
+   - **Design phase** (entered on `/team dynamic`): TL is blocked from using `bash`/`code_search`/`fetch_content`/`edit` entirely. `read` is allowed but **soft-limited** (every 4th non-`.md` read is intercepted once with a "do you really need to read?" reminder — retrying the read passes it, single-shot not sticky; `.md` reads never count), `write` is restricted to `.md` files only. This forces TL to focus on discussing requirements and designing the team rather than exploring or modifying code. The only tools available are `add_dynamic_member`, team management tools, `read` (soft-limited), and `.md` writes.
    - **Execution phase** (entered when the first `start_member` succeeds): TL regains access to all tools for monitoring and coordination. The standard team session guard still blocks code file writes.
    - Phase transition is automatic: `start_member` tool calls `onDynamicPhaseTransition`, which flips `teamCtx.dynamicPhase` from `"design"` to `"execution"`. The `before_agent_start` handler injects different prompts depending on the current phase.
 
@@ -190,7 +190,8 @@ src/
 
 17. **First-action protocol + TL read guard（双防亲自分析）** — TL 收到任务型诉求后亲自埋头分析（而不派发）是最常见的角色偏离。纯提示词约束不可靠（基座 coding-assistant 提示词驱动模型自己动手，且提示词中"能用代码验证的不要去问用户"曾与之矛盾、给了模型合规借口）。修复分两层：
    - **提示词层**：`src/prompts/tl-first-action.ts` 的「第一动作协议」（共享片段，防漂移）注入两种模式 TL 提示词的**顶部**——收到任务型诉求时第一个工具调用必须是 `start_member`/`team_send_and_wait`，派发前禁止 read/bash 代码文件；同时将旧规则限定为"需求对齐阶段允许读取 1-2 个文件查证"以消除矛盾。
-   - **运行时层**：`src/session/tl-read-guard.ts`——`agent_start` 重置 turn 计数；turn 内未发生 `team_send_and_wait` 派发时，**所有非管理工具**（read/bash/web_search/ctx_execute 等，不只 `read`——否则可用 bash grep/rg 绕过）超过阈值（默认 3）即进入**持续拦截模式**：派发前每次非管理工具调用都被 block，reason 含纠偏指引，首次拦截带 `firstBlock` 标记触发用户可见的通知与状态栏警示；`team_send_and_wait` 派发后立即解锁。管理工具（含 write/edit 与派发通道）永不拦截，解锁通道永远畅通。fail-open、设计阶段不启用。
+   - **运行时层**：`src/session/tl-read-guard.ts`——`agent_start` 重置 turn 计数；turn 内未发生 `team_send_and_wait` 派发时，**所有非管理工具**（read/bash/web_search/ctx_execute 等，不只 `read`——否则可用 bash grep/rg 绕过）超过阈值（默认 3）即进入**持续拦截模式**：派发前每次非管理工具调用都被 block，reason 含纠偏指引，首次拦截带 `firstBlock` 标记触发用户可见的通知与状态栏警示；`team_send_and_wait` 派发后立即解锁。管理工具（含 write/edit 与派发通道）永不拦截，解锁通道永远畅通。fail-open。
+   - **设计阶段 read 软限制（`createDesignReadGuard`，同文件）**：动态模式设计阶段没有可派发的 Member，上述 sticky 守卫不适用；但 read 仍需节流——非 `.md` read 每 `threshold` 次（默认 4）拦截**一次**并提醒「是否真的需要 read」，随后下一次 read 无条件放行（确需读取可再次调用，不持续拦截）；`.md` read 不计数；首次拦截触发通知 + 状态栏警示；`agent_start` 重置。
 
 18. **Shared context 自愈创建**——`.shared-context.md` 过去完全依赖 TL（LLM）在 `start_member` 前用 `write` 写入，LLM 不可靠遵守顺序，导致 `buildMemberConfig` 只能打警告且 member 带着悬空路径启动。现在 `src/session/shared-context.ts` 的 `ensureSharedContextFile()` 保证文件恒存在：会话启动时（`/team start` / `/team dynamic`）创建最小 stub（团队名册 + 占位章节），`buildMemberConfig` 内也防御性调用；已存在则绝不覆盖，fs 失败 fail-open。TL 仍负责后续用真实内容覆盖。
 
@@ -443,7 +444,7 @@ The design phase guard is active from the moment `/team dynamic` is entered. It 
   → 激活 TL 工具 + 设计阶段严格守卫 + widget（显示"设计阶段"）
   → 注入设计阶段提示词
 
-═══ 设计阶段（TL 被阻断：仅允许管理工具 + .md 写入，其余工具被白名单拦截）═══
+═══ 设计阶段（TL 被阻断：仅允许管理工具 + read（软限制）+ .md 写入，其余工具被白名单拦截）═══
 
 TL 按编排方法论 Playbook（orchestration-playbook.md，注入设计阶段提示词）推进六阶段：
   A. 需求对齐 — grilling 式逐个问题深挖（目标/范围/验收标准/约束/非目标）

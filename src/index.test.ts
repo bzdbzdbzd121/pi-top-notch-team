@@ -1,7 +1,11 @@
-import { describe, it, expect, vi, beforeEach, type Mock } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { transitionState } from "./session/state-machine";
 import type { MemberOperationalState } from "./session/context";
+import { createMockContext } from "./test/fixtures/mock-extension-api";
 
 // ── Helpers ────────────────────────────────────────────────
 
@@ -611,6 +615,121 @@ describe("TL pre-dispatch guard in tool_call handler", () => {
     const toolCall = getHandler("tool_call");
     for (let i = 0; i < 6; i++) {
       expect(toolCall({ toolName: "read", input: { path: `src/f${i}.ts` } })).toBeUndefined();
+    }
+  });
+});
+
+// ── Design-phase read limiter (dynamic mode) in tool_call handler ────
+
+describe("design-phase read limiter in tool_call handler", () => {
+  let pi: ExtensionAPI;
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    delete process.env.TEAM_ROLE;
+    tmpDir = mkdtempSync(join(tmpdir(), "design-read-guard-"));
+    process.env.TOP_NOTCH_TEAM_ROOT = tmpDir;
+    pi = createMockPi();
+    const mod = await import("../index");
+    mod.default(pi);
+    // Enter the REAL design phase via /team dynamic (flips the internal
+    // teamCtx to isDynamicSession=true + dynamicPhase="design").
+    const cmdDef = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    await cmdDef.handler("dynamic", createMockContext());
+  });
+
+  afterEach(() => {
+    delete process.env.TOP_NOTCH_TEAM_ROOT;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function getHandler(name: string): Function {
+    const onCalls = (pi.on as ReturnType<typeof vi.fn>).mock.calls;
+    return onCalls.find((c: any) => c[0] === name)![1];
+  }
+
+  it("blocks non-whitelisted tools in the design phase (bash etc.)", () => {
+    const toolCall = getHandler("tool_call");
+    const blocked = toolCall({ toolName: "bash", input: { command: "ls" } });
+    expect(blocked).toEqual(expect.objectContaining({ block: true }));
+    expect(blocked.reason).toContain("设计阶段");
+  });
+
+  it("allows read, then soft-blocks every 4th code read with a reminder (next read passes again)", () => {
+    const toolCall = getHandler("tool_call");
+    const read = (p: string) => toolCall({ toolName: "read", input: { path: p } });
+
+    expect(read("src/a.ts")).toBeUndefined();
+    expect(read("src/b.ts")).toBeUndefined();
+    expect(read("src/c.ts")).toBeUndefined();
+
+    const blocked = read("src/d.ts");
+    expect(blocked).toEqual(expect.objectContaining({ block: true }));
+    expect(blocked.reason).toContain("再次调用 read");
+
+    // soft: genuinely needed reads are retryable — NOT sticky
+    expect(read("src/e.ts")).toBeUndefined();
+    expect(read("src/f.ts")).toBeUndefined();
+    expect(read("src/g.ts")).toBeUndefined();
+    expect(read("src/h.ts")).toEqual(expect.objectContaining({ block: true })); // 8th
+  });
+
+  it("never blocks .md reads in the design phase", () => {
+    const toolCall = getHandler("tool_call");
+    for (let i = 0; i < 6; i++) {
+      expect(toolCall({ toolName: "read", input: { path: `docs/readme${i}.md` } })).toBeUndefined();
+    }
+  });
+
+  it("notifies the user on the first design-phase read block via ctx.ui", () => {
+    const toolCall = getHandler("tool_call");
+    const ui = createMockUi();
+    const ctx = { ui };
+
+    toolCall({ toolName: "read", input: { path: "src/a.ts" } }, ctx);
+    toolCall({ toolName: "read", input: { path: "src/b.ts" } }, ctx);
+    toolCall({ toolName: "read", input: { path: "src/c.ts" } }, ctx);
+    toolCall({ toolName: "read", input: { path: "src/d.ts" } }, ctx);
+
+    expect(ui.notify).toHaveBeenCalledWith(expect.stringContaining("read"), "warning");
+    expect(ui.setStatus).toHaveBeenCalledWith("tl-design-read-guard", expect.stringContaining("read"));
+
+    // next blocked read (8th) does NOT re-notify (firstBlock only on first)
+    ui.notify.mockClear();
+    toolCall({ toolName: "read", input: { path: "src/e.ts" } }, ctx);
+    toolCall({ toolName: "read", input: { path: "src/f.ts" } }, ctx);
+    toolCall({ toolName: "read", input: { path: "src/g.ts" } }, ctx);
+    toolCall({ toolName: "read", input: { path: "src/h.ts" } }, ctx);
+    expect(ui.notify).not.toHaveBeenCalled();
+  });
+
+  it("agent_start resets the design-phase read budget", () => {
+    const toolCall = getHandler("tool_call");
+    const agentStart = getHandler("agent_start");
+    const read = (p: string) => toolCall({ toolName: "read", input: { path: p } });
+
+    read("src/a.ts");
+    read("src/b.ts");
+    read("src/c.ts");
+    expect(read("src/d.ts")).toEqual(expect.objectContaining({ block: true }));
+
+    agentStart(); // new user-message turn → fresh budget
+    expect(read("src/e.ts")).toBeUndefined();
+    expect(read("src/f.ts")).toBeUndefined();
+    expect(read("src/g.ts")).toBeUndefined();
+    expect(read("src/h.ts")).toEqual(expect.objectContaining({ block: true })); // 4th again
+  });
+
+  it("execution-phase sticky guard does not apply in the design phase", () => {
+    const toolCall = getHandler("tool_call");
+    // 4+ code reads: soft blocks only, never the sticky pre-dispatch guard
+    for (let i = 0; i < 8; i++) {
+      const v = toolCall({ toolName: "read", input: { path: `src/f${i}.ts` } });
+      if (v) {
+        expect(v.reason).toContain("设计阶段");
+        expect(v.reason).not.toContain("team_send_and_wait");
+      }
     }
   });
 });

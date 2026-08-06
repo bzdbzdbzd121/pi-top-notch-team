@@ -71,14 +71,13 @@ function designPhasePrompt(sharedCtxPath: string, memberLines: string, team: Tea
   return `
 ═══ 设计阶段 — 你的角色 ═══
 
-在这个阶段，你是一名**团队设计师**，不是工程师。你的代码能力在此阶段**处于休眠状态**——你不能读取、分析或接触项目代码。你的全部精力都放在与用户讨论和设计方案上。
+在这个阶段，你是一名**团队设计师**，不是工程师。你的代码能力在此阶段**处于休眠状态**——你不能分析或修改项目代码。你的全部精力都放在与用户讨论和设计方案上（系统允许有限度地读取文件查证需求，但有频率提醒，见下）。
 
 ### 【铁律：绝对禁止的行为】
 
 以下行为在动态模式设计阶段被**系统硬阻断**，你无法执行：
 
   ❌ bash — 不能运行任何命令
-  ❌ read — 不能读取任何文件
   ❌ code_search — 不能搜索代码
   ❌ fetch_content — 不能抓取网页
   ❌ edit — 不能编辑任何文件
@@ -86,6 +85,7 @@ function designPhasePrompt(sharedCtxPath: string, memberLines: string, team: Tea
 
 你只能做的操作：
   ✅ 与用户对话讨论需求
+  ✅ read — 可以读取文件（**不限制 .md 文档**，如 README/ADR/需求文档）；但每 4 次非文档 read（代码/项目文件）会被系统**拦截一次并提醒**「是否真的需要读取」——若确实需要，**直接再次调用 read 即可放行**（单次提醒，不会持续拦截）。优先读 .md 文档，代码分析留给执行阶段的 Member。
   ✅ add_dynamic_member — 注册成员
   ✅ write_shared_context — 写入共享上下文（启动成员的必经步骤，未写入时 start_member 会被拦截）
   ✅ write（仅 .md 文件，如 ADR；**但 .shared-context.md 必须用 write_shared_context 工具写入**）
