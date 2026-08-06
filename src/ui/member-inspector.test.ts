@@ -70,7 +70,7 @@ function makeHandle() {
 
 function makeDeps(opts: {
   handles?: Record<string, any>;
-  opStates?: Record<string, "idle" | "working" | "crashed" | "stopped">;
+  opStates?: Record<string, "idle" | "working" | "compacting" | "crashed" | "stopped">;
 }) {
   const handles = new Map(Object.entries(opts.handles ?? {}));
   const opStates = new Map(Object.entries(opts.opStates ?? {}));
@@ -391,7 +391,7 @@ describe("MemberInspectorComponent — navigation & refresh", () => {
           },
         ],
       },
-    });
+    } as any);
     const deps = makeDeps({ handles: { a: handleA }, opStates: { a: "working" } });
     const { comp, state } = makeComponent(deps);
     comp.handleInput("e");
@@ -415,7 +415,7 @@ describe("MemberInspectorComponent — navigation & refresh", () => {
           },
         ],
       },
-    });
+    } as any);
     const deps = makeDeps({ handles: { a: handleA }, opStates: { a: "working" } });
     const { comp, state } = makeComponent(deps);
 

@@ -12,6 +12,7 @@ function createTeamContext(): TeamContext {
     isCreatingTeam: false,
     editingTeamName: null,
     isDynamicSession: false,
+    dynamicPhase: "design",
     processManager: null,
     memberHandles: new Map(),
     getHandle: vi.fn(),
@@ -81,7 +82,7 @@ describe("/team dynamic", () => {
     await cmdHandler.handler("dynamic", ctx);
 
     // Second call should reject
-    ctx.ui.notify.mockClear();
+    (ctx.ui.notify as ReturnType<typeof vi.fn>).mockClear();
     await cmdHandler.handler("dynamic", ctx);
     expect(ctx.ui.notify).toHaveBeenCalledWith(
       expect.stringContaining("团队会话期间仅支持"),
@@ -136,7 +137,7 @@ describe("/team dynamic", () => {
     expect(existsSync(sessionDir)).toBe(true);
 
     // Stop dynamic session
-    ctx.ui.notify.mockClear();
+    (ctx.ui.notify as ReturnType<typeof vi.fn>).mockClear();
     await cmdHandler.handler("stop", ctx);
 
     // Verify cleanup

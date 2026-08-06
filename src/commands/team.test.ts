@@ -14,6 +14,7 @@ function createTeamContext(): TeamContext {
     isCreatingTeam: false,
     editingTeamName: null,
     isDynamicSession: false,
+    dynamicPhase: "design",
     processManager: null,
     memberHandles: new Map(),
     getHandle: vi.fn(),

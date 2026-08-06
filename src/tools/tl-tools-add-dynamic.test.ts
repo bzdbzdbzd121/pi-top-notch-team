@@ -31,7 +31,7 @@ describe("add_dynamic_member tool", () => {
     const pi = createMockPi();
     registerTlTools(createMinimalDeps({ pi }));
     // Should NOT have add_dynamic_member — it's registered dynamically in /team dynamic handler
-    const registeredNames = pi.registerTool.mock.calls.map((c: any[]) => c[0].name);
+    const registeredNames = (pi.registerTool as ReturnType<typeof vi.fn>).mock.calls.map((c: any[]) => c[0].name);
     expect(registeredNames).not.toContain("add_dynamic_member");
   });
 });

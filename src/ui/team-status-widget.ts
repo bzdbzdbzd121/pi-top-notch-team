@@ -160,7 +160,7 @@ export function createTeamStatusWidget(options: {
   }
 
   // ── AbortController for cancelling in-flight poll requests ──
-  let abortController = new AbortController();
+  let abortController: AbortController | null = new AbortController();
 
   // ── Schedule next poll with adaptive interval ─────────
   function scheduleNextPoll(): void {

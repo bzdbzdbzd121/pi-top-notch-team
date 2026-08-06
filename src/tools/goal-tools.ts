@@ -192,11 +192,14 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
     // of throwing "Agent is already processing..." if the TL agent is still
     // streaming (or already streaming again) when the timer fires; it is
     // ignored when the agent is idle, so the reminder triggers a turn normally.
+    // Capture the goal in a local: TS narrowing does not survive the closure.
+    const goal = activeGoal;
+    if (!goal) return;
     setTimeout(() => {
       pi.sendUserMessage(
         `## ⚡ 目标提醒\n\n` +
-        `当前目标 **"${activeGoal.text}"** 尚未完成。\n\n` +
-        `**完成条件：**\n${activeGoal.criteria}\n\n` +
+        `当前目标 **"${goal.text}"** 尚未完成。\n\n` +
+        `**完成条件：**\n${goal.criteria}\n\n` +
         `---\n` +
         `请检查当前进度：\n\n` +
         `1. **如果目标尚未完成** — 继续调度成员执行下一轮任务，直到所有条件满足\n` +

@@ -28,11 +28,12 @@ vi.mock("@earendil-works/pi-tui", () => ({
 }));
 
 import { TeamModeEditor } from "./team-mode-editor";
+import type { Theme } from "@earendil-works/pi-coding-agent";
 
 const theme = { fg: (_color: string, text: string) => `<fg>${text}</fg>` };
 
 function createEditor(autocompleteLines: string[] = []): TeamModeEditor {
-  const editor = new TeamModeEditor({} as any, {} as any, {} as any, theme);
+  const editor = new TeamModeEditor({} as any, {} as any, {} as any, theme as unknown as Theme);
   (editor as any).autocompleteLines = autocompleteLines;
   editor.setTeamMode(true);
   return editor;

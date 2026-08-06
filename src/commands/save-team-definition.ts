@@ -85,6 +85,6 @@ export async function saveTeamDefinition(
     };
   }
 
-  writeTeam(teamData as TeamDefinition, rootDir);
+  writeTeam(teamData as unknown as TeamDefinition, rootDir);
   return null;
 }

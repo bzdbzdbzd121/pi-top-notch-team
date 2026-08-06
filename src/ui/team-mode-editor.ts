@@ -1,11 +1,11 @@
-import { CustomEditor } from "@earendil-works/pi-coding-agent";
+import { CustomEditor, type Theme } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 
 export class TeamModeEditor extends CustomEditor {
   private teamModeActive = false;
-  private fullTheme: { fg: (color: string, text: string) => string };
+  private fullTheme: Theme;
 
-  constructor(tui: any, theme: any, keybindings: any, fullTheme: { fg: (color: string, text: string) => string }) {
+  constructor(tui: any, theme: any, keybindings: any, fullTheme: Theme) {
     super(tui, theme, keybindings);
     this.fullTheme = fullTheme;
   }

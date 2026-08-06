@@ -40,6 +40,7 @@ function createMockResponseWaiter(): ResponseWaiter {
     resolveIfWaiting: vi.fn().mockReturnValue(false),
     cancelAll: vi.fn(),
     cancelByCorrId: vi.fn(),
+    clearCorrelation: vi.fn(),
   };
 }
 
@@ -222,7 +223,7 @@ describe("registerTlTools", () => {
 
   it("registers start_member with promptGuidelines mentioning the shared context gate", () => {
     callRegisterTlTools();
-    const def = pi.registerTool.mock.calls.find((c: any[]) => c[0].name === "start_member")![0];
+    const def = (pi.registerTool as ReturnType<typeof vi.fn>).mock.calls.find((c: any[]) => c[0].name === "start_member")![0];
     expect(def.promptGuidelines.join("\n")).toContain("Shared Context");
   });
 
@@ -439,7 +440,7 @@ describe("registerTlTools", () => {
       // One resolves, one never resolves
       mockResponseWaiter.waitForResponse = vi.fn((corrId: string) => {
         if (corrId.includes("resolve")) {
-          return Promise.resolve({ status: "response", from: "security-reviewer", content: "完成" });
+          return Promise.resolve({ status: "response" as const, from: "security-reviewer", content: "完成" });
         }
         return new Promise<WaitResult>(() => {}); // never resolves
       });
@@ -521,7 +522,7 @@ describe("registerTlTools", () => {
         expect.objectContaining({ to: "planner" })
       );
       // Response waiter should have been set up
-      const callArg = messageQueue.enqueue.mock.calls[0][0];
+      const callArg = (messageQueue.enqueue as ReturnType<typeof vi.fn>).mock.calls[0][0];
       expect(callArg.content).toContain("Do the plan");
       expect(callArg.content).toMatch(/<corr:[a-z0-9]+>/);
     });
@@ -604,7 +605,7 @@ describe("registerTlTools", () => {
       });
 
       expect(messageQueue.enqueue).toHaveBeenCalledTimes(1);
-      const callArg = messageQueue.enqueue.mock.calls[0][0];
+      const callArg = (messageQueue.enqueue as ReturnType<typeof vi.fn>).mock.calls[0][0];
       expect(callArg.to).toBe("planner");
       expect(callArg.content).toContain("line1\nline2");
     });
