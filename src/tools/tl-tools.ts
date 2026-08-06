@@ -349,7 +349,7 @@ export function registerTlTools(deps: TlToolsDeps): void {
       "  • MIXED strategy: batch A+B for parallel discovery, then use their combined outputs to craft C's single-thread task. This is often the most efficient pattern.",
       "BATCH ADVANTAGE: concurrent execution — total wall-clock time ≈ slowest single task rather than sum of all tasks.",
       "SEQUENTIAL COST: total wall-clock time = sum of all task durations; every pause between tasks adds latency.",
-      "BATCH ALIGNMENT (自动压缩): in a multi-task batch, if a member needs auto-compaction, ALL prompts of the batch wait until the LAST needed compaction finishes, then dispatch together — no member starts early (unified start). The wait is announced via [批屏障] notices and bounded by the batch budget (default 15 min, /team setting).",
+      "BATCH ALIGNMENT (自动压缩): in a multi-task batch, if a member needs auto-compaction, ALL prompts of the batch wait until the LAST needed compaction finishes, then dispatch together — no member starts early (unified start). The barrier is internal and fully silent — the TL only experiences a longer wait, bounded by the batch budget (default 15 min, /team setting).",
       "team_send_and_wait waits for ALL tasks to complete. Returns PARTIAL results if some members become idle without replying — in batch mode, one member's failure does not block the other members' results from being returned.",
       "Always fill in nextSteps with what you plan to do after the wait ends — it will be returned to you to keep the workflow on track.",
     ],
@@ -357,6 +357,10 @@ export function registerTlTools(deps: TlToolsDeps): void {
       type: "object",
       properties: {
         tasks: {
+          // `as any` on the closing brace: TypeBox's Static<> cannot infer
+          // the JSON-schema `oneOf` keyword (tasks collapses to `undefined`),
+          // which breaks the execute param variance check. Runtime schema
+          // and validation are unaffected.
           oneOf: [
             {
               type: "array",
@@ -380,7 +384,7 @@ export function registerTlTools(deps: TlToolsDeps): void {
             + "正确示例: tasks: [{to: \"planner\", content: \"...\"}]\n"
             + "错误示例: tasks: \"[{to: 'planner', content: '...'}]\"（这是字符串，框架会自动放行并修复）\n"
             + "要发送的任务列表。单个成员也使用 tasks 数组（如 [{to: \"name\", content: \"...\"}]）。多个成员同时发送时并发执行。",
-        },
+        } as any,
         nextSteps: { type: "string", description: "基于工作流程，wait 结束后下一步计划是什么。该信息会在工具返回时一并发送给你，用于强调工作流程方向。" },
       },
       required: ["tasks", "nextSteps"],
@@ -390,7 +394,6 @@ export function registerTlTools(deps: TlToolsDeps): void {
       params: { tasks: unknown; nextSteps: string }
     ): Promise<ToolResult> {
       return sendAndWaitExecute(params as Parameters<typeof sendAndWaitExecute>[0], {
-        pi,
         responseWaiter,
         memberOpsStates,
         lastPendingCorrId,
@@ -495,7 +498,6 @@ async function waitForAllIdle(
 }
 
 interface SendAndWaitCtx {
-  pi: ExtensionAPI;
   responseWaiter: ResponseWaiter;
   memberOpsStates: Map<string, MemberOperationalState>;
   lastPendingCorrId: Map<string, string>;
@@ -569,11 +571,6 @@ export interface BatchCompactionPlan {
   skip: string[];
 }
 
-/** Send a batch-barrier notice to the TL session (visible, not silent). */
-function notifyBarrier(ctx: SendAndWaitCtx, content: string): void {
-  ctx.pi.sendMessage({ customType: "team-message", content, display: true });
-}
-
 /**
  * Wait until all given members are out of `compacting`, or the deadline
  * passes. 1s poll (BARRIER_WAIT_POLL_MS); deadline = batch budget
@@ -618,6 +615,11 @@ function waitForMembersIdle(
  *
  * Fail-open everywhere: stats failures, compaction failures, timeouts and
  * budget overruns all end with the batch dispatched as-is.
+ *
+ * The barrier is FULLY SILENT to the TL — it is an internal mechanism; the
+ * TL only experiences a longer wait inside team_send_and_wait. No [批屏障]
+ * notices are sent (they were removed: the TL does not need to perceive
+ * the compaction barrier).
  */
 async function runBatchCompactionBarrier(
   targets: string[],
@@ -641,20 +643,13 @@ async function runBatchCompactionBarrier(
     cfg.batchMaxWaitMinutes > 0 ? cfg.batchMaxWaitMinutes * 60_000 : Infinity;
   const deadline = Date.now() + budgetMs;
 
-  // 1. WAIT: members already compacting (E3 — never re-compact). Announced
-  //    so the wait is never silent (建议 3); releases as soon as a member is
-  //    out of compacting (crashed/stopped included — no hang).
+  // 1. WAIT: members already compacting (E3 — never re-compact). Silent —
+  //    the barrier is internal; the TL only experiences a longer wait.
+  //    Releases as soon as a member is out of compacting (crashed/stopped
+  //    included — no hang).
   if (plan.toWait.length > 0) {
-    notifyBarrier(
-      ctx,
-      `[批屏障] 等待成员 ${plan.toWait.join("、")} 的进行中压缩完成，然后统一派发…`
-    );
     await waitForMembersIdle(plan.toWait, ctx.memberOpsStates, deadline);
     if (Date.now() >= deadline) {
-      notifyBarrier(
-        ctx,
-        `[批屏障] 等待超预算（${cfg.batchMaxWaitMinutes > 0 ? `${cfg.batchMaxWaitMinutes} 分钟` : "不限"}），已停止压缩，整批派发`
-      );
       return new Set<string>();
     }
   }
@@ -671,16 +666,7 @@ async function runBatchCompactionBarrier(
   );
   const toCompact = statsResults.filter((r) => r.needs).map((r) => r.name);
 
-  // 3. Notify BEFORE compaction starts (|S| > 0): a user-visible new behavior
-  //    must be announced, otherwise the TL thinks the tool is stuck.
-  if (toCompact.length > 0) {
-    notifyBarrier(
-      ctx,
-      `[批屏障] 本批 ${toCompact.length} 个成员需自动压缩（${toCompact.join("、")}），其余成员将等待，压缩完成后统一派发`
-    );
-  }
-
-  // 4. COMPACT: strictly serial (at most one compact RPC at a time). A
+  // 3. COMPACT: strictly serial (at most one compact RPC at a time). A
   //    compaction already in flight when the budget runs out is left to run
   //    to its own timeout — "stop remaining" means stop NOT-YET-STARTED
   //    compactions only.
@@ -688,11 +674,7 @@ async function runBatchCompactionBarrier(
   for (const name of toCompact) {
     if (Date.now() >= deadline) {
       // Budget exhausted — stop the not-yet-started compactions (D1:
-      // maxWait fallback).
-      notifyBarrier(
-        ctx,
-        `[批屏障] 等待超预算（${cfg.batchMaxWaitMinutes > 0 ? `${cfg.batchMaxWaitMinutes} 分钟` : "不限"}），已停止压缩，整批派发`
-      );
+      // maxWait fallback). Silent: the batch still dispatches as-is.
       break;
     }
     // Re-check state: the member may have left idle between stats and here
@@ -703,19 +685,14 @@ async function runBatchCompactionBarrier(
     if (!handle) continue;
 
     // Synchronous state set before any await (race-free, F2 pattern);
-    // finally-reset on every path (F3 / E8: Esc-safe).
+    // finally-reset on every path (F3 / E8: Esc-safe). Success and failure
+    // are both silent — the batch dispatches as-is either way (fail-open).
     runtime.beginCompaction(name);
-    const result = await runtime.compactNow(name, handle, cfg);
+    await runtime.compactNow(name, handle, cfg);
     runtime.endCompaction(name);
 
     // Success or failure both count as an attempt (at most one per dispatch).
     attempted.add(name);
-    if (!result.ok) {
-      notifyBarrier(
-        ctx,
-        `[批屏障] 成员 "${name}" 压缩失败/超时（${result.error}），将随本批直接派发`
-      );
-    }
   }
 
   return attempted;

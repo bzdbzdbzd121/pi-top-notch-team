@@ -13,6 +13,7 @@ import { registerGoalTools, registerGoalAgentHandler, resetGoal, GOAL_TOOL_NAMES
 import { registerSharedContextTool, SHARED_CONTEXT_TOOL_NAME } from "./src/tools/shared-context-tool";
 import { ensureToolRegistered } from "./src/commands/shared/ensure-tool";
 import { createProcessManager } from "./src/process/manager";
+import type { MemberProcessHandle } from "./src/process/member-process";
 import { createTeamStatusWidget } from "./src/ui/team-status-widget";
 import { createEditModeWidget } from "./src/ui/edit-mode-widget";
 import { createCreateModeWidget } from "./src/ui/create-mode-widget";

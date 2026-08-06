@@ -316,16 +316,16 @@ describe("team_send_and_wait batch barrier (phase 3)", () => {
     expect(order).toEqual(["stats:a", "stats:b", "compact:a", "compact:b", "enqueue:a", "enqueue:b"]);
     expect(enqueuedFor(messageQueue, "a")[0].skipAutoCompact).toBe(true);
     expect(enqueuedFor(messageQueue, "b")[0].skipAutoCompact).toBe(true);
-    // Failure notification + start notification, both visible to TL
+    // The barrier is fully silent to the TL — no [批屏障] notices even on
+    // compaction failure (the batch dispatches as-is, fail-open).
     const notices = (pi.sendMessage as ReturnType<typeof vi.fn>).mock.calls.map((c: any[]) => c[0].content as string);
-    expect(notices.some((n) => n.includes("[批屏障]") && n.includes("需自动压缩"))).toBe(true);
-    expect(notices.some((n) => n.includes("[批屏障]") && n.includes("压缩失败") && n.includes("a"))).toBe(true);
+    expect(notices.some((n) => n.includes("[批屏障]"))).toBe(false);
     // finally-reset invariant: both members back to idle after the barrier
     expect(memberOpsStates.get("a")).toBe("idle");
     expect(memberOpsStates.get("b")).toBe("idle");
   });
 
-  it("notifies ONCE when all compactions succeed (start notice only, success silent)", async () => {
+  it("barrier is fully silent: zero notices when compaction is needed and succeeds", async () => {
     setup = setupBarrier({
       states: { a: "idle", b: "idle" },
       handles: { a: { stats: () => usageResponse(95, 190000) } },
@@ -341,10 +341,7 @@ describe("team_send_and_wait batch barrier (phase 3)", () => {
     });
 
     const notices = (pi.sendMessage as ReturnType<typeof vi.fn>).mock.calls.map((c: any[]) => c[0].content as string);
-    const barrierNotices = notices.filter((n) => n.includes("[批屏障]"));
-    expect(barrierNotices).toHaveLength(1);
-    expect(barrierNotices[0]).toContain("需自动压缩");
-    expect(barrierNotices[0]).toContain("a");
+    expect(notices.some((n) => n.includes("[批屏障]"))).toBe(false);
   });
 
   it("maxWait budget exceeded: stops remaining compactions, un-attempted member gets NO skip", async () => {
@@ -384,7 +381,7 @@ describe("team_send_and_wait batch barrier (phase 3)", () => {
       expect(enqueuedFor(messageQueue, "a")[0].skipAutoCompact).toBe(true);
       expect(enqueuedFor(messageQueue, "b")[0].skipAutoCompact).toBeUndefined();
       const notices = (pi.sendMessage as ReturnType<typeof vi.fn>).mock.calls.map((c: any[]) => c[0].content as string);
-      expect(notices.some((n) => n.includes("[批屏障]") && n.includes("超预算"))).toBe(true);
+      expect(notices.some((n) => n.includes("[批屏障]"))).toBe(false);
     } finally {
       vi.useRealTimers();
     }
@@ -410,12 +407,9 @@ describe("team_send_and_wait batch barrier (phase 3)", () => {
 
       // a is compacting → NO stats/compact for a; the barrier waits (1s poll)
       expect(order).toEqual([]);
-      // The wait itself is announced (建议 3: no silent waiting)
-      const waitNotices = (pi.sendMessage as ReturnType<typeof vi.fn>).mock.calls
-        .map((c: any[]) => c[0].content as string)
-        .filter((n) => n.includes("[批屏障]") && n.includes("等待成员"));
-      expect(waitNotices).toHaveLength(1);
-      expect(waitNotices[0]).toContain("a");
+      // The wait is silent — the barrier is internal to the tool call
+      const notices = (pi.sendMessage as ReturnType<typeof vi.fn>).mock.calls.map((c: any[]) => c[0].content as string);
+      expect(notices.some((n) => n.includes("[批屏障]"))).toBe(false);
 
       // a's in-flight compaction finishes (simulated by the inline path resetting state)
       memberOpsStates.set("a", "idle");

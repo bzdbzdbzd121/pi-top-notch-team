@@ -30,12 +30,12 @@
 | 成员分类 | `planBatchCompaction` 纯函数：idle→查 stats；compacting→待等集合（不重复发 compact）；working/crashed/stopped→跳过（消息走 followUp/未送达现有路径） |
 | stats 预检 | 并行 `get_session_stats`（3s 超时，per-member fail-open=不压缩）；同成员多任务去重（只查一次） |
 | 压缩执行 | 需压缩集合 S **串行**：`beginCompaction`（同步置位）→ `compactNow`（RPC，timeoutMinutes 超时）→ `endCompaction`（finally 复位） |
-| 压缩失败 | per-member fail-open：失败者**带 skip** 随批统一派发 + 通知「成员 X 压缩失败/超时（原因），将随本批直接派发」；**其余成员继续串行压缩** |
-| 批预算 | `batchMaxWaitMinutes`（默认 15 分钟，0=不限，`/team setting` 可调）：WAIT 与全部压缩共享总预算；超预算**停止未开始的压缩**（在飞 compact RPC 跑满自身 timeout 后停，属预期）→ 整批 enqueue 派发 + 通知 |
-| 待等集合 | 轮询条件为**非 compacting**（idle/crashed/stopped 均放行——成员崩溃或 /team stop 后压缩已无意义，不得挂起到超时）；1s 轮询；等待开始即通知 |
+| 压缩失败 | per-member fail-open：失败者**带 skip** 随批统一派发（静默，不通知 TL）；**其余成员继续串行压缩** |
+| 批预算 | `batchMaxWaitMinutes`（默认 15 分钟，0=不限，`/team setting` 可调）：WAIT 与全部压缩共享总预算；超预算**停止未开始的压缩**（在飞 compact RPC 跑满自身 timeout 后停，属预期）→ 整批 enqueue 派发（静默） |
+| 待等集合 | 轮询条件为**非 compacting**（idle/crashed/stopped 均放行——成员崩溃或 /team stop 后压缩已无意义，不得挂起到超时）；1s 轮询；等待静默进行 |
 | skip 规则 | `skipAutoCompact: true` **仅加给屏障中实际执行过压缩尝试的成员**（成功或失败均算，at most one per dispatch）；maxWait 中断未轮到者、非 S 成员不带（内联路径自然获得第二次机会）；非屏障路径（单任务/成员互发/Inspector 直发/backup 解析）永不产生带标记消息 |
 | 孤儿消息防护 | 屏障压缩期间到达的消息进共享 pending（`queueDuringCompaction`）；屏障 `endCompaction` 只复位不 flush，由后续第一条到达该成员的消息（内联直发分支，含带标记消息）**先 drain pending（FIFO）再发自己**；内联路径 finally 保持 [当前消息 → 积压] 顺序 |
-| 可见性 | 压缩开始前通知一次（成功静默哲学不变）；待等开始通知一次；单成员失败/超时通知一次；超预算通知一次 |
+| 可见性 | **完全静默**：屏障对 TL 零通知（[批屏障] 通知已移除）——TL 无需感知压缩屏障，只感知 team_send_and_wait 更长的等待；压缩等待/开始/失败/超预算均不打扰 TL（fail-open 行为不变，内联路径保留自身既有失败通知） |
 | 状态机 | 复用 `compacting` 状态（无新状态）；屏障期间无 wait 检测（wait 在 enqueue 后启动），all-idle 误释放不可能 |
 | Esc/中断 | `endCompaction` 在 finally 中复位（成功/失败/中断均复位）；corrId 注册与 enqueue 严格在预检之后——promise 被丢弃无残留状态；promise 继续则压缩完成、消息照常派发（与现状"Esc 后成员后台运行"一致） |
 | `to:"all"` | team_send_and_wait 的未知目标校验本就拒绝 `all`（非成员）；屏障只见显式目标（E13 文档化） |
