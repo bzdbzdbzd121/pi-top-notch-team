@@ -8,7 +8,7 @@ import { loadSettings } from "./src/settings/settings";
 import { resolveAutoCompact } from "./src/settings/resolve-auto-compact";
 import { join } from "node:path";
 import { rmSync } from "node:fs";
-import { registerTlTools } from "./src/tools/tl-tools";
+import { registerTlTools, type TlToolsDeps } from "./src/tools/tl-tools";
 import { registerGoalTools, registerGoalAgentHandler, resetGoal, GOAL_TOOL_NAMES } from "./src/tools/goal-tools";
 import { registerSharedContextTool, SHARED_CONTEXT_TOOL_NAME } from "./src/tools/shared-context-tool";
 import { ensureToolRegistered } from "./src/commands/shared/ensure-tool";
@@ -27,8 +27,18 @@ import { buildDynamicModePrompt } from "./src/prompts/dynamic-mode";
 import { FIRST_ACTION_PROTOCOL_PROMPT } from "./src/prompts/tl-first-action";
 import { buildWorkflowPrompt, WORKFLOW_ACTIVATION_BANNER } from "./src/prompts/workflow-prompt";
 import { createTlReadGuard, createDesignReadGuard } from "./src/session/tl-read-guard";
+import { enforceSessionToolVisibility, SESSION_TOOL_NAMES } from "./src/session/session-tool-visibility";
 import { getSharedContextPath } from "./src/session/shared-context";
 import { openMemberInspector, type MemberInspectorHandle } from "./src/ui/member-inspector";
+import {
+  registerStartTeamSessionTool,
+  registerStopTeamSessionTool,
+} from "./src/tools/agent-session-tools";
+import {
+  START_TEAM_SESSION_TOOL_NAME,
+  STOP_TEAM_SESSION_TOOL_NAME,
+} from "./src/tools/agent-session-tool-names";
+import { buildAgentInitiatedPrompt } from "./src/prompts/agent-initiated-mode";
 
 export default function (pi: ExtensionAPI) {
   // If running as a member process (TEAM_ROLE is set), skip TL-only tools
@@ -50,12 +60,13 @@ export default function (pi: ExtensionAPI) {
     editingTeamName: null,
     isDynamicSession: false,
     dynamicPhase: "design",
+    agentInitiatedTask: null,
     processManager: null,
     memberHandles: memberHandlesRO,
     getHandle: (name) => memberHandles.get(name),
     setHandle: (name, handle) => { memberHandles.set(name, handle); },
     clearHandles: () => { memberHandles.clear(); },
-    tlToolNames: ["start_member", "stop_member", "list_members", "get_member_log", "team_send_and_wait", "wait_and_get_member_status", "set_goal", "finish_goal", SHARED_CONTEXT_TOOL_NAME],
+    tlToolNames: [...SESSION_TOOL_NAMES],
 
     router: null,
     messageQueue: null,
@@ -157,10 +168,23 @@ export default function (pi: ExtensionAPI) {
   let tlCurrentModel: string | undefined;
 
   // Only register the agent_end reminder handler at module init (safe, guards itself).
-  // Goal tools (set_goal/finish_goal) are registered on-demand when a session starts.
+  // The session tools themselves are NOT registered here — they are registered
+  // on-demand at session start via ensureSessionToolsRegistered() (see below),
+  // so outside a session the tool registry contains none of them.
   registerGoalAgentHandler(pi);
 
-  registerTlTools({
+  // start_team_session is the SINGLE deliberate exception to session-scoped
+  // registration (ADR-0003): it must be visible at all times so the agent can
+  // autonomously enter a team session. stop_team_session stays session-scoped
+  // (registered via ensureSessionToolsRegistered, activated only in
+  // agent-initiated sessions — see session-tool-visibility.ts).
+  registerStartTeamSessionTool({ pi, teamCtx });
+
+  // TL tools (start_member … wait_and_get_member_status) are registered only
+  // when a session starts. The deps are captured here (module scope) and passed
+  // to registerTlTools at that time — all are closures over module-level state,
+  // so late registration is safe.
+  const tlToolsDeps: TlToolsDeps = {
     pi,
     manager,
     responseWaiter,
@@ -197,14 +221,26 @@ export default function (pi: ExtensionAPI) {
     autoCompact,
     getAutoCompact: () => resolveAutoCompact(loadSettings(getRootDir())),
     getHandle: (name: string) => teamCtx.getHandle(name),
-  });
+  };
 
-  // write_shared_context — dedicated shared-context write tool. Registered eagerly,
-  // activated via teamCtx.tlToolNames (setActiveTools) during team sessions only.
-  // start_member is gated on its write having happened (see start_member tool).
-  registerSharedContextTool(pi);
-
-  // team_send_and_wait and wait_and_get_member_status are registered in src/tools/tl-tools.ts
+  // ── Session-only tools: register on-demand, never at extension load ──
+  // All team-session tools (6 TL process tools + write_shared_context +
+  // set_goal/finish_goal) are registered ONLY when a team session starts
+  // (onSessionStart) and enforced at every turn boundary (before_agent_start).
+  // Outside a session the tool registry contains none of them.
+  const ensureSessionToolsRegistered = () => {
+    // registerTlTools registers all six TL tools atomically — checking one name suffices.
+    ensureToolRegistered(pi, "start_member", () => registerTlTools(tlToolsDeps));
+    ensureToolRegistered(pi, SHARED_CONTEXT_TOOL_NAME, () => registerSharedContextTool(pi));
+    for (const toolName of GOAL_TOOL_NAMES) {
+      ensureToolRegistered(pi, toolName, () => registerGoalTools(pi));
+    }
+    // stop_team_session is registered at every session start (harmless) but
+    // ACTIVATED only in agent-initiated sessions (session-tool-visibility).
+    ensureToolRegistered(pi, STOP_TEAM_SESSION_TOOL_NAME, () =>
+      registerStopTeamSessionTool({ pi, teamCtx })
+    );
+  };
 
   // ── Helper: safely extract path from tool input ─────────
   function extractPathFromInput(input: unknown): string | undefined {
@@ -228,6 +264,8 @@ export default function (pi: ExtensionAPI) {
     "start_member", "stop_member", "list_members", "get_member_log",
     "wait_and_get_member_status", "team_send_and_wait",
     "set_goal", "finish_goal", SHARED_CONTEXT_TOOL_NAME,
+    // Agent-initiated session lifecycle (ADR-0003): start → clean re-entry error; stop → abort delegation
+    START_TEAM_SESSION_TOOL_NAME, STOP_TEAM_SESSION_TOOL_NAME,
     // read/write: read unrestricted, write restricted to .md files (checked separately)
     "read",
     "write",
@@ -239,6 +277,8 @@ export default function (pi: ExtensionAPI) {
     "start_member", "stop_member", "list_members", "get_member_log",
     "wait_and_get_member_status", "team_send_and_wait",
     "set_goal", "finish_goal", "add_dynamic_member", SHARED_CONTEXT_TOOL_NAME,
+    // Agent-initiated session lifecycle (ADR-0003)
+    START_TEAM_SESSION_TOOL_NAME, STOP_TEAM_SESSION_TOOL_NAME,
     // Read-only exploration & monitoring
     "read", "bash",
     "web_search", "fetch_content", "get_search_content",
@@ -276,7 +316,14 @@ export default function (pi: ExtensionAPI) {
 
   // ── Call-level guard: whitelist-based blocking during team session ───
   pi.on("tool_call", (event, ctx) => {
-    if (!getSessionState().active) return; // only block during active team session
+    const sessionForGuard = getSessionState();
+    if (!sessionForGuard.active) return; // only block during active team session
+
+    // ADR-0003: dispatch-policing guards (design read limiter, TL pre-dispatch
+    // guard) apply ONLY to user-initiated sessions. In agent-initiated sessions
+    // the team is the agent's own chosen means — reading/analyzing freely is
+    // legitimate. Write guards (below) apply to both origins.
+    const isAgentInitiated = sessionForGuard.origin === "agent";
 
     // ── Resolve current phase ──
     const isDesignPhase = teamCtx.isDynamicSession && teamCtx.dynamicPhase === "design";
@@ -320,12 +367,13 @@ export default function (pi: ExtensionAPI) {
         event.toolName === "read" || event.toolName === "write" || event.toolName === "edit"
           ? extractPathFromInput(event.input)
           : undefined;
-      if (isDesignPhase) {
+      if (isDesignPhase && !isAgentInitiated) {
         // Design-phase read limiter: read is ALLOWED (exploring the project
         // to design the team is legitimate), but every `threshold`-th
         // non-.md read is blocked ONCE as a soft reminder — the next read
         // call passes again if it is genuinely needed. Not sticky: there is
         // no Member to dispatch to in the design phase.
+        // (Skipped for agent-initiated sessions — ADR-0003.)
         const verdict = designReadGuard.checkToolCall(event.toolName, filePath);
         if (verdict.block) {
           if (verdict.firstBlock) {
@@ -342,12 +390,13 @@ export default function (pi: ExtensionAPI) {
           }
           return { block: true, reason: verdict.reason };
         }
-      } else {
+      } else if (!isDesignPhase && !isAgentInitiated) {
         // ── Pre-dispatch guard: count non-management tool calls, block once ──
         // Applies to ALL whitelisted tools (read, bash, web_search, ctx_execute, etc.)
         // — not just `read` — because TL can bypass a read-only guard via bash grep/rg/cat.
         // Management tools (start_member, team_send_and_wait, write, edit, etc.) are
         // exempted inside checkToolCall.
+        // (Skipped for agent-initiated sessions — ADR-0003.)
         const verdict = tlReadGuard.checkToolCall(event.toolName, filePath);
         if (verdict.block) {
           // First block: surface a user-visible notification + status bar warning so
@@ -426,7 +475,7 @@ export default function (pi: ExtensionAPI) {
 
       // Deactivate team tools on session shutdown
       const _shutdownActive = pi.getActiveTools();
-      const _shutdownToRemove = new Set([...teamCtx.tlToolNames, "add_dynamic_member", "create_team_definition", "update_team_definition"]);
+      const _shutdownToRemove = new Set([...teamCtx.tlToolNames, "add_dynamic_member", "create_team_definition", "update_team_definition", STOP_TEAM_SESSION_TOOL_NAME]);
       pi.setActiveTools(_shutdownActive.filter((t: string) => !_shutdownToRemove.has(t)));
 
       // Best-effort cleanup of session directory
@@ -437,6 +486,7 @@ export default function (pi: ExtensionAPI) {
       }
       teamCtx.isDynamicSession = false;
       teamCtx.dynamicPhase = "design";
+      teamCtx.agentInitiatedTask = null;
     }
   });
 
@@ -464,7 +514,7 @@ export default function (pi: ExtensionAPI) {
 
         // Deactivate team tools on stale session cleanup
         const _freshActive = pi.getActiveTools();
-        const _freshToRemove = new Set([...teamCtx.tlToolNames, "add_dynamic_member", "create_team_definition", "update_team_definition"]);
+        const _freshToRemove = new Set([...teamCtx.tlToolNames, "add_dynamic_member", "create_team_definition", "update_team_definition", STOP_TEAM_SESSION_TOOL_NAME]);
         pi.setActiveTools(_freshActive.filter((t: string) => !_freshToRemove.has(t)));
 
         if (isDynamic && teamName) {
@@ -474,6 +524,7 @@ export default function (pi: ExtensionAPI) {
         }
         teamCtx.isDynamicSession = false;
         teamCtx.dynamicPhase = "design";
+        teamCtx.agentInitiatedTask = null;
       }
     }
 
@@ -518,21 +569,24 @@ export default function (pi: ExtensionAPI) {
 
   // Wire UI lifecycle hooks so commands/team.ts can install/uninstall immediately
   teamCtx.onSessionStart = (ui) => {
+    // Register ALL session-only tools on-demand when a team session starts
+    // (/team start or /team dynamic). Runs BEFORE the widget guard below —
+    // registration must not depend on widget state (the widget may already be
+    // installed on session resume). Outside a session, none of these tools
+    // exist in the registry.
+    ensureSessionToolsRegistered();
+
     // If already installed, skip
     if (teamStatusWidget) return;
     const session = getSessionState();
     if (!session.teamDefinition) return;
-
-    // Register goal tools on-demand when a team session starts
-    for (const toolName of GOAL_TOOL_NAMES) {
-      ensureToolRegistered(pi, toolName, () => registerGoalTools(pi));
-    }
 
     teamStatusWidget = createTeamStatusWidget({
       teamName: session.teamDefinition.name,
       getMembers: () => getSessionState().teamDefinition?.members ?? [],
       teamCtx,
       memberOpsStates,
+      origin: session.origin,
     });
     teamStatusWidget.install(ui, ui.theme);
 
@@ -605,6 +659,26 @@ export default function (pi: ExtensionAPI) {
   pi.on("before_agent_start", async (event, _ctx) => {
     const session = getSessionState();
 
+    // ── Session tool visibility enforcement ──
+    // Invariant: all team-session tools (start_member … wait_and_get_member_status,
+    // write_shared_context, set_goal/finish_goal) are visible ONLY during an
+    // active team session (/team start or /team dynamic). They are registered
+    // on-demand at session start and pi's active-tool set is the only visibility
+    // gate; enforce it at every turn boundary so a stale active list (extension
+    // reload, other extensions' setActiveTools, plan-mode toggles) can never
+    // leak them outside a session. No-op when the set is already correct.
+    enforceSessionToolVisibility({
+      sessionActive: session.active,
+      agentInitiated: session.active && session.origin === "agent",
+      activeTools: pi.getActiveTools(),
+      isRegistered: (name) =>
+        (((pi as any).getAllTools?.() ?? []) as Array<{ name: string }>).some(
+          (t) => t.name === name
+        ),
+      registerTools: ensureSessionToolsRegistered,
+      setActiveTools: (names) => pi.setActiveTools(names),
+    });
+
     // Safety net: if widget wasn't installed by /team start (e.g., session resume),
     // install it here. Also clean up if session ended without /team stop.
     if (session.active && session.teamDefinition && !teamStatusWidget) {
@@ -613,6 +687,7 @@ export default function (pi: ExtensionAPI) {
         getMembers: () => getSessionState().teamDefinition?.members ?? [],
         teamCtx,
         memberOpsStates,
+        origin: session.origin,
       });
       teamStatusWidget.install(_ctx.ui, _ctx.ui.theme);
       _ctx.ui.setStatus("team-inspector-hint", "alt+t 打开成员检视浮窗");
@@ -716,7 +791,14 @@ export default function (pi: ExtensionAPI) {
 如果用户想取消操作，告诉用户输入 \`/team done\`（或 \`/team cancel\`）退出。
 `;
     } else if (teamCtx.isDynamicSession && session.teamDefinition) {
-      extraPrompt = buildDynamicModePrompt(session.teamDefinition, teamCtx.dynamicPhase, session.sessionId);
+      extraPrompt = session.origin === "agent"
+        ? buildAgentInitiatedPrompt(
+            session.teamDefinition,
+            teamCtx.dynamicPhase,
+            session.sessionId,
+            teamCtx.agentInitiatedTask ?? "（任务描述缺失——请回顾对话上下文确认使命）",
+          )
+        : buildDynamicModePrompt(session.teamDefinition, teamCtx.dynamicPhase, session.sessionId);
     } else if (session.active && session.teamDefinition) {
       const team = session.teamDefinition;
       const memberLines = team.members

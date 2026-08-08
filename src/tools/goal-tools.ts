@@ -38,6 +38,16 @@ export function setGoalForTesting(goal: GoalState): void {
   activeGoal = goal;
 }
 
+/**
+ * Programmatically set the active goal (resets the reminder cooldown).
+ * Used by the set_goal tool and by the start_team_session tool, which
+ * auto-seeds the goal from its `task` parameter (ADR-0003).
+ */
+export function setGoalInternal(text: string, criteria: string): void {
+  activeGoal = { text, criteria, completed: false };
+  lastReminderSeq = 0;
+}
+
 // ── Prompt snippet for TL tools ────────────────────────────
 
 const GOAL_PROMPT_SNIPPET = "Set/finish a session goal to track overall objective";
@@ -91,12 +101,7 @@ export function registerGoalTools(pi: ExtensionAPI): void {
         };
       }
 
-      activeGoal = {
-        text: params.text,
-        criteria: params.criteria,
-        completed: false,
-      };
-      lastReminderSeq = 0; // Reset cooldown so first reminder fires promptly
+      setGoalInternal(params.text, params.criteria);
       return {
         details: { goal: params.text },
         content: [

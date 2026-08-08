@@ -69,6 +69,7 @@ describe("buildMemberConfig", () => {
       startedAt: Date.now(),
       sessionId: "abc123",
       sharedContextWritten: true,
+      origin: "user",
     };
   });
 
@@ -629,6 +630,7 @@ describe("buildMemberConfig model resolution", () => {
       startedAt: Date.now(),
       sessionId: "abc123",
       sharedContextWritten: true,
+      origin: "user",
     };
   });
 

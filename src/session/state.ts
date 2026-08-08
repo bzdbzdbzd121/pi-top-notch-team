@@ -1,5 +1,8 @@
 import type { TeamDefinition, TeamMember } from "../team/definition";
 
+/** How the team session was started. See ADR-0003. */
+export type SessionOrigin = "user" | "agent";
+
 export interface TeamSessionState {
   active: boolean;
   teamDefinition: TeamDefinition | null;
@@ -13,6 +16,12 @@ export interface TeamSessionState {
    * .shared-context.md is intercepted by the tool_call guard.
    */
   sharedContextWritten: boolean;
+  /**
+   * Session origin: "user" (via /team start | /team dynamic) or "agent" (via the
+   * start_team_session tool, ADR-0003). Determines guard strength (dispatch-policing
+   * guards apply only to user-initiated sessions) and stop_team_session visibility.
+   */
+  origin: SessionOrigin;
 }
 
 let currentSession: TeamSessionState = {
@@ -21,6 +30,7 @@ let currentSession: TeamSessionState = {
   startedAt: null,
   sessionId: null,
   sharedContextWritten: false,
+  origin: "user",
 };
 
 /** Returns a snapshot of the current session state (defensive clone, read-only). */
@@ -45,13 +55,21 @@ function generateSessionId(): string {
   return `${ts}-${rand}`;
 }
 
-export function startSession(team: TeamDefinition, sessionId?: string): void {
+export interface StartSessionOptions {
+  /** Explicit session ID (defaults to a generated unique one). */
+  sessionId?: string;
+  /** Session origin (defaults to "user"). See ADR-0003. */
+  origin?: SessionOrigin;
+}
+
+export function startSession(team: TeamDefinition, options: StartSessionOptions = {}): void {
   currentSession = {
     active: true,
     teamDefinition: team,
     startedAt: Date.now(),
-    sessionId: sessionId ?? generateSessionId(),
+    sessionId: options.sessionId ?? generateSessionId(),
     sharedContextWritten: false,
+    origin: options.origin ?? "user",
   };
 }
 
@@ -62,6 +80,7 @@ export function endSession(): void {
     startedAt: null,
     sessionId: null,
     sharedContextWritten: false,
+    origin: "user",
   };
 }
 

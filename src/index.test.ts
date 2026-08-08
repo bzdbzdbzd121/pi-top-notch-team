@@ -75,22 +75,21 @@ describe("index.ts default export (integration)", () => {
     );
   });
 
-  it("registers team management tools on load", async () => {
+  it("registers ONLY start_team_session at load (ADR-0003 exception to session-scoped registration)", async () => {
     const mod = await import("../index");
     mod.default(pi);
 
-    // Should register multiple tools (create_team_definition, update_team_definition,
-    // plus all TL tools via registerTlTools)
-    expect(pi.registerTool).toHaveBeenCalled();
-    const registeredCalls = (pi.registerTool as ReturnType<typeof vi.fn>).mock.calls;
-    const toolNames = registeredCalls.map((c: any) => c[0].name);
-
-    // team_send_and_wait and wait_and_get_member_status should be among registered tools
-    expect(toolNames).toContain("team_send_and_wait");
-    expect(toolNames).toContain("wait_and_get_member_status");
-    expect(toolNames).toContain("start_member");
-    expect(toolNames).toContain("stop_member");
-    expect(toolNames).toContain("write_shared_context");
+    // Session-only tools (start_member … wait_and_get_member_status,
+    // write_shared_context, set_goal/finish_goal, stop_team_session) must NOT
+    // exist in the tool registry outside a team session — they are registered
+    // on-demand at session start (onSessionStart → ensureSessionToolsRegistered)
+    // and enforced at every before_agent_start turn boundary.
+    // The single deliberate exception (ADR-0003): start_team_session is
+    // registered at load so the agent can autonomously enter a team session.
+    const registered = (pi.registerTool as ReturnType<typeof vi.fn>).mock.calls.map(
+      (c: any) => c[0].name
+    );
+    expect(registered).toEqual(["start_team_session"]);
   });
 
   it("registers pi.on for tool_call handler", async () => {

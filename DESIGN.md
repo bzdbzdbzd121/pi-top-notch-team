@@ -95,6 +95,7 @@ pi-top-notch-team/
 │   ├── session/
 │   │   ├── state.ts            ← Team session state tracking (structuredClone deep copy)
 │   │   ├── context.ts          ← TeamContext shared mutable state interface
+│   │   ├── session-tool-visibility.ts ← 会话工具可见性强制（纯函数）：9 个团队会话工具（start_member…finish_goal）仅在会话期间注册+激活，before_agent_start 回合边界强制执行
 │   │   └── state-machine.ts    ← Pure function: MemberOperationalState transitions
 │   ├── config.ts               ← getRootDir() env var override
 │   ├── test/
@@ -144,7 +145,7 @@ Since TL and Member are declared as two separate extensions, but both are loaded
 | Member RPC process | `"rpc"` | **Member** — registers `team_send_message` tool, injects team system prompt via env vars |
 
 **Detection logic:**
-- `index.ts` (TL side): always registers commands and tools. TL tools are **deactivated** by default (not in active set) and activated when `/team start` calls `pi.setActiveTools()`. No mode check needed.
+- `index.ts` (TL side): registers the /team command at load; registers team tools **only on session start** (`onSessionStart` → `ensureSessionToolsRegistered`) and enforces registration+activation at every `before_agent_start` turn boundary (`enforceSessionToolVisibility`). Outside a session the tool registry contains none of them. No mode check needed.
 - `member.ts` (Member side): checks `process.env.TEAM_ROLE` at startup. If not set, exits early (no tools registered).
 
 **Detection logic in `member.ts`:**
@@ -441,7 +442,7 @@ write_shared_context({ content: "# Shared Context\n..." })
 - On success calls `markSharedContextWritten()` — the session flag that **gates `start_member`**: until this tool has been called at least once, every `start_member` call returns an error telling the TL to write the shared context first
 - fs write failure → error returned, flag **not** set (fail-open, gate stays closed)
 - Direct `write`/`edit` calls targeting `.shared-context.md` are intercepted by the `tool_call` guard and redirected here (keeps the flag accurate)
-- Registered eagerly at extension init, activated during team sessions via `teamCtx.tlToolNames`; on both phase whitelists
+- Registered on-demand at session start (`ensureSessionToolsRegistered`), activated during team sessions via `teamCtx.tlToolNames`; on both phase whitelists
 
 ### `add_dynamic_member` (dynamic mode only)
 
@@ -844,14 +845,16 @@ interface TeamSessionState {
   startedAt: number | null;
   sessionId: string | null;
   sharedContextWritten: boolean;  // set by write_shared_context; gates start_member
+  origin: "user" | "agent";      // session origin (ADR-0003); defaults to "user"
 }
 
 // src/session/context.ts — shared mutable references for the extension
 interface TeamContext {
   isCreatingTeam: boolean;
   editingTeamName: string | null;
-  isDynamicSession: boolean;  // true during /team dynamic
+  isDynamicSession: boolean;  // true during /team dynamic or agent-initiated sessions
   dynamicPhase: "design" | "execution";  // dynamic mode phase (only relevant when isDynamicSession is true)
+  agentInitiatedTask: string | null;      // mission statement of an agent-initiated session (ADR-0003); null otherwise
   processManager: ProcessManager | null;
   memberHandles: ReadonlyMap<string, MemberProcessHandle>; // use getHandle()/setHandle()/clearHandles()
   router: Router;
@@ -878,6 +881,8 @@ Session state (active + team definition) is stored in `session/state.ts` as a mo
 **`addMemberToSession(member: TeamMember): TeamDefinition`** — Adds a member to the active session's team definition and refreshes the session state. Used by the `add_dynamic_member` tool during `/team dynamic`. Throws if no active session.
 
 **`sharedContextWritten` + `markSharedContextWritten()`** — The session flag backing the shared-context gate. Starts `false` on `startSession`, reset to `false` on `endSession`/new session. Only the `write_shared_context` tool sets it (successful fs write only). `start_member` refuses to launch any member while it is `false`.
+
+**`origin` (Session Origin)** — Records how the session was started: `"user"` (`/team start` / `/team dynamic`) or `"agent"` (the `start_team_session` tool, ADR-0003). Drives guard strength (dispatch-policing guards apply only to user-initiated sessions), prompt selection (autonomous vs. playbook prompts), `stop_team_session` visibility, and the widget origin marker (🤖/👤). See §18.
 
 ## 12. Error Handling
 
@@ -1177,3 +1182,67 @@ Messages typed into the input box bypass the TL. To keep the team consistent:
 ### Shortcut hint
 
 On session start (`teamCtx.onSessionStart` + the `before_agent_start` safety net), a persistent footer status is set via `ctx.ui.setStatus("team-inspector-hint", "alt+t 打开成员检视浮窗")` — same footer area as the "团队成员运行中" status but a separate key, so the two coexist. Cleared on session end.
+
+## 18. Agent-initiated Team Sessions (自主会话, ADR-0003)
+
+The agent can start a team session **itself** — without the user typing `/team dynamic` — to delegate a complex task to Members.
+
+### Entry & lifecycle
+
+```
+TL calls start_team_session(task)          ← registered at extension LOAD (the single
+  │                                           deliberate exception to session-scoped
+  │                                           registration, decision #21)
+  ├─ guard: session already active → error (re-entry)
+  ├─ bootstrapDynamicSession(origin "agent")   src/setup/dynamic-session-bootstrap.ts
+  │    ├─ mkdir sessions/_dynamic_<ts>/
+  │    ├─ startSession(emptyTeam, { origin: "agent" })
+  │    ├─ ensureSharedContextFile (stub)
+  │    ├─ teamCtx: isDynamicSession=true, dynamicPhase="design"
+  │    ├─ ensureAddDynamicMemberTool
+  │    └─ onSessionStart → activate session tools + add_dynamic_member + stop_team_session
+  ├─ teamCtx.agentInitiatedTask = task
+  ├─ setGoalInternal(task, derived criteria)   ← Goal reminders keep the TL on track
+  └─ notify: "🤖 Agent 已自主启动团队会话：<task>"
+
+… autonomous design → add_dynamic_member → write_shared_context → start_member …
+… (phase flips to execution as usual) dispatch → monitor → report …
+
+TL calls stop_team_session()               ← session-scoped; ACTIVATED only in
+  ├─ guard: origin !== "agent" → refuse        agent-initiated sessions
+  │          (user-initiated lifecycle stays user-owned, /team stop)
+  └─ teardownTeamSession()                   src/session/teardown.ts — shared with
+                                               /team stop: stop members, deactivate
+                                               tools, widgets off, dir cleanup,
+                                               endSession + resetGoal
+```
+
+### Session Origin drives three behaviors
+
+| Behavior | `origin: "user"` | `origin: "agent"` |
+|----------|------------------|-------------------|
+| TL prompt | Playbook dynamic-mode prompt (grilling + confirmation gate + first-action protocol) | Autonomous prompt (`src/prompts/agent-initiated-mode.ts`) — no grilling, no gate, no first-action protocol; mission = `agentInitiatedTask` |
+| Dispatch-policing guards | tl-read-guard (execution) + design read soft limit (design) — enforced | Both skipped in the `tool_call` handler; write guards (`.md`-only write/edit, design-phase whitelist) still apply |
+| `stop_team_session` | Registered but never activated (removed from active set by `enforceSessionToolVisibility`) | Activated at bootstrap; teardown available to the TL |
+
+Rationale (the core design philosophy): in a user-initiated session the user's expectation is "do this *as a team*", so guards enforce the team workflow; in an agent-initiated session the team is the agent's own chosen means — the user only cares about the result, so the agent gets process freedom. **Write guards are origin-independent**: TL and member processes share one filesystem, and concurrent writes physically overwrite each other — a structural hazard, not a trust issue. The escape hatch always exists: don't start a session, or `stop_team_session` and edit directly.
+
+### Boundaries
+
+- **Nesting is structurally impossible** — `index.ts` returns early when `TEAM_ROLE` is set, so member processes never see `start_team_session`.
+- **Re-entry** returns an error while any session is active.
+- **Visibility** — bootstrap fires a `🤖` notify with the task summary, and the team status widget carries a persistent origin marker (🤖 agent / 👤 user) in its title.
+- **User oversight is unchanged** — widget, Member Inspector (`alt+t`), Esc, `/team stop` all work regardless of origin.
+
+### Files
+
+| File | Role |
+|------|------|
+| `src/tools/agent-session-tools.ts` | `start_team_session` (load-time) + `stop_team_session` (session-scoped, agent-only activation) |
+| `src/tools/agent-session-tool-names.ts` | Tool name constants (leaf module — avoids import cycles) |
+| `src/setup/dynamic-session-bootstrap.ts` | Shared bootstrap behind `/team dynamic` and `start_team_session` (+ `ensureAddDynamicMemberTool`) |
+| `src/session/teardown.ts` | Shared teardown behind `/team stop` and `stop_team_session` |
+| `src/prompts/agent-initiated-mode.ts` | Autonomous design/execution phase prompts (mission-anchored) |
+| `src/session/state.ts` | `SessionOrigin` + `origin` field on `TeamSessionState` |
+| `src/session/session-tool-visibility.ts` | `AGENT_SESSION_TOOL_NAMES` + `agentInitiated` dep — origin-conditional activation |
+| `index.ts` | Load-time registration, origin-branched guards/prompt, whitelist additions |

@@ -223,4 +223,49 @@ describe("createTeamStatusWidget", () => {
     const linesAfter = setWidget.mock.calls[0][1] as string[];
     expect(linesAfter[1]).toContain("新成员");
   });
+
+  describe("session origin marker (ADR-0003)", () => {
+    it("shows 🤖 in the title for agent-initiated sessions", async () => {
+      const { createTeamStatusWidget } = await loadModule();
+      const setWidget = vi.fn();
+      const widget = createTeamStatusWidget({
+        teamName: "_dynamic_1",
+        getMembers: () => [createTeamMember("coder", "编码员")],
+        teamCtx: createMockTeamCtx() as any,
+        memberOpsStates: new Map([["coder", "idle"]]),
+        origin: "agent",
+      });
+      widget.install({ setWidget }, createMockTheme());
+      expect(setWidget.mock.calls[0][1][0]).toContain("🤖");
+    });
+
+    it("shows 👤 in the title for user-initiated sessions (default)", async () => {
+      const { createTeamStatusWidget } = await loadModule();
+      const setWidget = vi.fn();
+      const widget = createTeamStatusWidget({
+        teamName: "my-team",
+        getMembers: () => [createTeamMember("coder", "编码员")],
+        teamCtx: createMockTeamCtx() as any,
+        memberOpsStates: new Map([["coder", "idle"]]),
+      });
+      widget.install({ setWidget }, createMockTheme());
+      expect(setWidget.mock.calls[0][1][0]).toContain("👤");
+      expect(setWidget.mock.calls[0][1][0]).not.toContain("🤖");
+    });
+
+    it("shows the origin marker in design-phase (0 members) title", async () => {
+      const { createTeamStatusWidget } = await loadModule();
+      const setWidget = vi.fn();
+      const widget = createTeamStatusWidget({
+        teamName: "_dynamic_2",
+        getMembers: () => [],
+        teamCtx: createMockTeamCtx() as any,
+        memberOpsStates: new Map(),
+        origin: "agent",
+      });
+      widget.install({ setWidget }, createMockTheme());
+      expect(setWidget.mock.calls[0][1][0]).toContain("🤖");
+      expect(setWidget.mock.calls[0][1][0]).toContain("设计阶段");
+    });
+  });
 });

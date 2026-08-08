@@ -26,7 +26,7 @@ pi install ./pi-top-notch-team
 ```
 User's pi session (TL extension)
   ├── 11 subcommands (/team create, dynamic, edit, cancel, start, stop, list, show, delete, status, help)
-  ├── 9 TL tools (start_member, stop_member, list_members, get_member_log, wait_and_get_member_status, team_send_and_wait, add_dynamic_member, set_goal, finish_goal)
+  ├── 10 个 TL 工具（9 个会话专用工具 start_member, stop_member, list_members, get_member_log, wait_and_get_member_status, team_send_and_wait, write_shared_context, set_goal, finish_goal + 动态模式专用 add_dynamic_member）——仅在团队会话期间注册+激活
 
 Batch send: team_send_and_wait now supports tasks array for concurrent dispatch to multiple members. Previously single-target to/content/nextSteps; now unified tasks:[{to, content}] + nextSteps. **Batch when tasks are independent (parallel execution); sequential when task B depends on task A's output. See TL Tools table for decision rules.**
   ├── Message channel (queue → router → responseWaiter)
@@ -86,6 +86,9 @@ src/
 ├── tools/
 │   ├── tl-tools.ts   ← 7 TL process management tools (Deps-based DI)
 │   ├── goal-tools.ts  ← Goal system: set_goal/finish_goal tools + agent_end reminder
+│   ├── agent-session-tools.ts ← start_team_session（加载时注册，ADR-0003 例外）+ stop_team_session（会话作用域，仅自主会话激活）
+│   ├── agent-session-tool-names.ts ← 工具名常量（叶子模块，防循环依赖）
+│   ├── session-tool-visibility.ts ← 会话工具可见性强制（纯函数）：9 个团队会话工具（start_member…finish_goal）仅在会话期间注册+可见，before_agent_start 回合边界强制执行；AGENT_SESSION_TOOL_NAMES 按 origin 条件激活
 │   ├── shared-context-tool.ts ← write_shared_context 工具：唯一合法的共享上下文写入入口，成功后标记会话状态（start_member 门控依赖）
 │   └── tl-tools-add-dynamic.test.ts  ← add_dynamic_member tool tests
 ├── team/
@@ -93,7 +96,8 @@ src/
 │   ├── schema.ts     ← YAML field validation
 │   └── store.ts      ← Read/write/delete team YAML files
 ├── session/
-│   ├── state.ts      ← TeamSessionState (structuredClone deep copy), addMemberToSession()
+│   ├── state.ts      ← TeamSessionState (structuredClone deep copy), addMemberToSession(), SessionOrigin
+│   ├── teardown.ts   ← 共享会话终结逻辑（/team stop 与 stop_team_session 复用）
 │   ├── shared-context.ts ← Shared context path 单一来源 + ensureSharedContextFile() 自愈创建（缺 stub 则自动生成）
 │   ├── state.test.ts ← addMemberToSession tests
 │   ├── tl-read-guard.ts  ← TL 亲自分析的运行时软纠偏（turn 内未派发且非管理工具调用超阀值 → 持续拦截直到派发）
@@ -102,6 +106,7 @@ src/
 │   └── state-machine.ts  ← Pure function state machine: MemberOperationalState transitions
 ├── prompts/
 │   ├── dynamic-mode.ts  ← TL system prompt template for /team dynamic mode (design/execution phases)
+│   ├── agent-initiated-mode.ts ← agent 自主会话提示词（ADR-0003）：使命锚定、无 grilling/确认门/第一动作协议
 │   ├── tl-first-action.ts ← 共享「第一动作协议」提示词片段，注入两种模式 TL 提示词顶部
 │   ├── workflow-prompt.ts ← 预定义团队的工作流提示词构建（纯函数）：激活横幅 + 操作型执行协议，替代旧内联描述性注入
 │   ├── workflow-prompt.test.ts ← 工作流提示词测试
@@ -109,7 +114,8 @@ src/
 │   └── dynamic-mode.test.ts  ← 动态模式提示词测试
 ├── setup/            ← Modular extracted setup modules
 │   ├── member-lifecycle.ts  ← createAndRegisterMember, buildMemberConfig, getMemberLog
-│   └── message-channel.ts   ← createMessageChannel factory (queue+router+waiter wiring)
+│   ├── message-channel.ts   ← createMessageChannel factory (queue+router+waiter wiring)
+│   ├── dynamic-session-bootstrap.ts ← 动态会话共享 bootstrap（/team dynamic 与 start_team_session 复用）+ ensureAddDynamicMemberTool
 ├── settings/         ← Global settings (/team setting)
 │   ├── settings.ts        ← TeamSettings type + <rootDir>/settings.yaml read/write
 │   ├── resolve-model.ts   ← Pure function: member model precedence resolution
@@ -152,6 +158,7 @@ src/
 9. **Session isolation via sessionId** — Each team session generates a unique `sessionId` in `TeamSessionState`. `buildMemberConfig` uses this ID to nest session data under `sessions/<team-name>/<sessionId>/` instead of the flat `sessions/<team-name>/`. This prevents conflicts when the same pre-defined team is used across multiple sessions. On `/team stop`, the session subdirectory is cleaned up. Dynamic mode sessions (`_dynamic_<ts>`) use their unique team name for the same purpose — the entire team directory is removed on stop.
 
 10. **Goal system for TL autonomy** — `src/tools/goal-tools.ts` registers `set_goal` and `finish_goal` tools plus an `agent_end` event handler. When the TL sets a goal at session start and later finishes a turn (agent_end), the system checks if the goal is still active and incomplete. If so, it queues a user message (via `setTimeout(0)` to avoid the agent_end lifecycle conflict with `sendUserMessage`, plus `deliverAs: "followUp"` so the reminder queues instead of throwing `Agent is already processing` if the TL agent is still inside the post-agent_end settlement window or already streaming again when the timer fires) re-triggering the TL with a reminder of the goal and its completion criteria. This prevents the TL from unnecessarily asking the user "should I continue?" mid-task. The goal is stored in module-level memory, has a 10-second cooldown between reminders to prevent loops, checks `ctx.signal?.aborted` to skip reminders when the user pressed Esc or redirected the agent, and is reset on session shutdown.
+   **会话工具注册与可见性（turn-boundary enforcement）**：全部 9 个团队会话工具（`start_member`/`stop_member`/`list_members`/`get_member_log`/`team_send_and_wait`/`wait_and_get_member_status`/`write_shared_context`/`set_goal`/`finish_goal`）**只在团队会话（`/team start` 或 `/team dynamic`）期间注册**——扩展加载时不注册任何团队工具（见决策 #21）。由于 pi 没有 unregisterTool API，首次会话后工具会永久留在注册表中——活跃工具集是唯一可见性闸门，因此 `src/session/session-tool-visibility.ts` 的 `enforceSessionToolVisibility()`（纯函数 + DI，`SESSION_TOOL_NAMES` 与 `teamCtx.tlToolNames` 同源）在每个 `before_agent_start` 回合边界强制该不变式：会话活跃 → 确保注册（幂等）+ 激活；会话不活跃 → 从活跃集移除（绝不注册）。防止扩展重载/其他扩展 setActiveTools/plan-mode 切换等产生陈旧活跃列表导致工具泄漏到会话外。
 
 11. **Defensive parsing for `tasks` parameter** — `src/tools/tl-tools.ts` includes a `parseTasks()` function that handles four formats for the `tasks` parameter:
     - Raw array (correct): `tasks: [{to: "a", content: "..."}]` (invalid entries missing string `to`/`content` are dropped with a warning)
@@ -201,7 +208,11 @@ src/
    - 新增专用工具 `write_shared_context(content)`（`src/tools/shared-context-tool.ts`），只写会话的 `.shared-context.md`，成功后调用 `markSharedContextWritten()` 置位会话状态 `sharedContextWritten`（`src/session/state.ts`）；fs 失败则 fail-open 且**不置位**。
    - `start_member` 工具执行前检查 `getSessionState().sharedContextWritten`，未置位则拒绝启动并提示先调用 `write_shared_context`（硬门控，无逃生口——工具本身很轻量，TL 只需先写一次）。
    - tool_call 守卫拦截 `write`/`edit` 直接写 `.shared-context.md` 的调用，重定向到 `write_shared_context`，保证标记与文件内容一致。
-   - 工具随 `tlToolNames` 在会话期间激活/停用，进入设计与执行阶段白名单；`.shared-context.md` 的 stub 自愈（`ensureSharedContextFile`）保留为兜底（member 启动后仍能读到文件），但不再替代 TL 的显式写入。
+   - 工具与其他会话工具一样**只在会话期间注册**（`onSessionStart` → `ensureSessionToolsRegistered`），随 `tlToolNames` 在会话期间激活/停用。`.shared-context.md` 的 stub 自愈（`ensureSharedContextFile`）保留为兜底（member 启动后仍能读到文件），但不再替代 TL 的显式写入。
+
+21. **会话工具只在会话期间注册（session-scoped registration）** — 全部 9 个团队会话工具（6 个 TL 进程管理工具 + `write_shared_context` + `set_goal`/`finish_goal`）**不在扩展加载时注册**，而是由 `index.ts` 的 `ensureSessionToolsRegistered()`（内部用 `ensureToolRegistered` 幂等去重）在 `onSessionStart`（`/team start` 与 `/team dynamic` 共用，置于 widget 守卫之前）按需注册；`before_agent_start` 回合边界经 `enforceSessionToolVisibility()`（`src/session/session-tool-visibility.ts`，纯函数 + DI，`SESSION_TOOL_NAMES` 与 `teamCtx.tlToolNames` 同源）强制注册+激活/停用不变式。效果：会话外工具注册表与活跃集均不含任何团队工具（实测 fresh pi 运行 9 工具零出现）；`dynamic-handler` 先 `onSessionStart` 注册再 `setActiveTools` 激活（不依赖 pi 的 registerTool 自动激活行为）。模式工具（`create_team_definition`/`update_team_definition`/`add_dynamic_member`）维持各自的按需注册生命周期，不在本强制范围内。**唯一刻意例外**：`start_team_session` 在加载时注册（见决策 #22）。
+
+22. **Agent 自主会话（agent-initiated team sessions，ADR-0003）** — `start_team_session(task)` 在**扩展加载时注册**（决策 #21 的唯一例外），agent 可随时自主进入动态团队会话委派复杂任务。核心设计哲学：**会话来源（`origin: "user" | "agent"`，`TeamSessionState.origin`）决定守卫强度**——手动会话 = 用户期望「以团队方式做事」，全守卫；自主会话 = agent 自己的手段选择，用户只要结果，故移除派发管制（tl-read-guard、设计 read 软限制、第一动作协议），保留写入管制（TL 与成员共享同一文件系统，并发写会物理覆盖——结构性安全非不信任）。完全自主：无 Playbook grilling、无确认门；`task` 必填并自动置 Goal + 注入自主版提示词（`src/prompts/agent-initiated-mode.ts`）。生命周期对称：`stop_team_session` 由 agent 自主终结会话——会话作用域注册但**仅自主会话激活**（`AGENT_SESSION_TOOL_NAMES` 条件可见性），与 `/team stop` 共享 `src/session/teardown.ts`。嵌套结构性不可能（`TEAM_ROLE` 早退）；重入返回错误。可见性：启动 notify（🤖 + task 摘要）+ widget 持久来源标记（🤖/👤）。预定义团队支持明确推迟（dynamic-only 先行）。
 
 ## Dependency Injection Pattern
 
@@ -315,7 +326,7 @@ npm test          # Run all tests (vitest)
 npm run test:watch  # Watch mode
 ```
 
-598 tests across 42 files (state-machine, member-process, event-handler, response-waiter, message-channel, member, save-team-definition, config, ui-widget, member-inspector tests included). Tests live alongside source as `*.test.ts`.
+805 tests across 50 files (state-machine, member-process, event-handler, response-waiter, message-channel, member, save-team-definition, config, ui-widget, member-inspector, agent-session-tools, agent-initiated-mode prompt tests included). Tests live alongside source as `*.test.ts`.
 
 | Test Level | What | How |
 |-----------|------|-----|
@@ -354,13 +365,20 @@ npm run test:watch  # Watch mode
 | `/team setting` | Interactive settings menu — member default model (follow TL current model / fixed available model) + auto-compaction (toggle / percent & token thresholds / timeout). Also allowed during a session |
 | `/team help` | Display usage help for all subcommands |
 
-## TL Tools (active only during team session)
+## TL Tools (registered + active only during team session)
+
+> **例外（ADR-0003）**：`start_team_session` 在**扩展加载时注册**、会话外可见（见下表）；`stop_team_session` 会话作用域注册、仅自主会话激活。
+
+| Tool | Description |
+|------|-------------|
+| `start_team_session(task)` | **加载时注册**（决策 #21 唯一例外）。agent 自主启动动态团队会话（`origin: "agent"`）：`task` 必填——自动置 Goal + 注入自主版设计阶段提示词。全程无确认门；读/分析自由（无派发管制守卫），代码写入仍归成员。已有活跃会话时返回错误。成员进程结构性无法调用（`TEAM_ROLE` 早退）。 |
+| `stop_team_session()` | 结束 agent 自主会话（停成员、摘 widget、清理会话目录）。会话作用域注册，**仅自主会话出现在活跃工具集**；对 `origin: "user"` 的会话拒绝执行（手动会话归用户 `/team stop`）。与 `/team stop` 共享 `teardownTeamSession()`。 |
 
 | Tool | Description |
 |------|-------------|
 | `write_shared_context(content)` | Write the team shared context to the session's `.shared-context.md` (overwrite). **Must be called before the first `start_member` — start_member is blocked until then.** Sets the session `sharedContextWritten` flag; direct `write`/`edit` of `.shared-context.md` is intercepted and redirected here. Call again to update, then notify members to re-read. |
 | `add_dynamic_member(name, label, systemPrompt, model?)` | Register a member in `/team dynamic` mode. Name is the identifier, label is Chinese display name, systemPrompt is role definition. Only available in dynamic mode. |
-| `set_goal(text, criteria)` | Set a session goal with verifiable completion criteria. The system will automatically re-trigger the TL with a reminder if it stops working before the goal is met. Call at the start of a task to prevent unnecessary mid-task interruptions. |
+| `set_goal(text, criteria)` | Set a session goal with verifiable completion criteria. The system will automatically re-trigger the TL with a reminder if it stops working before the goal is met. Call at the start of a task to prevent unnecessary mid-task interruptions. **可见性**：仅团队会话（`/team start`/`/team dynamic`）期间可见——`onSessionStart` 注册，`before_agent_start` 回合边界强制（见决策 #10）。 |
 | `finish_goal()` | Mark the current goal as completed and stop the reminder system. Call when all goal criteria are met, or when an unresolvable blocker is encountered. |
 | `start_member(name)` | Launch a Member's pi RPC process. In dynamic mode, the first call triggers the design→execution phase transition. |
 | `stop_member(name)` | Gracefully terminate a Member process |
@@ -404,6 +422,7 @@ During an active team session (including `/team dynamic`), a `tool_call` event h
 add_dynamic_member, start_member, stop_member, list_members,
 get_member_log, wait_and_get_member_status, team_send_and_wait,
 set_goal, finish_goal, write_shared_context,
+start_team_session, stop_team_session,   ← ADR-0003（重入报错/放弃委派）
 read (unrestricted),
 write (only .md files — checked per-call)
 ```
@@ -413,6 +432,7 @@ write (only .md files — checked per-call)
 start_member, stop_member, list_members, get_member_log,
 wait_and_get_member_status, team_send_and_wait,
 set_goal, finish_goal, add_dynamic_member, write_shared_context,
+start_team_session, stop_team_session,   ← ADR-0003
 read, bash, web_search, fetch_content, get_search_content,
 write, edit (both only .md files — checked per-call),
 ctx_search, ctx_stats, ctx_doctor, ctx_insight,
@@ -428,7 +448,7 @@ Key points:
 - **No more blocklist gaps** — tools like `ctx_execute`, `ctx_execute_file`, `ctx_batch_execute`, `mcp`, `ctx_upgrade` are NOT on either whitelist, so they're automatically blocked. No need to manually track every tool that could write files.
 - **`write`/`edit` are on both whitelists** — but an additional per-call check restricts them to `.md` files only.
 - **`.shared-context.md` 专属拦截** — `write`/`edit` 的目标若是 `.shared-context.md`，无论哪个阶段都会被 block 并重定向到 `write_shared_context` 工具（保证 start_member 门控标记准确）。
-- **TL 预派发守卫（执行阶段）** — `read`/`bash`/`web_search` 等虽在白名单中，但 `src/session/tl-read-guard.ts` 会对"turn 内未派发任务且非管理工具调用超过 3 次"的情况**持续拦截**（sticky block）：派发前每次非管理工具调用都被 block（首次含用户可见通知），直到 `team_send_and_wait` 发生。防止 TL 亲自分析代码而不派发，且无法用 grep/rg 绕过。详见 DESIGN.md。
+- **TL 预派发守卫（执行阶段）** — `read`/`bash`/`web_search` 等虽在白名单中，但 `src/session/tl-read-guard.ts` 会对"turn 内未派发任务且非管理工具调用超过 3 次"的情况**持续拦截**（sticky block）：派发前每次非管理工具调用都被 block（首次含用户可见通知），直到 `team_send_and_wait` 发生。防止 TL 亲自分析代码而不派发，且无法用 grep/rg 绕过。详见 DESIGN.md。**仅 `origin: "user"` 会话生效**——自主会话（ADR-0003）移除此守卫与设计阶段 read 软限制（读与分析自由，代码写入守卫不变）。
 - The design phase whitelist lifts to the execution phase whitelist on the first `start_member` call.
 
 The design phase guard is active from the moment `/team dynamic` is entered. It lifts when the first `start_member` call succeeds, transitioning to the execution phase.
@@ -510,6 +530,7 @@ TL: 监控进展、协调异常、write_shared_context 更新共享上下文（�
 
 - `docs/adr/0001-members-as-independent-pi-rpc-processes.md` — Core architecture
 - `docs/adr/0002-tl-as-central-message-router.md` — Message channel design
+- `docs/adr/0003-agent-initiated-team-sessions.md` — Agent-initiated sessions via load-time `start_team_session`
 
 ## Design Document
 

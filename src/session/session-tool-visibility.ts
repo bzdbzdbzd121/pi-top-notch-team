@@ -1,5 +1,6 @@
 import { GOAL_TOOL_NAMES } from "../tools/goal-tools";
 import { SHARED_CONTEXT_TOOL_NAME } from "../tools/shared-context-tool";
+import { STOP_TEAM_SESSION_TOOL_NAME } from "../tools/agent-session-tool-names";
 
 /**
  * Session-only tool visibility enforcement.
@@ -39,9 +40,19 @@ export const SESSION_TOOL_NAMES = [
   ...GOAL_TOOL_NAMES,
 ] as const;
 
+/**
+ * Tools registered at session start like SESSION_TOOL_NAMES but ACTIVATED
+ * only in agent-initiated sessions (ADR-0003): user-initiated sessions keep
+ * their lifecycle user-owned (/team stop), so stop_team_session must never
+ * leak into their active tool set.
+ */
+export const AGENT_SESSION_TOOL_NAMES = [STOP_TEAM_SESSION_TOOL_NAME] as const;
+
 export interface SessionToolVisibilityDeps {
   /** Whether a team session (predefined or dynamic) is currently active. */
   sessionActive: boolean;
+  /** Whether the active session is agent-initiated (ADR-0003). Ignored when sessionActive is false. */
+  agentInitiated: boolean;
   /** Current active tool names (pi.getActiveTools()). */
   activeTools: string[];
   /** Whether a tool name is already registered (pi.getAllTools()). */
@@ -65,19 +76,32 @@ export interface SessionToolVisibilityResult {
 export function enforceSessionToolVisibility(
   deps: SessionToolVisibilityDeps
 ): SessionToolVisibilityResult {
-  const { sessionActive, activeTools } = deps;
+  const { sessionActive, agentInitiated, activeTools } = deps;
   const active = new Set(activeTools);
 
   if (sessionActive) {
     // Session active → session tools must be registered (idempotent) and
-    // active. Registration must happen BEFORE activation: pi.setActiveTools
-    // silently ignores unregistered names.
-    const missingActive = SESSION_TOOL_NAMES.filter((n) => !active.has(n));
-    if (missingActive.length > 0) {
-      if (SESSION_TOOL_NAMES.some((n) => !deps.isRegistered(n))) {
+    // active. Agent-only tools (stop_team_session) join the required set only
+    // for agent-initiated sessions; in user-initiated sessions they must NOT
+    // be active (lifecycle stays user-owned).
+    const required = agentInitiated
+      ? [...SESSION_TOOL_NAMES, ...AGENT_SESSION_TOOL_NAMES]
+      : [...SESSION_TOOL_NAMES];
+    const forbidden = agentInitiated ? [] : [...AGENT_SESSION_TOOL_NAMES];
+
+    const missingActive = required.filter((n) => !active.has(n));
+    const leakedActive = forbidden.filter((n) => active.has(n));
+    if (missingActive.length > 0 || leakedActive.length > 0) {
+      if (required.some((n) => !deps.isRegistered(n))) {
         deps.registerTools();
       }
-      const next = [...new Set([...activeTools, ...SESSION_TOOL_NAMES])];
+      const leakedSet: ReadonlySet<string> = new Set(leakedActive);
+      const next = [
+        ...new Set([
+          ...activeTools.filter((n) => !leakedSet.has(n)),
+          ...required,
+        ]),
+      ];
       deps.setActiveTools(next);
       return { changed: true, activeTools: next };
     }
@@ -87,8 +111,8 @@ export function enforceSessionToolVisibility(
   // No session → session tools must never be active (they may remain
   // registered; pi has no unregisterTool API, but the active set is the only
   // visibility gate).
-  const leakedSet = new Set(SESSION_TOOL_NAMES);
-  const leaked = SESSION_TOOL_NAMES.filter((n) => active.has(n));
+  const leakedSet: ReadonlySet<string> = new Set([...SESSION_TOOL_NAMES, ...AGENT_SESSION_TOOL_NAMES]);
+  const leaked = [...leakedSet].filter((n) => active.has(n));
   if (leaked.length > 0) {
     const next = activeTools.filter((n) => !leakedSet.has(n));
     deps.setActiveTools(next);

@@ -46,8 +46,8 @@ describe("sessionId", () => {
     expect(state.sessionId).toBe(originalId);
   });
 
-  it("accepts a custom sessionId via parameter", () => {
-    startSession(baseTeam, "my-custom-id");
+  it("accepts a custom sessionId via options", () => {
+    startSession(baseTeam, { sessionId: "my-custom-id" });
     const state = getSessionState();
     expect(state.sessionId).toBe("my-custom-id");
   });
@@ -127,6 +127,41 @@ describe("sharedContextWritten", () => {
     markSharedContextWritten();
     addMemberToSession({ name: "coder", label: "编码员", systemPrompt: "Code" });
     expect(getSessionState().sharedContextWritten).toBe(true);
+  });
+});
+
+describe("session origin (ADR-0003)", () => {
+  let baseTeam: TeamDefinition;
+
+  beforeEach(() => {
+    endSession();
+    baseTeam = {
+      name: "test-team",
+      description: "A test team",
+      members: [],
+    };
+  });
+
+  it("defaults to \"user\" when no origin is given", () => {
+    startSession(baseTeam);
+    expect(getSessionState().origin).toBe("user");
+  });
+
+  it("accepts origin \"agent\" via options", () => {
+    startSession(baseTeam, { origin: "agent" });
+    expect(getSessionState().origin).toBe("agent");
+  });
+
+  it("resets origin to \"user\" on endSession", () => {
+    startSession(baseTeam, { origin: "agent" });
+    endSession();
+    expect(getSessionState().origin).toBe("user");
+  });
+
+  it("preserves origin across addMemberToSession calls", () => {
+    startSession(baseTeam, { origin: "agent" });
+    addMemberToSession({ name: "coder", label: "编码员", systemPrompt: "Code" });
+    expect(getSessionState().origin).toBe("agent");
   });
 });
 

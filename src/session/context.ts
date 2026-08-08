@@ -23,11 +23,17 @@ export interface TeamContext {
   isCreatingTeam: boolean;
   /** When editing, holds the team name. Null otherwise. */
   editingTeamName: string | null;
-  /** Whether the current session is a dynamic team mode (/team dynamic). */
+  /** Whether the current session is a dynamic team mode (/team dynamic or agent-initiated). */
   isDynamicSession: boolean;
   /** Dynamic team mode phase: "design" (discuss + plan) or "execution" (started members, dispatching tasks).
    *  Only relevant when isDynamicSession is true. */
   dynamicPhase: "design" | "execution";
+  /**
+   * The mission statement of an agent-initiated session (the `task` argument of
+   * start_team_session, ADR-0003). Null for user-initiated sessions. Injected
+   * into the autonomous TL prompt; cleared on session teardown.
+   */
+  agentInitiatedTask: string | null;
   processManager: ProcessManager | null;
   /** Direct Map access (read-only view). Prefer getHandle/setHandle for writes. */
   memberHandles: ReadonlyMap<string, MemberProcessHandle>;

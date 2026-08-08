@@ -27,7 +27,7 @@ The per-session behavior and constraints that the TL communicates to a Member du
 _Avoid_: Baking session tasks into YAML definition
 
 **Process Management Tools**:
-A set of nine tools registered only during an active Team Session: `start_member`, `stop_member`, `list_members`, `get_member_log`, `wait_and_get_member_status`, `team_send_and_wait`, `add_dynamic_member` (dynamic mode only), `set_goal`, and `finish_goal`. These tools manage the lifecycle of Member `pi --mode rpc` processes, enable TL-to-Member communication, and provide a goal-tracking system to keep the TL on task. Not available outside a Team Session.
+A set of tools that exist in the tool registry **only during an active Team Session** (registered on-demand at session start, never at extension load): 9 session-scoped tools — `start_member`, `stop_member`, `list_members`, `get_member_log`, `wait_and_get_member_status`, `team_send_and_wait`, `write_shared_context`, `set_goal`, `finish_goal` — plus `add_dynamic_member` (dynamic mode only). These tools manage the lifecycle of Member `pi --mode rpc` processes, enable TL-to-Member communication, gate the shared-context write, and provide a goal-tracking system to keep the TL on task. Not registered and not available outside a Team Session.
 
 **Real-time Message Channel**:
 The communication medium through which agents (Team Lead and Members) exchange information during a Team Session. Implementation is separate from the team orchestration logic.
@@ -62,6 +62,17 @@ _Avoid_: compressing, summarizing
 **Member Inspector** (成员检视浮窗):
 A full-keyboard overlay summoned by the user with `alt+t` during an active Team Session. Displays a horizontal tab per Member (including crashed/stopped ones, marked with status icons), the selected Member's conversation content (user/assistant messages rendered in full, tool calls collapsed to one-line summaries with an `e` key toggle, thinking hidden), and a footer with each Member's operational state, context usage %, and key hints. The user can send messages directly to a Member via an input box (`i`/`Enter` to open; Enter sends `prompt` when idle or `follow_up` when busy, `Ctrl+Enter` sends `steer`), and run control commands (`ctrl+a` abort, `ctrl+m` compact). Direct user messages are prefixed with `[用户直接指令（非 TL）]:` so the Member can distinguish the source; user interventions are not mirrored into the TL session. Content refresh is event-driven: Member RPC events mark the tab dirty and trigger a throttled `get_messages` refetch. Not available outside a Team Session.
 _Avoid_: 监控面板, 第二终端
+
+**Session Origin** (会话来源):
+A Team Session attribute (`origin: "user" | "agent"`) recording how the session was started. Determines guard strength (dispatch-policing guards apply only to user-initiated sessions; write guards apply to both) and tool visibility (`stop_team_session` is offered only in agent-initiated sessions). See ADR-0003.
+
+**Agent-initiated Team Session** (自主会话):
+A Dynamic Team Mode session started by the TL itself via the `start_team_session(task)` tool — registered at extension load time, the single deliberate exception to session-scoped tool registration. Fully autonomous: no requirements grilling, no plan confirmation gate; the TL designs, launches, coordinates, reports, and tears the session down via `stop_team_session`. Dispatch-policing guards (TL read guard, design-phase read soft limit, first-action protocol) do not apply — the user cares about the result, not the process; write guards (TL may not edit code) still apply because TL and Members share one filesystem. The team status widget carries a persistent 🤖 origin marker.
+_Avoid_: sub-agent delegation, self-spawned team
+
+**User-initiated Team Session** (手动会话):
+A Team Session started by an explicit user command (`/team start <name>` or `/team dynamic`). The user owns the lifecycle (`/team stop`), and the full guard set applies because the user's intent is "do this as a team".
+_Avoid_: manual session
 
 **Team Session Lifecycle**:
 1. User runs `/team start <name>` or `/team dynamic`

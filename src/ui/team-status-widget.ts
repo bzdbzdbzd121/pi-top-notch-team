@@ -40,8 +40,15 @@ export function createTeamStatusWidget(options: {
   getMembers: () => TeamMember[];
   teamCtx: TeamContext;
   memberOpsStates: Map<string, MemberOperationalState>;
+  /**
+   * Session origin marker (ADR-0003): "agent" sessions show 🤖, user sessions 👤
+   * in the title so the user can always tell how the session was started.
+   * Defaults to "user".
+   */
+  origin?: "user" | "agent";
 }): TeamStatusWidget {
-  const { teamName, getMembers, teamCtx, memberOpsStates } = options;
+  const { teamName, getMembers, teamCtx, memberOpsStates, origin = "user" } = options;
+  const originMarker = origin === "agent" ? "🤖" : "👤";
   const contextUsageMap = new Map<string, MemberContextInfo | null>();
 
   let pollingTimer: ReturnType<typeof setTimeout> | null = null;
@@ -54,7 +61,7 @@ export function createTeamStatusWidget(options: {
 
     // Handle design phase (0 members)
     if (currentMembers.length === 0) {
-      const title = `● DYNAMIC TEAM — 设计阶段`;
+      const title = `● DYNAMIC TEAM ${originMarker} — 设计阶段`;
       const statusText = "✅ 设计团队中（尚无成员）";
       const titleVw = visibleWidth(title);
       const statusVw = visibleWidth(statusText);
@@ -124,7 +131,7 @@ export function createTeamStatusWidget(options: {
     const styledStatus = segments.map((s) => s.styled).join(sepStyled);
 
     // Title text
-    const title = `● TEAM MODE — ${teamName}`;
+    const title = `● TEAM MODE ${originMarker} — ${teamName}`;
 
     // Compute total visible width for all lines.
     // Each line has different left-border prefix width:

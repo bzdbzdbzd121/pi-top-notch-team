@@ -43,6 +43,9 @@ export const MANAGEMENT_TOOLS = new Set([
   "start_member", "stop_member", "list_members", "get_member_log",
   "wait_and_get_member_status", "team_send_and_wait",
   "set_goal", "finish_goal", "add_dynamic_member",
+  // Agent-initiated session lifecycle (ADR-0003) — whitelisted in sessions;
+  // coordination, not "doing the work".
+  "start_team_session", "stop_team_session",
   "write", "edit",  // Restricted to .md-only during sessions; legitimate TL management work
 ]);
 

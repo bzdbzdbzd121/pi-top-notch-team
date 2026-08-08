@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import {
   enforceSessionToolVisibility,
   SESSION_TOOL_NAMES,
+  AGENT_SESSION_TOOL_NAMES,
   type SessionToolVisibilityDeps,
 } from "./session-tool-visibility";
 
@@ -10,11 +11,12 @@ import {
 function makeDeps(overrides: Partial<SessionToolVisibilityDeps> = {}) {
   const registered = new Set<string>();
   const registerTools = vi.fn(() => {
-    for (const name of SESSION_TOOL_NAMES) registered.add(name);
+    for (const name of [...SESSION_TOOL_NAMES, ...AGENT_SESSION_TOOL_NAMES]) registered.add(name);
   });
   const setActiveTools = vi.fn();
   const deps: SessionToolVisibilityDeps = {
     sessionActive: false,
+    agentInitiated: false,
     activeTools: ["read", "bash"],
     isRegistered: (name) => registered.has(name),
     registerTools,
@@ -160,6 +162,61 @@ describe("enforceSessionToolVisibility", () => {
       const counts = new Map<string, number>();
       for (const n of result.activeTools) counts.set(n, (counts.get(n) ?? 0) + 1);
       for (const n of SESSION_TOOL_NAMES) expect(counts.get(n)).toBe(1);
+    });
+  });
+
+  describe("agent-initiated sessions (ADR-0003)", () => {
+    it("activates AGENT_SESSION_TOOL_NAMES alongside the 9 session tools", () => {
+      const { deps, setActiveTools, registered } = makeDeps({
+        sessionActive: true,
+        agentInitiated: true,
+        activeTools: ["read", "bash"],
+      });
+      for (const name of [...SESSION_TOOL_NAMES, ...AGENT_SESSION_TOOL_NAMES]) registered.add(name);
+      const result = enforceSessionToolVisibility(deps);
+      expect(result.changed).toBe(true);
+      expect(result.activeTools).toEqual([
+        "read", "bash",
+        ...SESSION_TOOL_NAMES,
+        ...AGENT_SESSION_TOOL_NAMES,
+      ]);
+      expect(setActiveTools).toHaveBeenCalled();
+    });
+
+    it("no-op in an agent session when everything is already active", () => {
+      const { deps, setActiveTools, registered } = makeDeps({
+        sessionActive: true,
+        agentInitiated: true,
+        activeTools: ["read", ...SESSION_TOOL_NAMES, ...AGENT_SESSION_TOOL_NAMES],
+      });
+      for (const name of [...SESSION_TOOL_NAMES, ...AGENT_SESSION_TOOL_NAMES]) registered.add(name);
+      const result = enforceSessionToolVisibility(deps);
+      expect(result.changed).toBe(false);
+      expect(setActiveTools).not.toHaveBeenCalled();
+    });
+
+    it("removes stop_team_session from a user-initiated session (lifecycle stays user-owned)", () => {
+      const { deps, setActiveTools, registered } = makeDeps({
+        sessionActive: true,
+        agentInitiated: false,
+        activeTools: ["read", ...SESSION_TOOL_NAMES, ...AGENT_SESSION_TOOL_NAMES],
+      });
+      for (const name of [...SESSION_TOOL_NAMES, ...AGENT_SESSION_TOOL_NAMES]) registered.add(name);
+      const result = enforceSessionToolVisibility(deps);
+      expect(result.changed).toBe(true);
+      expect(result.activeTools).toEqual(["read", ...SESSION_TOOL_NAMES]);
+      expect(setActiveTools).toHaveBeenCalledWith(["read", ...SESSION_TOOL_NAMES]);
+    });
+
+    it("removes stop_team_session outside a session (leak cleanup)", () => {
+      const { deps, setActiveTools } = makeDeps({
+        sessionActive: false,
+        activeTools: ["read", ...AGENT_SESSION_TOOL_NAMES],
+      });
+      const result = enforceSessionToolVisibility(deps);
+      expect(result.changed).toBe(true);
+      expect(result.activeTools).toEqual(["read"]);
+      expect(setActiveTools).toHaveBeenCalledWith(["read"]);
     });
   });
 });
