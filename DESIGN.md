@@ -1139,6 +1139,7 @@ Overlay: `ctx.ui.custom(component, { overlay: true, overlayOptions: { width: "90
 - user/assistant text rendered in full (wrapped)
 - thinking blocks hidden by default, toggleable per tab with `t` (rendered as dim `💭 思考` + wrapped content)
 - tool calls collapsed to one-line summaries (`🔧 name arg-summary`), expandable with `e`
+- expanded tool call arguments: pretty-printed JSON, **every line wrapped to the frame width** — long `content`/`command`/`path` values wrap across multiple lines instead of being hard-truncated (the summary line wraps too); total display lines capped at a 40-line budget per call (`EXPANDED_ARGS_MAX_LINES`), overflow collapsed to a `…` marker
 - tool results collapsed to `✓/✗ toolName first-line`, expandable with `e`
 - virtual scroll: full message history kept in memory, only the visible slice is rendered
 - unknown/custom AgentMessage roles fall back to a truncated `[role] json` line

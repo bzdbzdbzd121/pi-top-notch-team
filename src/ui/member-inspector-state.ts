@@ -133,7 +133,13 @@ export type MemberOpState = "idle" | "working" | "compacting" | "crashed" | "sto
 
 // ── Constants ──────────────────────────────────────────────
 
-/** Max lines shown for an expanded tool call's arguments. */
+/**
+ * Display-line budget for an expanded tool call's arguments.
+ * Counts WRAPPED lines (not raw JSON lines): a single very long JSON line
+ * (e.g. a long `content` value) wraps to multiple display lines, so the
+ * budget caps total screen lines instead of raw JSON lines. When the
+ * budget runs out, the remainder is collapsed into a "…" marker.
+ */
 export const EXPANDED_ARGS_MAX_LINES = 40;
 /** Max lines shown for an expanded tool result's content. */
 export const EXPANDED_RESULT_MAX_LINES = 60;
@@ -407,14 +413,35 @@ function buildBodyRaw(
         }
         if (block.type === "toolCall") {
           const summary = summarizeArgs(block.name, block.arguments);
-          blockLines.push(
-            theme.fg("toolTitle", `  🔧 ${block.name}${summary ? ` ${summary}` : ""}`)
-          );
+          // Summary line wraps like any other text — a wide summary must
+          // not get hard-truncated by fitLinesToWidth (which drops content).
+          for (const l of wrapText(
+            `  🔧 ${block.name}${summary ? ` ${summary}` : ""}`,
+            textWidth
+          )) {
+            blockLines.push(theme.fg("toolTitle", l));
+          }
           if (expanded) {
+            // Each JSON line is wrapped to textWidth before being emitted:
+            // long values (path/content/command strings) wrap instead of
+            // being truncated, so the full arguments stay readable. The
+            // budget counts wrapped display lines, preventing a single
+            // huge value from exploding the body; overflow collapses to "…".
             const json = JSON.stringify(block.arguments ?? {}, null, 2);
-            const jsonLines = json.split("\n").slice(0, EXPANDED_ARGS_MAX_LINES);
-            for (const jl of jsonLines) blockLines.push(theme.fg("dim", `    ${jl}`));
-            if (json.split("\n").length > EXPANDED_ARGS_MAX_LINES) {
+            let budget = EXPANDED_ARGS_MAX_LINES;
+            let truncated = false;
+            for (const jl of json.split("\n")) {
+              const wrapped = wrapText(`    ${jl}`, textWidth);
+              if (wrapped.length > budget) {
+                truncated = true;
+                blockLines.push(...wrapped.slice(0, budget).map((l) => theme.fg("dim", l)));
+                budget = 0;
+                break;
+              }
+              for (const l of wrapped) blockLines.push(theme.fg("dim", l));
+              budget -= wrapped.length;
+            }
+            if (truncated) {
               blockLines.push(theme.fg("dim", "    …"));
             }
           }

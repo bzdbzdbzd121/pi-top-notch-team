@@ -255,21 +255,66 @@ describe("buildBodyLines", () => {
     }
   });
 
-  it("expandArgs JSON lines are truncated by fitLinesToWidth (A2 contract)", () => {
+  it("expandArgs long JSON lines wrap to width with full content", () => {
     const long = { path: "x".repeat(300) };
     const lines = buildBodyLines([assistantMsg(toolCallBlock("read", long))], {
       ...opts,
       expanded: true,
     });
-    const wide = lines.find((l) => l.includes('"path"'));
-    expect(wide).toBeDefined();
-    // Raw build output may exceed textWidth (expandArgs bypasses wrapText)…
-    const fitted = fitLinesToWidth(lines, 40);
-    for (const l of fitted) {
+    // Wrap (not truncate): every display line fits the width…
+    for (const l of lines) {
+      expect(l.length).toBeLessThanOrEqual(opts.width);
+    }
+    // …and the full 300-char value survives (no hard truncation).
+    expect(lines.join("")).toContain("x".repeat(300));
+  });
+
+  it("expandArgs wraps long values into multiple lines (no ellipsis loss)", () => {
+    const long = { command: "a".repeat(120) };
+    const lines = buildBodyLines([assistantMsg(toolCallBlock("bash", long))], {
+      ...opts,
+      expanded: true,
+    });
+    const joined = lines.join("\n");
+    // Content lines are wrapped, so no line carries a truncation ellipsis
+    // beyond the 4-space indent (the one-line summary's own 60-char "…"
+    // is absent because summarizeArgs prefers `command` = 120 chars →
+    // sliced — filter it out by looking at the indented JSON region).
+    const jsonRegion = joined.split("\n").filter((l) => l.startsWith("    "));
+    expect(jsonRegion.length).toBeGreaterThan(1);
+    for (const l of jsonRegion) {
+      expect(l.length).toBeLessThanOrEqual(opts.width);
+      expect(l.endsWith("…")).toBe(false);
+    }
+    // No separator: the wrapped value stays contiguous across lines
+    expect(lines.join("")).toContain("a".repeat(120));
+  });
+
+  it("expandArgs caps display lines at the budget with an overflow marker", () => {
+    // 60 keys → raw JSON has 60+ lines, well over the 40-line budget.
+    const args: Record<string, any> = {};
+    for (let i = 0; i < 60; i++) args[`key${i}`] = `v${i}`;
+    const lines = buildBodyLines([assistantMsg(toolCallBlock("write", args))], {
+      ...opts,
+      expanded: true,
+    });
+    const keyLines = lines.filter((l) => l.startsWith("    ") && l.includes("key"));
+    expect(keyLines.length).toBeLessThanOrEqual(40);
+    expect(lines.some((l) => l.trim() === "…")).toBe(true);
+  });
+
+  it("collapsed summary line wraps when the one-liner exceeds width", () => {
+    const long = { path: "p".repeat(90) }; // summary 60 chars + indent > narrow width
+    const lines = buildBodyLines([assistantMsg(toolCallBlock("read", long))], {
+      ...opts,
+      width: 40,
+    });
+    for (const l of lines) {
       expect(l.length).toBeLessThanOrEqual(40);
     }
-    // …and the truncated line keeps its ellipsis
-    expect(fitted.join("\n")).toContain("…");
+    // The 60-char truncated summary survives in full (wrapped, not cut)
+    expect(lines.join("")).toContain("p".repeat(59) + "…");
+    expect(lines.filter((l) => l.includes("🔧"))).toHaveLength(1);
   });
 });
 
