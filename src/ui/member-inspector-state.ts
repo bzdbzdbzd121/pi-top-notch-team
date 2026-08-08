@@ -144,9 +144,9 @@ export const EXPANDED_RESULT_MAX_LINES = 60;
  * uses ctrl+o.
  */
 export function buildNavHints(expanded: boolean, showThinking: boolean): string {
-  const expandHint = expanded ? "e 折叠详情" : "e 展开详情";
+  const expandHint = expanded ? "e 隐藏工具详情" : "e 展开工具详情";
   const thinkingHint = showThinking ? "t 隐藏思考" : "t 显示思考";
-  return `←→ 切换成员  ↑↓ 三行滚动  End 跳至底部  i 输入消息  ${expandHint}  ${thinkingHint}`;
+  return `←→ 切换成员 ↑↓ 三行滚动 End 跳至底部 i 输入消息 ${expandHint} ${thinkingHint}`;
 }
 export const KEY_HINTS_ACTION =
   "ctrl+a 中断  ctrl+b/ctrl+shift+a 全中断  ctrl+o 压缩  Esc 关闭";

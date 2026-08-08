@@ -455,7 +455,7 @@ describe("MemberInspectorComponent — render", () => {
     expect(joined).toContain("切换成员");
     expect(joined).toContain("三行滚动");
     expect(joined).toContain("跳至底部");
-    expect(joined).toContain("e 展开详情");
+    expect(joined).toContain("e 展开工具详情");
     expect(joined).toContain("t 显示思考");
     expect(joined).toContain("ctrl+a 中断");
     expect(joined).toContain("ctrl+b/ctrl+shift+a 全中断");
@@ -768,13 +768,13 @@ describe("MemberInspectorComponent — render", () => {
     }
   });
 
-  it("expand hint flips to 折叠 while details are expanded", () => {
+  it("expand hint flips to 隐藏工具详情 while details are expanded", () => {
     const deps = makeDeps({ handles: {}, opStates: {} });
     const { comp, state } = makeComponent(deps);
     state.tabs[0].expanded = true;
     const joined = comp.render(80).join("\n");
-    expect(joined).toContain("e 折叠详情");
-    expect(joined).not.toContain("e 展开详情");
+    expect(joined).toContain("e 隐藏工具详情");
+    expect(joined).not.toContain("e 展开工具详情");
   });
 
   it("thinking hint flips to 隐藏 while thinking is shown", () => {
