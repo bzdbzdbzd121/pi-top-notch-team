@@ -63,7 +63,7 @@ Tab completion for team names is supported on `/team start`, `/team show`, `/tea
 ```
 Your pi session (TL extension)
   ├── /team command (11 subcommands)
-  ├── 7 process management tools (incl. add_dynamic_member)
+  ├── 10 TL tools (9 session-only: start_member, stop_member, list_members, get_member_log, wait_and_get_member_status, team_send_and_wait, write_shared_context, set_goal, finish_goal; + add_dynamic_member for dynamic mode)
   ├── Message channel (event-handler → queue → router → response-waiter)
   └── Member Process Manager
         ├── Member A (pi --mode rpc)
@@ -75,7 +75,7 @@ Your pi session (TL extension)
 
 1. **Define a team** — Use `/team create` to describe your team. The TL collects details and saves a YAML definition to `~/.pi/top-notch-team/teams/`. Or use `/team dynamic` to skip pre-definition and let the TL design the team at runtime.
 
-2. **Start a session** — `/team start <name>` or `/team dynamic` activates TL tools (`start_member`, `stop_member`, `list_members`, `get_member_log`, `wait_and_get_member_status`, `team_send_message`, `team_send_and_wait`, `add_dynamic_member`) and injects team awareness into the TL's system prompt.
+2. **Start a session** — `/team start <name>` or `/team dynamic` registers + activates the session tools (`start_member`, `stop_member`, `list_members`, `get_member_log`, `wait_and_get_member_status`, `team_send_and_wait`, `write_shared_context`, `set_goal`, `finish_goal`, plus `add_dynamic_member` in dynamic mode) and injects team awareness into the TL's system prompt. Outside a session, none of these tools exist in the tool registry.
 
 3. **TL works with you** — The TL clarifies requirements, writes a Shared Context document, and spawns Members via `start_member`.
 
@@ -109,7 +109,7 @@ members:
 
 See [DESIGN.md](DESIGN.md) for the full architecture spec and [docs/adr/](docs/adr/) for decision records.
 
-**TL** — user's pi session, registers `/team` command + process management tools.
+**TL** — user's pi session, registers `/team` command at load; team tools are registered on-demand at session start and deactivated on session end.
 
 **Members** — independent `pi --mode rpc` subprocesses, keep own context.
 
@@ -121,6 +121,7 @@ See [DESIGN.md](DESIGN.md) for the full architecture spec and [docs/adr/](docs/a
 
 | Tool | Description |
 |------|-------------|
+| `write_shared_context(content)` | Write the team shared context to `.shared-context.md`. **Must be called before the first `start_member`** (hard gate). |
 | `start_member(name)` | Launch a Member's pi RPC process |
 | `stop_member(name)` | Gracefully terminate a Member process |
 | `list_members()` | Show all member statuses |
@@ -128,8 +129,10 @@ See [DESIGN.md](DESIGN.md) for the full architecture spec and [docs/adr/](docs/a
 | `wait_and_get_member_status()` | 等待所有 member 空闲后查看运行状态: idle/working/crashed/stopped。如有 member 在工作则阻塞。No parameters. |
 | `add_dynamic_member(name, label, systemPrompt, model?)` | Register a member in /team dynamic mode (name=identifier, label=Chinese display name) |
 | `team_send_and_wait({tasks: [{to, content}], nextSteps})` | Send message(s) to one or more members and wait for ALL responses. Tasks array supports concurrent dispatch to different members for parallel execution. Returns partial results if some members fail. nextSteps 在 wait 结束后随结果返回。 |
+| `set_goal(text, criteria)` | Set a session goal with verifiable completion criteria; the system re-triggers the TL if it stops before the goal is met. |
+| `finish_goal()` | Mark the current goal as completed and stop the reminder system. |
 
-These tools are only available while a team session is active.
+These tools are only registered and available while a team session is active.
 
 ## Installation
 

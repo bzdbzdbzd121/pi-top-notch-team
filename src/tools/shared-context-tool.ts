@@ -20,8 +20,10 @@ import { dirname } from "node:path";
  *   - The tool_call guard intercepts direct write/edit calls targeting
  *     .shared-context.md and redirects the TL here, so the flag stays accurate.
  *
- * The tool is registered eagerly at extension init (like the other TL tools)
- * but only activated during team sessions via teamCtx.tlToolNames.
+ * The tool is NOT registered at extension init — like all other session-only
+ * tools it is registered on-demand at session start (onSessionStart) and
+ * activated via teamCtx.tlToolNames (setActiveTools). Outside a team session
+ * it does not exist in the tool registry at all.
  */
 
 export const SHARED_CONTEXT_TOOL_NAME = "write_shared_context";
