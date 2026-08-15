@@ -353,11 +353,13 @@ export function registerTlTools(deps: TlToolsDeps): void {
       // P3 防截断协议（长 content 是 team_send_and_wait 校验失败的首要诱因：
       // 流式输出被截断 → partial-json 补全成"缺 to 的合法对象" → 校验/丢弃）。
       // 定位为引导性 best practice（γ）：从源头降低截断概率。
+      // 注意：~800 是预防阈值（事前建议拆分），与运行时诊断阈值
+      // TRUNCATION_CONTENT_THRESHOLD=500（事后判定疑似截断）独立。
       "TRUNCATION PREVENTION — 防截断协议：",
       "  • content 超 ~800 字符时：拆分为多次调用，或指示成员读取文件路径——任务详情不要写入 .shared-context.md（全员共享 + 全量覆盖会污染其他成员上下文，批处理并发覆盖有竞态），引用成员私有或独立文件路径。",
       "  • tasks 条目键顺序：先写 to 再写 content（键序决定截断后幸存字段——输出被截断时靠后的字段丢失）。",
       "  • 每回合 tool call 数量控制在 1-2 个：同批多个 tool call 会挤占输出预算，后面的 tool call 更容易被截断。",
-      "  • 收到 Validation failed（缺 to/content）→ 立即用更短的 content 重试，不要原样重发（原样重发 → 再截断 → 再失败）。",
+      "  • 收到'任务条目无效已被丢弃'（缺 to/content）或'0 个任务'错误 → 立即用更短的 content 重试，不要原样重发（原样重发 → 再截断 → 再失败）。",
       '  • 收到"未知成员"错误 → 先怀疑 to 被截断（常见截半形态如 "c"），重发完整成员名。',
       "DECISION RULE — Batch vs Sequential:",
       "  • BATCH (multiple tasks[] entries) when: tasks are INDEPENDENT — no task's output is needed to craft another task's instructions. Example: concurrent code reviews of different files by different reviewers. Batch = parallel execution: all members work simultaneously.",
@@ -850,6 +852,11 @@ interface DroppedTaskDetail {
  * 0 任务截断启发式的 content 长度阈值：被丢弃条目缺 to 且 content 超过
  * 该长度时，错误文案显式给出截断指引（D8——只做间接推断，不做未闭合检测：
  * execute 层拿到的是 partial-json 修复后的对象，截断痕迹已丢失）。
+ *
+ * 注意：与提示词中的预防阈值（~800 字符，见 promptGuidelines 防截断协议）
+ * 数值不同——500 是诊断阈值（事后判定本次输入是否疑似截断），800 是预防
+ * 阈值（事前建议 TL 拆分长 content 的触发线）。两者独立、刻意不同：诊断
+ * 需要保守（宁可漏报不可误报），预防需要提前（留出余量）。
  */
 export const TRUNCATION_CONTENT_THRESHOLD = 500;
 

@@ -539,6 +539,7 @@ TL: 监控进展、协调异常、write_shared_context 更新共享上下文（�
 - `docs/adr/0002-tl-as-central-message-router.md` — Message channel design
 - `docs/adr/0003-agent-initiated-team-sessions.md` — Agent-initiated sessions via load-time `start_team_session`
 - `docs/adr/0004-team-session-resume.md` — Team session resume: member session persistence + manifest + /team resume
+- `docs/adr/0005-pi-upstream-truncation-marking.md` — Upstream framework truncation marking proposal (finalize-time detection + length-protection extension + oneOf error de-noising; non-blocking, for pi upstream issue)
 
 ## Design Document
 
