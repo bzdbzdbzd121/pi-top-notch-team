@@ -332,7 +332,7 @@ npm test          # Run all tests (vitest)
 npm run test:watch  # Watch mode
 ```
 
-870 tests across 53 files (state-machine, member-process incl. resume args, manifest, resume-handler, event-handler, response-waiter, message-channel, member, save-team-definition, config, ui-widget, member-inspector, agent-session-tools, agent-initiated-mode prompt tests included). Tests live alongside source as `*.test.ts`.
+测试覆盖面较广（状态机、member-process 含 resume 参数、manifest、resume-handler、event-handler、response-waiter、message-channel、member、save-team-definition、config、UI widget、member-inspector、agent-session-tools、agent-initiated-mode 提示词等）。测试以 `*.test.ts` 形式与源码同目录存放，具体数量以 `npm test` 实时输出为准。
 
 | Test Level | What | How |
 |-----------|------|-----|
