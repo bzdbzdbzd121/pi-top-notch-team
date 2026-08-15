@@ -2,7 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
-import { createMemberProcess } from "../process/member-process";
+import { createMemberProcess, hasSessionFiles } from "../process/member-process";
 import type { MemberProcessHandle, MemberProcessConfig } from "../process/member-process";
 import type { ProcessManager } from "../process/manager";
 import type { MessageQueue } from "../channel/message-queue";
@@ -33,8 +33,8 @@ export interface MemberLifecycleDeps {
   perTurnReplied?: Set<string>;
   /** Auto-reply tracking: pending setTimeout refs for scheduled auto-replies. */
   pendingAutoReplies?: Map<string, NodeJS.Timeout>;
-  /** Activity hook forwarded to the event handler (Member Inspector). */
-  onMemberActivity?: (memberName: string, eventType: string) => void;
+  /** Activity hook forwarded to the event handler (Member Inspector). Receives the full member RPC event. */
+  onMemberActivity?: (memberName: string, event: any) => void;
 }
 
 // ── createAndRegisterMember ────────────────────────────────
@@ -72,6 +72,12 @@ export function createAndRegisterMember(
 export interface BuildMemberConfigOptions {
   /** TL's current model as "provider/id" — used when the global setting is "follow". */
   tlCurrentModel?: string;
+  /**
+   * Force session resume (`--continue`). When omitted, resume is auto-detected:
+   * a member whose session dir already contains persisted pi session files is
+   * always resumed (context continuity on restart), a fresh dir starts fresh.
+   */
+  resume?: boolean;
 }
 
 export function buildMemberConfig(
@@ -121,6 +127,10 @@ export function buildMemberConfig(
       new URL("../../member.ts", import.meta.url)
     ),
     cwd: process.cwd(),
+    // Resume whenever this member already has persisted session files — covers
+    // /team resume, TL-process restarts, and intentional stop/start cycles.
+    // A fresh sessionId dir has no files and starts clean.
+    ...(options?.resume || hasSessionFiles(sessionDir) ? { resume: true } : {}),
     ...(resolved.model ? { model: resolved.model } : {}),
   };
 }

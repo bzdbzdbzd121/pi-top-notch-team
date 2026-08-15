@@ -1,7 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
-import { createMemberProcess, MAX_COMMAND_SIZE, MAX_PENDING_WRITES, type MemberProcessConfig } from "./member-process";
+import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createMemberProcess, hasSessionFiles, MAX_COMMAND_SIZE, MAX_PENDING_WRITES, type MemberProcessConfig } from "./member-process";
 
 function createMockSpawn() {
   const stdin = new PassThrough();
@@ -61,7 +64,6 @@ describe("createMemberProcess", () => {
         "--mode", "rpc",
         "--session-dir", "/tmp/sessions/refactoring/analyzer",
         "-e", "/path/to/member.ts",
-        "--no-session", "false",
       ],
       expect.objectContaining({
         cwd: "/test/project",
@@ -95,11 +97,86 @@ describe("createMemberProcess", () => {
         "--mode", "rpc",
         "--session-dir", "/tmp/sessions/refactoring/analyzer",
         "-e", "/path/to/member.ts",
-        "--no-session", "false",
         "--model", "anthropic/claude-sonnet-4-5",
       ],
       expect.objectContaining({ cwd: "/test/project" })
     );
+  });
+
+  // ── Session persistence & resume (team session resume, ADR-0004) ──
+
+  it("never passes --no-session (member sessions must persist for resume)", async () => {
+    const { process: mockProcess, stdout } = createMockSpawn();
+    const spawnMock = vi.fn().mockReturnValue(mockProcess);
+
+    const member = createMemberProcess(defaultConfig, spawnMock);
+    const startPromise = member.start();
+    emitReadyStdout(stdout);
+    await startPromise;
+
+    const args = spawnMock.mock.calls[0][1] as string[];
+    expect(args).not.toContain("--no-session");
+  });
+
+  it("adds --continue when resume is requested and session files exist", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "member-resume-"));
+    // pi nests session files under a per-cwd subdir — hasSessionFiles must be recursive
+    mkdirSync(join(dir, "nested-cwd"), { recursive: true });
+    writeFileSync(join(dir, "nested-cwd", "2024-01-01T00-00-00_abc123.jsonl"), "{}\n");
+    const { process: mockProcess, stdout } = createMockSpawn();
+    const spawnMock = vi.fn().mockReturnValue(mockProcess);
+
+    const member = createMemberProcess({ ...defaultConfig, sessionDir: dir, resume: true }, spawnMock);
+    const startPromise = member.start();
+    emitReadyStdout(stdout);
+    await startPromise;
+
+    expect(spawnMock.mock.calls[0][1] as string[]).toContain("--continue");
+  });
+
+  it("omits --continue when resume is requested but no session files exist", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "member-resume-empty-"));
+    const { process: mockProcess, stdout } = createMockSpawn();
+    const spawnMock = vi.fn().mockReturnValue(mockProcess);
+
+    const member = createMemberProcess({ ...defaultConfig, sessionDir: dir, resume: true }, spawnMock);
+    const startPromise = member.start();
+    emitReadyStdout(stdout);
+    await startPromise;
+
+    expect(spawnMock.mock.calls[0][1] as string[]).not.toContain("--continue");
+  });
+
+  it("auto-resumes with --continue on restart after a successful first start (crash recovery)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "member-restart-"));
+    writeFileSync(join(dir, "session.jsonl"), "{}\n"); // pi persists incrementally
+    const first = createMockSpawn();
+    const second = createMockSpawn();
+    const spawnMock = vi.fn().mockReturnValueOnce(first.process).mockReturnValue(second.process);
+
+    const member = createMemberProcess({ ...defaultConfig, sessionDir: dir }, spawnMock);
+    const startPromise = member.start();
+    emitReadyStdout(first.stdout);
+    await startPromise;
+    // First start: fresh (no --continue — files exist but this handle never ran)
+    expect(spawnMock.mock.calls[0][1] as string[]).not.toContain("--continue");
+
+    // Simulate crash, then auto-restart via the same handle
+    first.process.emit("exit", 1, null);
+    const restartPromise = member.start();
+    emitReadyStdout(second.stdout);
+    await restartPromise;
+
+    expect(spawnMock.mock.calls[1][1] as string[]).toContain("--continue");
+  });
+
+  it("hasSessionFiles detects nested .jsonl and tolerates missing dirs", () => {
+    const dir = mkdtempSync(join(tmpdir(), "hsf-"));
+    expect(hasSessionFiles(dir)).toBe(false);
+    mkdirSync(join(dir, "sub"), { recursive: true });
+    writeFileSync(join(dir, "sub", "a.jsonl"), "{}\n");
+    expect(hasSessionFiles(dir)).toBe(true);
+    expect(hasSessionFiles(join(dir, "does-not-exist"))).toBe(false);
   });
 
   it("resolves when started (process ready event)", async () => {

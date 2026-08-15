@@ -2,6 +2,7 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 import type { TeamContext, SessionUI } from "../../session/context";
 import { startSession, getSessionState } from "../../session/state";
 import { ensureSharedContextFile } from "../../session/shared-context";
+import { setManifestRuntimeContext, syncActiveManifest } from "../../session/manifest";
 import { readTeam } from "../../team/store";
 import { getRootDir } from "../../config";
 
@@ -31,6 +32,9 @@ export async function handleStart(
   teamCtx.onCreateEnd?.();
 
   startSession(team);
+  // Persist the session manifest immediately (the /team resume anchor).
+  setManifestRuntimeContext({ isDynamic: false, dynamicPhase: "design", agentInitiatedTask: null });
+  syncActiveManifest({ status: "active" });
   // Create the shared context stub up front so the file always exists for
   // members. NOTE: the real content must be written via the
   // write_shared_context tool — start_member is gated on it — so this stub

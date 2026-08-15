@@ -114,7 +114,7 @@ describe("/team dynamic", () => {
     rmSync(sessionDir, { recursive: true, force: true });
   });
 
-  it("/team stop cleans up dynamic session and directory", async () => {
+  it("/team stop marks the dynamic session stopped and keeps the directory", async () => {
     const pi = createMockExtensionAPI();
     const teamCtx = createTeamContext();
     const stopAllMock = vi.fn().mockResolvedValue(undefined);
@@ -148,8 +148,15 @@ describe("/team dynamic", () => {
     expect(stopAllMock).toHaveBeenCalled();
     expect(teamCtx.onSessionEnd).toHaveBeenCalled();
 
-    // Directory should be removed
-    expect(existsSync(sessionDir)).toBe(false);
+    // Directory is PRESERVED (session stays resumable via /team resume);
+    // the manifest is marked stopped instead of being deleted (ADR-0004).
+    expect(existsSync(sessionDir)).toBe(true);
+    const { readFileSync } = await import("node:fs");
+    const manifest = JSON.parse(
+      readFileSync(join(sessionDir, state.sessionId!, "session.json"), "utf-8")
+    );
+    expect(manifest.status).toBe("stopped");
+    expect(manifest.isDynamic).toBe(true);
   });
 
   it("appears in the help output", async () => {

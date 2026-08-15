@@ -2,12 +2,15 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerTeamCommand } from "./src/commands/team";
 import { TeamModeEditor } from "./src/ui/team-mode-editor";
 import { getSessionState, endSession } from "./src/session/state";
+import {
+  setManifestRuntimeContext,
+  syncActiveManifest,
+  resetManifestRuntimeContext,
+} from "./src/session/manifest";
 import type { TeamContext } from "./src/session/context";
 import { getRootDir } from "./src/config";
 import { loadSettings } from "./src/settings/settings";
 import { resolveAutoCompact } from "./src/settings/resolve-auto-compact";
-import { join } from "node:path";
-import { rmSync } from "node:fs";
 import { registerTlTools, type TlToolsDeps } from "./src/tools/tl-tools";
 import { registerGoalTools, registerGoalAgentHandler, resetGoal, GOAL_TOOL_NAMES } from "./src/tools/goal-tools";
 import { registerSharedContextTool, SHARED_CONTEXT_TOOL_NAME } from "./src/tools/shared-context-tool";
@@ -61,6 +64,7 @@ export default function (pi: ExtensionAPI) {
     isDynamicSession: false,
     dynamicPhase: "design",
     agentInitiatedTask: null,
+    resumedFrom: null,
     processManager: null,
     memberHandles: memberHandlesRO,
     getHandle: (name) => memberHandles.get(name),
@@ -106,6 +110,22 @@ export default function (pi: ExtensionAPI) {
   // ── Member Inspector (成员检视浮窗) ───────────────────────
   // Handle for the currently-open inspector overlay; null when closed.
   let inspectorHandle: MemberInspectorHandle | null = null;
+
+  // ── Team mode editor factory ──
+  // Extracted so onSessionStart can RE-register it: onSessionEnd calls
+  // setEditorComponent(undefined) which makes pi swap back to the default
+  // editor, leaving teamModeEditorInstance as a dangling reference — without
+  // re-registration, /team resume (or /team start after /team stop in the
+  // same process) would leave the border uncolored.
+  const registerTeamEditor = (ui: any) => {
+    ui.setEditorComponent((tui: any, theme: any, kb: any) => {
+      teamModeEditorInstance = new TeamModeEditor(tui, theme, kb, ui.theme);
+      if (getSessionState().active) {
+        teamModeEditorInstance.setTeamMode(true);
+      }
+      return teamModeEditorInstance;
+    });
+  };
 
   pi.registerShortcut("alt+t", {
     description: "Member Inspector（成员检视浮窗）",
@@ -157,8 +177,8 @@ export default function (pi: ExtensionAPI) {
     lastAssistantTexts,
     perTurnReplied,
     pendingAutoReplies,
-    onMemberActivity: (memberName: string, _eventType: string) => {
-      inspectorHandle?.markDirty(memberName);
+    onMemberActivity: (memberName: string, event: any) => {
+      inspectorHandle?.onMemberEvent(memberName, event);
     },
   };
 
@@ -208,6 +228,8 @@ export default function (pi: ExtensionAPI) {
     onDynamicPhaseTransition: () => {
       if (teamCtx.isDynamicSession && teamCtx.dynamicPhase === "design") {
         teamCtx.dynamicPhase = "execution";
+        setManifestRuntimeContext({ dynamicPhase: "execution" });
+        syncActiveManifest();
         pi.sendMessage({
           customType: "team-message",
           content: "[系统] 动态团队模式已进入执行阶段。TL 现在可以读取项目代码和分析文件。",
@@ -458,13 +480,16 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ── session_shutdown: clean up team state on /new, /resume, /fork ──
+  // The session DIRECTORY IS PRESERVED (member contexts stay resumable via
+  // /team resume; manifest status stays "active" = interrupted). Member
+  // processes are stopped best-effort so no orphan keeps appending to a
+  // session file a later resume would reopen.
   pi.on("session_shutdown", () => {
     const _session = getSessionState();
     if (_session.active) {
-      const teamName = _session.teamDefinition?.name;
-      const sessionId = _session.sessionId;
       const isDynamic = teamCtx.isDynamicSession;
 
+      teamCtx.processManager?.stopAll().catch(() => {});
       endSession();
       resetGoal();
       if (teamCtx.onSessionEnd) {
@@ -478,15 +503,11 @@ export default function (pi: ExtensionAPI) {
       const _shutdownToRemove = new Set([...teamCtx.tlToolNames, "add_dynamic_member", "create_team_definition", "update_team_definition", STOP_TEAM_SESSION_TOOL_NAME]);
       pi.setActiveTools(_shutdownActive.filter((t: string) => !_shutdownToRemove.has(t)));
 
-      // Best-effort cleanup of session directory
-      if (isDynamic && teamName) {
-        try { rmSync(join(getRootDir(), "sessions", teamName), { recursive: true, force: true }); } catch (e) { console.warn('[top-notch-team] Failed to clean up dynamic session dir:', e); }
-      } else if (teamName && sessionId) {
-        try { rmSync(join(getRootDir(), "sessions", teamName, sessionId), { recursive: true, force: true }); } catch (e) { console.warn('[top-notch-team] Failed to clean up session dir:', e); }
-      }
       teamCtx.isDynamicSession = false;
       teamCtx.dynamicPhase = "design";
       teamCtx.agentInitiatedTask = null;
+      teamCtx.resumedFrom = null;
+      resetManifestRuntimeContext();
     }
   });
 
@@ -495,15 +516,13 @@ export default function (pi: ExtensionAPI) {
     // Track TL current model for /team setting "follow" mode
     tlCurrentModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
     // Part 1: Clean up stale team state when fresh session detected
+    // (session dir preserved — resumable via /team resume; members stopped
+    // best-effort, manifest keeps "active" = interrupted status)
     if (ctx.sessionManager) {
       const entries = ctx.sessionManager.getEntries() ?? [];
       const isFresh = entries.length <= 1;
       if (isFresh && getSessionState().active) {
-        const _session = getSessionState();
-        const teamName = _session.teamDefinition?.name;
-        const sessionId = _session.sessionId;
-        const isDynamic = teamCtx.isDynamicSession;
-
+        teamCtx.processManager?.stopAll().catch(() => {});
         endSession();
         resetGoal();
         if (teamCtx.onSessionEnd) {
@@ -517,14 +536,11 @@ export default function (pi: ExtensionAPI) {
         const _freshToRemove = new Set([...teamCtx.tlToolNames, "add_dynamic_member", "create_team_definition", "update_team_definition", STOP_TEAM_SESSION_TOOL_NAME]);
         pi.setActiveTools(_freshActive.filter((t: string) => !_freshToRemove.has(t)));
 
-        if (isDynamic && teamName) {
-          try { rmSync(join(getRootDir(), "sessions", teamName), { recursive: true, force: true }); } catch (e) { console.warn('[top-notch-team] Failed to clean up dynamic session dir:', e); }
-        } else if (teamName && sessionId) {
-          try { rmSync(join(getRootDir(), "sessions", teamName, sessionId), { recursive: true, force: true }); } catch (e) { console.warn('[top-notch-team] Failed to clean up session dir:', e); }
-        }
         teamCtx.isDynamicSession = false;
         teamCtx.dynamicPhase = "design";
         teamCtx.agentInitiatedTask = null;
+        teamCtx.resumedFrom = null;
+        resetManifestRuntimeContext();
       }
     }
 
@@ -541,13 +557,7 @@ export default function (pi: ExtensionAPI) {
     // command autocomplete and could cause empty candidate lists.
 
     // Register team mode editor factory (border color change)
-    ctx.ui.setEditorComponent((tui: any, theme: any, kb: any) => {
-      teamModeEditorInstance = new TeamModeEditor(tui, theme, kb, ctx.ui.theme);
-      if (getSessionState().active) {
-        teamModeEditorInstance.setTeamMode(true);
-      }
-      return teamModeEditorInstance;
-    });
+    registerTeamEditor(ctx.ui);
   });
 
   // ── model_select: keep TL current model up to date ──
@@ -561,7 +571,22 @@ export default function (pi: ExtensionAPI) {
       name: s.name,
       status: s.status,
       pid: s.pid,
-    })) ?? [])
+    })) ?? []),
+    {
+      // /team resume: spawn a member resuming its persisted pi session.
+      startResumedMember: async (name: string) => {
+        const config = buildMemberConfig(name, getSessionState(), { tlCurrentModel, resume: true });
+        if (!config) {
+          throw new Error(`无法为成员 "${name}" 构建配置`);
+        }
+        const handle = createAndRegisterMember(pi, config, memberLifecycleDeps);
+        teamCtx.setHandle(name, handle);
+        await handle.start();
+        // Record the fresh pid into the manifest
+        syncActiveManifest({ startedMember: { name, pid: handle.getState().pid } });
+        return handle.getState().pid;
+      },
+    }
   );
 
   // ── Team status widget (team mode visual indicator) ─────
@@ -575,6 +600,22 @@ export default function (pi: ExtensionAPI) {
     // installed on session resume). Outside a session, none of these tools
     // exist in the registry.
     ensureSessionToolsRegistered();
+
+    // Persist/refresh the on-disk session manifest (the /team resume anchor).
+    // Covers /team start, /team dynamic and /team resume — all funnel through
+    // this hook after the session state has been (re)initialized.
+    setManifestRuntimeContext({
+      isDynamic: teamCtx.isDynamicSession,
+      dynamicPhase: teamCtx.dynamicPhase,
+      agentInitiatedTask: teamCtx.agentInitiatedTask,
+    });
+    syncActiveManifest({ status: "active" });
+
+    // Re-register the editor factory BEFORE the widget guard below: after a
+    // /team stop the factory was cleared (setEditorComponent(undefined)) and
+    // teamModeEditorInstance is dangling — only a fresh factory instantiation
+    // (with session now active) reliably restores the colored border.
+    registerTeamEditor(ui);
 
     // If already installed, skip
     if (teamStatusWidget) return;
@@ -719,6 +760,31 @@ export default function (pi: ExtensionAPI) {
     }
 
     let extraPrompt = "";
+
+    // ── One-shot /team resume banner ──
+    // Set by the resume handler right after rehydration; consumed exactly once
+    // so the TL knows the session was restored from disk and in-flight work
+    // was not replayed.
+    let resumeBanner = "";
+    if (teamCtx.resumedFrom) {
+      const r = teamCtx.resumedFrom;
+      teamCtx.resumedFrom = null;
+      const restarted = r.restartedMembers.length > 0 ? r.restartedMembers.join("、") : "无";
+      const failed = r.failedMembers.length > 0 ? r.failedMembers.join("、") : "无";
+      resumeBanner = `
+## ⚡ 团队会话已从中断中恢复（/team resume）
+
+此会话（${r.teamName} / ${r.sessionId}）刚从磁盘清单恢复。成员进程已用 \`--continue\` 重启，**成员的完整对话上下文已保留**：
+- 已带上下文重启的成员：${restarted}
+- 重启失败的成员：${failed}${r.failedMembers.length > 0 ? "（可用 start_member 重试）" : ""}
+
+**恢复后的首要动作：**
+1. 用 \`list_members\` / \`wait_and_get_member_status\` 确认成员状态
+2. 中断前**正在执行中的任务不会自动继续**（成员进程当时已死亡），pending 的 team_send_and_wait 也已失效——必要时重新派发
+3. 向用户简要汇报恢复状态，然后继续完成原目标（如已设定 Goal 会随会话一并恢复）
+
+`;
+    }
 
     if (teamCtx.isCreatingTeam) {
       extraPrompt = `
@@ -912,8 +978,8 @@ Member 进程保持运行以便继续接收新任务。仅当成员进程异常�
 `;
     }
 
-    if (extraPrompt) {
-      return { systemPrompt: event.systemPrompt + extraPrompt };
+    if (extraPrompt || resumeBanner) {
+      return { systemPrompt: event.systemPrompt + resumeBanner + extraPrompt };
     }
   });
 }

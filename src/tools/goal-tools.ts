@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getSessionState, isActive } from "../session/state";
+import { syncActiveManifest } from "../session/manifest";
 
 // ── Types ──────────────────────────────────────────────────
 
@@ -102,6 +103,8 @@ export function registerGoalTools(pi: ExtensionAPI): void {
       }
 
       setGoalInternal(params.text, params.criteria);
+      // Persist into the session manifest so the goal survives TL restarts.
+      syncActiveManifest({ goal: { text: params.text, criteria: params.criteria } });
       return {
         details: { goal: params.text },
         content: [
@@ -147,6 +150,8 @@ export function registerGoalTools(pi: ExtensionAPI): void {
         };
       }
       goal.completed = true;
+      // Clear the goal from the persisted manifest (completed goals don't resume).
+      syncActiveManifest({ goal: null });
       return {
         details: { goal: goal.text, completed: true },
         content: [

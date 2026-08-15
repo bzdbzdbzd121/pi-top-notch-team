@@ -8,6 +8,7 @@ import type { AutoCompactRuntime } from "../channel/auto-compact";
 import type { ResolvedAutoCompact } from "../settings/resolve-auto-compact";
 import type { MemberOperationalState } from "../session/context";
 import { getSessionState } from "../session/state";
+import { syncActiveManifest } from "../session/manifest";
 import { createMemberProcess } from "../process/member-process";
 import { spawn } from "node:child_process";
 
@@ -144,6 +145,9 @@ export function registerTlTools(deps: TlToolsDeps): void {
       try {
         const handle = createMember(config);
         await handle.start();
+        // Persist started member + pid into the session manifest (/team resume
+        // restarts exactly this set and uses pids for orphan cleanup).
+        syncActiveManifest({ startedMember: { name: params.name, pid: handle.getState().pid } });
         // Notify the host about phase transition (e.g. dynamic mode design → execution)
         deps.onDynamicPhaseTransition?.();
         return {
@@ -191,6 +195,9 @@ export function registerTlTools(deps: TlToolsDeps): void {
     },
     async execute(_toolCallId: string, params: { name: string }): Promise<ToolResult> {
       await manager.stop(params.name);
+      // Intentional stop: remove from the manifest's started set so a later
+      // /team resume does not revive a member the TL deliberately stopped.
+      syncActiveManifest({ stoppedMember: params.name });
       return {
         details: {},
         content: [

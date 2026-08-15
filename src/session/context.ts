@@ -34,6 +34,17 @@ export interface TeamContext {
    * into the autonomous TL prompt; cleared on session teardown.
    */
   agentInitiatedTask: string | null;
+  /**
+   * Set by /team resume after a successful rehydrate; consumed (and cleared)
+   * by the next before_agent_start to inject a one-shot "session resumed"
+   * banner into the TL prompt.
+   */
+  resumedFrom?: {
+    teamName: string;
+    sessionId: string;
+    restartedMembers: string[];
+    failedMembers: string[];
+  } | null;
   processManager: ProcessManager | null;
   /** Direct Map access (read-only view). Prefer getHandle/setHandle for writes. */
   memberHandles: ReadonlyMap<string, MemberProcessHandle>;

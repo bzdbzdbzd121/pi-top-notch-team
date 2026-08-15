@@ -1,7 +1,23 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { readdirSync } from "node:fs";
 
 /** Maximum allowed serialized command size in bytes (1 MB). */
 export const MAX_COMMAND_SIZE = 1024 * 1024;
+
+/**
+ * Check whether a member session dir already contains a persisted pi session
+ * (`*.jsonl`, possibly nested one level in pi's per-cwd subdirectory). Used to
+ * decide whether `--continue` is safe: with no prior session file pi's
+ * continueRecent would have nothing to resume and the member would exit.
+ */
+export function hasSessionFiles(sessionDir: string): boolean {
+  try {
+    const entries = readdirSync(sessionDir, { withFileTypes: true, recursive: true });
+    return entries.some((e) => e.isFile() && e.name.endsWith(".jsonl"));
+  } catch {
+    return false;
+  }
+}
 
 /** Maximum number of pending writes before dropping oldest entries (OOM guard). */
 export const MAX_PENDING_WRITES = 1000;
@@ -26,6 +42,12 @@ export interface MemberProcessConfig {
   model?: string;
   /** Override the pi command path (for testing or custom installs). */
   piCommand?: string;
+  /**
+   * Resume the member's previous pi session (`--continue`) instead of starting
+   * fresh. Used by /team resume and by crash auto-restart so member context
+   * survives process death. Only honored when persisted session files exist.
+   */
+  resume?: boolean;
 }
 
 export type MemberStatus = "stopped" | "running" | "error";
@@ -77,6 +99,9 @@ export function createMemberProcess(
   let status: MemberStatus = "stopped";
   let pid: number | null = null;
   let startingInProgress = false;
+  // Becomes true after the first successful start. Subsequent (re)starts then
+  // resume the persisted session so a crash auto-restart does not lose context.
+  let startedOnce = false;
   const eventHandlers: Array<(event: any) => void> = [];
 
   // Write queue for handling backpressure (drain event)
@@ -274,12 +299,21 @@ export function createMemberProcess(
       });
 
       try {
+        // NOTE: never pass `--no-session` here — member sessions MUST persist
+        // (append-only .jsonl under sessionDir) so they survive crashes and can
+        // be resumed via `--continue`.
         const args = [
           "--mode", "rpc",
           "--session-dir", sessionDir,
           "-e", memberExtensionPath,
-          "--no-session", "false",
         ];
+        // Resume the persisted session when explicitly requested (/team resume)
+        // or when this handle has run before (crash auto-restart). Guarded by
+        // hasSessionFiles: with no prior .jsonl, --continue would find nothing
+        // and pi would exit immediately.
+        if ((config.resume || startedOnce) && hasSessionFiles(sessionDir)) {
+          args.push("--continue");
+        }
         if (model) {
           args.push("--model", model);
         }
@@ -364,6 +398,8 @@ export function createMemberProcess(
 
       // Wait for RPC process to be ready (first JSON line on stdout)
       await readyPromise;
+      // Mark after a successful start so later restarts resume the session.
+      startedOnce = true;
       } finally {
         startingInProgress = false;
       }

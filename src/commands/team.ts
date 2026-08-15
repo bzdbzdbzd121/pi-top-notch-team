@@ -18,6 +18,7 @@ import { handleDelete } from "./handlers/delete-handler";
 import { handleStatus } from "./handlers/status-handler";
 import { handleSetting } from "./handlers/setting-handler";
 import { handleHelp } from "./handlers/help-handler";
+import { handleResume, type ResumeHandlerDeps } from "./handlers/resume-handler";
 
 /**
  * Register a single /team command that dispatches to subcommand handlers.
@@ -29,6 +30,7 @@ import { handleHelp } from "./handlers/help-handler";
  *   /team done            — 完成并退出创建或编辑模式
  *   /team start <name>    — 启动团队会话
  *   /team stop            — 终止团队会话
+ *   /team resume [id]     — 恢复中断/已停止的团队会话（成员上下文完整保留）
  *   /team list            — 列出所有已创建的团队
  *   /team show <name>     — 显示团队定义详情
  *   /team delete <name>   — 删除团队定义
@@ -39,7 +41,8 @@ import { handleHelp } from "./handlers/help-handler";
 export function registerTeamCommand(
   pi: ExtensionAPI,
   teamCtx: TeamContext,
-  getMemberStatuses?: StatusProvider
+  getMemberStatuses?: StatusProvider,
+  resumeDeps?: ResumeHandlerDeps
 ): void {
   pi.registerCommand("team", {
     description: "管理团队（create / start / stop / list / show / delete / status）",
@@ -64,7 +67,7 @@ export function registerTeamCommand(
       }
 
       // Outside session: show all subcommands
-      const ALL_SUBCOMMANDS = ["create", "dynamic", "edit", "done", "cancel", "start", "stop", "list", "show", "delete", "status", "setting", "help"];
+      const ALL_SUBCOMMANDS = ["create", "dynamic", "edit", "done", "cancel", "start", "stop", "resume", "list", "show", "delete", "status", "setting", "help"];
       const TEAM_NAME_SUBCOMMANDS = ["start", "show", "delete", "edit"];
 
       const parts = prefix.split(/\s+/);
@@ -147,6 +150,13 @@ export function registerTeamCommand(
           return;
         case "stop":
           await handleStop(pi, teamCtx, ctx);
+          return;
+        case "resume":
+          if (!resumeDeps) {
+            ctx.ui.notify("/team resume 当前不可用（缺少成员启动依赖）。", "warning");
+            return;
+          }
+          await handleResume(pi, teamCtx, ctx, subargs, resumeDeps);
           return;
         case "list":
           await handleList(ctx);

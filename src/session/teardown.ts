@@ -3,9 +3,7 @@ import type { TeamContext } from "./context";
 import { getSessionState, endSession } from "./state";
 import { resetGoal } from "../tools/goal-tools";
 import { STOP_TEAM_SESSION_TOOL_NAME } from "../tools/agent-session-tool-names";
-import { getRootDir } from "../config";
-import { rmSync } from "node:fs";
-import { join } from "node:path";
+import { markManifestStopped, resetManifestRuntimeContext } from "./manifest";
 
 /**
  * Shared team-session teardown (ADR-0003).
@@ -50,25 +48,20 @@ export async function teardownTeamSession(
   teamCtx.onEditEnd?.();
   teamCtx.onCreateEnd?.();
 
-  // Clean up session directory
+  // Mark the session manifest as cleanly stopped. The session directory is
+  // intentionally PRESERVED (member pi session files + shared context) so the
+  // session stays resumable via /team resume — disk cleanup is explicit via
+  // /team delete, matching pi's own session semantics.
+  if (teamName !== "unknown" && sessionId) {
+    markManifestStopped(teamName, sessionId);
+  }
   if (isDynamic) {
-    const dynamicDir = join(getRootDir(), "sessions", teamName);
-    try {
-      rmSync(dynamicDir, { recursive: true, force: true });
-    } catch {
-      // Best-effort cleanup
-    }
     teamCtx.isDynamicSession = false;
     teamCtx.dynamicPhase = "design";
-  } else if (sessionId) {
-    const sessionDir = join(getRootDir(), "sessions", teamName, sessionId);
-    try {
-      rmSync(sessionDir, { recursive: true, force: true });
-    } catch {
-      // Best-effort cleanup
-    }
   }
   teamCtx.agentInitiatedTask = null;
+  teamCtx.resumedFrom = null;
+  resetManifestRuntimeContext();
 
   endSession();
   resetGoal();

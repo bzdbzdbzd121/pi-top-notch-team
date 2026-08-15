@@ -12,6 +12,7 @@ import type { TeamDefinition } from "../team/definition";
 const mockCreateMemberProcess = vi.fn();
 vi.mock("../process/member-process", () => ({
   createMemberProcess: (...args: any[]) => mockCreateMemberProcess(...args),
+  hasSessionFiles: () => false,
 }));
 
 // ── Test helpers ────────────────────────────────────────────

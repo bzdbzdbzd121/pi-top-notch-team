@@ -4,6 +4,7 @@ import { getSessionState } from "../session/state";
 import { bootstrapDynamicSession } from "../setup/dynamic-session-bootstrap";
 import { teardownTeamSession } from "../session/teardown";
 import { setGoalInternal } from "./goal-tools";
+import { setManifestRuntimeContext, syncActiveManifest } from "../session/manifest";
 import { START_TEAM_SESSION_TOOL_NAME, STOP_TEAM_SESSION_TOOL_NAME } from "./agent-session-tool-names";
 
 /**

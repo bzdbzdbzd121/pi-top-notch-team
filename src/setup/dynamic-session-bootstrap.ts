@@ -3,6 +3,7 @@ import type { TeamContext, SessionUI } from "../session/context";
 import type { SessionOrigin } from "../session/state";
 import { getSessionState, startSession, addMemberToSession } from "../session/state";
 import { ensureSharedContextFile } from "../session/shared-context";
+import { setManifestRuntimeContext, syncActiveManifest } from "../session/manifest";
 import { getRootDir } from "../config";
 import type { TeamDefinition, TeamMember } from "../team/definition";
 import { ensureToolRegistered } from "../commands/shared/ensure-tool";
@@ -51,6 +52,9 @@ export function ensureAddDynamicMemberTool(pi: ExtensionAPI, teamCtx: TeamContex
 
         try {
           addMemberToSession(member);
+          // Persist the updated roster — for dynamic teams this manifest is the
+          // ONLY durable copy of the member definitions (no YAML on disk).
+          syncActiveManifest();
           const session = getSessionState();
           if (session.teamDefinition) {
             teamCtx.router!.updateMembers(session.teamDefinition.members.map((m) => m.name));
@@ -107,6 +111,11 @@ export function bootstrapDynamicSession(
   ensureSharedContextFile(emptyTeam, getSessionState().sessionId);
   teamCtx.isDynamicSession = true;
   teamCtx.dynamicPhase = "design";
+
+  // Persist the session manifest immediately (the /team resume anchor) — do
+  // not rely on the onSessionStart UI hook, which embedders may skip.
+  setManifestRuntimeContext({ isDynamic: true, dynamicPhase: "design", agentInitiatedTask: null });
+  syncActiveManifest({ status: "active" });
 
   ensureAddDynamicMemberTool(pi, teamCtx);
 

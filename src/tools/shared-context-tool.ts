@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getSessionState, isActive, markSharedContextWritten } from "../session/state";
 import { getSharedContextPath } from "../session/shared-context";
+import { syncActiveManifest } from "../session/manifest";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
@@ -96,6 +97,8 @@ export function registerSharedContextTool(pi: ExtensionAPI): void {
       }
 
       markSharedContextWritten();
+      // Persist the gate flag into the session manifest (resume reuses it).
+      syncActiveManifest();
       return {
         details: { path, chars: params.content.length },
         content: [

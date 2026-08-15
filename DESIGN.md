@@ -383,9 +383,27 @@ The TL follows the **Orchestration Playbook** (`src/prompts/orchestration-playbo
 2. `teamCtx.clearHandles()` — clear member process handle map
 3. `router.updateMembers([])` — clear message channel targets
 4. `pi.setActiveTools([...filter out tlToolNames])` — deactivate TL tools
-5. If dynamic session: `rmSync(sessions/_dynamic_<ts>/, {recursive:true, force:true})` and `teamCtx.isDynamicSession = false`
-6. `endSession()` — clear session state
+5. `markManifestStopped(team, sessionId)` — mark `session.json` as `stopped`; **the session directory is PRESERVED** (member contexts + shared context stay resumable via `/team resume`; see ADR-0004). Dynamic sessions reset `teamCtx.isDynamicSession = false`
+6. `endSession()` + `resetGoal()` + `resetManifestRuntimeContext()` — clear in-memory state
 7. `before_agent_start` handler remains registered but checks `session.active` to skip injection
+
+### `/team resume [团队名或sessionId前缀]`
+
+恢复中断（TL 进程退出/被杀、/new、pi 会话切换）或已停止的团队会话（ADR-0004）。
+
+**Prerequisites (persisted at session runtime):**
+- Member pi sessions are always persisted (incremental append-only `.jsonl` under `sessions/<team>/<sessionId>/<member>/`); spawn never passes `--no-session`
+- `session.json` manifest: roster (the only durable copy for dynamic teams), origin, dynamicPhase, sharedContextWritten, Goal, startedMembers, memberPids, status (`active` = interrupted / `stopped` = clean stop)
+
+**Flow:**
+1. Scan `sessions/*/*/session.json` (incl. `_dynamic_*`), sort by `lastActiveAt` desc; arg filters by team name or sessionId prefix; multiple matches → `ctx.ui.select` picker
+2. Orphan cleanup: for each `memberPids` entry, verify via `/proc/<pid>/environ` (TEAM_NAME + session path) and SIGTERM survivors (Linux-only, best-effort)
+3. Rehydrate: `startSession(teamFromManifest, {sessionId, origin})` — manifest roster is authoritative (YAML supplies description/workflow only); restore `sharedContextWritten`, Goal, `isDynamicSession`/`dynamicPhase`/`agentInitiatedTask`
+4. `onSessionStart`（widget + 会话工具注册 + 重注册 team-mode 编辑器工厂——`onSessionEnd` 曾用 `setEditorComponent(undefined)` 将其清除，不重新注册则输入框边框不变色）+ 激活工具（动态团队 + `add_dynamic_member`，agent 来源 + `stop_team_session`）
+5. Restart every `startedMembers` entry with `--continue` (full context restore); failures reported, TL may retry via `start_member`
+6. Re-stamp manifest `active` with fresh pids; set `teamCtx.resumedFrom` for a one-shot TL prompt banner (next `before_agent_start`): context preserved, in-flight tasks NOT replayed, pending corrIds invalid — TL re-checks member status and re-dispatches
+
+**Resume semantics:** members restore to the last completed entry of their persisted session; work in flight at interruption time is lost (the process died mid-turn) and members come back idle. Task orchestration is rebuilt by the TL, matching pi's own resume model.
 
 ### `/team list`
 
@@ -876,7 +894,7 @@ interface TeamContext {
 - `"execution"`: Execution-phase whitelist applied (team management + read-only analysis tools + .md write/edit); tools like `ctx_execute`/`mcp` remain blocked
 - Transition from `"design"` → `"execution"` happens automatically on first `start_member` success, via the `onDynamicPhaseTransition` callback wired in `index.ts`
 
-Session state (active + team definition) is stored in `session/state.ts` as a module-level variable. Member process handles, message channel, and other runtime objects are in `TeamContext` passed to command handlers. On `/team stop`, all processes are terminated, handles cleared, and state reset.
+Session state (active + team definition) is stored in `session/state.ts` as a module-level variable, mirrored to disk as `session/manifest.ts`'s `session.json` (the /team resume anchor, ADR-0004). Member process handles, message channel, and other runtime objects are in `TeamContext` passed to command handlers. On `/team stop`, all processes are terminated, handles cleared, in-memory state reset — the session directory is kept (manifest marked `stopped`) so `/team resume` can restore it.
 
 **`addMemberToSession(member: TeamMember): TeamDefinition`** — Adds a member to the active session's team definition and refreshes the session state. Used by the `add_dynamic_member` tool during `/team dynamic`. Throws if no active session.
 
@@ -1137,7 +1155,7 @@ Overlay: `ctx.ui.custom(component, { overlay: true, overlayOptions: { width: "90
 ### Rendering Granularity
 
 - user/assistant text rendered in full (wrapped)
-- thinking blocks hidden by default, toggleable per tab with `t` (rendered as dim `💭 思考` + wrapped content)
+- thinking blocks hidden by default, toggleable per tab with `t` (rendered as dim `💭 思考` + wrapped content); **with `t` on, streaming thinking renders line-by-line as deltas arrive** (coalesced local rebuilds at an adaptive 100ms→1s cadence, no RPC; each flush wraps only the new delta via the append-only wrap cache — cost stays flat as thinking grows)
 - tool calls collapsed to one-line summaries (`🔧 name arg-summary`), expandable with `e`
 - expanded tool call arguments: pretty-printed JSON, **every line wrapped to the frame width** — long `content`/`command`/`path` values wrap across multiple lines instead of being hard-truncated (the summary line wraps too); total display lines capped at a 40-line budget per call (`EXPANDED_ARGS_MAX_LINES`), overflow collapsed to a `…` marker
 - tool results collapsed to `✓/✗ toolName first-line`, expandable with `e`
@@ -1146,12 +1164,52 @@ Overlay: `ctx.ui.custom(component, { overlay: true, overlayOptions: { width: "90
 
 ### Data Flow (event-driven refresh)
 
+Two independent refresh paths:
+
+**1. Streaming path (live tail — thinking/text/toolcall stream in as they happen):**
+
 ```
-Member RPC event (message_end / tool_execution_end / ...)
-  → event-handler.ts onMemberActivity(memberName, eventType) hook
-  → inspectorHandle.markDirty(memberName)          (cheap, no I/O)
-  → throttled flush (500ms): RPC get_messages
-  → buildBodyLines(messages, {width, expanded})    (pure function)
+Member RPC event message_start / message_update (deltas) / message_end
+  → event-handler.ts onMemberActivity(memberName, event) hook   (full event)
+  → inspectorHandle.onMemberEvent(memberName, event)
+  → MemberInspectorState: assemble the live partial assistant message
+      (message_start seeds content; contentIndex-keyed deltas grow blocks:
+       text/thinking accumulate, toolcall accumulates raw partialArgs JSON
+       and is finalized by toolcall_end)
+  → coalesced local rebuild + render (adaptive cadence 100ms→1s, STREAM_FLUSH_MS
+      baseline; backs off when a rebuild eats over half the interval, recovers
+      when cheap — nextStreamFlushDelay hysteresis)
+      — ZERO RPC traffic per delta: the live tail is appended to the last
+      fetched history and rebuilt via the incremental cache's streaming-tail
+      rule (INCREMENTAL_TAIL) + the P2 append-only wrap cache
+      (wrapAppendOnly: WeakMap per block object, wraps only the new delta —
+      O(Δ) per flush instead of re-wrapping the whole thinking/text block;
+      byte-identical to wrapText incl. grapheme clusters split across deltas).
+      Only the ACTIVE tab's tail is rebuilt per flush — N concurrently
+      streaming members no longer multiply the cost; inactive tabs catch up
+      on tab switch or via the refetch path (markDirty → flushDirty).
+```
+
+RPC-mode `message_update` events carry deltas only (the cumulative `partial`
+is stripped on the wire) and `get_messages` does NOT include the in-progress
+message — it lands in history only at `message_end`. Without the live tail the
+inspector showed nothing until the whole thinking block completed; now the
+💭 block grows line by line (followTail auto-scrolls; scrolled-up users get
+`↓ 有更新`). `message_end` keeps the authoritative message as a **pending
+completion** (rendered after the fetched history) until the refetch confirms
+it — a message never vanishes between `message_end` and the refetch, and
+`reconcilePending` drops it exactly once (content equality; tolerates
+interleaved toolResult messages between completions). `agent_end` clears the
+live tail.
+
+**2. Refetch path (completed content — unchanged):**
+
+```
+Member RPC event (tool_execution_end / message_end / ...)
+  → event-handler.ts onMemberActivity hook
+  → inspectorHandle.onMemberEvent(memberName, event)   (non-stream events)
+  → tab.dirty → throttled flush (500ms): RPC get_messages
+  → buildBodyLines([...messages, ...pendingCompletions, live?], opts)  (pure)
   → setTabLines (tail-follow or scroll-preserve + "↓ 有更新")
   → tui.requestRender()
 
