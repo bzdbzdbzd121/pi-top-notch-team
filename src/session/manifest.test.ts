@@ -149,4 +149,35 @@ describe("listSessionManifests", () => {
     writeFileSync(join(dir, "session.json"), "{not json");
     expect(listSessionManifests(rootDir)).toEqual([]);
   });
+
+  it("records the process cwd on sync", () => {
+    startSession(team, { sessionId: "s1" });
+    syncActiveManifest();
+    const m = readManifestFile(getManifestPath(rootDir, "think-tank", "s1"))!;
+    expect(m.cwd).toBe(process.cwd());
+  });
+
+  it("filters by cwd when the option is given", () => {
+    // One manifest from this cwd (via sync)…
+    startSession(team, { sessionId: "s-here" });
+    syncActiveManifest();
+    endSession();
+    // …and one from another directory (written directly)
+    const otherDir = join(rootDir, "sessions", "other-team", "s-else");
+    mkdirSync(otherDir, { recursive: true });
+    writeFileSync(join(otherDir, "session.json"), JSON.stringify({
+      version: 1, teamName: "other-team", sessionId: "s-else", origin: "user",
+      isDynamic: false, dynamicPhase: "execution", status: "active",
+      startedAt: 1, lastActiveAt: 2, cwd: "/elsewhere",
+      sharedContextWritten: true, goal: null, agentInitiatedTask: null,
+      members: [], startedMembers: [], memberPids: {},
+    }));
+
+    expect(listSessionManifests(rootDir).map((e) => e.manifest.sessionId).sort())
+      .toEqual(["s-else", "s-here"]);
+    expect(listSessionManifests(rootDir, { cwd: process.cwd() }).map((e) => e.manifest.sessionId))
+      .toEqual(["s-here"]);
+    expect(listSessionManifests(rootDir, { cwd: "/elsewhere" }).map((e) => e.manifest.sessionId))
+      .toEqual(["s-else"]);
+  });
 });

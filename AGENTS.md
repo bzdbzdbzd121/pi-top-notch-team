@@ -214,7 +214,7 @@ src/
 
 22. **Agent 自主会话（agent-initiated team sessions，ADR-0003）** — `start_team_session(task)` 在**扩展加载时注册**（决策 #21 的唯一例外），agent 可随时自主进入动态团队会话委派复杂任务。核心设计哲学：**会话来源（`origin: "user" | "agent"`，`TeamSessionState.origin`）决定守卫强度**——手动会话 = 用户期望「以团队方式做事」，全守卫；自主会话 = agent 自己的手段选择，用户只要结果，故移除派发管制（tl-read-guard、设计 read 软限制、第一动作协议），保留写入管制（TL 与成员共享同一文件系统，并发写会物理覆盖——结构性安全非不信任）。完全自主：无 Playbook grilling、无确认门；`task` 必填并自动置 Goal + 注入自主版提示词（`src/prompts/agent-initiated-mode.ts`）。生命周期对称：`stop_team_session` 由 agent 自主终结会话——会话作用域注册但**仅自主会话激活**（`AGENT_SESSION_TOOL_NAMES` 条件可见性），与 `/team stop` 共享 `src/session/teardown.ts`。嵌套结构性不可能（`TEAM_ROLE` 早退）；重入返回错误。可见性：启动 notify（🤖 + task 摘要）+ widget 持久来源标记（🤖/👤）。预定义团队支持明确推迟（dynamic-only 先行）。
 
-23. **团队会话恢复（/team resume，ADR-0004）** — 四层设计：(a) **member 会话落盘**：移除 spawn 参数中的 `--no-session false`（pi 的 `--no-session` 是裸布尔 flag，该写法曾使 member 纯内存运行、上下文从不落盘——根因 bug）；pi session 增量 append，崩溃仅丢最后半条。(b) **重启即续接**：`MemberProcessConfig.resume` + `buildMemberConfig` 自动探测（session 目录有 `.jsonl` 则 `--continue`）+ 进程内 `startedOnce`（崩溃 auto-restart 自动续接）；`hasSessionFiles` 守卫空目录。(c) **会话清单**：`sessions/<team>/<sessionId>/session.json` 持久化名册（动态团队唯一磁盘副本）/origin/phase/Goal/sharedContextWritten/startedMembers/memberPids，所有状态变更点合并写（tmp+rename 原子，fail-open）。(d) **停止即保留**：`/team stop`/`session_shutdown` 不再 rmSync，manifest 标记 `stopped` 或保留 `active`（中断语义）；`session_start` 检测到中断会话时状态栏提示。`/team resume` 以原 sessionId 重建状态、`--continue` 重启成员（上下文完整恢复）、/proc 校验后清理孤儿进程；中断时进行中的任务不重放，由 TL 确认状态后重建编排。
+23. **团队会话恢复（/team resume，ADR-0004）** — 四层设计：(a) **member 会话落盘**：移除 spawn 参数中的 `--no-session false`（pi 的 `--no-session` 是裸布尔 flag，该写法曾使 member 纯内存运行、上下文从不落盘——根因 bug）；pi session 增量 append，崩溃仅丢最后半条。(b) **重启即续接**：`MemberProcessConfig.resume` + `buildMemberConfig` 自动探测（session 目录有 `.jsonl` 则 `--continue`）+ 进程内 `startedOnce`（崩溃 auto-restart 自动续接）；`hasSessionFiles` 守卫空目录。(c) **会话清单**：`sessions/<team>/<sessionId>/session.json` 持久化名册（动态团队唯一磁盘副本）/origin/phase/Goal/sharedContextWritten/startedMembers/memberPids，所有状态变更点合并写（tmp+rename 原子，fail-open）。(d) **停止即保留**：`/team stop`/`session_shutdown` 不再 rmSync，manifest 标记 `stopped` 或保留 `active`（中断语义）；`session_start` 检测到中断会话时状态栏提示。`/team resume` 以原 sessionId 重建状态、`--continue` 重启成员（上下文完整恢复）、/proc 校验后清理孤儿进程；中断时进行中的任务不重放，由 TL 确认状态后重建编排。会话列表按 **cwd 项目作用域**过滤（对齐 `pi --resume`：manifest 记录创建时的 cwd，默认只列当前目录会话，`--all` 显示全部并附目录标注）。
 
 ## Dependency Injection Pattern
 
@@ -357,7 +357,7 @@ npm run test:watch  # Watch mode
 | `/team dynamic` | Dynamic team mode — TL designs team on the fly based on user requirements |
 | `/team edit <name>` | Natural language team modification via TL dialogue; installs edit-mode widget (⟳ `onEditStart`/`onEditEnd` hooks) |
 | `/team start <name>` | Start team session with a pre-defined YAML team, activate TL tools |
-| `/team resume [标识]` | 恢复中断或已停止的团队会话：按 session.json 清单重建状态，成员以 `--continue` 带完整上下文重启（ADR-0004） |
+| `/team resume [标识\|--all]` | 恢复中断或已停止的团队会话：按 session.json 清单重建状态，成员以 `--continue` 带完整上下文重启。默认仅列当前目录（cwd）的会话，`--all` 显示全部（ADR-0004） |
 | `/team stop` | Stop all members, deactivate TL tools（会话目录保留并标记 stopped，可用 /team resume 恢复；磁盘清理由 /team delete 负责） |
 | `/team list` | List all team definitions |
 | `/team show <name>` | Display team definition details |

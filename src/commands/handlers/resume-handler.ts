@@ -71,11 +71,12 @@ export function cleanupOrphanMembers(manifest: TeamSessionManifest): string[] {
 
 // ── Picker label ───────────────────────────────────────────
 
-function formatEntry(m: TeamSessionManifest): string {
+function formatEntry(m: TeamSessionManifest, showCwd: boolean): string {
   const when = new Date(m.lastActiveAt).toLocaleString();
   const status = m.status === "active" ? "中断" : "已停止";
   const kind = m.isDynamic ? "动态" : "预定义";
-  return `${m.teamName} (${m.sessionId}) — ${kind}/${status}/${m.members.length} 成员 — ${when}`;
+  const cwd = showCwd ? ` — ${m.cwd ?? "未知目录"}` : "";
+  return `${m.teamName} (${m.sessionId}) — ${kind}/${status}/${m.members.length} 成员 — ${when}${cwd}`;
 }
 
 // ── Handler ────────────────────────────────────────────────
@@ -93,28 +94,47 @@ export async function handleResume(
   }
 
   const rootDir = getRootDir();
-  const entries = listSessionManifests(rootDir);
+
+  // Project scoping (mirrors pi --resume): default to the current working
+  // directory only; "--all" lists sessions from every directory.
+  const parts = subargs.trim().split(/\s+/).filter(Boolean);
+  const showAll = parts.includes("--all");
+  const arg = parts.filter((p) => p !== "--all").join(" ");
+
+  const entries = listSessionManifests(
+    rootDir,
+    showAll ? undefined : { cwd: ctx.cwd ?? process.cwd() }
+  );
   if (entries.length === 0) {
-    ctx.ui.notify("没有可恢复的团队会话（未找到任何 session.json 清单）。", "info");
+    ctx.ui.notify(
+      showAll
+        ? "没有可恢复的团队会话（未找到任何 session.json 清单）。"
+        : "当前目录没有可恢复的团队会话。其他目录的会话可用 /team resume --all 查看。",
+      "info"
+    );
     return;
   }
 
   // ── Pick which session to resume ──
-  const arg = subargs.trim();
   let candidates = entries;
   if (arg) {
     candidates = entries.filter(
       (e) => e.manifest.teamName === arg || e.manifest.sessionId.startsWith(arg)
     );
     if (candidates.length === 0) {
-      ctx.ui.notify(`没有匹配 "${arg}" 的可恢复会话。`, "warning");
+      ctx.ui.notify(
+        showAll
+          ? `没有匹配 "${arg}" 的可恢复会话。`
+          : `当前目录没有匹配 "${arg}" 的可恢复会话（可用 --all 在所有目录中查找）。`,
+        "warning"
+      );
       return;
     }
   }
 
   let selected = candidates[0];
   if (candidates.length > 1) {
-    const options = candidates.map((e) => formatEntry(e.manifest));
+    const options = candidates.map((e) => formatEntry(e.manifest, showAll));
     const choice = await ctx.ui.select("选择要恢复的团队会话（按最后活跃时间排序）", options);
     if (!choice) return; // cancelled
     const idx = options.indexOf(choice);

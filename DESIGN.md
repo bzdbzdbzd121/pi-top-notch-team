@@ -396,7 +396,7 @@ The TL follows the **Orchestration Playbook** (`src/prompts/orchestration-playbo
 - `session.json` manifest: roster (the only durable copy for dynamic teams), origin, dynamicPhase, sharedContextWritten, Goal, startedMembers, memberPids, status (`active` = interrupted / `stopped` = clean stop)
 
 **Flow:**
-1. Scan `sessions/*/*/session.json` (incl. `_dynamic_*`), sort by `lastActiveAt` desc; arg filters by team name or sessionId prefix; multiple matches → `ctx.ui.select` picker
+1. Scan `sessions/*/*/session.json` (incl. `_dynamic_*`), sort by `lastActiveAt` desc; **filter to the current working directory by default** (manifest records the creating TL's cwd — mirrors `pi --resume` project scoping; `--all` lists every directory with cwd shown in labels); arg filters by team name or sessionId prefix; multiple matches → `ctx.ui.select` picker
 2. Orphan cleanup: for each `memberPids` entry, verify via `/proc/<pid>/environ` (TEAM_NAME + session path) and SIGTERM survivors (Linux-only, best-effort)
 3. Rehydrate: `startSession(teamFromManifest, {sessionId, origin})` — manifest roster is authoritative (YAML supplies description/workflow only); restore `sharedContextWritten`, Goal, `isDynamicSession`/`dynamicPhase`/`agentInitiatedTask`
 4. `onSessionStart`（widget + 会话工具注册 + 重注册 team-mode 编辑器工厂——`onSessionEnd` 曾用 `setEditorComponent(undefined)` 将其清除，不重新注册则输入框边框不变色）+ 激活工具（动态团队 + `add_dynamic_member`，agent 来源 + `stop_team_session`）

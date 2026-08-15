@@ -43,6 +43,7 @@ function writeManifest(rootDir: string, m: Partial<TeamSessionManifest> & { team
     status: "active",
     startedAt: Date.now() - 10000,
     lastActiveAt: Date.now() - 5000,
+    cwd: "/test/project", // matches createMockContext().cwd
     sharedContextWritten: true,
     goal: null,
     agentInitiatedTask: null,
@@ -168,5 +169,42 @@ describe("/team resume", () => {
     const active = (pi.setActiveTools as any).mock.calls.at(-1)?.[0] as string[];
     expect(active).toContain("add_dynamic_member");
     expect(active).toContain("stop_team_session");
+  });
+
+  it("only lists sessions from the current working directory by default", async () => {
+    writeManifest(rootDir, { teamName: "this-dir", sessionId: "s-here", startedMembers: [] });
+    writeManifest(rootDir, { teamName: "other-dir", sessionId: "s-else", startedMembers: [], cwd: "/other/project" });
+    const pi = createMockExtensionAPI();
+    const ctx = createMockContext();
+
+    // Only one candidate in this cwd → resumed directly without a picker
+    await handleResume(pi as any, makeTeamCtx(), ctx as any, "", { startResumedMember: vi.fn() });
+    expect(ctx.ui.select).not.toHaveBeenCalled();
+    expect(getSessionState().teamDefinition?.name).toBe("this-dir");
+  });
+
+  it("--all lists sessions from every directory", async () => {
+    writeManifest(rootDir, { teamName: "this-dir", sessionId: "s-here", startedMembers: [] });
+    writeManifest(rootDir, { teamName: "other-dir", sessionId: "s-else", startedMembers: [], cwd: "/other/project" });
+    const pi = createMockExtensionAPI();
+    const ctx = createMockContext();
+    (ctx.ui.select as any).mockImplementation(async (_t: string, opts: string[]) => opts[0]);
+
+    await handleResume(pi as any, makeTeamCtx(), ctx as any, "--all", { startResumedMember: vi.fn() });
+    expect(ctx.ui.select).toHaveBeenCalled();
+    // Picker shows 2 candidates and labels include the working directory
+    const options = (ctx.ui.select as any).mock.calls[0][1] as string[];
+    expect(options).toHaveLength(2);
+    expect(options.some((o) => o.includes("/other/project"))).toBe(true);
+  });
+
+  it("reports the --all escape hatch when the current directory has no sessions", async () => {
+    writeManifest(rootDir, { teamName: "other-dir", sessionId: "s-else", startedMembers: [], cwd: "/other/project" });
+    const pi = createMockExtensionAPI();
+    const ctx = createMockContext();
+
+    await handleResume(pi as any, makeTeamCtx(), ctx as any, "", { startResumedMember: vi.fn() });
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("--all"), "info");
+    expect(getSessionState().active).toBe(false);
   });
 });

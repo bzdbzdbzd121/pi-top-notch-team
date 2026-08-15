@@ -50,6 +50,11 @@ export interface TeamSessionManifest {
   status: "active" | "stopped";
   startedAt: number;
   lastActiveAt: number;
+  /** Working directory of the TL process that created this session. pi scopes
+   *  sessions per project (cwd); /team resume does the same — only sessions
+   *  from the current cwd are listed by default (--all shows everything).
+   *  Absent in manifests written before this field existed. */
+  cwd?: string;
   sharedContextWritten: boolean;
   goal: ManifestGoal | null;
   agentInitiatedTask: string | null;
@@ -131,9 +136,9 @@ export interface ManifestEntry {
  * (including `_dynamic_*`). Sorted by lastActiveAt descending (most recent
  * first). Corrupt/unreadable manifests are skipped.
  */
-export function listSessionManifests(rootDir: string): ManifestEntry[] {
+export function listSessionManifests(rootDir: string, options?: { cwd?: string }): ManifestEntry[] {
   const sessionsRoot = join(rootDir, "sessions");
-  const out: ManifestEntry[] = [];
+  let out: ManifestEntry[] = [];
   let teamDirs: string[];
   try {
     teamDirs = readdirSync(sessionsRoot, { withFileTypes: true })
@@ -158,6 +163,12 @@ export function listSessionManifests(rootDir: string): ManifestEntry[] {
     }
   }
   out.sort((a, b) => b.manifest.lastActiveAt - a.manifest.lastActiveAt);
+  // Project scoping (mirrors pi --resume): when a cwd filter is given, only
+  // sessions created in that directory are returned. Manifests without a cwd
+  // (written before this field existed) are excluded from filtered results.
+  if (options?.cwd) {
+    out = out.filter((e) => e.manifest.cwd === options.cwd);
+  }
   return out;
 }
 
@@ -212,6 +223,7 @@ export function syncActiveManifest(patch: ManifestSyncPatch = {}, rootDir: strin
       status: patch.status ?? existing?.status ?? "active",
       startedAt: existing?.startedAt ?? session.startedAt ?? Date.now(),
       lastActiveAt: Date.now(),
+      cwd: process.cwd(),
       sharedContextWritten: session.sharedContextWritten,
       goal: patch.goal !== undefined ? patch.goal : existing?.goal ?? null,
       agentInitiatedTask: runtimeCtx.agentInitiatedTask,
