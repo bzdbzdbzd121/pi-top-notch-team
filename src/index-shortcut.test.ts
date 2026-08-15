@@ -1,9 +1,17 @@
-import { it, expect, vi } from "vitest";
+import { it, expect, vi, beforeEach } from "vitest";
 
 // ── Integration smoke: index.ts default export wiring ──────
 // Verifies the Member Inspector shortcut is registered at extension init
 // and that the handler is gated on an active team session (decision #7:
 // no reaction outside a team session).
+
+// index.ts's default export returns early when TEAM_ROLE is set (member
+// process mode). Tests may run inside a member process (e.g. when the test
+// suite is executed by a team member agent), so the env var must be cleared
+// — same pattern as index.test.ts / index.agent-settled.test.ts.
+beforeEach(() => {
+  delete process.env.TEAM_ROLE;
+});
 
 function makeMockPi() {
   return {
