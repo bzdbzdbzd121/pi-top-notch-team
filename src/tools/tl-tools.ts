@@ -403,6 +403,10 @@ export function registerTlTools(deps: TlToolsDeps): void {
       },
       required: ["tasks", "nextSteps"],
     },
+    // P2：校验前规范化（prepareArguments，agent-loop 在 validateToolArguments
+    // 之前调用）——string 解码 / 单对象包裹等确定性修复在框架校验前完成，
+    // 减少 execute 内 parseTasks 的兜底面。契约见 prepareTeamSendAndWaitArgs。
+    prepareArguments: prepareTeamSendAndWaitArgs as any,
     async execute(
       _toolCallId: string,
       params: { tasks: unknown; nextSteps: string }
@@ -996,6 +1000,58 @@ function buildDropRecoveryNote(droppedDetails: DroppedTaskDetail[]): string {
   }
   lines.push(...droppedDetails.map((d) => `tasks[${d.index}] ${d.reason}，已丢弃`));
   return lines.join("\n");
+}
+
+/**
+ * P2：校验前规范化（prepareArguments 钩子，agent-loop 在 validateToolArguments
+ * 之前调用，types.d.ts:362）。契约（D2/D3 裁决）：
+ *
+ * - 只做确定性修复：string 编码数组（严格 JSON.parse 成功）→ 转数组；
+ *   单对象 → 包裹为数组。断串（parse 失败）→ 保持原样放行，由 execute
+ *   的 parseTasks salvage 兜底——钩子不复制 salvage 逻辑（避免双份实现漂移）。
+ * - 缺 to/content 条目：不修复字段、不抛错——数组原样放行，单对象包裹后
+ *   放行，由 execute 丢弃 + 逐条提示。
+ * - 绝不整批抛错：规范化后仍非 array/object/string 三形态的值（null/数字）
+ *   原样放行——框架原本也会拦，execute 0 任务分支兜底给出友好错误。
+ * - 修复路径输出恒为数组（满足 P1 放宽后的 schema），避免二次校验失败。
+ *
+ * 与 parseTasks 幂等衔接：规范化后 execute 内 parseTasks 只处理残余形态。
+ */
+export function prepareTeamSendAndWaitArgs(args: unknown): unknown {
+  if (typeof args !== "object" || args === null || Array.isArray(args)) {
+    return args; // 非对象参数（非 TParams 形态）：原样放行
+  }
+  const params = args as Record<string, unknown>;
+  if (!("tasks" in params)) {
+    return args; // 缺 tasks 字段：原样放行（required 校验归框架）
+  }
+  const tasks = params.tasks;
+  // 已合规形态：数组（含缺字段条目）不动。
+  if (Array.isArray(tasks)) {
+    return args;
+  }
+  // string 编码：严格 JSON.parse 成功且结果为数组/对象 → 转数组。
+  // 确定性修复的边界：只吃"完整 JSON"；断串留给 execute 的 salvage。
+  if (typeof tasks === "string") {
+    try {
+      const parsed: unknown = JSON.parse(tasks);
+      if (Array.isArray(parsed)) {
+        return { ...params, tasks: parsed };
+      }
+      if (typeof parsed === "object" && parsed !== null) {
+        return { ...params, tasks: [parsed] };
+      }
+    } catch {
+      // 断串：原样放行（execute parseTasks salvage 兜底）
+    }
+    return args;
+  }
+  // 单对象（含缺字段对象）：包裹为数组——条目不修复，execute 丢弃 + 逐条提示。
+  if (typeof tasks === "object" && tasks !== null) {
+    return { ...params, tasks: [tasks] };
+  }
+  // 其他形态（null/数字/布尔）：原样放行（框架拦截或 execute 0 任务分支）。
+  return args;
 }
 
 /** Parsed tasks from LLM input — handles raw array, string-encoded array, single object, and broken JSON salvage. */

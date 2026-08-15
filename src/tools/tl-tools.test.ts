@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { Compile } from "typebox/compile";
-import { registerTlTools, WAIT_IDLE_CHECK_INTERVAL_MS, WAIT_IDLE_REQUIRED_CONSECUTIVE } from "./tl-tools";
+import { registerTlTools, WAIT_IDLE_CHECK_INTERVAL_MS, WAIT_IDLE_REQUIRED_CONSECUTIVE, prepareTeamSendAndWaitArgs } from "./tl-tools";
 import { startSession, endSession, markSharedContextWritten } from "../session/state";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { ProcessManager } from "../process/manager";
@@ -55,14 +55,19 @@ function createMockResponseWaiter(): ResponseWaiter {
  * 九种形态）已足够忠实；且已实测 pi 运行时内置 typebox 1.3.7 与本测试
  * 所用版本对放宽 schema 的判定结果完全一致。
  *
+ * P2：按真实 agent-loop 流程执行——先 prepareArguments（校验前规范化，
+ * types.d.ts:362），再 Check（validateToolArguments），最后 execute。
+ *
  * passed=false 表示参数被框架层拦截（TypeBox oneOf 硬失败）。
  */
 async function executeViaFramework(toolDef: any, args: unknown) {
+  // 真实流程：prepareArguments → validateToolArguments（Check）→ execute
+  const prepared = toolDef.prepareArguments ? toolDef.prepareArguments(args) : args;
   const validator = Compile(toolDef.parameters);
-  if (!validator.Check(args)) {
+  if (!validator.Check(prepared)) {
     return { passed: false as const, result: undefined };
   }
-  return { passed: true as const, result: (await toolDef.execute("call-1", args)) as any };
+  return { passed: true as const, result: (await toolDef.execute("call-1", prepared)) as any };
 }
 
 function createMockMessageQueue(): MessageQueue {
@@ -544,6 +549,42 @@ describe("registerTlTools", () => {
       const numResult = await executeViaFramework(toolDef, { tasks: 42, nextSteps: "x" });
       expect(numResult.passed).toBe(false);
       expect(messageQueue.enqueue).not.toHaveBeenCalled();
+    });
+
+    // ── P2 prepareArguments 校验前规范化 ──
+
+    it("P2: team_send_and_wait 注册了 prepareArguments 钩子", () => {
+      const toolDef = getTeamSendAndWaitDef();
+      expect(typeof toolDef.prepareArguments).toBe("function");
+    });
+
+    it("P2: 双编码字符串经 prepare 后以数组形态通过框架校验", async () => {
+      memberOpsStates.set("planner", "idle");
+      const toolDef = getTeamSendAndWaitDef();
+      const args = { tasks: JSON.stringify([{ to: "planner", content: "Do" }]), nextSteps: "x" };
+      // 校验前规范化：字符串 → 数组
+      const prepared = toolDef.prepareArguments(args);
+      expect(Array.isArray(prepared.tasks)).toBe(true);
+      expect(Compile(toolDef.parameters).Check(prepared)).toBe(true);
+      // 全流程：prepare → Check → execute 正常派发
+      const { passed, result } = await executeViaFramework(toolDef, args);
+      expect(passed).toBe(true);
+      expect(messageQueue.enqueue).toHaveBeenCalledTimes(1);
+      expect(messageQueue.enqueue).toHaveBeenCalledWith(
+        expect.objectContaining({ to: "planner" })
+      );
+    });
+
+    it("P2: 单对象经 prepare 后以数组形态通过框架校验", async () => {
+      memberOpsStates.set("planner", "idle");
+      const toolDef = getTeamSendAndWaitDef();
+      const args = { tasks: { to: "planner", content: "Do" }, nextSteps: "x" };
+      const prepared = toolDef.prepareArguments(args);
+      expect(prepared.tasks).toEqual([{ to: "planner", content: "Do" }]);
+      expect(Compile(toolDef.parameters).Check(prepared)).toBe(true);
+      const { passed } = await executeViaFramework(toolDef, args);
+      expect(passed).toBe(true);
+      expect(messageQueue.enqueue).toHaveBeenCalledTimes(1);
     });
 
     it("未知成员错误：to 不是成员名前缀时不附截断提示", async () => {
@@ -1065,6 +1106,114 @@ describe("registerTlTools", () => {
 });
 
 // ── Additional execute behavior tests ──────────────────────
+
+describe("prepareTeamSendAndWaitArgs (P2 校验前规范化单测)", () => {
+  it("string 编码数组（严格 JSON.parse 成功）→ 转数组", () => {
+    const out = prepareTeamSendAndWaitArgs({
+      tasks: JSON.stringify([{ to: "planner", content: "Do" }, { to: "coder", content: "Code" }]),
+      nextSteps: "x",
+    });
+    expect(out).toEqual({
+      tasks: [{ to: "planner", content: "Do" }, { to: "coder", content: "Code" }],
+      nextSteps: "x",
+    });
+  });
+
+  it("string 编码单对象 → 包裹为数组", () => {
+    const out = prepareTeamSendAndWaitArgs({
+      tasks: JSON.stringify({ to: "planner", content: "Do" }),
+      nextSteps: "x",
+    }) as { tasks: unknown; nextSteps: string };
+    expect(out.tasks).toEqual([{ to: "planner", content: "Do" }]);
+  });
+
+  it("string 编码缺字段对象 → 包裹为数组（条目不修复）", () => {
+    const out = prepareTeamSendAndWaitArgs({
+      tasks: JSON.stringify({ content: "long" }),
+      nextSteps: "x",
+    }) as { tasks: unknown; nextSteps: string };
+    expect(out.tasks).toEqual([{ content: "long" }]);
+  });
+
+  it("断串（JSON.parse 失败）→ 原样放行，不抛错（execute salvage 兜底）", () => {
+    const args = { tasks: '[{"to": "planner", "content": "cut-', nextSteps: "x" };
+    expect(() => prepareTeamSendAndWaitArgs(args)).not.toThrow();
+    expect(prepareTeamSendAndWaitArgs(args)).toBe(args);
+  });
+
+  it("单对象 → 包裹为数组", () => {
+    const out = prepareTeamSendAndWaitArgs({
+      tasks: { to: "planner", content: "Do" },
+      nextSteps: "x",
+    }) as { tasks: unknown; nextSteps: string };
+    expect(out.tasks).toEqual([{ to: "planner", content: "Do" }]);
+  });
+
+  it("缺字段单对象 → 包裹为数组（条目不修复，execute 丢弃 + 逐条提示）", () => {
+    const out = prepareTeamSendAndWaitArgs({
+      tasks: { content: "long content here" },
+      nextSteps: "x",
+    }) as { tasks: unknown; nextSteps: string };
+    expect(out.tasks).toEqual([{ content: "long content here" }]);
+  });
+
+  it("缺 to 数组 → 原样放行（不抛错、不修复）", () => {
+    const args = { tasks: [{ content: "x" }], nextSteps: "x" };
+    expect(() => prepareTeamSendAndWaitArgs(args)).not.toThrow();
+    expect(prepareTeamSendAndWaitArgs(args)).toBe(args);
+  });
+
+  it("数组形态（含空数组）→ 原样放行", () => {
+    const args1 = { tasks: [{ to: "a", content: "b" }], nextSteps: "x" };
+    expect(prepareTeamSendAndWaitArgs(args1)).toBe(args1);
+    const args2 = { tasks: [], nextSteps: "x" };
+    expect(prepareTeamSendAndWaitArgs(args2)).toBe(args2);
+  });
+
+  it("tasks 为 null / 数字 / 缺 tasks 字段 → 原样放行（框架拦截或 execute 兜底）", () => {
+    const nullOut = prepareTeamSendAndWaitArgs({ tasks: null, nextSteps: "x" }) as { tasks: unknown };
+    expect(nullOut.tasks).toBeNull();
+    const numOut = prepareTeamSendAndWaitArgs({ tasks: 42, nextSteps: "x" }) as { tasks: unknown };
+    expect(numOut.tasks).toBe(42);
+    const noTasks = { nextSteps: "x" };
+    expect(prepareTeamSendAndWaitArgs(noTasks)).toBe(noTasks);
+    expect(prepareTeamSendAndWaitArgs("not-an-object")).toBe("not-an-object");
+    expect(prepareTeamSendAndWaitArgs(null)).toBeNull();
+  });
+
+  it("幂等：对输出再调用结果不变", () => {
+    const once = prepareTeamSendAndWaitArgs({
+      tasks: JSON.stringify([{ to: "planner", content: "Do" }]),
+      nextSteps: "x",
+    });
+    expect(prepareTeamSendAndWaitArgs(once)).toEqual(once);
+  });
+
+  it("修复路径输出恒满足放宽后的 schema（无二次校验失败）", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        tasks: {
+          oneOf: [{ type: "array", items: {} }, { type: "object" }, { type: "string" }],
+        },
+        nextSteps: { type: "string" },
+      },
+      required: ["tasks", "nextSteps"],
+    };
+    const validator = Compile(schema);
+    const inputs = [
+      { tasks: JSON.stringify([{ to: "a", content: "b" }]), nextSteps: "x" },
+      { tasks: JSON.stringify({ to: "a", content: "b" }), nextSteps: "x" },
+      { tasks: { to: "a", content: "b" }, nextSteps: "x" },
+      { tasks: { content: "only-content" }, nextSteps: "x" },
+      { tasks: [{ to: "a" }], nextSteps: "x" },
+      { tasks: [], nextSteps: "x" },
+    ];
+    for (const input of inputs) {
+      expect(validator.Check(prepareTeamSendAndWaitArgs(input))).toBe(true);
+    }
+  });
+});
 
 describe("stop_member execute", () => {
   let pi: ExtensionAPI;
