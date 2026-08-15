@@ -592,6 +592,16 @@ team_send_and_wait({
 - **No timeout**: waits indefinitely. The only exit paths are: all members respond, all members become idle, or `/team stop` cancels all pending waits
 - **Cancellation**: on `/team stop`, all pending waits are cancelled
 
+**防截断协议（P3）**：promptGuidelines 内置 5 条，从源头降低截断概率（长 content 是校验失败首要诱因）。P1/P2 已保证截断形态不再以误导性框架错误出现（schema 放宽 + prepareArguments 规范化 + 截断语义提示），本协议在此基础上降低**截断发生的概率**：
+
+1. **长 content 拆分** — content 超 ~800 字符时拆分为多次调用，或指示成员读取文件路径。**任务详情不写入 `.shared-context.md`**：该文件全员共享且 `write_shared_context` 全量覆盖，一次性任务详情写入会污染其他成员上下文，批处理并发覆盖存在竞态（D6 裁决）——引用成员私有或独立文件路径。
+2. **键序** — tasks 条目**先写 to 再写 content**：键序决定截断后幸存字段（输出被截断时靠后的字段丢失，γ 独立实证）。
+3. **tool call 数量** — 每回合控制在 1-2 个：同批多个 tool call 挤占输出预算，后面的 tool call 更容易被截断（β 场景）。
+4. **短重试** — 收到 Validation failed（缺 to/content）→ 立即用更短的 content 重试，**不要原样重发**（原样重发 → 再截断 → 再失败的死循环，β）。
+5. **未知成员疑截断** — 收到"未知成员"错误 → 先怀疑 to 被截断（常见截半形态如 `"c"`），重发完整成员名。
+
+定位为引导性 best practice 而非强制架构（γ）：截断 vs 模型漏生成无法从落盘参数区分，两条路径修复手段相同。
+
 **Difference from `team_send_message`:**
 
 | tool | behavior |

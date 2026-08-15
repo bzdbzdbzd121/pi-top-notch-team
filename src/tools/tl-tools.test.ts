@@ -558,6 +558,27 @@ describe("registerTlTools", () => {
       expect(typeof toolDef.prepareArguments).toBe("function");
     });
 
+    // ── P3 promptGuidelines 防截断协议 ──
+
+    it("P3: promptGuidelines 含防截断协议（5 条：长 content 拆分/独立文件引用、tool call 数量、短重试、先 to 后 content、未知成员疑截断）", () => {
+      const toolDef = getTeamSendAndWaitDef();
+      const guidelines = toolDef.promptGuidelines.join("\n");
+      // ① content 超 ~800 字符 → 拆分多次调用 / 指示成员读文件；
+      //    任务详情不写入 .shared-context.md（D6：全员共享 + 全量覆盖污染）
+      expect(guidelines).toContain("800");
+      expect(guidelines).toContain(".shared-context.md");
+      // ② 每回合 tool call 数量控制（同批多 call 挤占输出预算）
+      expect(guidelines).toContain("tool call");
+      // ③ Validation failed → 更短 content 重试，不原样重发
+      expect(guidelines).toContain("更短");
+      expect(guidelines).toContain("原样重发");
+      // ④ 键序：先写 to 再写 content（截断后幸存字段）
+      expect(guidelines).toContain("先写 to");
+      // ⑤ 未知成员错误 → 先疑 to 截断，重发完整名
+      expect(guidelines).toContain("未知成员");
+      expect(guidelines).toContain("重发完整");
+    });
+
     it("P2: 双编码字符串经 prepare 后以数组形态通过框架校验", async () => {
       memberOpsStates.set("planner", "idle");
       const toolDef = getTeamSendAndWaitDef();

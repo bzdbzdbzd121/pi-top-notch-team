@@ -350,6 +350,15 @@ export function registerTlTools(deps: TlToolsDeps): void {
       "⚠️ CRITICAL — tasks MUST be a raw JSON array, NOT a JSON-string-encoded array.",
       '   CORRECT: "tasks": [{ "to": "planner", "content": "..." }]',
       '   WRONG:   "tasks": "[{\"to\": \"planner\", ...}]"  ← Do NOT stringify. If you do, the system will auto-recover via JSON.parse.',
+      // P3 防截断协议（长 content 是 team_send_and_wait 校验失败的首要诱因：
+      // 流式输出被截断 → partial-json 补全成"缺 to 的合法对象" → 校验/丢弃）。
+      // 定位为引导性 best practice（γ）：从源头降低截断概率。
+      "TRUNCATION PREVENTION — 防截断协议：",
+      "  • content 超 ~800 字符时：拆分为多次调用，或指示成员读取文件路径——任务详情不要写入 .shared-context.md（全员共享 + 全量覆盖会污染其他成员上下文，批处理并发覆盖有竞态），引用成员私有或独立文件路径。",
+      "  • tasks 条目键顺序：先写 to 再写 content（键序决定截断后幸存字段——输出被截断时靠后的字段丢失）。",
+      "  • 每回合 tool call 数量控制在 1-2 个：同批多个 tool call 会挤占输出预算，后面的 tool call 更容易被截断。",
+      "  • 收到 Validation failed（缺 to/content）→ 立即用更短的 content 重试，不要原样重发（原样重发 → 再截断 → 再失败）。",
+      '  • 收到"未知成员"错误 → 先怀疑 to 被截断（常见截半形态如 "c"），重发完整成员名。',
       "DECISION RULE — Batch vs Sequential:",
       "  • BATCH (multiple tasks[] entries) when: tasks are INDEPENDENT — no task's output is needed to craft another task's instructions. Example: concurrent code reviews of different files by different reviewers. Batch = parallel execution: all members work simultaneously.",
       "  • SEQUENTIAL (one team_send_and_wait per task) when: task B's instructions DEPEND on task A's result. Example: analyzer identifies issues → need that report to construct mover's refactoring task. Sequential = each task waits for the previous one.",
