@@ -163,6 +163,26 @@ pi install ./pi-top-notch-team
 pi -e ./index.ts
 ```
 
+## 更新
+
+### 从 GitHub 安装的
+
+```bash
+# 只更新本扩展
+pi update github:bzdbzdbzd121/pi-top-notch-team
+
+# 或更新全部扩展包
+pi update --extensions
+```
+
+### 从本地路径安装的
+
+```bash
+cd pi-top-notch-team
+git pull
+pi install ./pi-top-notch-team   # 重新安装以生效
+```
+
 ## 开发
 
 ```bash
@@ -173,16 +193,6 @@ npm run test:watch # Watch 模式
 ```
 
 925 个测试。完整源码地图与 DI 模式文档见 [AGENTS.md](AGENTS.md)。
-
-## 设计决策
-
-关键决策记录在 [ADR](docs/adr/) 中：
-
-- **Member 作为独立的 pi --mode rpc 进程** — 独立上下文、会话持久化、可恢复。[ADR-0001](docs/adr/0001-members-as-independent-pi-rpc-processes.md)
-- **TL 作为中心消息路由器** — 基于 RPC 事件流，无需外部消息总线。[ADR-0002](docs/adr/0002-tl-as-central-message-router.md)
-- **环境变量注入角色** — Member 启动时通过环境变量获取角色/配置，而非读取 YAML 文件。
-- **Agent 自主发起团队会话** — `start_team_session` 让 agent 可以自主委派复杂任务。[ADR-0003](docs/adr/0003-agent-initiated-team-sessions.md)
-- **团队会话恢复** — 成员会话落盘 + 清单 + `/team resume`。[ADR-0004](docs/adr/0004-team-session-resume.md)
 
 ## License
 
