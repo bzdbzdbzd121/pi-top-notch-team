@@ -46,12 +46,14 @@ function createMockResponseWaiter(): ResponseWaiter {
 }
 
 /**
- * P1 模拟框架校验层：与 pi agent-loop 的 validateToolArguments 同路径——
- * 先 Compile(toolDef.parameters).Check(args)，通过后才调用 executeFn。
+ * P1 模拟框架校验层：用与 pi 框架同库的 TypeBox（Compile）对工具参数做
+ * 校验判定——这是 agent-loop validateToolArguments 的核心步骤。
  *
- * 消除旧测试直接调 executeFn 绕过框架校验的脱节（γ E12）：真实运行时
- * 缺 to/content 的条目在框架层就被 TypeBox oneOf 短路，parseTasks 根本
- * 不会执行——模拟层让测试断言与真实行为一致。
+ * 注意（S3）：真实框架路径还包含参数规范化层（normalizeOptionalNulls /
+ * Value.Convert / coerceWithJsonSchema），本 helper 只模拟校验判定本身。
+ * 对 P1 的断言目标（截断形态是否被 oneOf 拦截、放宽后的 schema 是否放行
+ * 九种形态）已足够忠实；且已实测 pi 运行时内置 typebox 1.3.7 与本测试
+ * 所用版本对放宽 schema 的判定结果完全一致。
  *
  * passed=false 表示参数被框架层拦截（TypeBox oneOf 硬失败）。
  */
@@ -503,10 +505,25 @@ describe("registerTlTools", () => {
       expect(result.content[0].text).toContain("无效");
       expect(result.content[0].text).toContain("参数疑似在输出传输中被截断");
       expect(result.content[0].text).toContain("请精简 content、拆分为多次调用");
+      // S2：0 任务错误文本同时拼入逐条字段原因
+      expect(result.content[0].text).toContain("tasks[0] 缺少有效的 to 字段，已丢弃");
       expect(messageQueue.enqueue).not.toHaveBeenCalled();
     });
 
-    it("0 任务截断启发式：content 短（≤500）时不误报截断", async () => {
+    it("0 任务截断启发式：单对象缺 to 且 content 超长同样触发", async () => {
+      const toolDef = getTeamSendAndWaitDef();
+      const { passed, result } = await executeViaFramework(toolDef, {
+        // 单对象缺 to 形态（object 分支放行，parseTasks 无效对象路径）
+        tasks: { content: "x".repeat(600) },
+        nextSteps: "next",
+      });
+      expect(passed).toBe(true); // object 分支放行
+      expect(result.content[0].text).toContain("无效");
+      expect(result.content[0].text).toContain("参数疑似在输出传输中被截断");
+      expect(messageQueue.enqueue).not.toHaveBeenCalled();
+    });
+
+    it("0 任务截断启发式：content 短（≤500）时不给出截断指引", async () => {
       const toolDef = getTeamSendAndWaitDef();
       const { passed, result } = await executeViaFramework(toolDef, {
         tasks: [{ content: "short" }],
@@ -515,6 +532,17 @@ describe("registerTlTools", () => {
       expect(passed).toBe(true);
       expect(result.content[0].text).toContain("无效");
       expect(result.content[0].text).not.toContain("参数疑似在输出传输中被截断");
+      expect(messageQueue.enqueue).not.toHaveBeenCalled();
+    });
+
+    it("框架层整体拦截：tasks 为 null / 数字（非三形态，不可恢复）", async () => {
+      const toolDef = getTeamSendAndWaitDef();
+      // 非 array/object/string 三形态的值过不了 oneOf（与截断无关，属模型
+      // 传错类型）——框架层拦截是显式信号，execute 不执行。
+      const nullResult = await executeViaFramework(toolDef, { tasks: null, nextSteps: "x" });
+      expect(nullResult.passed).toBe(false);
+      const numResult = await executeViaFramework(toolDef, { tasks: 42, nextSteps: "x" });
+      expect(numResult.passed).toBe(false);
       expect(messageQueue.enqueue).not.toHaveBeenCalled();
     });
 

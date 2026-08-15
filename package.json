@@ -25,6 +25,7 @@
   },
   "devDependencies": {
     "typescript": "^5.9.0",
+    "typebox": "^1.2.1",
     "vitest": "^3.2.0"
   }
 }

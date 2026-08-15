@@ -813,7 +813,24 @@ interface ParsedTasks {
    * 被丢弃条目的字段级原因（P1）：recoveryNote 逐条提示的数据源，
    * 也是 0 任务分支截断启发式的输入（缺 to 且 content 超长 → 疑似截断）。
    */
-  droppedDetails: Array<{ index: number; reason: string; contentLength: number }>;
+  droppedDetails: DroppedTaskDetail[];
+}
+
+/** 被丢弃条目的字段级信息（P1）。 */
+interface DroppedTaskDetail {
+  /** 条目在 tasks 数组中的下标（逐条提示定位用）。 */
+  index: number;
+  /** 人类可读的字段级无效原因（逐条提示展示用）。 */
+  reason: string;
+  /** 条目 content 字段的字符长度（0 任务截断启发式用）。 */
+  contentLength: number;
+  /**
+   * 结构化截断嫌疑判据（W1/S4）：to 字段缺失（而非类型错误）——流式截断
+   * 意味着 to 的字节从未发出，partial-json 修复后表现为字段缺失；而
+   * {to: 123} 类型错误、null 元素等与截断无关形态不误报。用布尔字段而非
+   * 字符串 contains 匹配，避免 reason 文案改动破坏判定。
+   */
+  missingTo: boolean;
 }
 
 /**
@@ -823,21 +840,30 @@ interface ParsedTasks {
  */
 export const TRUNCATION_CONTENT_THRESHOLD = 500;
 
+/** 条目判定结果：有效（含规范化任务）或无效（含字段级原因 + 截断嫌疑标记）。 */
+type TaskClassification =
+  | { ok: true; task: { to: string; content: string } }
+  | { ok: false; reason: string; missingTo: boolean };
+
 /**
- * 条目无效的字段级原因（P1 逐条提示）。返回 null 表示条目有效。
- * isValidTask 只回答"是否有效"；这里细分"为什么无效"：
- * 非对象 / 缺 to / 缺 content / 两者都缺。
+ * 条目分类器（P1）：单一判定源。细分"为什么无效"：
+ * 非对象 / 缺 to / 缺 content / 两者都缺。missingTo 只对"to 字段缺失"
+ * 置位（类型错误如 {to: 123} 不算截断嫌疑——W1 语义）。
  */
-function taskInvalidReason(t: unknown): string | null {
+function classifyTask(t: unknown): TaskClassification {
   if (typeof t !== "object" || t === null || Array.isArray(t)) {
-    return "不是对象";
+    return { ok: false, reason: "不是对象", missingTo: false };
   }
   const rec = t as Record<string, unknown>;
+  const missingTo = !("to" in rec);
   const toOk = typeof rec.to === "string" && rec.to !== "";
   const contentOk = typeof rec.content === "string" && rec.content !== "";
-  if (!toOk && !contentOk) return "缺少有效的 to 与 content 字段";
-  if (!toOk) return "缺少有效的 to 字段";
-  return "缺少有效的 content 字段";
+  if (toOk && contentOk) {
+    return { ok: true, task: { to: rec.to as string, content: rec.content as string } };
+  }
+  if (!toOk && !contentOk) return { ok: false, reason: "缺少有效的 to 与 content 字段", missingTo };
+  if (!toOk) return { ok: false, reason: "缺少有效的 to 字段", missingTo };
+  return { ok: false, reason: "缺少有效的 content 字段", missingTo };
 }
 
 /** 条目 content 字段的字符长度（截断启发式用；非字符串按 0 计）。 */
@@ -848,11 +874,7 @@ function contentLengthOf(t: unknown): number {
 }
 
 function isValidTask(t: unknown): t is { to: string; content: string } {
-  return (
-    typeof t === "object" && t !== null &&
-    typeof (t as Record<string, unknown>).to === "string" && (t as Record<string, unknown>).to !== "" &&
-    typeof (t as Record<string, unknown>).content === "string" && (t as Record<string, unknown>).content !== ""
-  );
+  return classifyTask(t).ok;
 }
 
 /** Extract a string field from a broken JSON object snippet. Tolerates raw control chars and key order. */
@@ -936,15 +958,17 @@ function salvageFromString(raw: string): { tasks: Array<{ to: string; content: s
 
 function validateTaskArray(arr: unknown[]): ParsedTasks {
   const tasks: Array<{ to: string; content: string }> = [];
-  const droppedDetails: ParsedTasks["droppedDetails"] = [];
+  const droppedDetails: DroppedTaskDetail[] = [];
   arr.forEach((t, index) => {
-    if (isValidTask(t)) {
-      tasks.push({ to: t.to, content: t.content });
+    const cls = classifyTask(t);
+    if (cls.ok) {
+      tasks.push({ to: cls.task.to, content: cls.task.content });
     } else {
       droppedDetails.push({
         index,
-        reason: taskInvalidReason(t) ?? "无效",
+        reason: cls.reason,
         contentLength: contentLengthOf(t),
+        missingTo: cls.missingTo,
       });
     }
   });
@@ -956,15 +980,22 @@ function validateTaskArray(arr: unknown[]): ParsedTasks {
 }
 
 /**
- * 丢弃提示（P1 逐条化）：首行醒目警告 + 每条字段级原因。
+ * 丢弃提示（P1 逐条化）：首行中性描述 + 逐条字段级原因。
+ * 截断嫌疑警告单独条件化（W1）：仅当存在缺 to 条目（missingTo）时才提示
+ * "疑似截断"——{to:123} 类型错误、null 元素等与截断无关形态不误报。
  * 与正常结果分离（recoveryNote 独立字段，不混入正文）。
  */
-function buildDropRecoveryNote(droppedDetails: ParsedTasks["droppedDetails"]): string {
+function buildDropRecoveryNote(droppedDetails: DroppedTaskDetail[]): string {
   if (droppedDetails.length === 0) return "";
-  return [
-    `⚠️ ${droppedDetails.length} 个任务条目无效已被丢弃（疑似参数生成时被截断——常见于 content 过长）。`,
-    ...droppedDetails.map((d) => `tasks[${d.index}] ${d.reason}，已丢弃`),
-  ].join("\n");
+  const lines = [`⚠️ ${droppedDetails.length} 个任务条目无效已被丢弃。`];
+  const truncationSuspects = droppedDetails.filter((d) => d.missingTo);
+  if (truncationSuspects.length > 0) {
+    lines.push(
+      `其中 ${truncationSuspects.length} 条缺少 to 字段，疑似参数生成时被截断（常见于 content 过长）。`
+    );
+  }
+  lines.push(...droppedDetails.map((d) => `tasks[${d.index}] ${d.reason}，已丢弃`));
+  return lines.join("\n");
 }
 
 /** Parsed tasks from LLM input — handles raw array, string-encoded array, single object, and broken JSON salvage. */
@@ -1013,11 +1044,17 @@ function parseTasks(raw: unknown): ParsedTasks {
   // record the field-level reason so the 0-task branch can apply the
   // truncation heuristic (缺 to + 超长 content).
   if (typeof raw === "object" && raw !== null && !Array.isArray(raw)) {
-    return {
-      tasks: [],
-      recoveryNote: "",
-      droppedDetails: [{ index: 0, reason: taskInvalidReason(raw) ?? "无效", contentLength: contentLengthOf(raw) }],
-    };
+    const cls = classifyTask(raw);
+    // raw 无效（上方 isValidTask 已放行有效对象）→ cls 必为 ok:false
+    if (!cls.ok) {
+      return {
+        tasks: [],
+        recoveryNote: "",
+        droppedDetails: [
+          { index: 0, reason: cls.reason, contentLength: contentLengthOf(raw), missingTo: cls.missingTo },
+        ],
+      };
+    }
   }
 
   return { tasks: [], recoveryNote: "", droppedDetails: [] };
@@ -1045,22 +1082,26 @@ async function sendAndWaitExecute(
         parseHint = `\nJSON.parse 失败原因：${e instanceof Error ? e.message : String(e)}`;
       }
     }
-    // 截断启发式（P1，D8）：间接推断——被丢弃条目缺 to 且 content 超长。
-    // 不做"未闭合引号"检测：execute 层拿到的是 partial-json 修复后的对象，
-    // 截断痕迹在修复层已丢失，无法直接检测。命中时显式给出截断指引，
-    // 打断 TL "原样重试 → 再截断 → 再失败"的死循环（β 死循环机制）。
+    // 截断启发式（P1，D8）：间接推断——被丢弃条目缺 to（missingTo，结构化
+    // 判据）且 content 超长。不做"未闭合引号"检测：execute 层拿到的是
+    // partial-json 修复后的对象，截断痕迹在修复层已丢失，无法直接检测。
+    // 命中时显式给出截断指引，打断 TL "原样重试 → 再截断 → 再失败"的
+    // 死循环（β 死循环机制）。
     const truncationSuspect = droppedDetails.some(
-      (d) => d.reason.includes("to") && d.contentLength > TRUNCATION_CONTENT_THRESHOLD
+      (d) => d.missingTo && d.contentLength > TRUNCATION_CONTENT_THRESHOLD
     );
     const truncationHint = truncationSuspect
       ? "\n\n⚠️ 参数疑似在输出传输中被截断（常见于 content 过长）。请精简 content、拆分为多次调用，或将长文本写入共享上下文后引用。"
       : "";
+    // S2：把逐条字段原因（recoveryNote）也拼入错误文本——仅 receivedPreview
+    // 展示原始值无法让 TL 定位"为什么无效"。
+    const recoveryBlock = recoveryNote ? `\n\n${recoveryNote}` : "";
     return {
       details: {},
       content: [{
         type: "text" as const,
         text: "tasks 无效。需要原始 JSON 数组（如 [{to: \"name\", content: \"...\"}]），"
-          + `但收到了 ${receivedType} 类型的值：${receivedPreview}${parseHint}。\n\n`
+          + `但收到了 ${receivedType} 类型的值：${receivedPreview}${parseHint}。${recoveryBlock}\n\n`
           + "💡 提示：content 很长或包含换行时，二次序列化成字符串容易出错（超长输出还可能被截断导致 JSON 未闭合）。"
           + "请直接传原始数组，或拆分为多次调用。\n"
           + "正确：\"tasks\": [{ \"to\": \"planner\", \"content\": \"...\" }]\n"
