@@ -1,7 +1,7 @@
 {
   "name": "pi-top-notch-team",
   "version": "0.1.0",
-  "description": "Multi-agent team collaboration for pi agent",
+  "description": "pi 的多智能体团队协作扩展——定义专业角色团队，协作完成复杂长任务",
   "license": "MIT",
   "author": "bzdbzdbzd121 <kneight@foxmail.com>",
   "repository": {
