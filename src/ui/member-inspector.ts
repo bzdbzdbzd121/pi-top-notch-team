@@ -10,6 +10,7 @@ import {
   buildFooterStatusLine,
   fitLinesToWidth,
   truncateLine,
+  nextStreamFlushDelay,
   KEY_HINTS_ACTION,
   INPUT_HINTS,
   buildNavHints,
@@ -40,6 +41,12 @@ export interface MemberInspectorDeps {
 export interface MemberInspectorHandle {
   /** Mark a member's tab dirty (called from the RPC event hook). */
   markDirty(memberName: string): void;
+  /**
+   * Full member RPC event (message_start / message_update / message_end /
+   * agent_end / ...). Routes streaming deltas to the live-tail path and
+   * everything else to the dirty/refetch path.
+   */
+  onMemberEvent(memberName: string, event: any): void;
   /** Close the overlay programmatically (e.g. /team stop). */
   close(): void;
   isOpen(): boolean;
@@ -49,6 +56,20 @@ export interface MemberInspectorHandle {
 
 /** Throttle window between a dirty mark and a get_messages refetch. */
 const REFRESH_THROTTLE_MS = 500;
+/**
+ * Coalescing window for stream deltas (message_update): the live tail is
+ * rebuilt + rendered at this cadence while deltas arrive — much faster than
+ * the RPC refetch path and with zero RPC traffic. Each rebuild is O(Δ) via
+ * the incremental cache + the P2 append-only wrap cache. This is the MINIMUM
+ * delay — the actual cadence adapts (see STREAM_FLUSH_MAX_MS).
+ */
+const STREAM_FLUSH_MS = 100;
+/**
+ * P2: upper bound for the adaptive stream cadence. When a rebuild eats over
+ * half the current interval (huge delta bursts, cold caches), the delay
+ * doubles up to this cap; cheap rebuilds recover toward STREAM_FLUSH_MS.
+ */
+const STREAM_FLUSH_MAX_MS = 1000;
 /** Interval for polling context usage (get_session_stats). */
 const STATS_POLL_MS = 5000;
 /** Timeout for a single RPC query from the inspector. */
@@ -118,6 +139,9 @@ export function openMemberInspector(
     markDirty(name: string) {
       component?.markDirty(name);
     },
+    onMemberEvent(name: string, event: any) {
+      component?.onMemberEvent(name, event);
+    },
     close() {
       closed = true;
       component?.close();
@@ -165,6 +189,10 @@ export class MemberInspectorComponent {
 
   private refreshTimer: ReturnType<typeof setTimeout> | null = null;
   private statsTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Stream-delta coalescing timer (live tail rebuilds, no RPC). */
+  private streamTimer: ReturnType<typeof setTimeout> | null = null;
+  /** P2: adaptive stream cadence (backs off / recovers with rebuild cost). */
+  private streamFlushDelayMs = STREAM_FLUSH_MS;
   /** P1-④/S2: compensation render pending for a suspended background render. */
   private renderTimer: ReturnType<typeof setTimeout> | null = null;
   /** P1-④: timestamp of the last key event (interaction window clock). */
@@ -173,6 +201,12 @@ export class MemberInspectorComponent {
   private fetching = new Set<string>();
   /** P1-③ per-tab incremental build caches (append-only prefix reuse). */
   private bodyCaches = new Map<string, BodyBuildCache>();
+  /**
+   * Last RPC-fetched message history per member — the base the live tail
+   * (pending completions + in-progress message) is appended to for streaming
+   * renders without waiting for the next get_messages round-trip.
+   */
+  private lastMessages = new Map<string, any[]>();
 
   constructor(
     private tui: any,
@@ -196,10 +230,13 @@ export class MemberInspectorComponent {
     if (this.refreshTimer) clearTimeout(this.refreshTimer);
     if (this.statsTimer) clearTimeout(this.statsTimer);
     if (this.renderTimer) clearTimeout(this.renderTimer);
+    if (this.streamTimer) clearTimeout(this.streamTimer);
     this.refreshTimer = null;
     this.statsTimer = null;
     this.renderTimer = null;
+    this.streamTimer = null;
     this.bodyCaches.clear();
+    this.lastMessages.clear();
     this.done(null);
   }
 
@@ -220,6 +257,51 @@ export class MemberInspectorComponent {
   }
 
   // ── Dirty marking (member activity events) ─────────────
+
+  /**
+   * Full-event router for the RPC activity hook. Streaming deltas
+   * (message_start / message_update / message_end) are assembled into the
+   * live tail and rendered locally at STREAM_FLUSH_MS — no RPC refetch per
+   * delta. All other events keep the legacy dirty → throttled refetch path.
+   */
+  onMemberEvent(memberName: string, event: any): void {
+    if (this.disposed) return;
+    const tab = this.state.tabs.find((t) => t.name === memberName);
+    if (!tab) return;
+    switch (event?.type) {
+      case "message_start":
+        if (event.message?.role === "assistant") {
+          this.state.setLiveMessage(memberName, event.message);
+          this.scheduleStreamFlush();
+        } else {
+          // user / toolResult message started — completed messages arrive via
+          // the refetch path (message_end below re-marks dirty).
+          this.markDirty(memberName);
+        }
+        return;
+      case "message_update":
+        if (event.assistantMessageEvent) {
+          this.state.applyLiveDelta(memberName, event.assistantMessageEvent);
+          this.scheduleStreamFlush();
+        }
+        return;
+      case "message_end":
+        if (event.message?.role === "assistant") {
+          // Keep the authoritative message visible (pending completion) until
+          // the refetch confirms it in history — no end-of-message flicker.
+          this.state.completeLiveMessage(memberName, event.message);
+          this.scheduleStreamFlush();
+        }
+        this.markDirty(memberName); // refetch: completed message lands in history
+        return;
+      case "agent_end":
+        this.state.clearStreaming(memberName);
+        this.markDirty(memberName);
+        return;
+      default:
+        this.markDirty(memberName);
+    }
+  }
 
   markDirty(memberName: string): void {
     const tab = this.state.tabs.find((t) => t.name === memberName);
@@ -300,6 +382,12 @@ export class MemberInspectorComponent {
           // in flight — do not commit or render into a dead component.
           if (this.disposed) return;
           const messages = response?.data?.messages ?? [];
+          // Keep the fetched history as the streaming base (live tail renders
+          // from it without waiting for the next refetch).
+          this.lastMessages.set(tab.name, messages);
+          // Completed messages that were shown as pending are now confirmed
+          // in history — drop them so they render exactly once.
+          this.state.reconcilePending(tab.name, messages);
           const width = this.lastWidth - 4;
           // P1-③: incremental body build — reuse the per-tab cache when the
           // history is append-only (boundary fingerprint guard inside), else
@@ -315,14 +403,23 @@ export class MemberInspectorComponent {
             showThinking: tab.showThinking,
             theme: this.inspectorTheme,
           };
+          // Streaming tail: pending completions + the in-progress message are
+          // appended after the fetched history (the incremental cache treats
+          // the last element as the streaming tail and rebuilds it every
+          // flush — the live path needs no special handling).
+          const live = tab.live;
+          const buildMessages =
+            live || tab.pendingCompletions.length > 0
+              ? [...messages, ...tab.pendingCompletions, ...(live ? [live] : [])]
+              : messages;
           // P1-④: route large FULL rebuilds through the chunked path — the
           // build runs in slices of CHUNK_SIZE messages, yielding to the
           // event loop between slices so key events are never starved by a
           // long synchronous rebuild. Incremental refreshes (the common
           // case) stay synchronous: O(增量) is cheap.
-          const lines = canIncrementCache(cache, messages, opts)
-            ? buildBodyLinesIncremental(cache, messages, opts).lines
-            : await this.buildBodyLinesChunked(cache, messages, opts);
+          const lines = canIncrementCache(cache, buildMessages, opts)
+            ? buildBodyLinesIncremental(cache, buildMessages, opts).lines
+            : await this.buildBodyLinesChunked(cache, buildMessages, opts);
           // P1-④/B1: a dirty mark that arrived DURING the fetch (e/t toggle,
           // member activity while the chunked build yields) must not be
           // silently consumed by setTabLines — capture it first, then
@@ -353,6 +450,78 @@ export class MemberInspectorComponent {
           this.fetching.delete(tab.name);
         });
     }
+  }
+
+  /**
+   * Coalesced stream flush: rebuilds the live tail (pending completions +
+   * in-progress message) from the last fetched history at STREAM_FLUSH_MS
+   * cadence — zero RPC traffic per delta. Incremental tail rebuilds are
+   * O(tail); the full path only runs on a cold cache (inspector opened
+   * mid-stream) and is a one-off.
+   */
+  private scheduleStreamFlush(): void {
+    if (this.streamTimer || this.disposed) return;
+    this.streamTimer = setTimeout(() => {
+      this.streamTimer = null;
+      this.flushStreaming();
+    }, this.streamFlushDelayMs);
+  }
+
+  private flushStreaming(): void {
+    if (this.disposed) return;
+    // P1-④: same interaction-window suspension as flushDirty — the rebuild
+    // is re-deferred while the user scrolls/types, dirty flags stay set.
+    if (this.inInteractionWindow()) {
+      this.scheduleStreamFlush();
+      return;
+    }
+    const bh = bodyHeight();
+    // P2: only the ACTIVE tab's live tail is rebuilt. Inactive tabs are not
+    // visible — their deltas keep accumulating in state and their lines catch
+    // up on tab switch (handleInput calls flushStreaming) or via the refetch
+    // path (message_end / agent_end markDirty → flushDirty covers all tabs).
+    // N concurrently streaming members no longer multiply the rebuild cost.
+    const tab = this.state.activeTab;
+    const started = Date.now();
+    if (tab && (tab.live || tab.pendingCompletions.length > 0)) {
+      const messages = this.lastMessages.get(tab.name) ?? [];
+      let cache = this.bodyCaches.get(tab.name);
+      if (!cache) {
+        cache = createBodyBuildCache();
+        this.bodyCaches.set(tab.name, cache);
+      }
+      const opts = {
+        width: Math.max(20, this.lastWidth - 4),
+        expanded: tab.expanded,
+        showThinking: tab.showThinking,
+        theme: this.inspectorTheme,
+      };
+      const buildMessages = [...messages, ...tab.pendingCompletions];
+      if (tab.live) buildMessages.push(tab.live);
+      const lines = buildBodyLinesIncremental(cache, buildMessages, opts).lines;
+      // Same dirty-flag protection as flushDirty: a markDirty that arrived
+      // while we built must not be consumed by setTabLines — restore it so
+      // the refetch path still runs.
+      const pending = tab.dirty;
+      this.state.setTabLines(
+        tab.name,
+        fitLinesToWidth(lines, Math.max(20, this.lastWidth - 2)),
+        bh
+      );
+      if (pending) {
+        tab.dirty = true;
+        this.scheduleFlush();
+      }
+    }
+    // P2: adapt the cadence to the measured rebuild cost (hysteresis band
+    // inside nextStreamFlushDelay keeps it stable between adjustments).
+    this.streamFlushDelayMs = nextStreamFlushDelay(
+      this.streamFlushDelayMs,
+      Date.now() - started,
+      STREAM_FLUSH_MS,
+      STREAM_FLUSH_MAX_MS
+    );
+    this.requestRenderSafe();
   }
 
   /**
@@ -611,8 +780,12 @@ export class MemberInspectorComponent {
     }
     if (matchesKey(data, Key.left)) {
       this.state.switchTab(-1);
+      // P2: inactive tabs skip streaming rebuilds — catch up the newly
+      // active tab's live tail immediately (O(Δ) via the wrap cache).
+      this.flushStreaming();
     } else if (matchesKey(data, Key.right)) {
       this.state.switchTab(1);
+      this.flushStreaming();
     } else if (matchesKey(data, Key.up)) {
       this.state.scrollBy(-3, bh);
     } else if (matchesKey(data, Key.down)) {

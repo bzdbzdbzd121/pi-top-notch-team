@@ -89,6 +89,129 @@ function* graphemeTokens(text: string): Generator<{ seg: string; width: number }
   }
 }
 
+// ── P2 append-only wrap cache (streaming thinking/text) ────
+//
+// The streaming tail is rebuilt every flush (~100ms). A live thinking/text
+// block grows by APPENDS only (thinking_delta / text_delta concat), yet the
+// legacy path re-wrapped the WHOLE accumulated text on every rebuild —
+// O(T) per flush, O(T²) over a stream; with CJK thinking (Intl.Segmenter
+// slow path) a 30KB block cost ~14ms/flush → a full core at long lengths.
+//
+// wrapAppendOnly caches the wrap state per BLOCK OBJECT (WeakMap — entries
+// die with the block; thinking_end/text_end replace the object, so the
+// final authoritative text always re-wraps exactly once) and consumes only
+// the new delta per call: O(Δ) per flush, O(T) over the whole stream.
+// Output is byte-identical to wrapText(fullText, width) at every step —
+// enforced by the append-only invariant plus one rollback rule: the last
+// grapheme of the in-progress line is uncommitted before each feed so a
+// grapheme cluster split across the delta boundary (ZWJ emoji, combining
+// marks) re-segments in the joined context.
+
+/** Resumable wrap state for one append-only block at one width. */
+interface AppendWrapEntry {
+  /** Wrap width this state was built with (mismatch → rebuild). */
+  width: number;
+  /** The full consumed text (append-guard: next text must startWith it). */
+  text: string;
+  /** Completed wrapped lines (raw, unthemed). */
+  lines: string[];
+  /** In-progress final wrapped line (raw, unthemed). */
+  cur: string;
+  /** Visible width of `cur`. */
+  curW: number;
+}
+
+const appendWrapCache = new WeakMap<object, AppendWrapEntry>();
+
+/** Feed one raw line (no "\n") into the entry — mirrors wrapText's per-line fast/grapheme paths. */
+function feedAppendRawLine(e: AppendWrapEntry, rawLine: string): void {
+  if (rawLine.length === 0) return;
+  // Fast path: pure ASCII — each char is one column, no segmenter needed.
+  // (Path choice is free: both paths implement identical width rules, so
+  // the output matches wrapText regardless of which runs.)
+  if (isPrintableAscii(rawLine)) {
+    for (let i = 0; i < rawLine.length; i++) {
+      if (e.curW + 1 > e.width) {
+        e.lines.push(e.cur);
+        const ch = rawLine[i];
+        e.cur = ch === " " ? "" : ch;
+        e.curW = ch === " " ? 0 : 1;
+      } else {
+        e.cur += rawLine[i];
+        e.curW += 1;
+      }
+    }
+    return;
+  }
+  for (const { seg, width: w } of graphemeTokens(rawLine)) {
+    if (e.curW + w > e.width) {
+      e.lines.push(e.cur);
+      e.cur = seg === " " ? "" : seg;
+      e.curW = seg === " " ? 0 : w;
+    } else {
+      e.cur += seg;
+      e.curW += w;
+    }
+  }
+}
+
+/** Feed `delta` into the entry, applying the exact wrapText line rules. */
+function feedAppendWrap(e: AppendWrapEntry, delta: string): void {
+  // Roll back the last grapheme of the in-progress line: a grapheme cluster
+  // may span the delta boundary (e.g. "👩" | "‍💻"), and re-feeding the
+  // partial tail in the joined context keeps segmentation identical to a
+  // full wrap. cur is bounded by the wrap width, so this is O(width).
+  let text = delta;
+  if (e.cur.length > 0) {
+    let lastIdx = 0;
+    let lastSeg = "";
+    for (const s of graphemeSegmenter.segment(e.cur)) {
+      lastIdx = s.index;
+      lastSeg = s.segment;
+    }
+    e.cur = e.cur.slice(0, lastIdx);
+    e.curW -= visibleWidth(lastSeg);
+    if (e.curW < 0) e.curW = 0; // ANSI-piece rollback can transiently over-subtract; wrapping is monotonic anyway
+    text = lastSeg + delta;
+  }
+  // Split on "\n" exactly like wrapText: a "\r\n" sequence leaves the "\r"
+  // (zero-width control) at the end of the completed raw line.
+  let start = 0;
+  for (;;) {
+    const nl = text.indexOf("\n", start);
+    feedAppendRawLine(e, nl < 0 ? text.slice(start) : text.slice(start, nl));
+    if (nl < 0) break;
+    e.lines.push(e.cur); // raw line complete — wrapText pushes cur here
+    e.cur = "";
+    e.curW = 0;
+    start = nl + 1;
+  }
+}
+
+/**
+ * wrapText for append-only-growing block text, cached per block object.
+ * Falls back to a full wrap on first use / width change / non-append
+ * mutation (shrink or prefix mismatch). Byte-identical to
+ * wrapText(text, width) under every caller-visible path.
+ */
+export function wrapAppendOnly(block: object, text: string, width: number): string[] {
+  if (width <= 0) return [""];
+  let e = appendWrapCache.get(block);
+  if (e && (e.width !== width || text.length < e.text.length || !text.startsWith(e.text))) {
+    e = undefined; // width change / rewrite — rebuild from scratch
+  }
+  if (!e) {
+    e = { width, text: "", lines: [], cur: "", curW: 0 };
+    appendWrapCache.set(block, e);
+  }
+  if (text.length > e.text.length) {
+    feedAppendWrap(e, text.slice(e.text.length));
+    e.text = text;
+  }
+  // wrapText contract: the in-progress final raw line is always emitted.
+  return [...e.lines, e.cur];
+}
+
 // ── Theme shape (identity-compatible for tests) ────────────
 
 export interface InspectorTheme {
@@ -127,6 +250,19 @@ export interface InspectorTab {
   /** Dirty flag set by member activity events; cleared after refetch. */
   dirty: boolean;
   contextInfo: MemberContextInfo | null;
+  /**
+   * Assembled in-progress assistant message (built from the member's
+   * message_start / message_update deltas). Rendered as the streaming tail;
+   * cleared by completeLiveMessage (message_end) / clearStreaming (agent_end).
+   */
+  live: LiveAssistantMessage | null;
+  /**
+   * Completed assistant messages (authoritative, from message_end) that are
+   * NOT yet confirmed in the RPC-fetched history. Rendered after the fetched
+   * messages so a message never vanishes between message_end and the next
+   * get_messages refetch; reconcilePending drops them once confirmed.
+   */
+  pendingCompletions: any[];
 }
 
 export type MemberOpState = "idle" | "working" | "compacting" | "crashed" | "stopped";
@@ -298,6 +434,126 @@ export function summarizeArgs(name: string, args: Record<string, any> | undefine
   return raw.length > max ? raw.slice(0, max - 1) + "…" : raw;
 }
 
+// ── Live streaming assembly (streaming thinking/text/toolcall) ──
+//
+// RPC-mode message_update events carry DELTAS only (the cumulative `partial`
+// is stripped on the wire), and get_messages does NOT include the in-progress
+// assistant message — it lands in history only at message_end. So while a
+// member streams its thinking, the inspector would show nothing until the
+// whole message completes. These functions assemble a live partial message
+// from message_start + message_update deltas, which the component renders as
+// the streaming tail (the incremental cache's INCREMENTAL_TAIL rule rebuilds
+// it every flush — exactly the designed fast path).
+
+/** Live in-progress assistant message assembled from stream deltas. */
+export interface LiveAssistantMessage {
+  role: "assistant";
+  content: any[];
+}
+
+/** Shallow-clone a content block (arguments included) so live mutation never touches the event object. */
+function cloneBlock(b: any): any {
+  if (!b || typeof b !== "object") return b;
+  const copy: any = { ...b };
+  if (b.arguments && typeof b.arguments === "object") copy.arguments = { ...b.arguments };
+  return copy;
+}
+
+/**
+ * Start a live message from message_start's initial assistant message
+ * (content blocks cloned; providers that seed blocks upfront keep them).
+ */
+export function createLiveAssistantMessage(message: any): LiveAssistantMessage {
+  const content = Array.isArray(message?.content) ? message.content : [];
+  return { role: "assistant", content: content.map(cloneBlock) };
+}
+
+/**
+ * Apply one RPC wire delta (`assistantMessageEvent`) to the live message.
+ * Content blocks are keyed by `contentIndex`; missing blocks are created on
+ * demand (defensive: deltas may arrive without a prior *_start, or the
+ * inspector opened mid-stream). toolcall blocks accumulate the raw partial
+ * JSON in `partialArgs` (marker: typeof === "string") and parse it on the
+ * fly; toolcall_end replaces the block with the authoritative toolCall.
+ * Unknown delta types are ignored without touching the blocks.
+ */
+export function applyAssistantDelta(live: LiveAssistantMessage, delta: any): void {
+  if (!delta || typeof delta !== "object" || typeof delta.type !== "string") return;
+  const { type, contentIndex } = delta;
+  if (typeof contentIndex !== "number" || contentIndex < 0) return;
+  const blocks = live.content;
+
+  /** Ensure a block of `kind` exists at `index` (fill gaps with text placeholders). */
+  function ensureBlock(index: number, kind: "text" | "thinking" | "toolCall"): any {
+    while (blocks.length <= index) blocks.push({ type: "text", text: "" });
+    const cur = blocks[index];
+    if (cur.type === kind) return cur;
+    const fresh =
+      kind === "text"
+        ? { type: "text", text: "" }
+        : kind === "thinking"
+          ? { type: "thinking", thinking: "" }
+          : { type: "toolCall", arguments: {}, partialArgs: "" };
+    blocks[index] = fresh;
+    return fresh;
+  }
+
+  switch (type) {
+    case "text_start":
+      blocks[contentIndex] = { type: "text", text: "" };
+      break;
+    case "text_delta": {
+      const b = ensureBlock(contentIndex, "text");
+      b.text = (b.text ?? "") + (delta.delta ?? "");
+      break;
+    }
+    case "text_end":
+      blocks[contentIndex] = { type: "text", text: delta.content ?? "" };
+      break;
+    case "thinking_start":
+      blocks[contentIndex] = { type: "thinking", thinking: "" };
+      break;
+    case "thinking_delta": {
+      const b = ensureBlock(contentIndex, "thinking");
+      b.thinking = (b.thinking ?? "") + (delta.delta ?? "");
+      break;
+    }
+    case "thinking_end":
+      blocks[contentIndex] = { type: "thinking", thinking: delta.content ?? "" };
+      break;
+    case "toolcall_start":
+      blocks[contentIndex] = { type: "toolCall", arguments: {}, partialArgs: "" };
+      break;
+    case "toolcall_delta": {
+      const b = ensureBlock(contentIndex, "toolCall");
+      b.partialArgs = (b.partialArgs ?? "") + (delta.delta ?? "");
+      try {
+        b.arguments = JSON.parse(b.partialArgs);
+      } catch {
+        // raw JSON still incomplete — keep the last successful parse
+      }
+      break;
+    }
+    case "toolcall_end":
+      if (delta.toolCall && typeof delta.toolCall === "object") {
+        blocks[contentIndex] = delta.toolCall;
+      }
+      break;
+  }
+}
+
+/**
+ * True when two messages render identically (role + content equality). Used
+ * to confirm that a pending completion has landed in the fetched history —
+ * the member process serializes everything, so reference equality is
+ * impossible; message_end.message IS the object that get_messages returns,
+ * so content equality is the precise signal.
+ */
+function sameMessageContent(a: any, b: any): boolean {
+  if (!a || !b || a.role !== b.role) return false;
+  return JSON.stringify(a.content ?? null) === JSON.stringify(b.content ?? null);
+}
+
 // ── Body line building ─────────────────────────────────────
 
 export interface BuildBodyOptions {
@@ -398,7 +654,9 @@ function buildBodyRaw(
           const thinking = typeof block.thinking === "string" ? block.thinking : "";
           if (thinking.trim().length === 0) continue;
           blockLines.push(theme.fg("dim", "  💭 思考"));
-          for (const l of wrapText(thinking, textWidth - 4)) {
+          // P2: append-only cached wrap — the streaming tail rebuilds every
+          // flush; only the new delta is wrapped, not the whole block.
+          for (const l of wrapAppendOnly(block, thinking, textWidth - 4)) {
             blockLines.push(theme.fg("dim", `    ${l}`));
           }
           continue;
@@ -408,41 +666,60 @@ function buildBodyRaw(
             blockLines.push(theme.fg("success", "● assistant"));
             wroteHeader = true;
           }
-          for (const l of wrapText(block.text ?? "", textWidth)) blockLines.push(l);
+          for (const l of wrapAppendOnly(block, block.text ?? "", textWidth)) blockLines.push(l);
           continue;
         }
         if (block.type === "toolCall") {
-          const summary = summarizeArgs(block.name, block.arguments);
+          // Live-streamed tool call (assembled from deltas): name arrives only
+          // at toolcall_end, so show the growing raw JSON instead of a summary.
+          const streaming = typeof block.partialArgs === "string";
+          const name = streaming ? "…" : block.name;
+          const summary = streaming
+            ? truncateLine(
+                (block.partialArgs ?? "").replace(/\s+/g, " ").trim(),
+                Math.max(10, textWidth - 14)
+              )
+            : summarizeArgs(block.name, block.arguments);
+          const label = streaming ? `  🔧 ${name} 调用中` : `  🔧 ${name}`;
+          const line = summary ? `${label} ${summary}` : label;
           // Summary line wraps like any other text — a wide summary must
           // not get hard-truncated by fitLinesToWidth (which drops content).
-          for (const l of wrapText(
-            `  🔧 ${block.name}${summary ? ` ${summary}` : ""}`,
-            textWidth
-          )) {
+          for (const l of wrapText(line, textWidth)) {
             blockLines.push(theme.fg("toolTitle", l));
           }
           if (expanded) {
-            // Each JSON line is wrapped to textWidth before being emitted:
-            // long values (path/content/command strings) wrap instead of
-            // being truncated, so the full arguments stay readable. The
-            // budget counts wrapped display lines, preventing a single
-            // huge value from exploding the body; overflow collapses to "…".
-            const json = JSON.stringify(block.arguments ?? {}, null, 2);
-            let budget = EXPANDED_ARGS_MAX_LINES;
-            let truncated = false;
-            for (const jl of json.split("\n")) {
-              const wrapped = wrapText(`    ${jl}`, textWidth);
-              if (wrapped.length > budget) {
-                truncated = true;
-                blockLines.push(...wrapped.slice(0, budget).map((l) => theme.fg("dim", l)));
-                budget = 0;
-                break;
+            if (streaming) {
+              const raw = block.partialArgs ?? "";
+              const wrapped = wrapText(`    ${raw}`, textWidth);
+              for (const l of wrapped.slice(0, EXPANDED_ARGS_MAX_LINES)) {
+                blockLines.push(theme.fg("dim", l));
               }
-              for (const l of wrapped) blockLines.push(theme.fg("dim", l));
-              budget -= wrapped.length;
-            }
-            if (truncated) {
-              blockLines.push(theme.fg("dim", "    …"));
+              if (wrapped.length > EXPANDED_ARGS_MAX_LINES) {
+                blockLines.push(theme.fg("dim", "    …"));
+              }
+            } else {
+              // Each JSON line is wrapped to textWidth before being emitted:
+              // long values (path/content/command strings) wrap instead of
+              // being truncated, so the full arguments stay readable. The
+              // budget counts wrapped display lines, preventing a single
+              // huge value from exploding the body; overflow collapses to "…".
+              const json = JSON.stringify(block.arguments ?? {}, null, 2);
+              let budget = EXPANDED_ARGS_MAX_LINES;
+              let truncated = false;
+              for (const jl of json.split("\n")) {
+                const wrapped = wrapText(`    ${jl}`, textWidth);
+                if (wrapped.length > budget) {
+                  truncated = true;
+                  blockLines.push(...wrapped.slice(0, budget).map((l) => theme.fg("dim", l)));
+                  budget = 0;
+                  break;
+                }
+                for (const l of wrapped) blockLines.push(theme.fg("dim", l));
+                budget -= wrapped.length;
+              }
+              if (truncated) {
+                blockLines.push(theme.fg("dim", "    …"));
+              }
             }
           }
           continue;
@@ -504,6 +781,29 @@ export const INCREMENTAL_TAIL = 1;
 
 /** Keys whose value never affects rendering (excluded from fingerprints). */
 const FINGERPRINT_IGNORED_KEYS = new Set(["id", "timestamp", "corrId", "sessionId"]);
+
+/**
+ * P2 adaptive stream-flush cadence. Hysteresis band between 1/8 and 1/2 of
+ * the current interval: a rebuild eating over half the interval doubles the
+ * delay (bounded by maxMs); a rebuild cheaper than an eighth of it recovers
+ * toward minMs. Keeps the rebuild CPU fraction bounded under pathological
+ * loads (huge single deltas, cold caches) without sacrificing the 100ms
+ * snappiness of the common case.
+ */
+export function nextStreamFlushDelay(
+  currentMs: number,
+  buildMs: number,
+  minMs: number,
+  maxMs: number
+): number {
+  if (buildMs > currentMs / 2 && currentMs < maxMs) {
+    return Math.min(maxMs, currentMs * 2);
+  }
+  if (buildMs < currentMs / 8 && currentMs > minMs) {
+    return Math.max(minMs, Math.floor(currentMs / 2));
+  }
+  return currentMs;
+}
 
 /** FNV-1a 64-bit (two interleaved 32-bit lanes), hex string. */
 function fnv1a64(s: string): string {
@@ -834,6 +1134,8 @@ export class MemberInspectorState {
           newBelow: false,
           dirty: true, // fetch on first open
           contextInfo: null,
+          live: null,
+          pendingCompletions: [],
         });
       }
     }
@@ -901,6 +1203,73 @@ export class MemberInspectorState {
     if (!tab) return;
     tab.showThinking = !tab.showThinking;
     tab.dirty = true; // rebuild lines with new thinking visibility
+  }
+
+  // ── Live streaming state (message_start / message_update / message_end) ──
+
+  /** Reset the tab's live message to a freshly started assistant message. */
+  setLiveMessage(name: string, message: any): void {
+    const tab = this.tabs.find((t) => t.name === name);
+    if (!tab) return;
+    tab.live = createLiveAssistantMessage(message);
+  }
+
+  /** Apply a stream delta to the tab's live message (lazily created on a missed message_start). */
+  applyLiveDelta(name: string, delta: any): void {
+    const tab = this.tabs.find((t) => t.name === name);
+    if (!tab) return;
+    if (!tab.live) tab.live = createLiveAssistantMessage({ role: "assistant", content: [] });
+    applyAssistantDelta(tab.live, delta);
+  }
+
+  /**
+   * Move the live message into pendingCompletions on message_end. The
+   * authoritative event message is kept so the display never loses the
+   * message between message_end and the refetch that confirms it.
+   */
+  completeLiveMessage(name: string, message: any): void {
+    const tab = this.tabs.find((t) => t.name === name);
+    if (!tab || !message || typeof message !== "object") return;
+    tab.live = null;
+    tab.pendingCompletions.push(message);
+  }
+
+  /** Drop live + pending state (agent_end / session teardown). */
+  clearStreaming(name: string): void {
+    const tab = this.tabs.find((t) => t.name === name);
+    if (!tab) return;
+    tab.live = null;
+    tab.pendingCompletions = [];
+  }
+
+  /**
+   * Drop pending completions already present in the freshly fetched history.
+   * Each entry is confirmed independently (backward scan with a strictly
+   * decreasing position bound — history is append-only, so a later completion
+   * sits at a higher index; interleaved toolResult/user messages between
+   * completions are tolerated). Unconfirmed entries are kept.
+   */
+  reconcilePending(name: string, messages: any[]): void {
+    const tab = this.tabs.find((t) => t.name === name);
+    const pending = tab?.pendingCompletions;
+    if (!tab || !pending || pending.length === 0) return;
+    const confirmed = new Set<number>();
+    let scanBound = messages.length; // strictly decreasing scan ceiling
+    for (let p = pending.length - 1; p >= 0; p--) {
+      let found = -1;
+      for (let i = scanBound - 1; i >= 0; i--) {
+        if (sameMessageContent(messages[i], pending[p])) {
+          found = i;
+          break;
+        }
+      }
+      if (found < 0) continue; // unconfirmed — earlier entries may still match
+      confirmed.add(p);
+      scanBound = found;
+    }
+    if (confirmed.size > 0) {
+      tab.pendingCompletions = pending.filter((_, i) => !confirmed.has(i));
+    }
   }
 
   openInput(): void {

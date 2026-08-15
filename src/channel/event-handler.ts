@@ -50,10 +50,12 @@ export interface EventHandlerDeps {
   /**
    * Optional activity hook for the Member Inspector (成员检视浮窗).
    * Called at the top of every member RPC event so UI observers can mark
-   * tabs dirty and throttle a get_messages refetch. Must be cheap — it
-   * fires on high-frequency events like message_update.
+   * tabs dirty and throttle a get_messages refetch — or, for streaming
+   * deltas (message_start / message_update / message_end), assemble the
+   * live partial message locally. Must be cheap — it fires on
+   * high-frequency events like message_update.
    */
-  onMemberActivity?: (memberName: string, eventType: string) => void;
+  onMemberActivity?: (memberName: string, event: any) => void;
 }
 
 // ── Dedup helpers ───────────────────────────────────────────
@@ -205,8 +207,11 @@ export function createMemberEventHandler(
 
     // Notify activity observers (Member Inspector dirty-marking). Cheap and
     // synchronous; the observer is responsible for throttling any follow-up.
+    // The FULL event is passed so stream deltas (message_start / message_update
+    // / message_end) can be assembled into a live partial message instead of
+    // waiting for the refetch.
     if (typeof event?.type === "string") {
-      deps.onMemberActivity?.(memberName, event.type);
+      deps.onMemberActivity?.(memberName, event);
     }
 
     // ── Surface fire-and-forget prompt rejections from the member's RPC layer ──

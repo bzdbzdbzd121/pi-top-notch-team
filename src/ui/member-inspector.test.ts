@@ -802,3 +802,194 @@ describe("MemberInspectorComponent — render", () => {
     expect(joined).not.toContain("Esc 关闭");
   });
 });
+
+describe("MemberInspectorComponent — live streaming (message_update deltas)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function streamHandle() {
+    const handle = makeHandle();
+    // History stays EMPTY while the assistant message streams — get_messages
+    // does not include the in-progress message (it lands only at message_end).
+    handle.sendCommandAndWait.mockResolvedValue({
+      data: { messages: [{ role: "user", content: "任务内容", timestamp: 1 }] },
+    } as any);
+    return handle;
+  }
+
+  function thinkingDelta(type: string, delta?: string) {
+    return { type: "message_update", assistantMessageEvent: { type, contentIndex: 0, ...(delta !== undefined ? { delta } : {}) } };
+  }
+
+  it("streams thinking line-by-line via local rebuilds — no RPC per delta", async () => {
+    const handleA = streamHandle();
+    const deps = makeDeps({ handles: { a: handleA }, opStates: { a: "working" } });
+    const { comp, state } = makeComponent(deps);
+    state.tabs[0].showThinking = true; // t toggle already pressed
+
+    comp.onMemberEvent("a", { type: "message_start", message: { role: "assistant", content: [] } });
+    comp.onMemberEvent("a", thinkingDelta("thinking_start"));
+    comp.onMemberEvent("a", thinkingDelta("thinking_delta", "第一步"));
+    comp.onMemberEvent("a", thinkingDelta("thinking_delta", " 第二步"));
+
+    // The stream flush path must NOT hit the RPC at all
+    await vi.advanceTimersByTimeAsync(200);
+    expect(handleA.sendCommandAndWait).not.toHaveBeenCalled();
+    const first = state.tabs[0].lines.join("\n");
+    expect(first).toContain("第一步 第二步");
+
+    // More deltas → coalesced rebuild shows the growth
+    comp.onMemberEvent("a", thinkingDelta("thinking_delta", " 第三步"));
+    await vi.advanceTimersByTimeAsync(200);
+    expect(handleA.sendCommandAndWait).not.toHaveBeenCalled();
+    expect(state.tabs[0].lines.join("\n")).toContain("第一步 第二步 第三步");
+
+    // message_end → the authoritative message lands in history via ONE refetch
+    const completed = { role: "assistant", content: [{ type: "thinking", thinking: "第一步 第二步 第三步" }], timestamp: 2 };
+    comp.onMemberEvent("a", { type: "message_end", message: completed });
+    await vi.advanceTimersByTimeAsync(600);
+    expect(handleA.sendCommandAndWait).toHaveBeenCalledTimes(1);
+    // Completed message renders from history — no duplication
+    const joined = state.tabs[0].lines.join("\n");
+    expect(joined).toContain("第一步 第二步 第三步");
+  });
+
+  it("stream flush suspends inside the interaction window and re-defer", async () => {
+    const handleA = streamHandle();
+    const deps = makeDeps({ handles: { a: handleA }, opStates: { a: "working" } });
+    const { comp, state } = makeComponent(deps);
+    state.tabs[0].showThinking = true;
+
+    comp.onMemberEvent("a", { type: "message_start", message: { role: "assistant", content: [] } });
+    comp.onMemberEvent("a", thinkingDelta("thinking_start"));
+    comp.onMemberEvent("a", thinkingDelta("thinking_delta", "A"));
+    // User starts scrolling (interaction window opens)
+    comp.handleInput(K.down);
+    await vi.advanceTimersByTimeAsync(300);
+    // Suspended — no rebuild yet
+    expect(state.tabs[0].lines.join("\n")).not.toContain("A");
+    // Window closes → deferred flush fires once
+    await vi.advanceTimersByTimeAsync(1200);
+    expect(state.tabs[0].lines.join("\n")).toContain("A");
+  });
+
+  it("message_end keeps the completed message visible as pending until refetch confirms", async () => {
+    const handleA = streamHandle();
+    const deps = makeDeps({ handles: { a: handleA }, opStates: { a: "working" } });
+    const { comp, state } = makeComponent(deps);
+
+    // Stream one message and complete it
+    comp.onMemberEvent("a", { type: "message_start", message: { role: "assistant", content: [{ type: "text", text: "前半" }] } });
+    comp.onMemberEvent("a", { type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "后段" } });
+    await vi.advanceTimersByTimeAsync(200);
+    const completed = { role: "assistant", content: [{ type: "text", text: "前半后段" }], timestamp: 2 };
+    comp.onMemberEvent("a", { type: "message_end", message: completed });
+
+    // Before the refetch lands: message still visible (pending completion)
+    await vi.advanceTimersByTimeAsync(300);
+    expect(handleA.sendCommandAndWait).not.toHaveBeenCalled();
+    expect(state.tabs[0].lines.join("\n")).toContain("前半后段");
+
+    // Refetch confirms it in history → pending dropped, rendered exactly once
+    await vi.advanceTimersByTimeAsync(400);
+    expect(handleA.sendCommandAndWait).toHaveBeenCalledTimes(1);
+    const joined = state.tabs[0].lines.join("\n");
+    const count = joined.split("前半后段").length - 1;
+    expect(count).toBe(1);
+  });
+
+  it("agent_end clears live state and triggers a refetch", async () => {
+    const handleA = streamHandle();
+    const deps = makeDeps({ handles: { a: handleA }, opStates: { a: "working" } });
+    const { comp, state } = makeComponent(deps);
+    state.tabs[0].showThinking = true;
+
+    comp.onMemberEvent("a", { type: "message_start", message: { role: "assistant", content: [] } });
+    comp.onMemberEvent("a", thinkingDelta("thinking_start"));
+    comp.onMemberEvent("a", thinkingDelta("thinking_delta", "残余"));
+    await vi.advanceTimersByTimeAsync(200);
+    expect(state.tabs[0].lines.join("\n")).toContain("残余");
+
+    comp.onMemberEvent("a", { type: "agent_end", messages: [] });
+    expect(state.tabs[0].live).toBeNull();
+    expect(state.tabs[0].pendingCompletions).toEqual([]);
+    await vi.advanceTimersByTimeAsync(600);
+    expect(handleA.sendCommandAndWait).toHaveBeenCalledTimes(1);
+    expect(state.tabs[0].lines.join("\n")).not.toContain("残余");
+  });
+
+  it("P2: streaming rebuilds only the ACTIVE tab; switching tabs catches up", async () => {
+    const handleA = streamHandle();
+    const handleB = streamHandle();
+    const deps = makeDeps({ handles: { a: handleA, b: handleB }, opStates: { a: "working", b: "working" } });
+    const { comp, state } = makeComponent(deps);
+    state.tabs[0].showThinking = true;
+    state.tabs[1].showThinking = true;
+
+    // Both members stream thinking concurrently.
+    for (const name of ["a", "b"]) {
+      comp.onMemberEvent(name, { type: "message_start", message: { role: "assistant", content: [] } });
+      comp.onMemberEvent(name, { type: "message_update", assistantMessageEvent: { type: "thinking_start", contentIndex: 0 } });
+      comp.onMemberEvent(name, { type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: `${name}的思考内容` } });
+    }
+    await vi.advanceTimersByTimeAsync(200);
+
+    // Active tab (a) rebuilt with the live tail; inactive tab (b) untouched.
+    expect(state.activeIndex).toBe(0);
+    expect(state.tabs[0].lines.join("\n")).toContain("a的思考内容");
+    expect(state.tabs[1].lines.join("\n")).not.toContain("b的思考内容");
+
+    // Switching to tab b triggers an immediate catch-up rebuild.
+    comp.handleInput(K.right);
+    expect(state.activeIndex).toBe(1);
+    expect(state.tabs[1].lines.join("\n")).toContain("b的思考内容");
+  });
+
+  it("message_update for a missed message_start lazily creates the live tail", async () => {
+    const handleA = streamHandle();
+    const deps = makeDeps({ handles: { a: handleA }, opStates: { a: "working" } });
+    const { comp, state } = makeComponent(deps);
+    state.tabs[0].showThinking = true;
+
+    // Inspector opened mid-stream: only deltas arrive
+    comp.onMemberEvent("a", thinkingDelta("thinking_delta", "迟到"));
+    await vi.advanceTimersByTimeAsync(200);
+    expect(state.tabs[0].live).not.toBeNull();
+    expect(state.tabs[0].lines.join("\n")).toContain("迟到");
+  });
+
+  it("non-stream events keep the legacy dirty → refetch path", async () => {
+    const handleA = streamHandle();
+    const deps = makeDeps({ handles: { a: handleA }, opStates: { a: "working" } });
+    const { comp, state } = makeComponent(deps);
+    state.tabs[0].dirty = false;
+
+    comp.onMemberEvent("a", { type: "tool_execution_end", toolName: "bash", result: {} });
+    expect(state.tabs[0].dirty).toBe(true);
+    await vi.advanceTimersByTimeAsync(600);
+    expect(handleA.sendCommandAndWait).toHaveBeenCalledTimes(1);
+  });
+
+  it("followTail auto-scrolls while thinking streams (bottom pinned)", async () => {
+    const handleA = streamHandle();
+    const deps = makeDeps({ handles: { a: handleA }, opStates: { a: "working" } });
+    const { comp, state } = makeComponent(deps);
+    state.tabs[0].showThinking = true;
+
+    comp.onMemberEvent("a", { type: "message_start", message: { role: "assistant", content: [] } });
+    comp.onMemberEvent("a", thinkingDelta("thinking_start"));
+    for (let i = 0; i < 12; i++) {
+      comp.onMemberEvent("a", thinkingDelta("thinking_delta", `第${i}行思考内容 `.repeat(2)));
+    }
+    await vi.advanceTimersByTimeAsync(200);
+    expect(state.tabs[0].followTail).toBe(true);
+    // Pinned at the bottom: last visible line carries the latest delta
+    const bh = 12; // 24 rows * 0.85 - 8 chrome
+    const visible = state.tabs[0].lines.slice(state.tabs[0].scrollOffset, state.tabs[0].scrollOffset + bh);
+    expect(visible[visible.length - 1]).toContain("第11行思考内容");
+  });
+});

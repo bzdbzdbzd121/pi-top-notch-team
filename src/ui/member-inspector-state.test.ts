@@ -17,6 +17,8 @@ import {
   extractText,
   summarizeArgs,
   IDENTITY_THEME,
+  createLiveAssistantMessage,
+  applyAssistantDelta,
 } from "./member-inspector-state";
 
 // ── Fixtures ───────────────────────────────────────────────
@@ -358,6 +360,195 @@ describe("buildFooterStatusLine", () => {
 });
 
 // ── MemberInspectorState ───────────────────────────────────
+
+describe("applyAssistantDelta (live streaming assembly)", () => {
+  it("assembles a thinking block from start/delta/end deltas", () => {
+    const live = createLiveAssistantMessage({ role: "assistant", content: [] });
+    applyAssistantDelta(live, { type: "thinking_start", contentIndex: 0 });
+    applyAssistantDelta(live, { type: "thinking_delta", contentIndex: 0, delta: "让我先分析" });
+    applyAssistantDelta(live, { type: "thinking_delta", contentIndex: 0, delta: "一下需求" });
+    expect(live.content).toEqual([{ type: "thinking", thinking: "让我先分析一下需求" }]);
+    applyAssistantDelta(live, { type: "thinking_end", contentIndex: 0, content: "让我先分析一下需求" });
+    expect(live.content[0]).toEqual({ type: "thinking", thinking: "让我先分析一下需求" });
+  });
+
+  it("assembles a text block after thinking (mixed contentIndex)", () => {
+    const live = createLiveAssistantMessage({ role: "assistant", content: [] });
+    applyAssistantDelta(live, { type: "thinking_start", contentIndex: 0 });
+    applyAssistantDelta(live, { type: "thinking_delta", contentIndex: 0, delta: "想" });
+    applyAssistantDelta(live, { type: "text_start", contentIndex: 1 });
+    applyAssistantDelta(live, { type: "text_delta", contentIndex: 1, delta: "好" });
+    applyAssistantDelta(live, { type: "text_delta", contentIndex: 1, delta: "的" });
+    expect(live.content).toEqual([
+      { type: "thinking", thinking: "想" },
+      { type: "text", text: "好的" },
+    ]);
+  });
+
+  it("fills missing blocks at contentIndex (defensive gap fill)", () => {
+    const live = createLiveAssistantMessage({ role: "assistant", content: [] });
+    // No prior *_start for index 1 — the block is created on demand
+    applyAssistantDelta(live, { type: "text_delta", contentIndex: 1, delta: "hi" });
+    expect(live.content).toEqual([{ type: "text", text: "" }, { type: "text", text: "hi" }]);
+  });
+
+  it("keeps initial blocks seeded by message_start", () => {
+    const live = createLiveAssistantMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "seed" }],
+    });
+    applyAssistantDelta(live, { type: "text_delta", contentIndex: 0, delta: "+more" });
+    expect(live.content[0].text).toBe("seed+more");
+  });
+
+  it("clones content so live mutation never touches the source message", () => {
+    const source = { role: "assistant", content: [{ type: "text", text: "x" }] };
+    const live = createLiveAssistantMessage(source);
+    applyAssistantDelta(live, { type: "text_delta", contentIndex: 0, delta: "y" });
+    expect(live.content[0].text).toBe("xy");
+    expect(source.content[0].text).toBe("x");
+  });
+
+  it("streams toolcall args as raw partial JSON, finalized on toolcall_end", () => {
+    const live = createLiveAssistantMessage({ role: "assistant", content: [] });
+    applyAssistantDelta(live, { type: "toolcall_start", contentIndex: 0 });
+    applyAssistantDelta(live, { type: "toolcall_delta", contentIndex: 0, delta: '{"path":' });
+    expect(live.content[0].type).toBe("toolCall");
+    expect(live.content[0].partialArgs).toBe('{"path":');
+    applyAssistantDelta(live, { type: "toolcall_delta", contentIndex: 0, delta: '"a.ts"}' });
+    expect(live.content[0].arguments).toEqual({ path: "a.ts" });
+    const toolCall = { type: "toolCall", id: "tc-1", name: "read", arguments: { path: "a.ts" } };
+    applyAssistantDelta(live, { type: "toolcall_end", contentIndex: 0, toolCall });
+    expect(live.content[0]).toEqual(toolCall);
+  });
+
+  it("ignores malformed deltas (no contentIndex / unknown type / null)", () => {
+    const live = createLiveAssistantMessage({ role: "assistant", content: [] });
+    applyAssistantDelta(live, null as any);
+    applyAssistantDelta(live, { type: "text_delta" } as any);
+    applyAssistantDelta(live, { type: "mystery_delta", contentIndex: 0, delta: "x" } as any);
+    expect(live.content).toEqual([]);
+  });
+
+  it("buildBodyLines renders a streaming live thinking block (showThinking)", () => {
+    const live = createLiveAssistantMessage({ role: "assistant", content: [] });
+    applyAssistantDelta(live, { type: "thinking_start", contentIndex: 0 });
+    applyAssistantDelta(live, { type: "thinking_delta", contentIndex: 0, delta: "正在思考" });
+    const lines = buildBodyLines([live], { width: 60, expanded: false, showThinking: true });
+    expect(lines.join("\n")).toContain("💭 思考");
+    expect(lines.join("\n")).toContain("正在思考");
+    // Hidden by default
+    const hidden = buildBodyLines([live], { width: 60, expanded: false });
+    expect(hidden.join("\n")).not.toContain("正在思考");
+  });
+
+  it("buildBodyLines renders a streaming tool call as 调用中 with raw JSON", () => {
+    const live = createLiveAssistantMessage({ role: "assistant", content: [] });
+    applyAssistantDelta(live, { type: "toolcall_start", contentIndex: 0 });
+    applyAssistantDelta(live, { type: "toolcall_delta", contentIndex: 0, delta: '{"path": "a.ts"}' });
+    const lines = buildBodyLines([live], { width: 60, expanded: false });
+    const joined = lines.join("\n");
+    expect(joined).toContain("调用中");
+    expect(joined).toContain('{"path": "a.ts"}');
+  });
+});
+
+describe("MemberInspectorState live streaming", () => {
+  function makeState() {
+    return new MemberInspectorState([{ name: "a", label: "A" }]);
+  }
+
+  it("setLiveMessage resets the live buffer; applyLiveDelta appends", () => {
+    const s = makeState();
+    s.setLiveMessage("a", { role: "assistant", content: [{ type: "text", text: "hi" }] });
+    expect(s.tabs[0].live?.content).toEqual([{ type: "text", text: "hi" }]);
+    s.applyLiveDelta("a", { type: "text_delta", contentIndex: 0, delta: "!" });
+    expect(s.tabs[0].live?.content[0].text).toBe("hi!");
+  });
+
+  it("applyLiveDelta lazily creates a live message when message_start was missed", () => {
+    const s = makeState();
+    s.applyLiveDelta("a", { type: "thinking_delta", contentIndex: 0, delta: "想" });
+    expect(s.tabs[0].live?.content[0]).toEqual({ type: "thinking", thinking: "想" });
+  });
+
+  it("completeLiveMessage moves live → pendingCompletions; clearStreaming drops both", () => {
+    const s = makeState();
+    s.setLiveMessage("a", { role: "assistant", content: [{ type: "text", text: "done" }] });
+    const authoritative = { role: "assistant", content: [{ type: "text", text: "done" }], timestamp: 9 };
+    s.completeLiveMessage("a", authoritative);
+    expect(s.tabs[0].live).toBeNull();
+    expect(s.tabs[0].pendingCompletions).toEqual([authoritative]);
+    s.clearStreaming("a");
+    expect(s.tabs[0].live).toBeNull();
+    expect(s.tabs[0].pendingCompletions).toEqual([]);
+  });
+
+  it("reconcilePending drops confirmed tail entries, keeps unconfirmed", () => {
+    const s = makeState();
+    const m1 = { role: "assistant", content: [{ type: "text", text: "one" }] };
+    const m2 = { role: "assistant", content: [{ type: "text", text: "two" }] };
+    s.tabs[0].pendingCompletions = [m1, m2];
+    // History tail contains m1 (identical content) but not m2
+    s.reconcilePending("a", [
+      { role: "user", content: "prompt" },
+      { role: "assistant", content: [{ type: "text", text: "one" }], timestamp: 42 },
+    ]);
+    expect(s.tabs[0].pendingCompletions).toEqual([m2]);
+    // Now m2 lands too
+    s.reconcilePending("a", [
+      { role: "user", content: "prompt" },
+      { role: "assistant", content: [{ type: "text", text: "one" }] },
+      { role: "assistant", content: [{ type: "text", text: "two" }] },
+    ]);
+    expect(s.tabs[0].pendingCompletions).toEqual([]);
+  });
+
+  it("reconcilePending keeps everything when nothing is confirmed", () => {
+    const s = makeState();
+    const m1 = { role: "assistant", content: [{ type: "text", text: "one" }] };
+    s.tabs[0].pendingCompletions = [m1];
+    s.reconcilePending("a", [{ role: "user", content: "prompt" }]);
+    expect(s.tabs[0].pendingCompletions).toEqual([m1]);
+  });
+
+  it("reconcilePending tolerates interleaved toolResult messages between completions", () => {
+    const s = makeState();
+    const m1 = { role: "assistant", content: [{ type: "text", text: "one" }] };
+    const m2 = { role: "assistant", content: [{ type: "text", text: "two" }] };
+    s.tabs[0].pendingCompletions = [m1, m2];
+    // History tail: m1, then a toolResult, then m2 — both completions are in
+    // history but not contiguously; both must be confirmed.
+    s.reconcilePending("a", [
+      { role: "user", content: "prompt" },
+      m1,
+      { role: "toolResult", toolName: "bash", content: [{ type: "text", text: "out" }] },
+      m2,
+    ]);
+    expect(s.tabs[0].pendingCompletions).toEqual([]);
+    // Only m1 in history → only m1 confirmed (m2 kept)
+    s.tabs[0].pendingCompletions = [m1, m2];
+    s.reconcilePending("a", [{ role: "user", content: "prompt" }, m1]);
+    expect(s.tabs[0].pendingCompletions).toEqual([m2]);
+  });
+
+  it("reconcilePending keeps one of two identical completions when only one landed", () => {
+    const s = makeState();
+    const same = { role: "assistant", content: [{ type: "text", text: "好的" }] };
+    const clone = { role: "assistant", content: [{ type: "text", text: "好的" }] };
+    s.tabs[0].pendingCompletions = [same, clone];
+    s.reconcilePending("a", [{ role: "user", content: "prompt" }, same]);
+    expect(s.tabs[0].pendingCompletions).toEqual([clone]);
+  });
+
+  it("syncMembers gives new tabs null live + empty pendingCompletions", () => {
+    const s = makeState();
+    s.syncMembers([{ name: "a", label: "A" }, { name: "z", label: "Z" }]);
+    const z = s.tabs.find((t) => t.name === "z")!;
+    expect(z.live).toBeNull();
+    expect(z.pendingCompletions).toEqual([]);
+  });
+});
 
 describe("MemberInspectorState", () => {
   function makeState() {
