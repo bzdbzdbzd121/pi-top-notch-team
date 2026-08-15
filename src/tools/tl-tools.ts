@@ -371,15 +371,22 @@ export function registerTlTools(deps: TlToolsDeps): void {
           oneOf: [
             {
               type: "array",
-              description: "正确格式：原始 JSON 数组",
-              items: {
-                type: "object",
-                properties: {
-                  to: { type: "string", description: "目标成员名称" },
-                  content: { type: "string", description: "消息内容" },
-                },
-                required: ["to", "content"],
-              },
+              description: "正确格式：原始 JSON 数组，条目为 {to, content} 对象",
+              // P1（schema 放宽）：items 有意放宽为 {}，不再要求 type/required。
+              // 流式输出截断时框架 partial-json 会把缺字段条目静默补全成
+              // "合法但缺 to"的对象——若 items 带硬约束，TypeBox oneOf 在
+              // execute 之前短路，parseTasks 的防御性恢复被完全架空，且框架
+              // 错误文本误导 TL 反复原样重试。放宽后所有条目形态（null/标量/
+              // 缺字段对象）都进入 execute，由 isValidTask 统一过滤并逐条提示。
+              items: {},
+            },
+            {
+              type: "object",
+              // P1：单对象形态（LLM 幻觉）激活 parseTasks 的包裹路径。
+              // 刻意不设 required：设了会让缺字段单对象同时命中 array+object+
+              // string 三分支失败，oneOf 噪音不减反增（D4 裁决）——与 array
+              // 分支同策略，由 execute 的 isValidTask 统一判定。
+              description: "自动修复：单个任务对象会被 parseTasks 自动包裹为数组",
             },
             {
               type: "string",
@@ -802,6 +809,42 @@ interface ParsedTasks {
   tasks: Array<{ to: string; content: string }>;
   /** 非空时表示输入不规范（salvage 恢复 / 条目被丢弃），需要在结果中提醒 TL。 */
   recoveryNote: string;
+  /**
+   * 被丢弃条目的字段级原因（P1）：recoveryNote 逐条提示的数据源，
+   * 也是 0 任务分支截断启发式的输入（缺 to 且 content 超长 → 疑似截断）。
+   */
+  droppedDetails: Array<{ index: number; reason: string; contentLength: number }>;
+}
+
+/**
+ * 0 任务截断启发式的 content 长度阈值：被丢弃条目缺 to 且 content 超过
+ * 该长度时，错误文案显式给出截断指引（D8——只做间接推断，不做未闭合检测：
+ * execute 层拿到的是 partial-json 修复后的对象，截断痕迹已丢失）。
+ */
+export const TRUNCATION_CONTENT_THRESHOLD = 500;
+
+/**
+ * 条目无效的字段级原因（P1 逐条提示）。返回 null 表示条目有效。
+ * isValidTask 只回答"是否有效"；这里细分"为什么无效"：
+ * 非对象 / 缺 to / 缺 content / 两者都缺。
+ */
+function taskInvalidReason(t: unknown): string | null {
+  if (typeof t !== "object" || t === null || Array.isArray(t)) {
+    return "不是对象";
+  }
+  const rec = t as Record<string, unknown>;
+  const toOk = typeof rec.to === "string" && rec.to !== "";
+  const contentOk = typeof rec.content === "string" && rec.content !== "";
+  if (!toOk && !contentOk) return "缺少有效的 to 与 content 字段";
+  if (!toOk) return "缺少有效的 to 字段";
+  return "缺少有效的 content 字段";
+}
+
+/** 条目 content 字段的字符长度（截断启发式用；非字符串按 0 计）。 */
+function contentLengthOf(t: unknown): number {
+  if (typeof t !== "object" || t === null) return 0;
+  const content = (t as Record<string, unknown>).content;
+  return typeof content === "string" ? content.length : 0;
 }
 
 function isValidTask(t: unknown): t is { to: string; content: string } {
@@ -892,14 +935,36 @@ function salvageFromString(raw: string): { tasks: Array<{ to: string; content: s
 }
 
 function validateTaskArray(arr: unknown[]): ParsedTasks {
-  const valid = arr.filter(isValidTask).map(t => ({ to: t.to, content: t.content }));
-  const dropped = arr.length - valid.length;
+  const tasks: Array<{ to: string; content: string }> = [];
+  const droppedDetails: ParsedTasks["droppedDetails"] = [];
+  arr.forEach((t, index) => {
+    if (isValidTask(t)) {
+      tasks.push({ to: t.to, content: t.content });
+    } else {
+      droppedDetails.push({
+        index,
+        reason: taskInvalidReason(t) ?? "无效",
+        contentLength: contentLengthOf(t),
+      });
+    }
+  });
   return {
-    tasks: valid,
-    recoveryNote: dropped > 0
-      ? `⚠️ tasks 中有 ${dropped} 个条目缺少有效的 to/content 字段，已被丢弃。`
-      : "",
+    tasks,
+    droppedDetails,
+    recoveryNote: buildDropRecoveryNote(droppedDetails),
   };
+}
+
+/**
+ * 丢弃提示（P1 逐条化）：首行醒目警告 + 每条字段级原因。
+ * 与正常结果分离（recoveryNote 独立字段，不混入正文）。
+ */
+function buildDropRecoveryNote(droppedDetails: ParsedTasks["droppedDetails"]): string {
+  if (droppedDetails.length === 0) return "";
+  return [
+    `⚠️ ${droppedDetails.length} 个任务条目无效已被丢弃（疑似参数生成时被截断——常见于 content 过长）。`,
+    ...droppedDetails.map((d) => `tasks[${d.index}] ${d.reason}，已丢弃`),
+  ].join("\n");
 }
 
 /** Parsed tasks from LLM input — handles raw array, string-encoded array, single object, and broken JSON salvage. */
@@ -918,7 +983,7 @@ function parseTasks(raw: unknown): ParsedTasks {
         return validateTaskArray(parsed);
       }
       if (isValidTask(parsed)) {
-        return { tasks: [{ to: parsed.to, content: parsed.content }], recoveryNote: "" };
+        return { tasks: [{ to: parsed.to, content: parsed.content }], recoveryNote: "", droppedDetails: [] };
       }
     } catch {
       strictFailed = true;
@@ -933,17 +998,29 @@ function parseTasks(raw: unknown): ParsedTasks {
           `⚠️ tasks 以字符串传入且不是合法 JSON${strictFailed ? "（解析失败）" : ""}，已尽力恢复 ${tasks.length} 个任务` +
           (dropped > 0 ? `，丢弃 ${dropped} 个不完整条目` : "") +
           "。请核对恢复出的任务是否完整；下次直接传原始数组可避免信息丢失。",
+        droppedDetails: [],
       };
     }
-    return { tasks: [], recoveryNote: "" };
+    return { tasks: [], recoveryNote: "", droppedDetails: [] };
   }
 
   // Single object wrapped outside array — another common LLM hallucination
   if (isValidTask(raw)) {
-    return { tasks: [{ to: raw.to, content: raw.content }], recoveryNote: "" };
+    return { tasks: [{ to: raw.to, content: raw.content }], recoveryNote: "", droppedDetails: [] };
   }
 
-  return { tasks: [], recoveryNote: "" };
+  // Invalid non-array object (e.g. truncated `{content: "..."}` single object):
+  // record the field-level reason so the 0-task branch can apply the
+  // truncation heuristic (缺 to + 超长 content).
+  if (typeof raw === "object" && raw !== null && !Array.isArray(raw)) {
+    return {
+      tasks: [],
+      recoveryNote: "",
+      droppedDetails: [{ index: 0, reason: taskInvalidReason(raw) ?? "无效", contentLength: contentLengthOf(raw) }],
+    };
+  }
+
+  return { tasks: [], recoveryNote: "", droppedDetails: [] };
 }
 
 async function sendAndWaitExecute(
@@ -952,7 +1029,7 @@ async function sendAndWaitExecute(
 ): Promise<ToolResult> {
   const { responseWaiter, lastPendingCorrId, messageQueue, memberOpsStates } = ctx;
 
-  const { tasks, recoveryNote } = parseTasks(params.tasks);
+  const { tasks, recoveryNote, droppedDetails } = parseTasks(params.tasks);
 
   // Validate: at least one task
   if (tasks.length === 0) {
@@ -968,6 +1045,16 @@ async function sendAndWaitExecute(
         parseHint = `\nJSON.parse 失败原因：${e instanceof Error ? e.message : String(e)}`;
       }
     }
+    // 截断启发式（P1，D8）：间接推断——被丢弃条目缺 to 且 content 超长。
+    // 不做"未闭合引号"检测：execute 层拿到的是 partial-json 修复后的对象，
+    // 截断痕迹在修复层已丢失，无法直接检测。命中时显式给出截断指引，
+    // 打断 TL "原样重试 → 再截断 → 再失败"的死循环（β 死循环机制）。
+    const truncationSuspect = droppedDetails.some(
+      (d) => d.reason.includes("to") && d.contentLength > TRUNCATION_CONTENT_THRESHOLD
+    );
+    const truncationHint = truncationSuspect
+      ? "\n\n⚠️ 参数疑似在输出传输中被截断（常见于 content 过长）。请精简 content、拆分为多次调用，或将长文本写入共享上下文后引用。"
+      : "";
     return {
       details: {},
       content: [{
@@ -977,7 +1064,8 @@ async function sendAndWaitExecute(
           + "💡 提示：content 很长或包含换行时，二次序列化成字符串容易出错（超长输出还可能被截断导致 JSON 未闭合）。"
           + "请直接传原始数组，或拆分为多次调用。\n"
           + "正确：\"tasks\": [{ \"to\": \"planner\", \"content\": \"...\" }]\n"
-          + "错误：\"tasks\": \"[{...}]\"  ← 不要额外序列化成字符串",
+          + "错误：\"tasks\": \"[{...}]\"  ← 不要额外序列化成字符串"
+          + truncationHint,
       }],
     };
   }
@@ -997,12 +1085,21 @@ async function sendAndWaitExecute(
   const unknownTargets = tasks.filter(t => !memberOpsStates.has(t.to));
   if (unknownTargets.length > 0) {
     const names = unknownTargets.map(t => `"${t.to}"`).join(", ");
-    const validNames = Array.from(memberOpsStates.keys()).join(", ");
+    const validNames = Array.from(memberOpsStates.keys());
+    // 截半形态（P1，γ 实测：`{"content":"abc","to":"c"}` 过校验进 execute）：
+    // to 是某个有效成员名的严格前缀且更短 → 高度疑似 to 被截断（长 content
+    // 把 to 挤出输出预算），提示重发完整成员名而不是让 TL 怀疑自己传错。
+    const truncationSuspects = unknownTargets.filter(
+      (t) => validNames.some((n) => n.startsWith(t.to) && n.length > t.to.length)
+    );
+    const truncationHint = truncationSuspects.length > 0
+      ? `\n\n⚠️ ${truncationSuspects.map((t) => `"${t.to}"`).join(", ")} 的 to 值可能被截断（内容不完整），请重发完整成员名。`
+      : "";
     return {
       details: {},
       content: [{
         type: "text" as const,
-        text: `目标成员 ${names} 不存在或未启动。请先使用 start_member 启动这些成员。\n有效成员：${validNames}。`,
+        text: `目标成员 ${names} 不存在或未启动。请先使用 start_member 启动这些成员。\n有效成员：${validNames.join(", ")}。${truncationHint}`,
       }],
     };
   }

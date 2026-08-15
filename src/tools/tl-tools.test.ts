@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { Compile } from "typebox/compile";
 import { registerTlTools, WAIT_IDLE_CHECK_INTERVAL_MS, WAIT_IDLE_REQUIRED_CONSECUTIVE } from "./tl-tools";
 import { startSession, endSession, markSharedContextWritten } from "../session/state";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -42,6 +43,24 @@ function createMockResponseWaiter(): ResponseWaiter {
     cancelByCorrId: vi.fn(),
     clearCorrelation: vi.fn(),
   };
+}
+
+/**
+ * P1 模拟框架校验层：与 pi agent-loop 的 validateToolArguments 同路径——
+ * 先 Compile(toolDef.parameters).Check(args)，通过后才调用 executeFn。
+ *
+ * 消除旧测试直接调 executeFn 绕过框架校验的脱节（γ E12）：真实运行时
+ * 缺 to/content 的条目在框架层就被 TypeBox oneOf 短路，parseTasks 根本
+ * 不会执行——模拟层让测试断言与真实行为一致。
+ *
+ * passed=false 表示参数被框架层拦截（TypeBox oneOf 硬失败）。
+ */
+async function executeViaFramework(toolDef: any, args: unknown) {
+  const validator = Compile(toolDef.parameters);
+  if (!validator.Check(args)) {
+    return { passed: false as const, result: undefined };
+  }
+  return { passed: true as const, result: (await toolDef.execute("call-1", args)) as any };
 }
 
 function createMockMessageQueue(): MessageQueue {
@@ -321,17 +340,195 @@ describe("registerTlTools", () => {
       expect(toolDef.parameters.required).toContain("nextSteps");
       expect(toolDef.parameters.properties.tasks).toBeDefined();
       expect(toolDef.parameters.properties.tasks.oneOf).toBeDefined();
+      expect(toolDef.parameters.properties.tasks.oneOf.length).toBe(3);
+      // P1: array 分支 items 放宽为 {}（不再有 type/required 硬约束——
+      // 截断形态的缺字段条目必须放行到 execute，由 isValidTask 统一过滤）
       expect(toolDef.parameters.properties.tasks.oneOf[0].type).toBe("array");
-      expect(toolDef.parameters.properties.tasks.oneOf[0].items.properties.to).toBeDefined();
-      expect(toolDef.parameters.properties.tasks.oneOf[0].items.properties.content).toBeDefined();
-      expect(toolDef.parameters.properties.tasks.oneOf[0].items.required).toContain("to");
-      expect(toolDef.parameters.properties.tasks.oneOf[0].items.required).toContain("content");
-      expect(toolDef.parameters.properties.tasks.oneOf[1].type).toBe("string");
+      expect(toolDef.parameters.properties.tasks.oneOf[0].items).toEqual({});
+      // P1: 新增 object 分支（单对象自动包裹），不设 required（D4）
+      expect(toolDef.parameters.properties.tasks.oneOf[1].type).toBe("object");
+      expect(toolDef.parameters.properties.tasks.oneOf[1].required).toBeUndefined();
+      // string 分支保留（parseTasks 恢复/salvage）
+      expect(toolDef.parameters.properties.tasks.oneOf[2].type).toBe("string");
       expect(toolDef.parameters.properties.nextSteps).toBeDefined();
       expect(toolDef.parameters.properties.nextSteps.type).toBe("string");
       // Old fields removed
       expect(toolDef.parameters.properties.to).toBeUndefined();
       expect(toolDef.parameters.properties.content).toBeUndefined();
+    });
+
+    // ── P1 模拟框架校验层矩阵（γ 三形态实测表扩展，全部应先通过框架校验）──
+
+    /** 拿 team_send_and_wait 的 tool 定义（含 parameters + execute）。 */
+    function getTeamSendAndWaitDef(overrides?: Parameters<typeof callRegisterTlTools>[0]) {
+      let toolDef: any = null;
+      pi.registerTool = vi.fn((def: any) => {
+        if (def.name === "team_send_and_wait") toolDef = def;
+      });
+      callRegisterTlTools(overrides);
+      return toolDef;
+    }
+
+    it("矩阵①正确数组：通过框架校验并正常派发", async () => {
+      memberOpsStates.set("worker", "idle");
+      const toolDef = getTeamSendAndWaitDef();
+      const { passed, result } = await executeViaFramework(toolDef, {
+        tasks: [{ to: "worker", content: "Do the task" }],
+        nextSteps: "next",
+      });
+      expect(passed).toBe(true);
+      expect(messageQueue.enqueue).toHaveBeenCalledTimes(1);
+      expect(result.content[0].text).toContain("下一步计划");
+    });
+
+    it("矩阵②缺 to 数组：通过框架校验，execute 丢弃 + 逐条 note + 截断嫌疑警告", async () => {
+      memberOpsStates.set("worker", "idle");
+      const toolDef = getTeamSendAndWaitDef();
+      const { passed, result } = await executeViaFramework(toolDef, {
+        // 用户报告的失败形态：tasks[0] 仅含 content，缺 to
+        tasks: [{ content: "长内容" }, { to: "worker", content: "ok" }],
+        nextSteps: "next",
+      });
+      expect(passed).toBe(true); // P1 验收②：不再出现 TypeBox 框架错误
+      expect(messageQueue.enqueue).toHaveBeenCalledTimes(1); // 有效条目照常派发
+      expect(result.content[0].text).toContain("1 个任务条目无效已被丢弃");
+      expect(result.content[0].text).toContain("疑似参数生成时被截断");
+      expect(result.content[0].text).toContain("tasks[0] 缺少有效的 to 字段，已丢弃");
+    });
+
+    it("矩阵③缺 content 数组：通过框架校验，execute 丢弃 + 逐条 note", async () => {
+      memberOpsStates.set("worker", "idle");
+      const toolDef = getTeamSendAndWaitDef();
+      const { passed, result } = await executeViaFramework(toolDef, {
+        tasks: [{ to: "worker" }, { to: "worker", content: "ok" }],
+        nextSteps: "next",
+      });
+      expect(passed).toBe(true);
+      expect(messageQueue.enqueue).toHaveBeenCalledTimes(1);
+      expect(result.content[0].text).toContain("tasks[0] 缺少有效的 content 字段，已丢弃");
+    });
+
+    it("矩阵④单对象：通过 object 分支校验，execute 包裹派发（死代码转正）", async () => {
+      memberOpsStates.set("planner", "idle");
+      const toolDef = getTeamSendAndWaitDef();
+      const { passed, result } = await executeViaFramework(toolDef, {
+        tasks: { to: "planner", content: "Do the plan" },
+        nextSteps: "review",
+      });
+      expect(passed).toBe(true);
+      expect(messageQueue.enqueue).toHaveBeenCalledTimes(1);
+      expect(messageQueue.enqueue).toHaveBeenCalledWith(
+        expect.objectContaining({ to: "planner" })
+      );
+    });
+
+    it("矩阵⑤双编码字符串：通过 string 分支校验，execute JSON.parse 恢复", async () => {
+      memberOpsStates.set("planner", "idle");
+      const toolDef = getTeamSendAndWaitDef();
+      const { passed, result } = await executeViaFramework(toolDef, {
+        tasks: JSON.stringify([{ to: "planner", content: "Do the plan" }]),
+        nextSteps: "review the plan",
+      });
+      expect(passed).toBe(true);
+      expect(messageQueue.enqueue).toHaveBeenCalledTimes(1);
+      expect(messageQueue.enqueue).toHaveBeenCalledWith(
+        expect.objectContaining({ to: "planner" })
+      );
+    });
+
+    it("矩阵⑥断串字符串：通过 string 分支校验，execute salvage 恢复", async () => {
+      memberOpsStates.set("planner", "idle");
+      const toolDef = getTeamSendAndWaitDef();
+      const truncated =
+        '[{"to": "planner", "content": "Do the plan"}, {"to": "analyst", "content": "cut-off-mid-'
+      const { passed, result } = await executeViaFramework(toolDef, {
+        tasks: truncated,
+        nextSteps: "continue",
+      });
+      expect(passed).toBe(true);
+      expect(messageQueue.enqueue).toHaveBeenCalledTimes(1);
+      expect(messageQueue.enqueue).toHaveBeenCalledWith(
+        expect.objectContaining({ to: "planner" })
+      );
+      expect(result.content[0].text).toContain("已尽力恢复 1 个任务");
+      expect(result.content[0].text).toContain("丢弃 1 个不完整条目");
+    });
+
+    it("矩阵⑦空数组：通过框架校验，execute 返回 0 任务错误", async () => {
+      const toolDef = getTeamSendAndWaitDef();
+      const { passed, result } = await executeViaFramework(toolDef, {
+        tasks: [],
+        nextSteps: "do something",
+      });
+      expect(passed).toBe(true);
+      expect(result.content[0].text).toContain("无效");
+      expect(messageQueue.enqueue).not.toHaveBeenCalled();
+    });
+
+    it("矩阵⑧null 元素：通过 items {} 校验，execute 丢弃 + 逐条 note", async () => {
+      memberOpsStates.set("worker", "idle");
+      const toolDef = getTeamSendAndWaitDef();
+      const { passed, result } = await executeViaFramework(toolDef, {
+        tasks: [null, { to: "worker", content: "ok" }],
+        nextSteps: "next",
+      });
+      expect(passed).toBe(true); // items 放宽为 {} 后 null 不再触发 oneOf 硬失败
+      expect(messageQueue.enqueue).toHaveBeenCalledTimes(1);
+      expect(result.content[0].text).toContain("tasks[0] 不是对象，已丢弃");
+    });
+
+    it("矩阵⑨to 截半：通过框架校验，execute 未知成员错误 + 截断提示", async () => {
+      memberOpsStates.set("coder", "idle");
+      const toolDef = getTeamSendAndWaitDef();
+      // γ 实测形态：长 content 后 to 被截成单个字符
+      const { passed, result } = await executeViaFramework(toolDef, {
+        tasks: [{ to: "c", content: "some content" }],
+        nextSteps: "next",
+      });
+      expect(passed).toBe(true);
+      expect(messageQueue.enqueue).not.toHaveBeenCalled();
+      expect(result.content[0].text).toContain("不存在或未启动");
+      expect(result.content[0].text).toContain("to 值可能被截断");
+      expect(result.content[0].text).toContain("请重发完整成员名");
+    });
+
+    it("0 任务截断启发式：缺 to 且 content 超长（>500）时错误含截断指引", async () => {
+      const toolDef = getTeamSendAndWaitDef();
+      const { passed, result } = await executeViaFramework(toolDef, {
+        // 截断诱因形态：超长 content 把 to 挤出输出预算
+        tasks: [{ content: "x".repeat(600) }],
+        nextSteps: "next",
+      });
+      expect(passed).toBe(true);
+      expect(result.content[0].text).toContain("无效");
+      expect(result.content[0].text).toContain("参数疑似在输出传输中被截断");
+      expect(result.content[0].text).toContain("请精简 content、拆分为多次调用");
+      expect(messageQueue.enqueue).not.toHaveBeenCalled();
+    });
+
+    it("0 任务截断启发式：content 短（≤500）时不误报截断", async () => {
+      const toolDef = getTeamSendAndWaitDef();
+      const { passed, result } = await executeViaFramework(toolDef, {
+        tasks: [{ content: "short" }],
+        nextSteps: "next",
+      });
+      expect(passed).toBe(true);
+      expect(result.content[0].text).toContain("无效");
+      expect(result.content[0].text).not.toContain("参数疑似在输出传输中被截断");
+      expect(messageQueue.enqueue).not.toHaveBeenCalled();
+    });
+
+    it("未知成员错误：to 不是成员名前缀时不附截断提示", async () => {
+      memberOpsStates.set("existing-member", "idle");
+      const toolDef = getTeamSendAndWaitDef();
+      const { passed, result } = await executeViaFramework(toolDef, {
+        tasks: [{ to: "nonexistent-member", content: "Do something" }],
+        nextSteps: "next",
+      });
+      expect(passed).toBe(true);
+      expect(result.content[0].text).toContain("不存在或未启动");
+      expect(result.content[0].text).not.toContain("to 值可能被截断");
+      expect(messageQueue.enqueue).not.toHaveBeenCalled();
     });
 
     it("team_send_and_wait execute sends single task and waits for response", async () => {
@@ -539,13 +736,15 @@ describe("registerTlTools", () => {
 
       callRegisterTlTools();
 
-      // Simulate LLM sending a single object instead of array
-      const result = await executeFn("call-1", {
-        tasks: { to: "planner", content: "Do the plan" },
-        nextSteps: "review",
-      });
+      // Simulate LLM sending a single object instead of array.
+      // P1: 走模拟框架校验层——单对象必须通过 object 分支校验才到 execute。
+      const { passed, result } = await executeViaFramework(
+        (pi.registerTool as ReturnType<typeof vi.fn>).mock.calls.find((c: any[]) => c[0].name === "team_send_and_wait")![0],
+        { tasks: { to: "planner", content: "Do the plan" }, nextSteps: "review" }
+      );
 
       // Should still have sent the message
+      expect(passed).toBe(true);
       expect(messageQueue.enqueue).toHaveBeenCalledTimes(1);
       expect(messageQueue.enqueue).toHaveBeenCalledWith(
         expect.objectContaining({ to: "planner" })
@@ -610,7 +809,7 @@ describe("registerTlTools", () => {
       expect(callArg.content).toContain("line1\nline2");
     });
 
-    it("team_send_and_wait drops invalid entries from a raw array and warns", async () => {
+    it("team_send_and_wait drops invalid entries from a raw array and warns (逐条 note)", async () => {
       memberOpsStates.set("planner", "idle");
 
       let executeFn: Function = () => {};
@@ -622,16 +821,22 @@ describe("registerTlTools", () => {
 
       callRegisterTlTools();
 
-      const result = await executeFn("call-1", {
-        tasks: [{ to: "planner", content: "ok" }, { to: 123 }, "junk", {}],
-        nextSteps: "continue",
-      });
+      // P1: 走模拟框架校验层（旧测试直接调 executeFn，绕过框架校验，与真实行为脱节）
+      const { passed, result } = await executeViaFramework(
+        (pi.registerTool as ReturnType<typeof vi.fn>).mock.calls.find((c: any[]) => c[0].name === "team_send_and_wait")![0],
+        { tasks: [{ to: "planner", content: "ok" }, { to: 123 }, "junk", {}], nextSteps: "continue" }
+      );
 
+      expect(passed).toBe(true);
       expect(messageQueue.enqueue).toHaveBeenCalledTimes(1);
       expect(messageQueue.enqueue).toHaveBeenCalledWith(
         expect.objectContaining({ to: "planner" })
       );
-      expect(result.content[0].text).toContain("3 个条目");
+      // 首行醒目警告 + 逐条字段级原因
+      expect(result.content[0].text).toContain("⚠️ 3 个任务条目无效已被丢弃");
+      expect(result.content[0].text).toContain("tasks[1] 缺少有效的 to 与 content 字段，已丢弃");
+      expect(result.content[0].text).toContain("tasks[2] 不是对象，已丢弃");
+      expect(result.content[0].text).toContain("tasks[3] 缺少有效的 to 与 content 字段，已丢弃");
     });
 
     it("team_send_and_wait error for unrecoverable string includes JSON.parse failure detail", async () => {
