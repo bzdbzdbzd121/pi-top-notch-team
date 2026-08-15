@@ -1,5 +1,7 @@
 # pi-top-notch-team
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 Multi-agent team collaboration extension for [pi](https://pi.dev). Define teams of specialized agent roles that work together on complex, long-running tasks.
 
 When a team session starts, your current pi session becomes the **Team Lead (TL)**, which orchestrates **Member** agents — each running as an independent `pi --mode rpc` subprocess. Members keep their own context and memory, and communicate through a real-time message channel routed by the TL.
@@ -16,7 +18,10 @@ When a team session starts, your current pi session becomes the **Team Lead (TL)
 ## Quick Start
 
 ```bash
-# Install
+# Install from GitHub
+pi install github:bzdbzdbzd121/pi-top-notch-team
+
+# Or install from a local clone
 pi install ./pi-top-notch-team
 
 # Or try without installing

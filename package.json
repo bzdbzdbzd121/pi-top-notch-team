@@ -2,8 +2,21 @@
   "name": "pi-top-notch-team",
   "version": "0.1.0",
   "description": "Multi-agent team collaboration for pi agent",
+  "license": "MIT",
+  "author": "bzdbzdbzd121 <kneight@foxmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bzdbzdbzd121/pi-top-notch-team.git"
+  },
+  "homepage": "https://github.com/bzdbzdbzd121/pi-top-notch-team#readme",
+  "bugs": "https://github.com/bzdbzdbzd121/pi-top-notch-team/issues",
   "keywords": [
-    "pi-package"
+    "pi-package",
+    "pi-extension",
+    "multi-agent",
+    "agent-team",
+    "ai-agents",
+    "orchestration"
   ],
   "type": "module",
   "pi": {

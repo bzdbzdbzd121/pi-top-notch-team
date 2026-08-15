@@ -4,3 +4,18 @@ shared-context.md
 .shared-context.md
 code_review_*.md
 *.swp
+
+# OS / editor
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Test coverage
+coverage/
+
+# Env & runtime data
+.env
+.env.*
+sessions/
