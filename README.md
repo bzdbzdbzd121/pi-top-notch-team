@@ -304,7 +304,7 @@ npm test           # 运行全部测试
 npm run test:watch # Watch 模式
 ```
 
-925 个测试。完整源码地图与 DI 模式文档见 [AGENTS.md](AGENTS.md)。
+完整源码地图与 DI 模式文档见 [AGENTS.md](AGENTS.md)。
 
 ## License
 
