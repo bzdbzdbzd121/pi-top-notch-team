@@ -45,6 +45,16 @@ export interface TeamContext {
     restartedMembers: string[];
     failedMembers: string[];
   } | null;
+  /**
+   * One-shot "session ended" notice. Set by teardownTeamSession (/team stop
+   * and stop_team_session — the only session exits that keep the conversation
+   * alive); consumed (and cleared) by the next before_agent_start to inject a
+   * banner into the TL prompt telling the agent the team session is over and
+   * the team tools are deactivated. Rides the next user-initiated turn — it
+   * never triggers a conversation of its own. Cleared without firing when a
+   * new session starts before the notice was consumed.
+   */
+  sessionEndedNotice: boolean;
   processManager: ProcessManager | null;
   /** Direct Map access (read-only view). Prefer getHandle/setHandle for writes. */
   memberHandles: ReadonlyMap<string, MemberProcessHandle>;

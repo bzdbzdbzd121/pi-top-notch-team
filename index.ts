@@ -43,6 +43,51 @@ import {
 } from "./src/tools/agent-session-tool-names";
 import { buildAgentInitiatedPrompt } from "./src/prompts/agent-initiated-mode";
 
+/**
+ * Team-tool names that leave durable traces in the conversation history when
+ * the TL orchestrates a team session. Used to decide whether the one-shot
+ * "session ended" banner is relevant for the CURRENT conversation (see
+ * before_agent_start).
+ */
+const TEAM_TRACE_TOOL_NAMES: ReadonlySet<string> = new Set([
+  ...SESSION_TOOL_NAMES,
+  "add_dynamic_member",
+  START_TEAM_SESSION_TOOL_NAME,
+  STOP_TEAM_SESSION_TOOL_NAME,
+]);
+
+/**
+ * Whether the current conversation history contains team-session traces.
+ *
+ * Signals (any one suffices):
+ * 1. An assistant message with a toolCall named after a team tool
+ *    (start_member, team_send_and_wait, …) — the TL actively orchestrated.
+ * 2. A custom_message entry with customType "team-message" — member replies
+ *    routed to the TL via the message channel.
+ *
+ * Fail-open: when the session manager is unavailable (RPC mode, tests) the
+ * check cannot be performed — treat as traced so the primary /team stop
+ * → next-turn case keeps working. A fresh /new conversation has neither
+ * signal, so the banner is correctly skipped there; /fork and /resume of a
+ * team conversation copy/restore the entries, so the banner fires there too.
+ */
+function historyHasTeamTraces(ctx: {
+  sessionManager?: { getEntries?: () => unknown[] } | null;
+} | null | undefined): boolean {
+  const entries = ctx?.sessionManager?.getEntries?.() ?? null;
+  if (!entries) return true; // no session manager → fail open (inject)
+  return entries.some((e: any) => {
+    if (!e) return false;
+    if (e.type === "custom_message") {
+      return e.customType === "team-message";
+    }
+    if (e.type !== "message" || e.message?.role !== "assistant") return false;
+    return Array.isArray(e.message.content) && e.message.content.some(
+      (c: any) => c?.type === "toolCall" && typeof c?.name === "string" && TEAM_TRACE_TOOL_NAMES.has(c.name)
+    );
+  });
+}
+
 export default function (pi: ExtensionAPI) {
   // If running as a member process (TEAM_ROLE is set), skip TL-only tools
   // to avoid tool name conflicts with member.ts.
@@ -65,6 +110,7 @@ export default function (pi: ExtensionAPI) {
     dynamicPhase: "design",
     agentInitiatedTask: null,
     resumedFrom: null,
+    sessionEndedNotice: false,
     processManager: null,
     memberHandles: memberHandlesRO,
     getHandle: (name) => memberHandles.get(name),
@@ -512,9 +558,20 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ── session_start: reset stale team state + register autocomplete/editor ──
-  pi.on("session_start", (_event, ctx) => {
+  pi.on("session_start", (event, ctx) => {
     // Track TL current model for /team setting "follow" mode
     tlCurrentModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+
+    // A brand-new conversation (/new) has no team history — a pending
+    // session-ended notice would be pure noise there, so drop it. /fork and
+    // /resume COPY/RESTORE the history (which may contain team traces where
+    // the banner is helpful), so they leave the flag alone — the content
+    // check at consumption time decides. (The flag is only ever set by
+    // teardownTeamSession; startup sessions never have it.)
+    if ((event as { reason?: string } | undefined)?.reason === "new") {
+      teamCtx.sessionEndedNotice = false;
+    }
+
     // Part 1: Clean up stale team state when fresh session detected
     // (session dir preserved — resumable via /team resume; members stopped
     // best-effort, manifest keeps "active" = interrupted status)
@@ -761,6 +818,40 @@ export default function (pi: ExtensionAPI) {
 
     let extraPrompt = "";
 
+    // ── One-shot "session ended" banner ──
+    // Set by teardownTeamSession (/team stop and stop_team_session — the only
+    // session exits that keep the conversation alive). Consumed exactly once on
+    // the next turn: the TL's history still contains the Team Lead system
+    // prompt and team-tool usage patterns, so without this it keeps acting as
+    // Team Lead and tries to call deactivated team tools (which fail with the
+    // cryptic "Tool xxx not found" error). The banner rides the next
+    // user-initiated turn — it never triggers a conversation of its own.
+    //
+    // Precision gate: the banner only fires if the CURRENT conversation
+    // history actually contains team traces. This kills the stale-notice edge
+    // cases — after /new the history is fresh (no banner), after /fork or
+    // /resume of a team conversation the traces were copied/restored (banner
+    // fires and is exactly what the TL needs), and after /resume of a
+    // different non-team conversation there are no traces (no banner).
+    let sessionEndedBanner = "";
+    if (!session.active && teamCtx.sessionEndedNotice) {
+      teamCtx.sessionEndedNotice = false;
+      if (historyHasTeamTraces(_ctx)) {
+        sessionEndedBanner = `
+## ⚠️ 团队会话已结束
+
+上一个团队会话（/team stop）已结束，你已回到**普通模式**：
+- 所有团队工具已停用（team_send_and_wait、start_member、stop_member、list_members、get_member_log、wait_and_get_member_status、write_shared_context、set_goal、finish_goal 等均不可用）
+- 你不再是 Team Lead，成员进程已全部停止
+
+**请以普通模式继续当前工作**：直接用 read/bash/edit/write 等常规工具回答用户或完成任务。不要再尝试调用团队工具（误调会得到 "Tool xxx not found" 错误）——如果用户需要再次进入团队模式，请告诉用户使用 /team start 或 /team dynamic。
+`;
+      }
+    } else if (session.active) {
+      // A new team session started before the notice was consumed — drop it.
+      teamCtx.sessionEndedNotice = false;
+    }
+
     // ── One-shot /team resume banner ──
     // Set by the resume handler right after rehydration; consumed exactly once
     // so the TL knows the session was restored from disk and in-flight work
@@ -978,8 +1069,8 @@ Member 进程保持运行以便继续接收新任务。仅当成员进程异常�
 `;
     }
 
-    if (extraPrompt || resumeBanner) {
-      return { systemPrompt: event.systemPrompt + resumeBanner + extraPrompt };
+    if (extraPrompt || resumeBanner || sessionEndedBanner) {
+      return { systemPrompt: event.systemPrompt + sessionEndedBanner + resumeBanner + extraPrompt };
     }
   });
 }

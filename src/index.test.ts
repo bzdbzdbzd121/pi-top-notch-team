@@ -806,3 +806,180 @@ describe("write_shared_context in tool_call guard", () => {
     expect(blocked.reason).toContain("代码文件");
   });
 });
+
+// ── Session-ended banner in before_agent_start ─────────────────────
+
+// After the user exits a team session (/team stop or stop_team_session), the
+// TL's history still contains the Team Lead system prompt and team-tool usage
+// patterns. The teardown sets the one-shot sessionEndedNotice flag; the next
+// before_agent_start consumes it and injects a banner telling the agent the
+// session is over — riding the next user-initiated turn, never triggering a
+// conversation of its own.
+
+describe("session-ended banner in before_agent_start", () => {
+  let pi: ExtensionAPI;
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    delete process.env.TEAM_ROLE;
+    tmpDir = mkdtempSync(join(tmpdir(), "session-ended-banner-"));
+    process.env.TOP_NOTCH_TEAM_ROOT = tmpDir;
+    pi = createMockPi();
+    const mod = await import("../index");
+    mod.default(pi);
+  });
+
+  afterEach(() => {
+    delete process.env.TOP_NOTCH_TEAM_ROOT;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function getHandler(name: string): Function {
+    const onCalls = (pi.on as ReturnType<typeof vi.fn>).mock.calls;
+    return onCalls.find((c: any) => c[0] === name)![1];
+  }
+
+  function getTeamCommandHandler() {
+    return (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
+  }
+
+  async function runStop() {
+    const cmdDef = getTeamCommandHandler();
+    await cmdDef.handler("stop", createMockContext());
+  }
+
+  async function runBeforeAgentStart(systemPrompt = "BASE", ctx: any = { ui: createMockUi() }) {
+    const handler = getHandler("before_agent_start");
+    return handler({ systemPrompt }, ctx);
+  }
+
+  it("injects the session-ended banner once on the next turn after /team stop (no new conversation)", async () => {
+    // Enter a real team session via /team dynamic (no YAML needed on disk)
+    const cmdDef = getTeamCommandHandler();
+    await cmdDef.handler("dynamic", createMockContext());
+
+    // Turn while the session is active: normal TL prompt, no banner
+    let result = await runBeforeAgentStart();
+    expect(result.systemPrompt).toContain("Team Lead");
+    expect(result.systemPrompt).not.toContain("团队会话已结束");
+
+    // User exits the session via /team stop
+    await runStop();
+
+    // Next turn: the one-shot banner tells the TL the session is over and the
+    // team tools are deactivated — the TL stops acting as Team Lead
+    result = await runBeforeAgentStart();
+    expect(result.systemPrompt).toContain("团队会话已结束");
+    expect(result.systemPrompt).toContain("team_send_and_wait");
+    expect(result.systemPrompt).toContain("普通模式");
+    // The Team Lead prompt section is gone (only the banner's mention remains)
+    expect(result.systemPrompt).not.toContain("当前任务：Team Lead");
+
+    // Second turn: banner consumed — not repeated (no prompt modification at all)
+    result = await runBeforeAgentStart();
+    expect(result).toBeUndefined();
+  });
+
+  it("no banner when no team session was ever active", async () => {
+    const result = await runBeforeAgentStart();
+    expect(result).toBeUndefined();
+  });
+
+  it("drops the pending notice when a new session starts before it is consumed", async () => {
+    // Exit one session, then immediately start another (/team dynamic again)
+    // before any turn boundary — the stale notice must not leak into the new
+    // session's prompt.
+    const cmdDef = getTeamCommandHandler();
+    await cmdDef.handler("dynamic", createMockContext());
+    await runStop();
+    await cmdDef.handler("dynamic", createMockContext());
+
+    const result = await runBeforeAgentStart();
+    expect(result.systemPrompt).toContain("Team Lead");
+    expect(result.systemPrompt).not.toContain("团队会话已结束");
+  });
+
+  it("no banner in a fresh /new conversation — session_start reason 'new' clears the pending notice", async () => {
+    // /team stop leaves the notice pending…
+    const cmdDef = getTeamCommandHandler();
+    await cmdDef.handler("dynamic", createMockContext());
+    await runStop();
+
+    // …then the user starts a brand-new conversation (/new): session_start
+    // fires with reason "new" and must drop the stale notice.
+    const sessionStart = getHandler("session_start");
+    await sessionStart({ type: "session_start", reason: "new" }, createMockContext());
+
+    // First turn of the new conversation: no banner (not even fail-open, the
+    // flag is gone).
+    const result = await runBeforeAgentStart();
+    expect(result).toBeUndefined();
+  });
+
+  it("no banner when the current history has no team traces (e.g. /new without the session_start reason signal)", async () => {
+    const cmdDef = getTeamCommandHandler();
+    await cmdDef.handler("dynamic", createMockContext());
+    await runStop();
+
+    // Fresh-conversation history: only an ordinary user message, no team tools.
+    const freshCtx = {
+      ui: createMockUi(),
+      sessionManager: {
+        getEntries: () => [
+          { type: "message", message: { role: "user", content: "hello" } },
+        ],
+      },
+    };
+    const result = await runBeforeAgentStart(undefined, freshCtx);
+    expect(result).toBeUndefined();
+  });
+
+  it("banner fires when the history contains team traces (fork/resume of a team conversation)", async () => {
+    const cmdDef = getTeamCommandHandler();
+    await cmdDef.handler("dynamic", createMockContext());
+    await runStop();
+
+    // Copied/restored history: an assistant team tool call is a durable trace.
+    const tracedCtx = {
+      ui: createMockUi(),
+      sessionManager: {
+        getEntries: () => [
+          {
+            type: "message",
+            message: {
+              role: "assistant",
+              content: [
+                { type: "text", text: "let me dispatch" },
+                { type: "toolCall", id: "t1", name: "team_send_and_wait", arguments: {} },
+              ],
+            },
+          },
+        ],
+      },
+    };
+    const result = await runBeforeAgentStart(undefined, tracedCtx);
+    expect(result.systemPrompt).toContain("团队会话已结束");
+
+    // Consumed exactly once.
+    const again = await runBeforeAgentStart(undefined, tracedCtx);
+    expect(again).toBeUndefined();
+  });
+
+  it("banner fires on routed member messages too (custom_message team-message trace)", async () => {
+    const cmdDef = getTeamCommandHandler();
+    await cmdDef.handler("dynamic", createMockContext());
+    await runStop();
+
+    const tracedCtx = {
+      ui: createMockUi(),
+      sessionManager: {
+        getEntries: () => [
+          { type: "custom_message", customType: "team-message", content: "member reply" },
+        ],
+      },
+    };
+    const result = await runBeforeAgentStart(undefined, tracedCtx);
+    expect(result.systemPrompt).toContain("团队会话已结束");
+  });
+});

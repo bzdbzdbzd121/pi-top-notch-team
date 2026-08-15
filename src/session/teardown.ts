@@ -25,6 +25,15 @@ export async function teardownTeamSession(
   const sessionId = session.sessionId;
   const isDynamic = teamCtx.isDynamicSession;
 
+  // One-shot "session ended" notice for the TL: consumed by the next
+  // before_agent_start to inject a banner telling the agent the team session
+  // is over and the team tools are deactivated — without triggering a new
+  // conversation. Only set when a session was actually active (a bare
+  // `/team stop` with nothing running must not produce a spurious banner).
+  if (session.active) {
+    teamCtx.sessionEndedNotice = true;
+  }
+
   if (teamCtx.processManager) {
     await teamCtx.processManager.stopAll();
   }

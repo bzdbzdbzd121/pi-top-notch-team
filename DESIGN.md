@@ -384,8 +384,8 @@ The TL follows the **Orchestration Playbook** (`src/prompts/orchestration-playbo
 3. `router.updateMembers([])` — clear message channel targets
 4. `pi.setActiveTools([...filter out tlToolNames])` — deactivate TL tools
 5. `markManifestStopped(team, sessionId)` — mark `session.json` as `stopped`; **the session directory is PRESERVED** (member contexts + shared context stay resumable via `/team resume`; see ADR-0004). Dynamic sessions reset `teamCtx.isDynamicSession = false`
-6. `endSession()` + `resetGoal()` + `resetManifestRuntimeContext()` — clear in-memory state
-7. `before_agent_start` handler remains registered but checks `session.active` to skip injection
+6. `endSession()` + `resetGoal()` + `resetManifestRuntimeContext()` — clear in-memory state. **Before that**, if a session was active, `teamCtx.sessionEndedNotice = true` — a one-shot notice consumed by the next `before_agent_start`
+7. `before_agent_start` handler remains registered but checks `session.active` to skip injection — except the **one-shot session-ended banner**: when `sessionEndedNotice` is set and no session is active, the next turn's prompt gets a ⚠️ banner (「团队会话已结束…团队工具已停用…请以普通模式继续」) so the TL stops acting as Team Lead and stops calling deactivated team tools (which would otherwise fail with the cryptic `Tool xxx not found`). It rides the next user-initiated turn — **no new conversation is triggered**. Consumed exactly once; cleared silently if a new session starts first. **Edge-case guards** (stale notice in replaced conversations): `session_start` with `reason: "new"` drops a pending notice (a fresh `/new` conversation has no team history); at consumption, `historyHasTeamTraces()` checks the current entries for durable team traces (assistant `toolCall` named after a team tool, or a `custom_message` entry with `customType: "team-message"`) and skips the banner when none exist — this covers `/resume` of a *different non-team* conversation, while `/fork`/`/resume` of a team conversation copy the traces and keep the banner (exactly what the TL needs there). No session manager → fail-open (inject)
 
 ### `/team resume [团队名或sessionId前缀]`
 
@@ -873,6 +873,8 @@ interface TeamContext {
   isDynamicSession: boolean;  // true during /team dynamic or agent-initiated sessions
   dynamicPhase: "design" | "execution";  // dynamic mode phase (only relevant when isDynamicSession is true)
   agentInitiatedTask: string | null;      // mission statement of an agent-initiated session (ADR-0003); null otherwise
+  resumedFrom?: {...} | null;              // one-shot /team resume banner (consumed by next before_agent_start)
+  sessionEndedNotice: boolean;             // one-shot "session ended" banner (set by teardown, consumed by next before_agent_start)
   processManager: ProcessManager | null;
   memberHandles: ReadonlyMap<string, MemberProcessHandle>; // use getHandle()/setHandle()/clearHandles()
   router: Router;
