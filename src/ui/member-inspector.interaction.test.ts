@@ -284,7 +284,7 @@ describe("P1-④ 交互感知刷新抑制（挂起 + 补刷 + 分片）", () => 
     expect(handleA.sendCommandAndWait).toHaveBeenCalledTimes(1);
 
     comp.handleInput("e"); // explicit expand intent DURING the build
-    expect(state.tabs[0].expanded).toBe(true);
+    expect(state.expanded).toBe(true);
 
     held!(); // release the build
     await new Promise((r) => realSetTimeout(r, 1200)); // finish #1 → re-flush → fetch#2
@@ -347,7 +347,7 @@ describe("P1-④ 交互感知刷新抑制（挂起 + 补刷 + 分片）", () => 
 
     comp.handleInput("\x1b[B"); // scroll opens the window
     comp.handleInput("e"); // explicit expand intent — must not be deferred
-    expect(state.tabs[0].expanded).toBe(true);
+    expect(state.expanded).toBe(true);
     await vi.advanceTimersByTimeAsync(600);
     expect(handleA.sendCommandAndWait).toHaveBeenCalledTimes(1); // immediate flush
   });

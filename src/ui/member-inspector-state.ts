@@ -241,10 +241,6 @@ export interface InspectorTab {
   scrollOffset: number;
   /** True when the view is pinned to the latest content. */
   followTail: boolean;
-  /** Tool call / result detail expansion toggle. */
-  expanded: boolean;
-  /** Thinking block visibility toggle. */
-  showThinking: boolean;
   /** New content arrived while not following tail. */
   newBelow: boolean;
   /** Dirty flag set by member activity events; cleared after refetch. */
@@ -280,8 +276,8 @@ export const EXPANDED_ARGS_MAX_LINES = 40;
 /** Max lines shown for an expanded tool result's content. */
 export const EXPANDED_RESULT_MAX_LINES = 60;
 /**
- * Navigation key hints for the footer. The expand/collapse hint reflects
- * the active tab's current expansion state (press `e` to toggle).
+ * Navigation key hints for the footer. The expand/collapse hint reflects the
+ * current GLOBAL expansion state (press `e` to toggle ALL member tabs).
  * Note: ctrl+m is indistinguishable from Enter in terminals, so compact
  * uses ctrl+o.
  */
@@ -1116,6 +1112,15 @@ export class MemberInspectorState {
   inputBuffer = "";
   /** Transient notice shown in the footer (e.g. send result). */
   notice: string | null = null;
+  /**
+   * GLOBAL view-mode toggles (e/t 开关全局化). The e/t switches are
+   * inspector-level view modes, NOT per-member states: one keypress flips
+   * ALL member tabs. Single source of truth — tabs carry no per-tab fields,
+   * so a divergent per-member state is structurally impossible and members
+   * added later (dynamic mode) automatically inherit the current values.
+   */
+  expanded = false;
+  showThinking = false;
 
   constructor(members: { name: string; label: string }[]) {
     this.syncMembers(members);
@@ -1137,8 +1142,6 @@ export class MemberInspectorState {
           lines: [],
           scrollOffset: 0,
           followTail: true,
-          expanded: false,
-          showThinking: false,
           newBelow: false,
           dirty: true, // fetch on first open
           contextInfo: null,
@@ -1200,17 +1203,16 @@ export class MemberInspectorState {
   }
 
   toggleExpand(): void {
-    const tab = this.activeTab;
-    if (!tab) return;
-    tab.expanded = !tab.expanded;
-    tab.dirty = true; // rebuild lines with new expansion state
+    // Global view-mode toggle: flip the single source of truth and mark
+    // EVERY tab dirty so flushDirty rebuilds all of them (running tabs via
+    // RPC refetch, stopped/crashed tabs with a cache via local rebuild).
+    this.expanded = !this.expanded;
+    for (const t of this.tabs) t.dirty = true;
   }
 
   toggleThinking(): void {
-    const tab = this.activeTab;
-    if (!tab) return;
-    tab.showThinking = !tab.showThinking;
-    tab.dirty = true; // rebuild lines with new thinking visibility
+    this.showThinking = !this.showThinking;
+    for (const t of this.tabs) t.dirty = true;
   }
 
   // ── Live streaming state (message_start / message_update / message_end) ──

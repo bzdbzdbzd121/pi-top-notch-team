@@ -17,6 +17,7 @@ import {
   IDENTITY_THEME,
   type BodyBuildCache,
   type BuildBodyOptions,
+  type InspectorTab,
   type InspectorTheme,
 } from "./member-inspector-state";
 
@@ -362,7 +363,15 @@ export class MemberInspectorComponent {
       const handle = this.deps.getHandle(tab.name);
       const opState = this.deps.memberOpsStates.get(tab.name);
       if (!handle || opState === "stopped" || opState === "crashed") {
-        tab.dirty = false;
+        // Stopped/crashed members have NO new data source — if a history
+        // cache exists it is the authoritative full set, so a global e/t
+        // toggle rebuilds locally (zero RPC). Without a cache there is
+        // nothing to render: clear the dirty mark and skip.
+        if (this.lastMessages.has(tab.name)) {
+          this.rebuildTabFromCache(tab);
+        } else {
+          tab.dirty = false;
+        }
         continue;
       }
       this.fetching.add(tab.name);
@@ -399,8 +408,8 @@ export class MemberInspectorComponent {
           }
           const opts = {
             width: Math.max(20, width),
-            expanded: tab.expanded,
-            showThinking: tab.showThinking,
+            expanded: this.state.expanded,
+            showThinking: this.state.showThinking,
             theme: this.inspectorTheme,
           };
           // Streaming tail: pending completions + the in-progress message are
@@ -492,8 +501,8 @@ export class MemberInspectorComponent {
       }
       const opts = {
         width: Math.max(20, this.lastWidth - 4),
-        expanded: tab.expanded,
-        showThinking: tab.showThinking,
+        expanded: this.state.expanded,
+        showThinking: this.state.showThinking,
         theme: this.inspectorTheme,
       };
       const buildMessages = [...messages, ...tab.pendingCompletions];
@@ -520,6 +529,40 @@ export class MemberInspectorComponent {
       Date.now() - started,
       STREAM_FLUSH_MS,
       STREAM_FLUSH_MAX_MS
+    );
+    this.requestRenderSafe();
+  }
+
+  /**
+   * P1 (global toggles): rebuild a stopped/crashed tab's display lines from
+   * the last RPC-fetched history — zero RPC. A stopped/crashed member cannot
+   * produce new messages, so `lastMessages` is the authoritative full set and
+   * the local rebuild is always consistent with the current global e/t state
+   * (the exact inconsistency globalizing the toggles would otherwise expose:
+   * a stale collapsed render on a tab whose member is no longer fetchable).
+   * Mirrors the flushStreaming build (incremental cache + streaming tail +
+   * fixed-width contract) so toggles land identically on every tab.
+   */
+  private rebuildTabFromCache(tab: InspectorTab): void {
+    const messages = this.lastMessages.get(tab.name) ?? [];
+    let cache = this.bodyCaches.get(tab.name);
+    if (!cache) {
+      cache = createBodyBuildCache();
+      this.bodyCaches.set(tab.name, cache);
+    }
+    const opts = {
+      width: Math.max(20, this.lastWidth - 4),
+      expanded: this.state.expanded,
+      showThinking: this.state.showThinking,
+      theme: this.inspectorTheme,
+    };
+    const buildMessages = [...messages, ...tab.pendingCompletions];
+    if (tab.live) buildMessages.push(tab.live);
+    const lines = buildBodyLinesIncremental(cache, buildMessages, opts).lines;
+    this.state.setTabLines(
+      tab.name,
+      fitLinesToWidth(lines, Math.max(20, this.lastWidth - 2)),
+      bodyHeight()
     );
     this.requestRenderSafe();
   }
@@ -917,7 +960,7 @@ export class MemberInspectorComponent {
       const label = `> ${this.state.inputBuffer}`;
       footer2 = theme.fg("accent", "✎ ") + truncateLine(label, inner - 4) + "▌";
     } else {
-      footer2 = " " + buildNavHints(tab?.expanded ?? false, tab?.showThinking ?? false);
+      footer2 = " " + buildNavHints(this.state.expanded, this.state.showThinking);
     }
     const footer2Line = border("│ ") + padVisible(truncateLine(footer2, inner - 2), inner - 2) + border(" │");
 

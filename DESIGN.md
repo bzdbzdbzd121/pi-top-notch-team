@@ -1147,8 +1147,8 @@ Overlay: `ctx.ui.custom(component, { overlay: true, overlayOptions: { width: "90
 | `i` / `Enter` | Open input box |
 | `Enter` (in input) | Send: `prompt` when idle, `follow_up` when busy |
 | `Ctrl+Enter` (in input) | Send `steer` (immediate redirect) |
-| `e` | Toggle tool call/result detail expansion for the active tab |
-| `t` | Toggle thinking block visibility for the active tab (hidden by default) |
+| `e` | Toggle tool call/result detail expansion — **GLOBAL**: flips ALL member tabs (running: RPC refetch; stopped/crashed with cache: local rebuild) |
+| `t` | Toggle thinking block visibility (hidden by default) — **GLOBAL**: flips ALL member tabs |
 | `ctrl+a` | `abort` the active tab's member |
 | `ctrl+b` / `ctrl+shift+a` | `abort` ALL executing members (working/compacting) in one shot; idle/stopped/crashed are skipped. `ctrl+shift+a` requires Kitty keyboard protocol — legacy terminals send the same byte as `ctrl+a` (single abort), so `ctrl+b` remains the all-terminal key |
 | `ctrl+o` | `compact` the active tab's member (NOT ctrl+m — indistinguishable from Enter in terminals) |
@@ -1157,7 +1157,7 @@ Overlay: `ctx.ui.custom(component, { overlay: true, overlayOptions: { width: "90
 ### Rendering Granularity
 
 - user/assistant text rendered in full (wrapped)
-- thinking blocks hidden by default, toggleable per tab with `t` (rendered as dim `💭 思考` + wrapped content); **with `t` on, streaming thinking renders line-by-line as deltas arrive** (coalesced local rebuilds at an adaptive 100ms→1s cadence, no RPC; each flush wraps only the new delta via the append-only wrap cache — cost stays flat as thinking grows)
+- thinking blocks hidden by default, **globally** toggleable with `t` (rendered as dim `💭 思考` + wrapped content); **with `t` on, streaming thinking renders line-by-line as deltas arrive** (coalesced local rebuilds at an adaptive 100ms→1s cadence, no RPC; each flush wraps only the new delta via the append-only wrap cache — cost stays flat as thinking grows)
 - tool calls collapsed to one-line summaries (`🔧 name arg-summary`), expandable with `e`; the arg summary is **sized to the actual frame width** (`textWidth - 14`, matching the streaming `调用中` variant and the tool-result lines) instead of a fixed 60-char cap — wide frames show more of the argument, narrow frames truncate with `…` (visible-width aware, CJK-safe)
 - expanded tool call arguments: pretty-printed JSON, **every line wrapped to the frame width** — long `content`/`command`/`path` values wrap across multiple lines instead of being hard-truncated (the summary line wraps too); total display lines capped at a 40-line budget per call (`EXPANDED_ARGS_MAX_LINES`), overflow collapsed to a `…` marker
 - tool results collapsed to `✓/✗ toolName first-line`, expandable with `e`

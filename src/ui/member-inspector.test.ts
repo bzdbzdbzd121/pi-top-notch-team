@@ -379,65 +379,178 @@ describe("MemberInspectorComponent — navigation & refresh", () => {
     expect(handleA.sendCommandAndWait).not.toHaveBeenCalled();
   });
 
-  it("'e' toggles expansion and refetches with expanded rendering", async () => {
+  it("T2: 'e' toggles expansion GLOBALLY — one keypress refetches ALL members with expanded rendering", async () => {
+    const toolMsg = {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "1", name: "read", arguments: { path: "a.ts" } }],
+      timestamp: 1,
+    };
     const handleA = makeHandle();
-    handleA.sendCommandAndWait.mockResolvedValue({
-      data: {
-        messages: [
-          {
-            role: "assistant",
-            content: [{ type: "toolCall", id: "1", name: "read", arguments: { path: "a.ts" } }],
-            timestamp: 1,
-          },
-        ],
-      },
-    } as any);
+    handleA.sendCommandAndWait.mockResolvedValue({ data: { messages: [toolMsg] } } as any);
+    const handleB = makeHandle();
+    handleB.sendCommandAndWait.mockResolvedValue({ data: { messages: [toolMsg] } } as any);
+    const deps = makeDeps({ handles: { a: handleA, b: handleB }, opStates: { a: "working", b: "working" } });
+    const { comp, state } = makeComponent(deps);
+
+    // Baseline: both tabs fetched collapsed (no expanded JSON)
+    comp.markDirty("a");
+    comp.markDirty("b");
+    await vi.advanceTimersByTimeAsync(600);
+    expect(state.tabs[0].lines.join("\n")).not.toContain('"path"');
+    expect(state.tabs[1].lines.join("\n")).not.toContain('"path"');
+
+    comp.handleInput("e");
+    expect(state.expanded).toBe(true);
+    await vi.advanceTimersByTimeAsync(600);
+    // N-way refetch from ONE keypress — both members rebuilt
+    expect(handleA.sendCommandAndWait).toHaveBeenCalledTimes(2);
+    expect(handleB.sendCommandAndWait).toHaveBeenCalledTimes(2);
+    // BOTH tabs rendered with the global expanded value
+    expect(state.tabs[0].lines.join("\n")).toContain('"path"');
+    expect(state.tabs[1].lines.join("\n")).toContain('"path"');
+    // Footer hint reflects the global value
+    expect(comp.render(80).join("\n")).toContain("e 隐藏工具详情");
+  });
+
+  it("T2b: 't' toggles thinking visibility GLOBALLY — all member tabs switch together", async () => {
+    const thinkMsg = {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "让我先分析一下需求" },
+        { type: "text", text: "好的" },
+      ],
+      timestamp: 1,
+    };
+    const handleA = makeHandle();
+    handleA.sendCommandAndWait.mockResolvedValue({ data: { messages: [thinkMsg] } } as any);
+    const handleB = makeHandle();
+    handleB.sendCommandAndWait.mockResolvedValue({ data: { messages: [thinkMsg] } } as any);
+    const deps = makeDeps({ handles: { a: handleA, b: handleB }, opStates: { a: "working", b: "working" } });
+    const { comp, state } = makeComponent(deps);
+
+    // Default: thinking hidden on BOTH tabs
+    comp.markDirty("a");
+    comp.markDirty("b");
+    await vi.advanceTimersByTimeAsync(600);
+    expect(state.tabs[0].lines.join("\n")).not.toContain("让我先分析一下需求");
+    expect(state.tabs[1].lines.join("\n")).not.toContain("让我先分析一下需求");
+
+    // Toggle on → both tabs refetch and render the thinking block
+    comp.handleInput("t");
+    expect(state.showThinking).toBe(true);
+    await vi.advanceTimersByTimeAsync(600);
+    expect(state.tabs[0].lines.join("\n")).toContain("让我先分析一下需求");
+    expect(state.tabs[1].lines.join("\n")).toContain("让我先分析一下需求");
+
+    // Toggle off again → thinking hidden on both tabs
+    comp.handleInput("t");
+    expect(state.showThinking).toBe(false);
+    await vi.advanceTimersByTimeAsync(600);
+    expect(state.tabs[0].lines.join("\n")).not.toContain("让我先分析一下需求");
+    expect(state.tabs[1].lines.join("\n")).not.toContain("让我先分析一下需求");
+  });
+
+  it("T3: a member added mid-session inherits the GLOBAL toggle values", async () => {
+    const toolMsg = {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "1", name: "read", arguments: { path: "a.ts" } }],
+      timestamp: 1,
+    };
+    const handleA = makeHandle();
+    handleA.sendCommandAndWait.mockResolvedValue({ data: { messages: [toolMsg] } } as any);
+    const handleC = makeHandle();
+    handleC.sendCommandAndWait.mockResolvedValue({ data: { messages: [toolMsg] } } as any);
+    const deps = makeDeps({ handles: { a: handleA, c: handleC }, opStates: { a: "working", c: "working" } });
+    const { comp, state } = makeComponent(deps);
+
+    comp.handleInput("e"); // global expand ON before the new member appears
+    expect(state.expanded).toBe(true);
+
+    // Dynamic member "c" joins the team mid-session
+    deps.getMembers = () => [
+      { name: "a", label: "分析员" },
+      { name: "b", label: "编码员" },
+      { name: "c", label: "测试员" },
+    ];
+    await vi.advanceTimersByTimeAsync(600); // flush → syncMembers picks up "c"
+    expect(state.tabs).toHaveLength(3);
+    expect(handleC.sendCommandAndWait).toHaveBeenCalled();
+    // The new tab renders with the global expanded value — no per-tab field
+    // to drift back to the default false
+    expect(state.tabs[2].lines.join("\n")).toContain('"path"');
+  });
+
+  it("T5: toggle during an in-flight fetch — dirty survives, catch-up flush rebuilds with the new opts", async () => {
+    let resolveFetch!: (v: any) => void;
+    const handleA = makeHandle();
+    handleA.sendCommandAndWait.mockReturnValue(new Promise((res) => { resolveFetch = res; }));
     const deps = makeDeps({ handles: { a: handleA }, opStates: { a: "working" } });
     const { comp, state } = makeComponent(deps);
-    comp.handleInput("e");
-    expect(state.tabs[0].expanded).toBe(true);
-    await vi.advanceTimersByTimeAsync(600);
+
+    comp.markDirty("a");
+    await vi.advanceTimersByTimeAsync(600); // fetch#1 in flight
+    expect(handleA.sendCommandAndWait).toHaveBeenCalledTimes(1);
+
+    comp.handleInput("e"); // toggle DURING the fetch
+    expect(state.expanded).toBe(true);
+    expect(state.tabs[0].dirty).toBe(true); // intent retained, not consumed
+
+    resolveFetch({
+      data: {
+        messages: [
+          { role: "assistant", content: [{ type: "toolCall", id: "1", name: "read", arguments: { path: "a.ts" } }], timestamp: 1 },
+        ],
+      },
+    });
+    await vi.advanceTimersByTimeAsync(600); // fetch#1 commits → catch-up flush → fetch#2
+    expect(handleA.sendCommandAndWait).toHaveBeenCalledTimes(2);
+    expect(state.tabs[0].dirty).toBe(false); // consumed by the catch-up flush
     expect(state.tabs[0].lines.join("\n")).toContain('"path"');
   });
 
-  it("'t' toggles thinking visibility and refetches with thinking rendered", async () => {
-    const handleA = makeHandle();
-    handleA.sendCommandAndWait.mockResolvedValue({
-      data: {
-        messages: [
-          {
-            role: "assistant",
-            content: [
-              { type: "thinking", thinking: "让我先分析一下需求" },
-              { type: "text", text: "好的" },
-            ],
-            timestamp: 1,
-          },
-        ],
-      },
-    } as any);
-    const deps = makeDeps({ handles: { a: handleA }, opStates: { a: "working" } });
-    const { comp, state } = makeComponent(deps);
+  it.each(["stopped", "crashed"] as const)(
+    "T6: %s member with cached history rebuilds LOCALLY on toggle — zero RPC",
+    async (opState) => {
+      const toolMsg = {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "1", name: "read", arguments: { path: "a.ts" } }],
+        timestamp: 1,
+      };
+      const handleA = makeHandle();
+      handleA.sendCommandAndWait.mockResolvedValue({ data: { messages: [toolMsg] } } as any);
+      const deps = makeDeps({ handles: { a: handleA }, opStates: { a: "working" } });
+      const { comp, state } = makeComponent(deps);
 
-    // Default: thinking hidden — fetch and verify
-    state.tabs[0].dirty = false;
-    comp.markDirty("a");
-    await vi.advanceTimersByTimeAsync(600);
-    expect(state.tabs[0].lines.join("\n")).not.toContain("让我先分析一下需求");
+      // Seed the history cache while the member is running (collapsed)
+      comp.markDirty("a");
+      await vi.advanceTimersByTimeAsync(600);
+      expect(handleA.sendCommandAndWait).toHaveBeenCalledTimes(1);
+      expect(state.tabs[0].lines.join("\n")).not.toContain('"path"');
 
-    // Toggle on → refetch renders the thinking block
-    comp.handleInput("t");
-    expect(state.tabs[0].showThinking).toBe(true);
-    await vi.advanceTimersByTimeAsync(600);
-    expect(state.tabs[0].lines.join("\n")).toContain("💭 思考");
-    expect(state.tabs[0].lines.join("\n")).toContain("让我先分析一下需求");
+      // Member stops/crashes — no new data source; the cache is authoritative
+      deps.memberOpsStates.set("a", opState);
+      comp.handleInput("e");
+      await vi.advanceTimersByTimeAsync(600);
+      // Local rebuild — the toggle must NOT trigger get_messages
+      expect(handleA.sendCommandAndWait).toHaveBeenCalledTimes(1);
+      expect(state.tabs[0].lines.join("\n")).toContain('"path"');
+    }
+  );
 
-    // Toggle off again → thinking hidden
-    comp.handleInput("t");
-    expect(state.tabs[0].showThinking).toBe(false);
-    await vi.advanceTimersByTimeAsync(600);
-    expect(state.tabs[0].lines.join("\n")).not.toContain("让我先分析一下需求");
-  });
+  it.each(["stopped", "crashed"] as const)(
+    "T7: %s member WITHOUT cache — dirty cleared, no RPC, no throw",
+    async (opState) => {
+      const handleA = makeHandle();
+      const deps = makeDeps({ handles: { a: handleA }, opStates: { a: opState } });
+      const { comp, state } = makeComponent(deps);
+      state.tabs[0].dirty = true; // never fetched — no cache
+      comp.handleInput("t"); // toggle
+      await vi.advanceTimersByTimeAsync(600);
+      expect(handleA.sendCommandAndWait).not.toHaveBeenCalled();
+      expect(state.tabs[0].dirty).toBe(false); // skipped, not stuck dirty
+      expect(state.showThinking).toBe(true); // global toggle still flipped
+    }
+  );
 });
 
 describe("MemberInspectorComponent — render", () => {
@@ -771,7 +884,7 @@ describe("MemberInspectorComponent — render", () => {
   it("expand hint flips to 隐藏工具详情 while details are expanded", () => {
     const deps = makeDeps({ handles: {}, opStates: {} });
     const { comp, state } = makeComponent(deps);
-    state.tabs[0].expanded = true;
+    state.expanded = true;
     const joined = comp.render(80).join("\n");
     expect(joined).toContain("e 隐藏工具详情");
     expect(joined).not.toContain("e 展开工具详情");
@@ -780,7 +893,7 @@ describe("MemberInspectorComponent — render", () => {
   it("thinking hint flips to 隐藏 while thinking is shown", () => {
     const deps = makeDeps({ handles: {}, opStates: {} });
     const { comp, state } = makeComponent(deps);
-    state.tabs[0].showThinking = true;
+    state.showThinking = true;
     const joined = comp.render(80).join("\n");
     expect(joined).toContain("t 隐藏思考");
     expect(joined).not.toContain("t 显示思考");
@@ -829,7 +942,7 @@ describe("MemberInspectorComponent — live streaming (message_update deltas)", 
     const handleA = streamHandle();
     const deps = makeDeps({ handles: { a: handleA }, opStates: { a: "working" } });
     const { comp, state } = makeComponent(deps);
-    state.tabs[0].showThinking = true; // t toggle already pressed
+    state.showThinking = true; // t toggle already pressed (global)
 
     comp.onMemberEvent("a", { type: "message_start", message: { role: "assistant", content: [] } });
     comp.onMemberEvent("a", thinkingDelta("thinking_start"));
@@ -862,7 +975,7 @@ describe("MemberInspectorComponent — live streaming (message_update deltas)", 
     const handleA = streamHandle();
     const deps = makeDeps({ handles: { a: handleA }, opStates: { a: "working" } });
     const { comp, state } = makeComponent(deps);
-    state.tabs[0].showThinking = true;
+    state.showThinking = true;
 
     comp.onMemberEvent("a", { type: "message_start", message: { role: "assistant", content: [] } });
     comp.onMemberEvent("a", thinkingDelta("thinking_start"));
@@ -906,7 +1019,7 @@ describe("MemberInspectorComponent — live streaming (message_update deltas)", 
     const handleA = streamHandle();
     const deps = makeDeps({ handles: { a: handleA }, opStates: { a: "working" } });
     const { comp, state } = makeComponent(deps);
-    state.tabs[0].showThinking = true;
+    state.showThinking = true;
 
     comp.onMemberEvent("a", { type: "message_start", message: { role: "assistant", content: [] } });
     comp.onMemberEvent("a", thinkingDelta("thinking_start"));
@@ -927,8 +1040,7 @@ describe("MemberInspectorComponent — live streaming (message_update deltas)", 
     const handleB = streamHandle();
     const deps = makeDeps({ handles: { a: handleA, b: handleB }, opStates: { a: "working", b: "working" } });
     const { comp, state } = makeComponent(deps);
-    state.tabs[0].showThinking = true;
-    state.tabs[1].showThinking = true;
+    state.showThinking = true; // global toggle covers both tabs
 
     // Both members stream thinking concurrently.
     for (const name of ["a", "b"]) {
@@ -953,7 +1065,7 @@ describe("MemberInspectorComponent — live streaming (message_update deltas)", 
     const handleA = streamHandle();
     const deps = makeDeps({ handles: { a: handleA }, opStates: { a: "working" } });
     const { comp, state } = makeComponent(deps);
-    state.tabs[0].showThinking = true;
+    state.showThinking = true;
 
     // Inspector opened mid-stream: only deltas arrive
     comp.onMemberEvent("a", thinkingDelta("thinking_delta", "迟到"));
@@ -978,7 +1090,7 @@ describe("MemberInspectorComponent — live streaming (message_update deltas)", 
     const handleA = streamHandle();
     const deps = makeDeps({ handles: { a: handleA }, opStates: { a: "working" } });
     const { comp, state } = makeComponent(deps);
-    state.tabs[0].showThinking = true;
+    state.showThinking = true;
 
     comp.onMemberEvent("a", { type: "message_start", message: { role: "assistant", content: [] } });
     comp.onMemberEvent("a", thinkingDelta("thinking_start"));

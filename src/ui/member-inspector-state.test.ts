@@ -664,26 +664,29 @@ describe("MemberInspectorState", () => {
     expect(s.tabs[0].followTail).toBe(true);
   });
 
-  it("toggleExpand flips expanded and marks tab dirty for rebuild", () => {
+  it("T1: toggleExpand flips the GLOBAL expanded and marks ALL tabs dirty", () => {
     const s = makeState();
-    s.tabs[0].dirty = false;
+    for (const t of s.tabs) t.dirty = false;
     s.toggleExpand();
-    expect(s.tabs[0].expanded).toBe(true);
-    expect(s.tabs[0].dirty).toBe(true);
+    expect(s.expanded).toBe(true);
+    // Every tab is dirty — not just the active one (global view-mode toggle)
+    for (const t of s.tabs) expect(t.dirty).toBe(true);
+    s.toggleExpand();
+    expect(s.expanded).toBe(false);
   });
 
-  it("toggleThinking flips showThinking and marks tab dirty for rebuild", () => {
+  it("toggleThinking flips the GLOBAL showThinking and marks ALL tabs dirty", () => {
     const s = makeState();
-    s.tabs[0].dirty = false;
-    expect(s.tabs[0].showThinking).toBe(false);
+    for (const t of s.tabs) t.dirty = false;
+    expect(s.showThinking).toBe(false);
     s.toggleThinking();
-    expect(s.tabs[0].showThinking).toBe(true);
-    expect(s.tabs[0].dirty).toBe(true);
+    expect(s.showThinking).toBe(true);
+    for (const t of s.tabs) expect(t.dirty).toBe(true);
     s.toggleThinking();
-    expect(s.tabs[0].showThinking).toBe(false);
+    expect(s.showThinking).toBe(false);
   });
 
-  it("syncMembers preserves showThinking across member reconciliation", () => {
+  it("syncMembers preserves the global toggles across member reconciliation", () => {
     const s = makeState();
     s.toggleThinking();
     s.syncMembers([
@@ -692,8 +695,16 @@ describe("MemberInspectorState", () => {
       { name: "c", label: "C" },
       { name: "d", label: "D" },
     ]);
-    expect(s.tabs[0].showThinking).toBe(true);
-    expect(s.tabs[3].showThinking).toBe(false); // new tabs default off
+    expect(s.showThinking).toBe(true);
+  });
+
+  it("T4: empty tabs — toggles flip the global value without throwing", () => {
+    const s = new MemberInspectorState([]);
+    expect(s.tabs).toHaveLength(0);
+    s.toggleExpand();
+    expect(s.expanded).toBe(true);
+    s.toggleThinking();
+    expect(s.showThinking).toBe(true);
   });
 
   it("input buffer supports insert/backspace/clear with unicode safety", () => {
