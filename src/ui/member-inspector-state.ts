@@ -416,8 +416,17 @@ export function extractText(content: unknown): string {
   return "";
 }
 
-/** One-line summary of a tool call's arguments. */
-export function summarizeArgs(name: string, args: Record<string, any> | undefined): string {
+/**
+ * One-line summary of a tool call's arguments.
+ * `maxWidth` (default 60) caps the summary at the given visible width so
+ * completed tool calls use the actual frame width instead of a fixed cap
+ * (truncation is visible-width aware via truncateLine, CJK-safe).
+ */
+export function summarizeArgs(
+  name: string,
+  args: Record<string, any> | undefined,
+  maxWidth = 60
+): string {
   if (!args || typeof args !== "object") return "";
   // Prefer a path/command-like argument for a meaningful one-liner
   const preferred =
@@ -430,8 +439,7 @@ export function summarizeArgs(name: string, args: Record<string, any> | undefine
     raw = keys.length > 0 ? keys.join(", ") : "";
   }
   raw = raw.replace(/\s+/g, " ").trim();
-  const max = 60;
-  return raw.length > max ? raw.slice(0, max - 1) + "…" : raw;
+  return truncateLine(raw, Math.max(10, maxWidth));
 }
 
 // ── Live streaming assembly (streaming thinking/text/toolcall) ──
@@ -679,7 +687,7 @@ function buildBodyRaw(
                 (block.partialArgs ?? "").replace(/\s+/g, " ").trim(),
                 Math.max(10, textWidth - 14)
               )
-            : summarizeArgs(block.name, block.arguments);
+            : summarizeArgs(block.name, block.arguments, Math.max(10, textWidth - 14));
           const label = streaming ? `  🔧 ${name} 调用中` : `  🔧 ${name}`;
           const line = summary ? `${label} ${summary}` : label;
           // Summary line wraps like any other text — a wide summary must

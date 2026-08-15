@@ -108,6 +108,18 @@ describe("summarizeArgs", () => {
     const out = summarizeArgs("bash", { command: "x".repeat(200) });
     expect(out.length).toBeLessThanOrEqual(60);
   });
+
+  it("honors the caller-provided width budget", () => {
+    const wide = summarizeArgs("bash", { command: "x".repeat(200) }, 40);
+    expect(wide.length).toBeLessThanOrEqual(40);
+    expect(wide.endsWith("…")).toBe(true);
+    // Short values are never truncated, regardless of budget
+    expect(summarizeArgs("read", { path: "a.ts" }, 10)).toBe("a.ts");
+  });
+
+  it("defaults to the fixed 60-char cap when no width is given", () => {
+    expect(summarizeArgs("bash", { command: "y".repeat(200) }).length).toBeLessThanOrEqual(60);
+  });
 });
 
 // ── fitLinesToWidth (P1-① 构建期定宽契约) ────────────────
@@ -229,6 +241,28 @@ describe("buildBodyLines", () => {
     expect(lines.join("\n")).toContain('"path"');
   });
 
+  it("sizes completed tool call summaries to the frame width", () => {
+    // Regression: summaries used a fixed 60-char cap even on wide frames;
+    // they must now use the actual width budget (textWidth - 14), so a
+    // wide frame shows more than 60 chars of the argument.
+    const lines = buildBodyLines(
+      [assistantMsg(toolCallBlock("bash", { command: "x".repeat(200) }))],
+      { ...opts, width: 120 }
+    );
+    const toolLines = lines.filter((l) => l.includes("🔧"));
+    expect(toolLines.join("\n")).toMatch(/x{61,}/);
+  });
+
+  it("truncates completed tool call summaries to the frame width on narrow frames", () => {
+    const lines = buildBodyLines(
+      [assistantMsg(toolCallBlock("bash", { command: "x".repeat(200) }))],
+      { ...opts, width: 40 }
+    );
+    const toolLines = lines.filter((l) => l.includes("🔧"));
+    // width 40 → textWidth 38 → budget Math.max(10, 38-14)=24 → 23 x + …
+    expect(toolLines.join("\n")).toMatch(/x{23}…/);
+  });
+
   it("renders tool result as one-line summary with status icon", () => {
     const ok = buildBodyLines([toolResultMsg("read", "file contents here")], opts);
     expect(ok.some((l) => l.includes("✓ read"))).toBe(true);
@@ -279,8 +313,8 @@ describe("buildBodyLines", () => {
     });
     const joined = lines.join("\n");
     // Content lines are wrapped, so no line carries a truncation ellipsis
-    // beyond the 4-space indent (the one-line summary's own 60-char "…"
-    // is absent because summarizeArgs prefers `command` = 120 chars →
+    // beyond the 4-space indent (the one-line summary's own width-budgeted
+    // "…" is absent because summarizeArgs prefers `command` = 120 chars →
     // sliced — filter it out by looking at the indented JSON region).
     const jsonRegion = joined.split("\n").filter((l) => l.startsWith("    "));
     expect(jsonRegion.length).toBeGreaterThan(1);
@@ -306,16 +340,21 @@ describe("buildBodyLines", () => {
   });
 
   it("collapsed summary line wraps when the one-liner exceeds width", () => {
-    const long = { path: "p".repeat(90) }; // summary 60 chars + indent > narrow width
-    const lines = buildBodyLines([assistantMsg(toolCallBlock("read", long))], {
-      ...opts,
-      width: 40,
-    });
+    // A long tool name pushes the one-liner past the frame width even
+    // though the summary itself is already truncated to the frame budget
+    // (width 40 → textWidth 38 → budget 24 = 23 p + …) → wraps, not cut.
+    const long = { path: "p".repeat(90) };
+    const lines = buildBodyLines(
+      [assistantMsg(toolCallBlock("true_sight_diff_impact", long))],
+      { ...opts, width: 40 }
+    );
     for (const l of lines) {
       expect(l.length).toBeLessThanOrEqual(40);
     }
-    // The 60-char truncated summary survives in full (wrapped, not cut)
-    expect(lines.join("")).toContain("p".repeat(59) + "…");
+    // The width-budgeted summary survives in full (wrapped, not cut)
+    expect(lines.join("")).toContain("p".repeat(23) + "…");
+    // Wrapped into two lines: label line + continuation (label carries 🔧)
+    expect(lines).toHaveLength(2);
     expect(lines.filter((l) => l.includes("🔧"))).toHaveLength(1);
   });
 });

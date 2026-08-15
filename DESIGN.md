@@ -1156,7 +1156,7 @@ Overlay: `ctx.ui.custom(component, { overlay: true, overlayOptions: { width: "90
 
 - user/assistant text rendered in full (wrapped)
 - thinking blocks hidden by default, toggleable per tab with `t` (rendered as dim `💭 思考` + wrapped content); **with `t` on, streaming thinking renders line-by-line as deltas arrive** (coalesced local rebuilds at an adaptive 100ms→1s cadence, no RPC; each flush wraps only the new delta via the append-only wrap cache — cost stays flat as thinking grows)
-- tool calls collapsed to one-line summaries (`🔧 name arg-summary`), expandable with `e`
+- tool calls collapsed to one-line summaries (`🔧 name arg-summary`), expandable with `e`; the arg summary is **sized to the actual frame width** (`textWidth - 14`, matching the streaming `调用中` variant and the tool-result lines) instead of a fixed 60-char cap — wide frames show more of the argument, narrow frames truncate with `…` (visible-width aware, CJK-safe)
 - expanded tool call arguments: pretty-printed JSON, **every line wrapped to the frame width** — long `content`/`command`/`path` values wrap across multiple lines instead of being hard-truncated (the summary line wraps too); total display lines capped at a 40-line budget per call (`EXPANDED_ARGS_MAX_LINES`), overflow collapsed to a `…` marker
 - tool results collapsed to `✓/✗ toolName first-line`, expandable with `e`
 - virtual scroll: full message history kept in memory, only the visible slice is rendered
