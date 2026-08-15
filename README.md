@@ -1,6 +1,7 @@
 # pi-top-notch-team
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![CI](https://github.com/bzdbzdbzd121/pi-top-notch-team/actions/workflows/ci.yml/badge.svg)](https://github.com/bzdbzdbzd121/pi-top-notch-team/actions/workflows/ci.yml)
 
 Multi-agent team collaboration extension for [pi](https://pi.dev). Define teams of specialized agent roles that work together on complex, long-running tasks.
 
