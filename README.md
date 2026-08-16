@@ -30,7 +30,7 @@
 
 ```bash
 # 从 GitHub 安装
-pi install github:bzdbzdbzd121/pi-top-notch-team
+pi install git:github.com/bzdbzdbzd121/pi-top-notch-team
 
 # 或从本地克隆安装
 pi install ./pi-top-notch-team
@@ -259,7 +259,7 @@ members:
 ### 从 GitHub 安装
 
 ```bash
-pi install github:bzdbzdbzd121/pi-top-notch-team
+pi install git:github.com/bzdbzdbzd121/pi-top-notch-team
 ```
 
 ### 从本地路径安装
@@ -281,7 +281,7 @@ pi -e ./index.ts
 
 ```bash
 # 只更新本扩展
-pi update github:bzdbzdbzd121/pi-top-notch-team
+pi update git:github.com/bzdbzdbzd121/pi-top-notch-team
 
 # 或更新全部扩展包
 pi update --extensions
