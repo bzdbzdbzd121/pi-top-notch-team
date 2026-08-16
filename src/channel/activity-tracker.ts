@@ -250,7 +250,10 @@ export function applyActivityEvent(
       let truncated = state.toolNameTruncated;
       if (rawName !== undefined) {
         const next = truncateToolName(rawName);
-        if (next !== toolName) {
+        // A1: also compare the truncation STATUS — a name whose stored form
+        // matches but whose flag differs (e.g. exactly MAX chars) would
+        // otherwise leave a stale ellipsis flag behind.
+        if (next !== toolName || rawName.length > TOOL_NAME_MAX_CHARS !== truncated) {
           toolName = next;
           truncated = rawName.length > TOOL_NAME_MAX_CHARS;
         }

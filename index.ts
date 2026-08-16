@@ -42,6 +42,10 @@ import {
   STOP_TEAM_SESSION_TOOL_NAME,
 } from "./src/tools/agent-session-tool-names";
 import { buildAgentInitiatedPrompt } from "./src/prompts/agent-initiated-mode";
+import {
+  createActivityTracker,
+  type ActivityTracker,
+} from "./src/channel/activity-tracker";
 
 /**
  * Team-tool names that leave durable traces in the conversation history when
@@ -153,6 +157,13 @@ export default function (pi: ExtensionAPI) {
   // Auto-reply tracking: pending setTimeout refs for scheduled auto-replies
   const pendingAutoReplies = new Map<string, NodeJS.Timeout>();
 
+  // ── Fine-grained activity display layer (phase 1/2) ─────────
+  // Per-member activity tracker feeding the team-status widget's live phases
+  // (thinking / tool-calling / executing / output). Lifecycle follows the
+  // widget: created at session start, cleared at session end (decision #7 —
+  // no leaks). The onMemberActivity multi-cast below feeds it per event.
+  let activityTracker: ActivityTracker | null = null;
+
   // ── Member Inspector (成员检视浮窗) ───────────────────────
   // Handle for the currently-open inspector overlay; null when closed.
   let inspectorHandle: MemberInspectorHandle | null = null;
@@ -224,7 +235,37 @@ export default function (pi: ExtensionAPI) {
     perTurnReplied,
     pendingAutoReplies,
     onMemberActivity: (memberName: string, event: any) => {
-      inspectorHandle?.onMemberEvent(memberName, event);
+      // Multi-cast to all activity consumers with PER-CONSUMER isolation (N4):
+      // a throwing observer must never break the other observers — and the
+      // event-handler call site also guards the state machine updates that
+      // follow (belt and suspenders). Order matters: tracker first, then the
+      // widget signature (which reads tracker state), P3 delete in between.
+      try {
+        inspectorHandle?.onMemberEvent(memberName, event);
+      } catch {
+        /* isolate */
+      }
+      try {
+        activityTracker?.onEvent(memberName, event);
+      } catch {
+        /* isolate */
+      }
+      // P3: process death clears the member's display state — an executing
+      // member that crashes would otherwise display ⚙️ forever (executing is
+      // staleness-exempt). Auto-restart re-creates the entry on the next
+      // agent_start.
+      if (event?.type === "process_exit" || event?.type === "process_error") {
+        try {
+          activityTracker?.delete(memberName);
+        } catch {
+          /* isolate */
+        }
+      }
+      try {
+        teamStatusWidget?.onMemberEvent(memberName, event);
+      } catch {
+        /* isolate */
+      }
     },
   };
 
@@ -684,6 +725,7 @@ export default function (pi: ExtensionAPI) {
       getMembers: () => getSessionState().teamDefinition?.members ?? [],
       teamCtx,
       memberOpsStates,
+      activityTracker: activityTracker ?? (activityTracker = createActivityTracker()),
       origin: session.origin,
     });
     teamStatusWidget.install(ui, ui.theme);
@@ -701,6 +743,12 @@ export default function (pi: ExtensionAPI) {
     if (teamStatusWidget) {
       teamStatusWidget.uninstall();
       teamStatusWidget = null;
+    }
+
+    // Fine-grained activity layer lifecycle follows the widget (no leaks).
+    if (activityTracker) {
+      activityTracker.clear();
+      activityTracker = null;
     }
 
     // Close the Member Inspector if open
@@ -785,6 +833,7 @@ export default function (pi: ExtensionAPI) {
         getMembers: () => getSessionState().teamDefinition?.members ?? [],
         teamCtx,
         memberOpsStates,
+        activityTracker: activityTracker ?? (activityTracker = createActivityTracker()),
         origin: session.origin,
       });
       teamStatusWidget.install(_ctx.ui, _ctx.ui.theme);
@@ -793,6 +842,10 @@ export default function (pi: ExtensionAPI) {
     if (!session.active && teamStatusWidget) {
       teamStatusWidget.uninstall();
       teamStatusWidget = null;
+      if (activityTracker) {
+        activityTracker.clear();
+        activityTracker = null;
+      }
       _ctx.ui.setStatus("team-inspector-hint", undefined);
     }
 

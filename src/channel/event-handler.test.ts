@@ -127,6 +127,22 @@ describe("createMemberEventHandler", () => {
     expect(deps.memberOpsStates.get("worker")).toBe("working");
   });
 
+  it("N4: a throwing onMemberActivity must NOT break the state machine update that follows", async () => {
+    // The activity observers (Member Inspector / activity tracker) sit at the
+    // TOP of the handler, before the state machine if-chain — an observer bug
+    // must be isolated so agent_start/agent_end transitions still happen.
+    const { createMemberEventHandler } = await loadModule();
+    const deps = createMockDeps({
+      onMemberActivity: vi.fn().mockImplementation(() => {
+        throw new Error("tracker boom");
+      }),
+    });
+    const handler = createMemberEventHandler("worker", deps as any);
+    expect(() => handler({ type: "agent_start" })).not.toThrow();
+    expect(deps.memberOpsStates.get("worker")).toBe("working");
+    expect((deps as any).onMemberActivity).toHaveBeenCalledTimes(1);
+  });
+
   it("should set state to idle on agent_end", async () => {
     const { createMemberEventHandler } = await loadModule();
     const deps = createMockDeps();

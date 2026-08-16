@@ -141,6 +141,16 @@ describe("applyActivityEvent — transition table", () => {
     expect(state.toolNameTruncated).toBe(true);
   });
 
+  it("A1: update whose truncated form matches but truncation STATUS differs recomputes the flag (no stale ellipsis)", () => {
+    // Stored: "bash -c make" → "bash -" (truncated). A new update carries
+    // exactly TOOL_NAME_MAX_CHARS chars — same stored form, but NOT truncated:
+    // the stale flag must be corrected even though the name string matches.
+    let state = run(1000, ev.agentStart(), ev.toolStart("bash -c make"));
+    state = applyActivityEvent(state, ev.toolUpdate("bash -"), 5000);
+    expect(state.toolName).toBe("bash -");
+    expect(state.toolNameTruncated).toBe(false);
+  });
+
   it("tool_execution_update on a fresh member (missed start) fail-softs into executing", () => {
     const state = run(1000, ev.toolUpdate("bash -c make"));
     expect(state.phase).toBe("executing");

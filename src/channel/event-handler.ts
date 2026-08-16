@@ -211,7 +211,13 @@ export function createMemberEventHandler(
     // / message_end) can be assembled into a live partial message instead of
     // waiting for the refetch.
     if (typeof event?.type === "string") {
-      deps.onMemberActivity?.(memberName, event);
+      try {
+        deps.onMemberActivity?.(memberName, event);
+      } catch {
+        // N4: activity observers (Member Inspector / activity tracker) are
+        // best-effort display consumers — an observer bug must never break
+        // the state machine updates that follow in this handler.
+      }
     }
 
     // ── Surface fire-and-forget prompt rejections from the member's RPC layer ──
