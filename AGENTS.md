@@ -30,11 +30,13 @@ User's pi session (TL extension)
 
 Batch send: team_send_and_wait now supports tasks array for concurrent dispatch to multiple members. Previously single-target to/content/nextSteps; now unified tasks:[{to, content}] + nextSteps. **Batch when tasks are independent (parallel execution); sequential when task B depends on task A's output. See TL Tools table for decision rules.**
   ├── Message channel (queue → router → responseWaiter)
+  ├── Activity display layer (activity-tracker: 纯函数细粒度阶段状态，与 memberOpsStates 并行不互写；onMemberActivity 多播 → Inspector + tracker + widget)
   ├── Member Process Manager
   │     ├── Member A (pi --mode rpc, member.ts)
   │     ├── Member B (pi --mode rpc, member.ts)
   │     └── Member C (pi --mode rpc, member.ts)
   └── Team mode UI widget (live member status + context usage %, above editor)
+      └── 事件驱动刷新：N1 双层渲染去重（签名过滤 + styled 行闸门）→ 合并节流 120ms+自适应退避
 ```
 
 **Key files:**
@@ -79,7 +81,9 @@ src/
 │   ├── router.ts     ← Routes to member / tl / all / self-skip
 │   ├── response-waiter.ts  ← team_send_and_wait correlation matching + response buffer
 │   ├── auto-compact.ts    ← Shared Auto-Compaction runtime (primitives + pending/flush)
-│   └── event-handler.ts    ← Member RPC event handler (state machine, dedup, routing)
+│   ├── activity-tracker.ts  ← 细粒度活动状态纯函数层（阶段 1）：ActivityPhase/MemberActivity、applyActivityEvent()/derivePhase()/createActivityTracker()；N5 硬性 O(1) 纪律（零 import、无字符串构建）+ D10 toolName 截断预计算
+│   ├── activity-tracker.test.ts ← 转换表全映射/多流优先级/陈旧判定边界/agent_end 丢弃门/N5 纪律静态锁定（44 例）
+│   └── event-handler.ts    ← Member RPC event handler (state machine, dedup, routing; N4 调用点隔离)
 ├── process/          ← Member process lifecycle
 │   ├── member-process.ts  ← pi --mode rpc spawn wrapper (write queue, size guard)
 │   └── manager.ts    ← Multi-member lifecycle + operational state + auto-restart
@@ -122,7 +126,9 @@ src/
 │   ├── resolve-model.ts   ← Pure function: member model precedence resolution
 │   └── resolve-auto-compact.ts ← Pure functions: auto-compaction resolution + threshold check + menu label
 ├── ui/               ← TUI components for team mode
-│   ├── team-status-widget.ts  ← Bordered widget: live member status + context %
+│   ├── team-status-widget.ts  ← Bordered widget: live member status + context %；阶段 2 实时化：细粒度阶段渲染（💭/🔧/⚙️+toolName（D10 截断+省略号）/📤/✅ + 时长微文案）+ N1 双层渲染去重（调度侧签名过滤 + 渲染侧 styled 行比较闸门）+ N2 轮询完成保留 refresh + N3 轮询并行化 + 合并节流（120ms + nextStreamFlushDelay 自适应退避，上限 1s）
+│   ├── team-status-widget.test.ts ← widget 单测：徽标/截断/overlay 优先级/时长格式/N1 双闸门（颜色盲区 B1）/S1 进程死亡强制调度/定时器清理
+│   ├── team-status-widget.integration.test.ts ← 集成测试：mock 成员 RPC 事件注入断言 setWidget 内容；N2 轮询闭环/N3 并行化/N6 风暴护栏 + P3 + 单帧成本实测留档
 │   ├── edit-mode-widget.ts   ← Bordered widget: ✏️ EDIT MODE — <team name>
 │   ├── create-mode-widget.ts ← Bordered widget: 🆕 CREATE MODE
 │   ├── scroll-select.ts      ← Scrollable + filterable select dialog (ctx.ui.custom, maxVisible window + fuzzy search)
@@ -219,6 +225,8 @@ src/
 
 24. **会话结束一次性提醒（session-ended banner）** — 用户 `/team stop`（或 agent 调 `stop_team_session`）后，TL 的对话历史仍含 Team Lead 系统提示词与团队工具使用模式，且会话工具已停用（决策 #21），TL 下一轮仍可能以 Team Lead 自居、尝试调用已停用的团队工具——而 pi 对非活跃工具的报错是晦涩的 `Tool xxx not found`（agent-loop 在 `beforeToolCall` 之前就短路，扩展无法改写该错误）。修复：`teardownTeamSession` 在会话确实活跃过时置位 `teamCtx.sessionEndedNotice`（一次性标记，与 `resumedFrom` 同模式）；`before_agent_start` 在会话不活跃且标记未消费时，向下一轮系统提示词注入 ⚠️「团队会话已结束」横幅（工具已停用清单 + 回到普通模式的指示 + 再次进入用 /team start），并消费标记；若新会话先启动则静默丢弃。**横幅搭下一次用户发起的回合——绝不触发新对话**（pi 没有不触发回合地向 agent 注入上下文的手段；`pi.sendMessage` 会发起回合，被明确排除）。空转 `/team stop`（无活跃会话）不置位，避免虚假横幅。**边缘情况双层守卫**：(a) `session_start` 事件带 `reason: "new"`（/new 全新对话无团队历史）时直接清除 pending 标记；/fork 与 /resume 复制/恢复历史，不碰标记。(b) 消费时内容检查 `historyHasTeamTraces()`：当前对话历史确含团队痕迹（assistant toolCall 名为团队工具 / custom_message `customType: "team-message"` 的成员路由消息）才注入——/new 新对话无痕迹→不注入；/fork、/resume 团队对话痕迹被复制→注入（正是所需）；/resume 到别的非团队对话→无痕迹→不注入。sessionManager 不可用时 fail-open（照常注入），保证主场景（/team stop → 下一轮）稳定。
 25. **防截断协议（promptGuidelines，P3）** — `team_send_and_wait` 的 promptGuidelines 内置 5 条防截断协议（长 content 是校验失败的首要诱因：流式输出截断 → partial-json 补全成"缺 to 的合法对象"）。P1/P2 已保证截断形态不再以误导性框架错误出现（宽容处理 + 截断语义提示），本协议从**源头降低截断概率**：① content 超 ~800 字符时拆分多次调用或指示成员读取文件路径——**任务详情不写入 `.shared-context.md`**（全员共享 + `write_shared_context` 全量覆盖会污染其他成员上下文、批处理并发覆盖有竞态，D6 裁决），引用成员私有或独立文件路径；② 键序**先写 to 再写 content**（键序决定截断后幸存字段，γ 独立实证）；③ 每回合 tool call 控制在 1-2 个（同批多 call 挤占输出预算，β 场景）；④ 收到 Validation failed（缺 to/content）→ 用更短 content 重试，不原样重发（打断死循环，β）；⑤ 收到"未知成员"错误 → 先疑 to 截断（截半形态如 "c"），重发完整成员名。定位为**引导性 best practice 而非强制架构**（γ）。
+26. **细粒度活动状态显示层（activity-tracker，双状态机并行）** — 成员状态栏实时化：新增独立于 `memberOpsStates`（控制面）的**显示面**（`src/channel/activity-tracker.ts` 纯函数 + per-member Map，互不写入——控制面被 wait/all-idle/批屏障/auto-compact 强依赖，红线不动）。`onMemberActivity` 单播改**多播**（Inspector + tracker + widget；N4 每消费者独立 try/catch，event-handler 调用点再兜底——observer 抛错绝不中断状态机更新）。事件→流活跃标志→优先级推导（executing > tool-calling > output > thinking）；agent_start 置 thinking（D1）、message_end 清全部流落 working 绝不落 idle（D4，回合内多消息间隙不误报空闲）、agent_end 权威归零 idle（D9）；**防卡死三层兜底**：message_end 清流 → agent_end 归零 → 30s 陈旧判定（豁免 executing，惰性化于渲染时 derivePhase(state, now)）；agent_end 后旧 delta 丢弃门（`ended` 标记，未启动成员不受门控）；**P3**：process_exit/process_error 时 `tracker.delete(memberName)`（executing 豁免 stale 下崩溃成员必须清条目，auto-restart 后 agent_start 重建）+ 进程死亡**强制调度**渲染（S1：idle 成员崩溃签名不变时不再等 30s 轮询）。显示优先级：`compacting > crashed/stopped > 细粒度 phase > working 兜底 > idle`（进程级与压缩态以逻辑层为权威）；widget 渲染时 overlay，tracker 生命周期随 widget install/uninstall（防泄漏）。
+27. **事件驱动渲染的性能纪律（N1-N6）** — 阶段 2 性能验收项全部落实：**N1 双层渲染去重**（收益最大）：调度侧 per-member 显示签名（logical+phase+toolName+**秒取整时长**，未变不调度）+ 渲染侧 **styled 行比较闸门**（未变跳过 setWidget——setWidget 是上游全量重建+无条件 requestRender 的最大成本项；**B1 修正**：raw 比较有颜色盲区——working 兜底（默认色）与 tool-calling（warning）raw 相同 styled 不同，故闸门键必须含颜色）。**N2**：轮询完成保留 refresh()（原方案"轮询不再承担刷新职责"表述修正——否则长无事件期时长/百分比冻结、30s 陈旧判定无执行窗口）；渲染闸门把关使轮询 refresh 零额外成本。**N3**：轮询 `Promise.allSettled` 并行化（串行 for-await + 3s 超时最坏 3N s → ≤3s）+ abort 后不重排（修复 uninstall 期间定时器泄漏）。**N5**：tracker 事件路径硬性 O(1)（零 import、无字符串构建（D10 截断为唯一有界例外）、被忽略事件返回同引用零分配，静态扫描测试锁定）。**N6**：性能护栏测试（8 成员 × 500 事件风暴：setWidget 有界 ≤100 且非零、tracker <50ms、uninstall 零定时器、单帧成本实测留档）。伪优化排除清单（P1-P13：段级重绘/事件批处理/delta 抽样/worker 渲染等）与可选优化（O1-O4）定位见 DESIGN.md §20。
 
 ## Dependency Injection Pattern
 
@@ -543,4 +551,4 @@ TL: 监控进展、协调异常、write_shared_context 更新共享上下文（�
 
 ## Design Document
 
-See [DESIGN.md](./DESIGN.md) for the full design specification (16 sections).
+See [DESIGN.md](./DESIGN.md) for the full design specification (20 sections).

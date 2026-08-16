@@ -1317,3 +1317,193 @@ Rationale (the core design philosophy): in a user-initiated session the user's e
 | `src/session/state.ts` | `SessionOrigin` + `origin` field on `TeamSessionState` |
 | `src/session/session-tool-visibility.ts` | `AGENT_SESSION_TOOL_NAMES` + `agentInitiated` dep — origin-conditional activation |
 | `index.ts` | Load-time registration, origin-branched guards/prompt, whitelist additions |
+
+## 19. 细粒度活动状态显示层（Activity Tracker + 事件驱动渲染）
+
+### 背景与根因
+
+团队会话中输入框上方的 member 状态栏原先只能显示回合级粗粒度状态（`working` 是 agent_start→agent_end 全程一个 🔧），刷新靠 5s/30s 轮询搭车——状态变化最多滞后 5~30s。**问题是"数据通路没接到 widget"，不是"没有数据"**：成员 RPC 的流式增量事件（thinking/toolcall/text delta + tool_execution_*，含 toolName）已实时到达 TL 进程（Member Inspector 已在消费），只需新增一个独立于粗粒度逻辑状态机的**细粒度显示层**（纯函数 + per-member Map），把 `onMemberActivity` 改为多播喂给 widget。
+
+### 双状态机职责划分（控制面 vs 显示面）
+
+| | 控制面（既有） | 显示面（新增） |
+|---|---|---|
+| 模块 | `memberOpsStates` / `state-machine.ts` | `src/channel/activity-tracker.ts` |
+| 职责 | wait/all-idle 门控、批屏障、auto-compact | 仅喂 widget 的阶段/工具名/时长 |
+| 状态 | idle/working/compacting/crashed/stopped | thinking/tool-calling/executing/output/working/idle |
+| 事件源 | 逻辑事件（task_started…） | 成员 RPC 流式事件（agent_*/message_*/tool_execution_*） |
+| 权威关系 | **进程级（crashed/stopped）与压缩态（compacting）以逻辑层为权威**，widget 渲染时 overlay | 其余阶段以显示面为准 |
+
+两状态机并行、互不写入（红线：`memberOpsStates` / `state-machine.ts` / `tl-tools.ts` 零改动）；"两个状态机不一致"不是 bug——控制面驱动门控，显示面驱动展示。
+
+### 数据来源（全部已存在，零新增通道）
+
+| 事件 | 用途 |
+|------|------|
+| `agent_start` / `agent_end` | 回合边界：置 thinking（初始态）/ 权威归零 idle |
+| `message_update`（`assistantMessageEvent.type`: thinking/text/toolcall 的 start/delta/end） | 阶段切换主信号源 |
+| `message_end` | 清除全部流式标志（防卡死第一保险，落 working 非 idle） |
+| `tool_execution_start/update/end` | executing 阶段 + toolName（start 时 D10 截断预计算） |
+| `process_exit` / `process_error` | 由逻辑层 overlay 呈现 crashed/stopped；集成层 P3 清理 tracker 条目 |
+| `get_session_stats`（保留轮询） | 仅上下文百分比（降频：活跃 15s / 空闲 30s） |
+
+### 状态规则（applyActivityEvent，纯函数）
+
+| 事件 | 动作 |
+|------|------|
+| `agent_start` | 清空 streams/toolName（防上回合残留污染）→ 置 thinking（D1：默认起点，无思考模型由工作态兜底） |
+| `message_update` delta | 置对应流标志（thinking/text/toolcall） |
+| `message_update` *_end | 清对应流标志（D6：不写死降级，由优先级推导自然落位） |
+| `tool_execution_start` | streams.executing = true；toolName 截 6 字符预计算存储（D10 + `toolNameTruncated` 标记） |
+| `tool_execution_update` | 保持 executing；**仅在事件携带 toolName 时更新，缺失保留原值（审查 P1）**；同名字短路跳过重复截断（P2/A1） |
+| `tool_execution_end` | 清 executing → 自然回到仍活跃的流（D5）或落 working（D3） |
+| `message_end` | 清全部流标志 → working，**绝不落 idle**（D4：回合内多消息间隙不得误报空闲） |
+| `agent_end` | 权威归零 idle（D9：直接归零不延迟——节流窗口自然掩盖瞬闪） |
+| 未知事件 | 幂等忽略（process_* 由逻辑层负责） |
+
+**阶段推导 `derivePhase(state, now)`（惰性，渲染时计算）**：
+1. 回合外（agent_end 后）→ idle
+2. 回合内按优先级取活跃流：`executing > tool-calling > output > thinking`；无活跃流 → working（流标志全部为假时以存储 phase 为权威——agent_start 的初始 thinking 无法由流标志表达）
+3. 陈旧判定（D7）：thinking/tool-calling/output 的 `lastDeltaAt` 超过 30s 且无新事件 → 降级 working；**executing 豁免**（长工具执行合法无 delta）；惰性化——判定只在读取时发生，无 Timer、无扫描
+
+**多流优先级理由（D5）**：现代模型多块并行流式是常态，简单"最近事件定阶段"每秒抖动数次；工具执行是外部副作用（最重）、thinking 是内部过程（最轻）。流活跃标志结构（start 置位 / end 清位 / message_end 全清）是优先级的基础（乙指出的实现缺口）。
+
+### agent_end 后旧 delta 丢弃门
+
+agent_end 是权威归零点；之后到达的流事件属于已结束回合（延迟投递），一律丢弃直到下一次 agent_start。实现为状态内 `ended` 标记（agent_end 置位 / agent_start 复位）——**未启动成员（fresh 条目）不受门控**（漏 agent_start 时首个事件仍能建立状态，不卡死）。
+
+### 接线（index.ts）
+
+```
+成员 RPC 事件 → event-handler（N4 调用点 try/catch 兜底）
+  → onMemberActivity 多播（每消费者独立 try/catch，N4）
+      ├── Member Inspector（现状，不动）
+      ├── activityTracker.onEvent（O(1) Map 更新）
+      ├── P3：process_exit/process_error → tracker.delete(memberName)
+      └── teamStatusWidget.onMemberEvent（N1 签名过滤 + 节流调度）
+  → 逻辑层状态机更新（不受 observer 异常影响）
+```
+
+tracker 生命周期随 widget install/uninstall（onSessionStart / onSessionEnd / before_agent_start 安全网双处），无泄漏。
+
+### 显示方案（team-status-widget）
+
+```
+│ 💭 分析员甲 12s 45% │ 🔧 编码员 bash 1m20s 30% │ 📤 分析员乙 8s 12% │ ✅ 审查员 8% │
+```
+
+| 显示态 | 图标 | 文案 | 颜色 |
+|--------|------|------|------|
+| thinking | 💭 | `label 12s`（时长由 phaseSince 派生，零 Timer） | accent |
+| tool-calling | 🔧 | `label`（toolName 未知） | warning |
+| executing | ⚙️ | `label toolName… 1m20s`（D10 截断存储 + 渲染端省略号） | warning |
+| output | 📤 | `label 8s` | success |
+| working | 🔧 | `label`（中性兜底，不误报；无 tracker 数据时也显示 🔧 而非 ✅——dispatch→agent_start 窗口） | 默认 |
+| idle | ✅ | `label 百分比` | muted |
+| compacting / crashed / stopped | 🗜️ / 💥 / ⏹️ | 维持现状（逻辑层权威 overlay） | 维持现状 |
+
+- **渲染优先级**：`compacting > crashed/stopped > 细粒度 phase > working 兜底 > idle`
+- 不显示思考/输出内容与工具参数（隐私 + 单行放不下；内容查看走 alt+t Inspector）
+- toolName 保留至下一阶段事件（不做 2s 淡出——无 Timer、无跨回合残留交互）
+- 整行重建（O(N) μs 级，N≤8），不做段级局部重绘（D8）
+
+### 防卡死三层兜底
+
+1. `message_end` 清全部流标志（落 working 不落 idle——误报空闲违背核心诉求，故不采纳 message_end→idle）
+2. `agent_end` 权威归零 idle（双保险）
+3. 30s 陈旧判定（豁免 executing/compacting，回退 working 非 idle）——经 N2 轮询 refresh 闭环执行
+
+### 事件驱动刷新（N1 双层去重 + 节流）
+
+- **调度侧签名过滤**：每事件计算该成员的显示签名 `logical|phase|toolName|秒取整时长`；未变不调度渲染（流式期间 phase/toolName 窗口间几乎不变，消除"节流器被持续踢醒"）
+- **合并节流**：120ms 合并窗口 + `nextStreamFlushDelay` 自适应退避（上限 1s；复用 Inspector 模式），~10 次/s 仅为安全上限
+- **渲染侧闸门**：flush 时比较 styled 行（raw+颜色）与上次输出，未变跳过 setWidget（setWidget 是无状态快照全量重建 + 无条件 requestRender，上游实证为最大成本项；**B1：raw 比较有颜色盲区**——working 兜底与 tool-calling raw 相同 styled 不同，闸门键必须含颜色）
+
+### 显示层关键边界（审查沉淀）
+
+- **P3**：process_exit/process_error 必须 `tracker.delete(memberName)`——executing 豁免 stale 的成员崩溃后若不清理会永久显示 ⚙️；auto-restart 由下一次 agent_start 重建条目
+- **S1**：进程死亡事件**强制调度**渲染（绕过签名闸门）——idle 成员（无 tracker 条目）崩溃时 P3 delete 是 no-op、签名不变不调度，若不强制则崩溃显示滞后至 30s 轮询；flush ≥120ms 后逻辑层已更新，显示正确
+- **B1**：渲染闸门比较必须含颜色（styled 行）——working 兜底（默认色）与 tool-calling（warning）raw 完全相同
+- working 兜底色为"默认"（不调 theme.fg）；`ThemeColor` 无 "default" token，直接输出原始文本
+
+## 20. 性能评估与优化（N1–N6 / P1–P13 / O1–O4）
+
+> 本方案（成员状态栏实时化）的配套性能评估结论：**方案本身性能安全，无架构级优化需求**——事件侧每事件 O(1)（μs 级）、内存 KB 级零累积、对现有通道（消息队列/路由/批屏障/auto-compact/派发）零叠加、轮询 RPC 净减 2/3（活跃期 5s→15s）。全部新增成本量化后 <1% CPU + ~2KB 内存。
+
+### 四维度成本模型与量化
+
+| 维度 | 结论 | 量化依据 |
+|------|------|----------|
+| 事件处理 | 每事件 ~0.5–1μs（Map.get + 字段写，无字符串构建） | 8 成员并发风暴 400–800 事件/s ≈ 4ms/s CPU（<0.5%）；tracker 接入点在 onMemberActivity 回调，**不在 notifyHandlers 数组内**——每事件 handler 遍历 O(H) 不变；JSON.parse 是现状成本（Inspector 已承受），方案不增加解析次数。**集成测试实测：4000 事件 1.2ms（0.30μs/事件）** |
+| 渲染 | **唯一主要成本项**：setWidget →（无条件）requestRender → doRender 全屏重绘 | 上游实证：setWidget 全量销毁重建组件 + 无条件 requestRender + pi-tui doRender（16ms 节流合并）。**组件侧实测：buildDisplay+setWidget 8.5μs/帧**；真实 doRender 全屏遍历为 pi-tui 内部实现（依赖真实 TUI 环境，未直接实测），N1 收益论证不依赖精确帧成本（D4：真实值在百 μs–ms 级，方向共识成立） |
+| 内存 | MemberActivity ~200B/成员，20 成员 <5KB；零累积（不存 delta 内容/历史），uninstall 清空 | 与 Inspector 的 MB 级缓存本质不同 |
+| 轮询 | 净收益：活跃期 5s→15s，RPC 往返减 2/3；连带 sendCommandAndWait 临时 handler 匹配次数减 67% | N3 并行化后单次轮询最坏 ≤3s（max 语义），不再有 3N s 串行漂移 |
+
+### 稳态认知（最坏 vs 稳态双口径）
+
+- **最坏口径**：10 次/s（120ms 节流窗口的安全上限）——仅作预算上限
+- **稳态口径（认知修正）**：正确实现渲染去重后，渲染频率由**阶段切换 + 时长秒边界**驱动，而非 delta 频率——稳态约 **1–3 次/s**（阶段切换 5–10 次/回合 + 时长秒级进位 + 15s 轮询）；N6 风暴实测 setWidget 有界（4000 事件仅 1 次，B1 修复后 ≥1 非零）
+
+### N1–N6 决策与依据
+
+| # | 优化 | 做法 | 依据 | 预期收益 |
+|---|------|------|------|----------|
+| **N1** | 渲染去重双层闸门（收益最大） | ① 调度侧签名过滤（phase + toolName + **秒取整时长** + 逻辑层 overlay 状态，未变不调度）；② 渲染侧 **styled 行比较**（raw+颜色，未变跳过 setWidget） | 流式期间签名几乎不变；setWidget 是"无状态快照"全量重建 + 无条件 requestRender（实证）；秒取整进签名解决"时长秒边界必须触发"（增强 A）；B1 修正：raw 比较颜色盲区 | TUI 重绘从 ~10 次/s 降至 1–3 次/s（doRender 次数降 ~70–90%），唯一达"可感知 CPU/I/O"量级的成本项 |
+| **N2** | 轮询完成后保留 refresh()（表述修正） | `pollContextUsage` 完成（无论百分比是否变化）仍调用 refresh()；是否 setWidget 由 N1 渲染侧闸门把关 | 长无事件期时长/百分比冻结；陈旧判定需渲染闭环；轮询是唯一时间驱动兜底源 | 正确性：时长误差 ≤15s、百分比规律刷新、第三层防卡死生效；零成本 |
+| **N3** | 轮询并行化 | 串行 for-await 改 `Promise.allSettled` 并行（各自 try/catch） | 实证串行 + 3s 超时 = 最坏 3N s（N=8 → 24s）；降频后周期 < 耗时 → 调度漂移；顺带修复 abort 后仍重排的定时器泄漏 | 单次轮询最坏 3N s → ≤3s（max 语义）；周期确定化 |
+| **N4** | 多播异常隔离 | onMemberActivity 多播中每个消费者独立 try/catch + event-handler 调用点兜底 | onMemberActivity 调用点在 if 链**之前**，observer 抛错会中断后续状态机更新 | 状态机更新不被显示层异常中断（单测锁定：throw 后 agent_start/end 仍推进） |
+| **N5** | tracker 事件路径硬性 O(1)（验收硬标准） | onEvent 只写 streams 布尔 + 时间戳 + toolName + Map set；不构建字符串（D10 截断为唯一有界例外）、不调 theme/visibleWidth/UI、不拷贝大对象；模块零 import（不 import pi-tui/pi） | 事件风暴 400–800/s 下任何非 O(1) 操作线性放大 | 每事件成本锁定 ~1μs（实测 0.30μs）；防回归由静态扫描测试 + 代码审查双锁 |
+| **N6** | 性能护栏测试（CI 硬断言） | 集成测试注入 mock 高频事件（8 成员 × 500 事件），断言：① setWidget 调用有界（≤100）且非零（B1 修复后 S3 互补断言）；② 内容未变不触发 / 内容变化必触发双向断言（语义化避开时长进位歧义）；③ tracker 处理总耗时 < 50ms（实测 1.2ms）；④ performance.now() 实测单帧成本留档（buildDisplay+setWidget 8.5μs/帧；真实 doRender 为上游全屏遍历，依赖真实 TUI，记录实证链：setWidget→requestRender→doRender 16ms 节流）；⑤ uninstall 无定时器泄漏（vi.getTimerCount() === 0） | delta 频率未实测（依赖真实模型不稳定），CI 断言把"事件驱动不退化"锁进可验证硬约束 | 事件风暴下不退化成为回归护栏；消除 doRender 量化缺口 |
+
+### P1–P13 伪优化排除清单
+
+| # | 伪优化 | 排除依据 |
+|---|--------|----------|
+| P1 | 段级局部重绘（仅重绘变化段） | 单行段宽联动（toolName 截断推移后续段），段级宽度跟踪复杂度远超 O(N) 整行重建（N≤8 μs 级）；与 TUI 行级模型冲突 |
+| P2 | 事件批处理/队列化消费 | tracker 每事件 O(1)，批处理只增延迟与复杂度；异步化破坏 FIFO 顺序与 Inspector 实时性；合并职责已由渲染节流承担 |
+| P3 | worker/异步渲染 | widget 渲染 μs 级，移出主线程的通信成本 > 渲染成本本身 |
+| P4 | JSONL 解析微优化 / 缓冲合并 JSON.parse | 现状瓶颈不在 TL 侧解析（1–5ms/s）；改动共享热路径影响 Inspector；收益 <1ms/s，回归风险大 |
+| P5 | visibleWidth/宽度缓存 | 每段 2 次 × 8 段 × 10 次/s <0.4ms/s；文本内容变化导致命中率极低；引入失效管理 |
+| P6 | per-member 独立节流器/渲染队列 | 全局单合并窗口已天然批处理；分队列增加 N 个定时器，零收益 |
+| P7 | **delta 抽样（跳过部分事件降频）** | 破坏流标志 start/end 配对语义 → 阶段错误/卡死；正确性换不存在的性能问题（最容易被人捡回去的伪优化） |
+| P8 | 二进制协议替换 JSONL | 单事件 μs 级零收益；破坏顺序语义，协议复杂度爆炸 |
+| P9 | 轮询期间暂停 tracker | 职责错误：tracker 是显示层唯一事件源，暂停即显示冻结 |
+| P10 | 陈旧阈值调低（30s→5s） | thinking_delta 正常持续到达，5s 无 delta 基本不可能；调低只扩大误伤面（executing 已豁免） |
+| P11 | 节流窗口降到 <100ms | 终端 60fps（16ms 帧），100ms 已远超视觉需求；N1 后窗口大小几乎无关 |
+| P12 | 打字机/动画效果 | 需求未要求；直接放大渲染量（每帧 setWidget） |
+| P13 | derivePhase 记忆化缓存 | 几个 boolean 判断 O(1)，缓存 + 失效追踪复杂度 > 收益 |
+
+### O1–O4 可选优化定位
+
+| # | 优化 | 状态 |
+|---|------|------|
+| O1 | 1s 时长实时 tick | **默认不做，需用户反馈后评估**——N2 已保证时长误差 ≤15s；1s tick 违背"无定时器"纪律，收益边际 |
+| O2 | 增强 B（agent_end 惰性百分比查询，取消活跃期轮询） | **保留可选**——RPC 再省 ~98%（活跃期），非用户可见价值；若实施须保留 30s 空闲轮询兜底（long-idle 不刷新 + resume 首查延迟两个失效条件） |
+| O3 | 合并窗口参数一次性实测校准 | 阶段 2 落地后按真实流式频率采样校准一次（一次性测量非持续监控）；120ms 起始窗口 + `nextStreamFlushDelay` 退避为 Inspector 先例估计值 |
+| O4 | 超宽缓解（成员 >8–10 时 toolName 截断更激进） | **需用户反馈**——UX 非性能问题；单行溢出导致 TUI 换行/布局成本，截断参数调优零风险 |
+
+### 修订变更摘要（原方案 → 性能修订版）
+
+| 变更 | 原方案 | 修订版 |
+|------|--------|--------|
+| 「轮询不再承担刷新职责」表述 | 易误读为不 refresh | **明确：轮询完成后保留 refresh()**（N2，三方独立确认的必要修正；时长/百分比/陈旧判定闭环） |
+| 渲染刷新 | 合并节流 100–150ms（10 次/s 封顶即稳态） | **双层去重（N1）**：稳态 1–3 次/s（阶段切换 + 时长秒边界 + 15s 轮询），10/s 仅为安全上限 |
+| 轮询实现 | 串行 for-await（既有缺陷未触及） | **并行化 Promise.allSettled（N3）**：单次最坏 3N s → ≤3s |
+| onMemberActivity 多播 | 顺序分发，无隔离 | **消费者级异常隔离（N4）**：tracker 抛错不中断状态机更新 |
+| tracker 纪律 | O(1) 目标 | **验收硬标准（N5）**：无字符串构建/不碰 UI/不 import pi-tui；toolName 截断预计算（D10） |
+| 性能验证 | 无专项断言 | **N6 性能护栏**：事件风暴断言 + 双向去重断言 + 单帧成本实测 + 无泄漏 |
+| 其余（数据来源、状态设计、显示方案、D1–D13 裁决、阶段边界） | — | 全部不变（D1–D13 裁决记录见 §19 与上表；N 系列为实现细节与验收标准，不构成新裁决、不与之冲突） |
+| 可选增强 | O1 时长 tick / 增强 B | 维持可选（O1 默认不做需用户反馈；增强 B 保留 30s 兜底；新增 O3 窗口参数一次性校准、O4 超宽缓解） |
+
+### 风险与对策（性能视角）
+
+| 风险 | 对策 |
+|------|------|
+| 渲染去重引入"内容变了但未重绘"正确性缺陷 | 渲染侧 **styled 行比较**（B1 修正后含颜色，免键集遗漏风险）+ N6 "内容变化必触发"反向断言锁定 |
+| 时长显示在去重后冻结 | 秒取整进调度侧签名 + N2 轮询 refresh 提供时间驱动触发 |
+| 事件风暴下节流器被持续"踢醒" | N1 调度侧签名过滤（不变化不调度），消除"调度频率=事件频率"风险 |
+| 多播异常中断状态机更新 | N4 消费者级 try/catch + event-handler 调用点兜底 |
+| 轮询周期漂移导致百分比刷新不规律 | N3 并行化 + N2 完成后 refresh，周期确定化 |
+| 崩溃成员永久显示 executing | P3 tracker.delete + S1 进程死亡强制调度渲染（≤120ms 显示 💥/⏹️） |
+| 单行超宽（成员 >8–10）导致 TUI 换行/布局成本 | 已知 UX 边界（非性能问题），toolName 截断缓解；O4 需用户反馈 |
+| doRender 单帧成本量化缺口（三方均未实测） | N6 中 performance.now() 实测组件侧留档（8.5μs/帧）；N1 收益论证不依赖精确帧成本 |
