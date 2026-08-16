@@ -107,8 +107,10 @@ function phaseFromStreams(streams: ActivityStreams): ActivityPhase {
 
 /**
  * D10 precomputation: the ONLY string construction on the event path, and it
- * is bounded to a constant TOOL_NAME_MAX_CHARS slice executed once per tool
- * execution start (never per delta) — N5 discipline.
+ * is bounded to a constant TOOL_NAME_MAX_CHARS slice. Executed once per tool
+ * execution start, and per CHANGED name on updates (P2 short-circuit —
+ * tool_execution_update is a per-activity event and must not re-slice the
+ * same name on every occurrence). N5 discipline.
  */
 function truncateToolName(name: string): string {
   return name.length > TOOL_NAME_MAX_CHARS ? name.slice(0, TOOL_NAME_MAX_CHARS) : name;
@@ -157,7 +159,8 @@ function finalize(
  *   message_update (delta)    → set/clear the mapped stream flag; *_end clears
  *                               only its own stream (D6 — no hardcoded fallback)
  *   tool_execution_start      → executing + precomputed toolName (D10)
- *   tool_execution_update     → keep executing (idempotent liveness)
+ *   tool_execution_update     → keep executing; toolName updated only when the
+ *                               event carries one, preserved otherwise (P1)
  *   tool_execution_end        → clear executing; returns to any still-active
  *                               stream via priority (D5)
  *   message_end               → clear ALL stream flags; lands on working, never
@@ -165,7 +168,11 @@ function finalize(
  *                               report idle; first anti-stuck insurance)
  *   agent_end                 → authoritative zero point: idle (D9, no delay)
  *   anything else             → idempotent ignore (incl. process_* — process
- *                               states are the logical layer's overlay)
+ *                               states are the logical layer's overlay; the
+ *                               INTEGRATION layer must tracker.delete() a
+ *                               member's entry on process_exit, otherwise a
+ *                               member that crashed mid-execution stays
+ *                               `executing` forever — it is staleness-exempt)
  *
  * The post-agent_end gate discards stale deltas from the finished turn: after
  * agent_end, only agent_start revives the member.
@@ -223,12 +230,31 @@ export function applyActivityEvent(
       return finalize(state, EMPTY_STREAMS, now);
     }
 
-    case "tool_execution_start":
-    case "tool_execution_update": {
-      // D10: truncate at event time so renders consume the stored form.
+    case "tool_execution_start": {
+      // A new tool execution always re-derives the name from the event (D10).
       const rawName = typeof event?.toolName === "string" ? event.toolName : "";
       const toolName = rawName ? truncateToolName(rawName) : undefined;
       const truncated = !!toolName && rawName.length > TOOL_NAME_MAX_CHARS;
+      const withName = { ...state, toolName, toolNameTruncated: truncated };
+      return finalize(withName, { ...state.streams, executing: true }, now);
+    }
+
+    case "tool_execution_update": {
+      // P1: updates carry a toolName only when the source provides one — a
+      // missing name must PRESERVE the stored value, never clear it (the
+      // stored name survives until the next start / turn boundary).
+      // P2: skip re-truncation when the name is unchanged — update is a
+      // per-activity event and must not re-slice the same name per occurrence.
+      const rawName = typeof event?.toolName === "string" ? event.toolName : undefined;
+      let toolName = state.toolName;
+      let truncated = state.toolNameTruncated;
+      if (rawName !== undefined) {
+        const next = truncateToolName(rawName);
+        if (next !== toolName) {
+          toolName = next;
+          truncated = rawName.length > TOOL_NAME_MAX_CHARS;
+        }
+      }
       const withName = { ...state, toolName, toolNameTruncated: truncated };
       return finalize(withName, { ...state.streams, executing: true }, now);
     }
@@ -316,8 +342,10 @@ export function createActivityTracker(): ActivityTracker {
       ) {
         return;
       }
-      const current = members.get(memberName) ?? createInitialState(Date.now());
-      const next = applyActivityEvent(current, event, Date.now());
+      // P4: single clock read — phaseSince/lastDeltaAt stay same-source.
+      const now = Date.now();
+      const current = members.get(memberName) ?? createInitialState(now);
+      const next = applyActivityEvent(current, event, now);
       if (next !== current) members.set(memberName, next);
     },
 

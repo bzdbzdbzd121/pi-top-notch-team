@@ -119,6 +119,34 @@ describe("applyActivityEvent — transition table", () => {
     expect(state.streams.executing).toBe(true);
   });
 
+  it("tool_execution_update WITHOUT toolName PRESERVES the stored toolName (P1 — never cleared by a nameless update)", () => {
+    let state = run(1000, ev.agentStart(), ev.toolStart("bash -c make"));
+    expect(state.toolName).toBe("bash -");
+    state = applyActivityEvent(state, ev.toolUpdate(), 5000);
+    expect(state.toolName).toBe("bash -");
+    expect(state.toolNameTruncated).toBe(true);
+    expect(state.phase).toBe("executing");
+  });
+
+  it("tool_execution_update WITH a new toolName recomputes the stored form", () => {
+    const state = run(1000, ev.agentStart(), ev.toolStart("bash -c make"), ev.toolUpdate("git status"));
+    expect(state.toolName).toBe("git st");
+    expect(state.toolNameTruncated).toBe(true);
+  });
+
+  it("tool_execution_update with the SAME name skips re-truncation (P2 — per-activity event must not re-slice)", () => {
+    let state = run(1000, ev.agentStart(), ev.toolStart("bash -c make"));
+    state = applyActivityEvent(state, ev.toolUpdate("bash -c make"), 5000);
+    expect(state.toolName).toBe("bash -");
+    expect(state.toolNameTruncated).toBe(true);
+  });
+
+  it("tool_execution_update on a fresh member (missed start) fail-softs into executing", () => {
+    const state = run(1000, ev.toolUpdate("bash -c make"));
+    expect(state.phase).toBe("executing");
+    expect(state.toolName).toBe("bash -");
+  });
+
   it("tool_execution_end: clears executing; returns to a still-active stream (D5 — not working)", () => {
     const state = run(1000, ev.agentStart(), ev.msgUpdate("text_start"), ev.toolStart("bash"), ev.toolEnd());
     expect(state.streams.executing).toBe(false);
@@ -142,6 +170,14 @@ describe("applyActivityEvent — transition table", () => {
     );
     expect(state.streams).toEqual({ thinking: false, text: false, toolcall: false, executing: false });
     expect(state.phase).toBe("working");
+  });
+
+  it("out-of-order defense: message_end during executing clears ALL streams and self-heals to working (P5 — never idle)", () => {
+    const state = run(1000, ev.agentStart(), ev.toolStart("bash"), ev.msgEnd());
+    expect(state.streams).toEqual({ thinking: false, text: false, toolcall: false, executing: false });
+    expect(state.phase).toBe("working");
+    // The name survives the stream wipe (retained until the next stage event).
+    expect(state.toolName).toBe("bash");
   });
 
   it("agent_end: authoritative zero point → idle (D9: direct, no delay)", () => {
