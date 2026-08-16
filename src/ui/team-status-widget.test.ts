@@ -13,7 +13,10 @@ vi.mock("@earendil-works/pi-tui", () => ({
 
 function createMockTheme() {
   return {
-    fg: vi.fn((_color: string, text: string) => text),
+    // Wrap with a color marker so tests can distinguish styled output
+    // (the real theme.fg emits ANSI codes — the render gate compares styled
+    // lines, so a pass-through mock would hide color-only changes, B1).
+    fg: vi.fn((color: string, text: string) => `<${color}>${text}</${color}>`),
   };
 }
 
@@ -317,6 +320,37 @@ describe("createTeamStatusWidget", () => {
       // phaseSince unchanged (same phase throughout) → 65s → 1m05s
       h.widget.refresh();
       expect(h.middle()).toContain("1m05s");
+    });
+
+    it("B1: color-only change (working default → tool-calling warning) passes the render gate", async () => {
+      const h = build({ members: [createTeamMember("coder", "编码员")], opsStates: { coder: "working" } });
+      h.widget.install(h.ui, h.theme);
+      await vi.advanceTimersByTimeAsync(0);
+      // Install rendered the working fallback: 🔧 default (no color wrap).
+      expect(h.middle()).toContain("🔧");
+      expect(h.middle()).not.toContain("<warning>");
+      h.setWidget.mockClear();
+      // toolcall delta on a fresh member → tool-calling: RAW identical to the
+      // working fallback, styled differs (warning color) — must NOT be gated.
+      emit(h, "coder", { type: "message_update", assistantMessageEvent: { type: "toolcall_delta" } });
+      await vi.advanceTimersByTimeAsync(300);
+      expect(h.setWidget.mock.calls.length).toBe(1);
+      expect(h.middle()).toContain("<warning>");
+    });
+
+    it("S1: process death with an unchanged signature still re-renders promptly (no 30s poll lag)", async () => {
+      const h = build({ members: [createTeamMember("coder", "编码员")], opsStates: { coder: "idle" } });
+      h.widget.install(h.ui, h.theme);
+      await vi.advanceTimersByTimeAsync(0);
+      h.setWidget.mockClear();
+      // Idle member with NO tracker entry: process_exit leaves the signature
+      // unchanged (idle|idle) — the force-schedule path must still render,
+      // and by flush time the logical layer shows the process state.
+      emit(h, "coder", { type: "process_exit", memberName: "coder", exitCode: 0, wasRunning: true });
+      h.memberOpsStates.set("coder", "stopped"); // event-handler update, right after the multi-cast
+      await vi.advanceTimersByTimeAsync(300);
+      expect(h.setWidget.mock.calls.length).toBe(1);
+      expect(h.middle()).toContain("⏹️");
     });
 
     it("N1 scheduling gate: no-change events never trigger a render", async () => {

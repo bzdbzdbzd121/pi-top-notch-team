@@ -138,9 +138,14 @@ describe("createMemberEventHandler", () => {
       }),
     });
     const handler = createMemberEventHandler("worker", deps as any);
+    // agent_start: state machine update must land despite the throw
     expect(() => handler({ type: "agent_start" })).not.toThrow();
     expect(deps.memberOpsStates.get("worker")).toBe("working");
     expect((deps as any).onMemberActivity).toHaveBeenCalledTimes(1);
+    // agent_end: the same isolation holds for the completing transition
+    expect(() => handler({ type: "agent_end" })).not.toThrow();
+    expect(deps.memberOpsStates.get("worker")).toBe("idle");
+    expect((deps as any).onMemberActivity).toHaveBeenCalledTimes(2);
   });
 
   it("should set state to idle on agent_end", async () => {

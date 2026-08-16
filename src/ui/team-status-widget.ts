@@ -93,8 +93,13 @@ export function createTeamStatusWidget(options: {
 
   /** N1 scheduling side: per-member display signatures (last rendered decision). */
   const lastSignatures = new Map<string, string>();
-  /** N1 render side: raw (unstyled) line fingerprint of the last setWidget. */
-  let lastRawKey: string | null = null;
+  /**
+   * N1 render side: fingerprint of the last setWidget. Keyed on the STYLED
+   * lines (raw text + ANSI colors) — a raw-only comparison is color-blind:
+   * working fallback (default color) and tool-calling (warning) produce
+   * IDENTICAL raw lines but visually different output (B1).
+   */
+  let lastRenderKey: string | null = null;
 
   // ── Build display lines (with border) ──────────────────
   // Returns BOTH raw (unstyled, for width computation + N1 render gate) and
@@ -261,18 +266,20 @@ export function createTeamStatusWidget(options: {
   function refresh(): void {
     if (!currentUi || !currentTheme) return;
     const t0 = performance.now();
-    const { raw, styled } = buildDisplay(currentTheme);
+    const display = buildDisplay(currentTheme);
     lastBuildMs = performance.now() - t0;
-    // N1 render side: compare RAW (unstyled) lines with the last output —
-    // unchanged content skips setWidget entirely (setWidget is a full
-    // component rebuild + unconditional requestRender upstream, the single
-    // largest cost item of this feature). Raw comparison has no key-set
-    // blind spots (any render-affecting change shows up in the raw lines).
-    const rawKey = raw.join("\n");
-    if (rawKey === lastRawKey) return;
-    lastRawKey = rawKey;
+    // N1 render side: compare the STYLED lines (raw text + colors) with the
+    // last output — unchanged content skips setWidget entirely (setWidget is
+    // a full component rebuild + unconditional requestRender upstream, the
+    // single largest cost item of this feature). Styled embeds raw text, so a
+    // single comparison covers both content and color changes — raw-only
+    // comparison has a color blind spot (B1: working 🔧 default vs tool-calling
+    // 🔧 warning render identical raw lines).
+    const renderKey = display.styled.join("\n");
+    if (renderKey === lastRenderKey) return;
+    lastRenderKey = renderKey;
     try {
-      currentUi.setWidget("team-status", styled);
+      currentUi.setWidget("team-status", display.styled);
     } catch {
       // UI may be gone
     }
@@ -293,11 +300,20 @@ export function createTeamStatusWidget(options: {
     return `${logical}|${phase}|${tool}|${durSec}`;
   }
 
-  function onMemberEvent(memberName: string, _event: any): void {
+  function onMemberEvent(memberName: string, event: any): void {
     if (!currentUi) return; // not installed
     const now = Date.now();
     const sig = memberSignature(memberName, now);
-    if (sig === lastSignatures.get(memberName)) return; // N1 scheduling gate
+    // S1: process death must ALWAYS re-render promptly even when the signature
+    // is unchanged (e.g. an idle member with no tracker entry: P3 delete is a
+    // no-op, logical state updates AFTER the multi-cast) — otherwise the crash
+    // would only surface at the next poll (up to 30s). The flush runs ≥120ms
+    // later, by which time the event-handler's state machine update has landed.
+    const isProcessDeath =
+      event?.type === "process_exit" || event?.type === "process_error";
+    if (sig === lastSignatures.get(memberName) && !isProcessDeath) {
+      return; // N1 scheduling gate
+    }
     lastSignatures.set(memberName, sig);
     if (liveRefreshTimer) {
       liveRefreshPending = true; // dense stream — next flush backs off
@@ -414,7 +430,7 @@ export function createTeamStatusWidget(options: {
       }
       liveRefreshPending = false;
       lastSignatures.clear();
-      lastRawKey = null;
+      lastRenderKey = null;
       // Cancel any in-flight poll requests
       if (abortController) {
         abortController.abort();

@@ -13,7 +13,10 @@ vi.mock("@earendil-works/pi-tui", () => ({
 
 function createMockTheme() {
   return {
-    fg: vi.fn((_color: string, text: string) => text),
+    // Wrap with a color marker so tests can distinguish styled output
+    // (the real theme.fg emits ANSI codes — the render gate compares styled
+    // lines, so a pass-through mock would hide color-only changes, B1).
+    fg: vi.fn((color: string, text: string) => `<${color}>${text}</${color}>`),
   };
 }
 
@@ -142,9 +145,10 @@ describe("team-status-widget integration (tracker → widget live path)", () => 
     h.emit("coder", { type: "tool_execution_start", toolName: "bash -c make" });
     expect(h.tracker.getActivity("coder")?.phase).toBe("executing");
 
-    // Event-handler updates the logical layer, then the P3 delete runs.
-    h.memberOpsStates.set("coder", "crashed");
+    // Real ordering (S1): the multi-cast fires BEFORE the event-handler's
+    // state machine update — emit first, logical update right after.
     h.emit("coder", { type: "process_exit", memberName: "coder", exitCode: 1, wasRunning: true });
+    h.memberOpsStates.set("coder", "crashed");
     expect(h.tracker.getActivity("coder")).toBeUndefined();
 
     await vi.advanceTimersByTimeAsync(300);
@@ -266,6 +270,10 @@ describe("team-status-widget integration (tracker → widget live path)", () => 
     await vi.advanceTimersByTimeAsync(3000);
 
     expect(h.setWidget.mock.calls.length).toBeLessThanOrEqual(100);
+    // S3: with the B1 fix, the storm's final visual (tool-calling warning)
+    // differs from the install render (working fallback default) — at least
+    // one render must have happened (bounded, but never zero).
+    expect(h.setWidget.mock.calls.length).toBeGreaterThanOrEqual(1);
     expect(trackerMs).toBeLessThan(50);
     // eslint-disable-next-line no-console
     console.log(
