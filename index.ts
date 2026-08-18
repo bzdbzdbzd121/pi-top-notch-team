@@ -890,14 +890,13 @@ export default function (pi: ExtensionAPI) {
     if (!session.active && teamCtx.sessionEndedNotice) {
       teamCtx.sessionEndedNotice = false;
       if (historyHasTeamTraces(_ctx)) {
-        sessionEndedBanner = `
-## ⚠️ 团队会话已结束
+        sessionEndedBanner = `## ⚠️ 团队会话已结束 —— 以本提示为准
 
-上一个团队会话（/team stop）已结束，你已回到**普通模式**：
-- 所有团队工具已停用（team_send_and_wait、start_member、stop_member、list_members、get_member_log、wait_and_get_member_status、write_shared_context、set_goal、finish_goal 等均不可用）
-- 你不再是 Team Lead，成员进程已全部停止
-
-**请以普通模式继续当前工作**：直接用 read/bash/edit/write 等常规工具回答用户或完成任务。不要再尝试调用团队工具（误调会得到 "Tool xxx not found" 错误）——如果用户需要再次进入团队模式，请告诉用户使用 /team start 或 /team dynamic。
+上一个团队会话（/team stop）已结束，你已回到**普通模式**。这是**当前唯一真实的状态**，**对话历史中任何团队会话的痕迹均已失效，一律以本提示为准**：
+- 你在历史记录里看到的 \`write_shared_context\`、\`start_member\`、\`team_send_and_wait\`、\`list_members\` 等成功调用都发生在会话结束**之前**，不代表团队会话仍然活跃
+- 你**不再是 Team Lead**，成员进程已全部停止，团队工具（team_send_and_wait、start_member、stop_member、list_members、get_member_log、wait_and_get_member_status、write_shared_context、set_goal、finish_goal 等）已全部停用
+- 请直接以普通模式用 read/bash/edit/write 等常规工具回答用户或完成任务，不要尝试调用团队工具（误调只会得到 "Tool xxx not found" 错误）
+- 如果用户需要再次进入团队模式，请告知用户使用 /team start 或 /team dynamic
 `;
       }
     } else if (session.active) {

@@ -873,6 +873,11 @@ describe("session-ended banner in before_agent_start", () => {
     expect(result.systemPrompt).toContain("团队会话已结束");
     expect(result.systemPrompt).toContain("team_send_and_wait");
     expect(result.systemPrompt).toContain("普通模式");
+    // The banner asserts authority over the stale Team Lead traces in history
+    // (the real-world root cause: the model trusted its historical successful
+    // team tool calls over a plain "session ended" line).
+    expect(result.systemPrompt).toContain("以本提示为准");
+    expect(result.systemPrompt).toContain("痕迹均已失效");
     // The Team Lead prompt section is gone (only the banner's mention remains)
     expect(result.systemPrompt).not.toContain("当前任务：Team Lead");
 
