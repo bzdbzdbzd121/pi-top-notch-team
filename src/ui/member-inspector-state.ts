@@ -1071,7 +1071,9 @@ export function buildHeaderLine(
 // ── Footer line building ───────────────────────────────────
 
 export function stateIcon(state: MemberOpState): string {
-  return state === "working" ? "🔧" : state === "compacting" ? "🗜️" : state === "idle" ? "✅" : state === "crashed" ? "💥" : "⏹️";
+  // v2.2 图标微调（用户三次确认）：working → 💭（默认色，与 thinking 同图标靠
+  // 颜色区分——浮窗 footer 同理）；list_members 保持 D5 裁决的图标不改。
+  return state === "working" ? "💭" : state === "compacting" ? "🗜️" : state === "idle" ? "✅" : state === "crashed" ? "💥" : "⏹️";
 }
 
 export function buildFooterStatusLine(

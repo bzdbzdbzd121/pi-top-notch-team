@@ -20,18 +20,6 @@ function repeat(ch: string, n: number): string {
   return ch.repeat(n);
 }
 
-/**
- * Duration micro-caption (enhancement A): `12s`, `1m20s`. Derived from
- * phaseSince at render time — zero timers.
- */
-function formatDuration(ms: number): string {
-  const totalSec = Math.max(0, Math.floor(ms / 1000));
-  if (totalSec < 60) return `${totalSec}s`;
-  const m = Math.floor(totalSec / 60);
-  const s = totalSec % 60;
-  return `${m}m${String(s).padStart(2, "0")}s`;
-}
-
 // ── Widget Factory ────────────────────────────────────────
 
 export interface TeamStatusWidget {
@@ -44,8 +32,9 @@ export interface TeamStatusWidget {
   /**
    * Event-driven live-refresh entry (N1 scheduling side): called by the
    * onMemberActivity multi-cast AFTER the activity tracker consumed the event.
-   * Computes the member's display signature (logical state + phase + toolName
-   * + seconds-rounded duration); unchanged signature → no render scheduling.
+   * Computes the member's display signature (logical state + phase — v2:
+   * duration/toolName are gone from the display, so the signature is just
+   * `logical|phase`); unchanged signature → no render scheduling.
    */
   onMemberEvent(memberName: string, event: any): void;
 }
@@ -97,7 +86,9 @@ export function createTeamStatusWidget(options: {
    * N1 render side: fingerprint of the last setWidget. Keyed on the STYLED
    * lines (raw text + ANSI colors) — a raw-only comparison is color-blind:
    * working fallback (default color) and tool-calling (warning) produce
-   * IDENTICAL raw lines but visually different output (B1).
+   * IDENTICAL raw lines but visually different output (B1). v2 note: with
+   * pairs (working 💭 default vs thinking 💭 accent) render IDENTICAL raw
+   * lines — the styled comparison is exactly why the gate stays color-aware.
    */
   let lastRenderKey: string | null = null;
 
@@ -169,43 +160,39 @@ export function createTeamStatusWidget(options: {
         if (!activity || activity.phase === "idle") {
           if (logicalState === "working") {
             // Working but no fine-grained data yet (the dispatch → agent_start
-            // window) — honest 🔧 fallback, never a false ✅ idle.
-            icon = "🔧";
+            // window) — honest 💭 fallback (default color), never a false ✅ idle.
+            icon = "💭";
           } else {
             icon = "✅";
             color = "muted";
           }
         } else {
-          const durText = formatDuration(Date.now() - activity.phaseSince);
           switch (activity.phase) {
             case "thinking":
               icon = "💭";
               color = "accent";
-              extraRaw = ` ${durText}`;
               break;
             case "tool-calling":
-              // Tool argument generation (ms-scale) — name unknown until executing.
+              // Tool argument generation (ms-scale) — same visual as executing
+              // (🔧 warning): the phases stay structurally distinct, the
+              // display intentionally does not distinguish them (v2).
               icon = "🔧";
               color = "warning";
               break;
-            case "executing": {
-              icon = "⚙️";
+            case "executing":
+              // v2: executing uses 🔧 (same icon+color as tool-calling —靠阶段语义区分).
+              icon = "🔧";
               color = "warning";
-              // D10: the tracker stored the precomputed truncated name; the
-              // widget only appends the ellipsis when truncation happened.
-              const tool = activity.toolName;
-              const toolText = tool ? ` ${tool}${activity.toolNameTruncated ? "…" : ""}` : "";
-              extraRaw = `${toolText} ${durText}`;
               break;
-            }
             case "output":
-              icon = "📤";
+              // v2.2: output uses ✏️ (U+270F+U+FE0F).
+              icon = "✏️";
               color = "success";
-              extraRaw = ` ${durText}`;
               break;
             default:
-              // working — honest gap fallback, neutral color, no duration.
-              icon = "🔧";
+              // working — honest gap fallback (💭, default color; thinking is
+              // the SAME icon in accent — the color is the discriminator).
+              icon = "💭";
               break;
           }
         }
@@ -273,8 +260,11 @@ export function createTeamStatusWidget(options: {
     // a full component rebuild + unconditional requestRender upstream, the
     // single largest cost item of this feature). Styled embeds raw text, so a
     // single comparison covers both content and color changes — raw-only
-    // comparison has a color blind spot (B1: working 🔧 default vs tool-calling
-    // 🔧 warning render identical raw lines).
+    // comparison has a color blind spot (B1): same-icon different-color pairs
+    // render identical raw lines — pre-v2: working 🔧 vs tool-calling 🔧;
+    // v2.2: working 💭 default vs thinking 💭 accent. The styled comparison
+    // captures both the color-only transitions and dedups the same-icon
+    // same-color pair (tool-calling ↔ executing, both 🔧 warning).
     const renderKey = display.styled.join("\n");
     if (renderKey === lastRenderKey) return;
     lastRenderKey = renderKey;
@@ -288,22 +278,21 @@ export function createTeamStatusWidget(options: {
   // ── Live refresh scheduling (N1 scheduling side) ───────
   /**
    * Per-member display signature: everything that changes what the member's
-   * segment looks like. The seconds-rounded duration makes second boundaries
-   * trigger renders while suppressing sub-second churn (enhancement A + N1).
+   * segment looks like. v2: duration and toolName are gone from the display,
+   * so the signature is exactly `logical|phase` — same-phase deltas (and the
+   * tool-calling ↔ executing pair, whose styled output is identical) never
+   * schedule a render.
    */
-  function memberSignature(memberName: string, now: number): string {
+  function memberSignature(memberName: string): string {
     const logical = memberOpsStates.get(memberName) ?? "stopped";
-    const activity = activityTracker.getActivity(memberName, now);
+    const activity = activityTracker.getActivity(memberName);
     const phase = activity?.phase ?? "idle";
-    const tool = activity?.toolName ?? "";
-    const durSec = activity ? Math.max(0, Math.floor((now - activity.phaseSince) / 1000)) : 0;
-    return `${logical}|${phase}|${tool}|${durSec}`;
+    return `${logical}|${phase}`;
   }
 
   function onMemberEvent(memberName: string, event: any): void {
     if (!currentUi) return; // not installed
-    const now = Date.now();
-    const sig = memberSignature(memberName, now);
+    const sig = memberSignature(memberName);
     // S1: process death must ALWAYS re-render promptly even when the signature
     // is unchanged (e.g. an idle member with no tracker entry: P3 delete is a
     // no-op, logical state updates AFTER the multi-cast) — otherwise the crash

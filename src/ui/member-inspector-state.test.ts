@@ -393,7 +393,7 @@ describe("buildFooterStatusLine", () => {
       ["b", "crashed" as const],
     ]);
     const line = buildFooterStatusLine(state.tabs, ops, 120);
-    expect(line).toContain("🔧 分析员 42%");
+    expect(line).toContain("💭 分析员 42%");
     expect(line).toContain("💥 编码员 —");
   });
 });

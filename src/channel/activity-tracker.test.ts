@@ -7,7 +7,6 @@ import {
   createActivityTracker,
   derivePhase,
   STALE_AFTER_MS,
-  TOOL_NAME_MAX_CHARS,
   type ActivityPhase,
   type MemberActivity,
 } from "./activity-tracker";
@@ -30,9 +29,6 @@ function initial(now = 1000): MemberActivity {
   return {
     phase: "idle",
     ended: false,
-    toolName: undefined,
-    toolNameTruncated: false,
-    phaseSince: now,
     lastDeltaAt: now,
     streams: { thinking: false, text: false, toolcall: false, executing: false },
   };
@@ -50,13 +46,11 @@ function run(now = 1000, ...events: { type: string }[]): MemberActivity {
 // ── Transition table: full mapping ─────────────────────────
 
 describe("applyActivityEvent — transition table", () => {
-  it("agent_start: clears streams/toolName, lands on thinking as the default starting phase (D1)", () => {
+  it("agent_start: clears streams, lands on thinking as the default starting phase (D1)", () => {
     const state = run(1000, ev.agentStart());
     expect(state.phase).toBe("thinking");
     expect(state.ended).toBe(false);
     expect(state.streams).toEqual({ thinking: false, text: false, toolcall: false, executing: false });
-    expect(state.toolName).toBeUndefined();
-    expect(state.phaseSince).toBe(1001);
     expect(state.lastDeltaAt).toBe(1001);
   });
 
@@ -65,7 +59,6 @@ describe("applyActivityEvent — transition table", () => {
     state = applyActivityEvent(state, ev.agentStart(), 5000);
     expect(state.phase).toBe("thinking");
     expect(state.streams).toEqual({ thinking: false, text: false, toolcall: false, executing: false });
-    expect(state.phaseSince).toBe(5000);
   });
 
   it("thinking_start / thinking_delta activate the thinking stream", () => {
@@ -105,56 +98,39 @@ describe("applyActivityEvent — transition table", () => {
     expect(state.phase).toBe("thinking");
   });
 
-  it("tool_execution_start: executing phase + toolName precomputed (D10)", () => {
+  it("tool_execution_start: executing phase + stream flag", () => {
     const state = run(1000, ev.agentStart(), ev.toolStart("bash -c make"));
     expect(state.streams.executing).toBe(true);
     expect(state.phase).toBe("executing");
   });
 
-  it("tool_execution_update keeps executing (no phase change, stream stays set)", () => {
+  it("tool_execution_update is EQUIVALENT to start (merged case — same effect: executing stream set)", () => {
+    // v2: the start/update branches were merged (tool-name display removed).
+    // All four event shapes must behave identically.
+    const events = [
+      ["start", ev.toolStart("bash")],
+      ["start-nameless", ev.toolStart()],
+      ["update", ev.toolUpdate("bash")],
+      ["update-nameless", ev.toolUpdate()],
+    ] as const;
+    for (const [label, event] of events) {
+      const state = run(1000, ev.agentStart(), event);
+      expect(state.streams.executing, label).toBe(true);
+      expect(state.phase, label).toBe("executing");
+    }
+  });
+
+  it("tool_execution_update keeps executing (stream stays set through repeated updates)", () => {
     let state = run(1000, ev.agentStart(), ev.toolStart("bash"), ev.toolUpdate("bash"));
     expect(state.phase).toBe("executing");
-    state = applyActivityEvent(state, ev.toolUpdate("bash"), 5000);
+    state = applyActivityEvent(state, ev.toolUpdate(), 5000);
     expect(state.phase).toBe("executing");
     expect(state.streams.executing).toBe(true);
-  });
-
-  it("tool_execution_update WITHOUT toolName PRESERVES the stored toolName (P1 — never cleared by a nameless update)", () => {
-    let state = run(1000, ev.agentStart(), ev.toolStart("bash -c make"));
-    expect(state.toolName).toBe("bash -");
-    state = applyActivityEvent(state, ev.toolUpdate(), 5000);
-    expect(state.toolName).toBe("bash -");
-    expect(state.toolNameTruncated).toBe(true);
-    expect(state.phase).toBe("executing");
-  });
-
-  it("tool_execution_update WITH a new toolName recomputes the stored form", () => {
-    const state = run(1000, ev.agentStart(), ev.toolStart("bash -c make"), ev.toolUpdate("git status"));
-    expect(state.toolName).toBe("git st");
-    expect(state.toolNameTruncated).toBe(true);
-  });
-
-  it("tool_execution_update with the SAME name skips re-truncation (P2 — per-activity event must not re-slice)", () => {
-    let state = run(1000, ev.agentStart(), ev.toolStart("bash -c make"));
-    state = applyActivityEvent(state, ev.toolUpdate("bash -c make"), 5000);
-    expect(state.toolName).toBe("bash -");
-    expect(state.toolNameTruncated).toBe(true);
-  });
-
-  it("A1: update whose truncated form matches but truncation STATUS differs recomputes the flag (no stale ellipsis)", () => {
-    // Stored: "bash -c make" → "bash -" (truncated). A new update carries
-    // exactly TOOL_NAME_MAX_CHARS chars — same stored form, but NOT truncated:
-    // the stale flag must be corrected even though the name string matches.
-    let state = run(1000, ev.agentStart(), ev.toolStart("bash -c make"));
-    state = applyActivityEvent(state, ev.toolUpdate("bash -"), 5000);
-    expect(state.toolName).toBe("bash -");
-    expect(state.toolNameTruncated).toBe(false);
   });
 
   it("tool_execution_update on a fresh member (missed start) fail-softs into executing", () => {
     const state = run(1000, ev.toolUpdate("bash -c make"));
     expect(state.phase).toBe("executing");
-    expect(state.toolName).toBe("bash -");
   });
 
   it("tool_execution_end: clears executing; returns to a still-active stream (D5 — not working)", () => {
@@ -186,8 +162,6 @@ describe("applyActivityEvent — transition table", () => {
     const state = run(1000, ev.agentStart(), ev.toolStart("bash"), ev.msgEnd());
     expect(state.streams).toEqual({ thinking: false, text: false, toolcall: false, executing: false });
     expect(state.phase).toBe("working");
-    // The name survives the stream wipe (retained until the next stage event).
-    expect(state.toolName).toBe("bash");
   });
 
   it("agent_end: authoritative zero point → idle (D9: direct, no delay)", () => {
@@ -301,23 +275,7 @@ describe("multi-stream priority: executing > tool-calling > output > thinking", 
   });
 });
 
-// ── phaseSince semantics ───────────────────────────────────
 
-describe("phaseSince — current-phase start timestamp (duration micro-caption source)", () => {
-  it("unchanged while the phase persists (deltas within one phase)", () => {
-    let state = run(1000, ev.agentStart(), ev.msgUpdate("thinking_delta"), ev.msgUpdate("thinking_delta"));
-    const since = state.phaseSince;
-    state = applyActivityEvent(state, ev.msgUpdate("thinking_delta"), 5000);
-    expect(state.phase).toBe("thinking");
-    expect(state.phaseSince).toBe(since);
-  });
-
-  it("reset on every phase transition", () => {
-    const state = run(1000, ev.agentStart(), ev.msgUpdate("thinking_start"), ev.msgUpdate("text_start"));
-    expect(state.phase).toBe("output");
-    expect(state.phaseSince).toBe(1003); // the event that caused the transition
-  });
-});
 
 // ── Staleness judgment (D7, lazy at read time) ─────────────
 
@@ -361,48 +319,7 @@ describe("derivePhase — staleness (30s, exempt executing, lazy)", () => {
   });
 });
 
-// ── D10: toolName precomputation ───────────────────────────
 
-describe("D10 — toolName truncated at event time, renderers consume the stored form", () => {
-  it("long tool names are truncated to TOOL_NAME_MAX_CHARS and flagged", () => {
-    const long = "bash -c make -j8 all";
-    const state = run(1000, ev.agentStart(), ev.toolStart(long));
-    expect(state.toolName).toBe(long.slice(0, TOOL_NAME_MAX_CHARS));
-    expect(state.toolName).toHaveLength(TOOL_NAME_MAX_CHARS);
-    expect(state.toolNameTruncated).toBe(true);
-  });
-
-  it("short tool names are stored verbatim without the flag", () => {
-    const short = "read";
-    const state = run(1000, ev.agentStart(), ev.toolStart(short));
-    expect(state.toolName).toBe(short);
-    expect(state.toolNameTruncated).toBe(false);
-  });
-
-  it("missing toolName → executing without a name", () => {
-    const state = run(1000, ev.agentStart(), ev.toolStart(undefined));
-    expect(state.phase).toBe("executing");
-    expect(state.toolName).toBeUndefined();
-    expect(state.toolNameTruncated).toBe(false);
-  });
-
-  it("toolName is retained after tool_execution_end (no 2s fade; replaced by the next stage event)", () => {
-    const state = run(1000, ev.agentStart(), ev.toolStart("bash -c make"), ev.toolEnd());
-    expect(state.phase).toBe("working");
-    expect(state.toolName).toBe("bash -");
-  });
-
-  it("toolName is overwritten by the next tool execution and cleared at turn boundaries (no cross-turn residue)", () => {
-    let state = run(1000, ev.agentStart(), ev.toolStart("bash -c make"), ev.toolEnd(), ev.toolStart("git status"));
-    expect(state.toolName).toBe("git st");
-
-    state = applyActivityEvent(state, ev.agentEnd(), 9000);
-    expect(state.toolName).toBeUndefined();
-
-    state = applyActivityEvent(state, ev.agentStart(), 10000);
-    expect(state.toolName).toBeUndefined();
-  });
-});
 
 // ── derivePhase on constructed states (priority rule) ──────
 

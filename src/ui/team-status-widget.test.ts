@@ -226,30 +226,33 @@ describe("createTeamStatusWidget", () => {
       vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     });
 
-    it("renders fine-grained phases from tracker events with badges and toolName", async () => {
+    it("renders fine-grained phases from tracker events with icons and colors", async () => {
       const h = build({ members: [createTeamMember("coder", "编码员")], opsStates: { coder: "working" } });
       h.widget.install(h.ui, h.theme);
       await vi.advanceTimersByTimeAsync(0);
       h.setWidget.mockClear();
 
-      // agent_start → thinking 💭
+      // agent_start → thinking 💭 (accent)
       emit(h, "coder", { type: "agent_start" });
       emit(h, "coder", { type: "message_update", assistantMessageEvent: { type: "thinking_delta" } });
       await vi.advanceTimersByTimeAsync(300);
       expect(h.middle()).toContain("💭");
       expect(h.middle()).toContain("编码员");
+      expect(h.middle()).toContain("<accent>");
 
-      // tool execution → executing ⚙️ + truncated toolName + duration
+      // tool execution → executing 🔧 (warning) — same icon+color as tool-calling
       emit(h, "coder", { type: "tool_execution_start", toolName: "bash -c make" });
       await vi.advanceTimersByTimeAsync(300);
-      expect(h.middle()).toContain("⚙️");
-      expect(h.middle()).toContain("bash -…"); // D10 precomputed truncation + ellipsis
+      expect(h.middle()).toContain("🔧");
+      expect(h.middle()).toContain("<warning>");
+      expect(h.middle()).not.toContain("bash"); // v2: no tool name anywhere
 
-      // executing ends while text stream active → output 📤
+      // executing ends while text stream active → output ✏️ (success)
       emit(h, "coder", { type: "message_update", assistantMessageEvent: { type: "text_delta" } });
       emit(h, "coder", { type: "tool_execution_end" });
       await vi.advanceTimersByTimeAsync(300);
-      expect(h.middle()).toContain("📤");
+      expect(h.middle()).toContain("✏️");
+      expect(h.middle()).toContain("<success>");
 
       // agent_end → idle ✅ (the logical layer also flips working→idle right
       // after the activity hook fires — simulated here, mirrors event-handler)
@@ -260,7 +263,7 @@ describe("createTeamStatusWidget", () => {
       expect(h.middle()).not.toContain("💭");
     });
 
-    it("working gap fallback shows 🔧 without duration; tool-calling shows 🔧", async () => {
+    it("working gap fallback shows 💭 (default); tool-calling shows 🔧 (warning)", async () => {
       const h = build({ members: [createTeamMember("coder", "编码员")], opsStates: { coder: "working" } });
       h.widget.install(h.ui, h.theme);
       await vi.advanceTimersByTimeAsync(0);
@@ -269,14 +272,17 @@ describe("createTeamStatusWidget", () => {
       emit(h, "coder", { type: "agent_start" });
       emit(h, "coder", { type: "message_update", assistantMessageEvent: { type: "thinking_end" } });
       await vi.advanceTimersByTimeAsync(300);
-      // working: 🔧, no duration text
-      expect(h.middle()).toContain("🔧");
+      // working: 💭 (neutral default color — no color wrap; thinking is the
+      // SAME icon but accent — the color is the discriminator)
+      expect(h.middle()).toContain("💭");
+      expect(h.middle()).not.toContain("<accent>");
+      expect(h.middle()).not.toContain("<warning>");
 
       emit(h, "coder", { type: "message_update", assistantMessageEvent: { type: "toolcall_delta" } });
       await vi.advanceTimersByTimeAsync(300);
-      // tool-calling: 🔧 (same icon, distinct from executing ⚙️)
+      // tool-calling: 🔧 warning — distinct icon AND color from 💭 working
       expect(h.middle()).toContain("🔧");
-      expect(h.middle()).not.toContain("⚙️");
+      expect(h.middle()).toContain("<warning>");
     });
 
     it("logical-layer overlay wins over fine-grained phases (compacting/crashed/stopped)", async () => {
@@ -287,7 +293,7 @@ describe("createTeamStatusWidget", () => {
       emit(h, "coder", { type: "agent_start" });
       emit(h, "coder", { type: "tool_execution_start", toolName: "bash" });
       await vi.advanceTimersByTimeAsync(300);
-      expect(h.middle()).toContain("⚙️");
+      expect(h.middle()).toContain("🔧");
 
       h.memberOpsStates.set("coder", "compacting");
       h.widget.refresh();
@@ -300,42 +306,102 @@ describe("createTeamStatusWidget", () => {
       expect(h.middle()).toContain("⏹️");
     });
 
-    it("duration micro-caption formats seconds and minutes (12s / 1m05s)", async () => {
+    it("v2: tool-calling → executing renders IDENTICAL output → the render gate skips setWidget (correct N1 semantics)", async () => {
       const h = build({ members: [createTeamMember("coder", "编码员")], opsStates: { coder: "working" } });
       h.widget.install(h.ui, h.theme);
       await vi.advanceTimersByTimeAsync(0);
       h.setWidget.mockClear();
-      emit(h, "coder", { type: "agent_start" });
-      emit(h, "coder", { type: "message_update", assistantMessageEvent: { type: "thinking_delta" } });
-      await vi.advanceTimersByTimeAsync(300);
-      expect(h.middle()).toContain("0s");
-      // Keep the stream alive below the 30s staleness window with periodic deltas.
-      await vi.advanceTimersByTimeAsync(29_700); // t≈30000
-      emit(h, "coder", { type: "message_update", assistantMessageEvent: { type: "thinking_delta" } });
-      await vi.advanceTimersByTimeAsync(300); // t≈30300 — 30s duration
-      expect(h.middle()).toContain("30s");
-      await vi.advanceTimersByTimeAsync(29_700); // t≈60000
-      emit(h, "coder", { type: "message_update", assistantMessageEvent: { type: "thinking_delta" } });
-      await vi.advanceTimersByTimeAsync(5_300); // t≈65300
-      // phaseSince unchanged (same phase throughout) → 65s → 1m05s
-      h.widget.refresh();
-      expect(h.middle()).toContain("1m05s");
-    });
 
-    it("B1: color-only change (working default → tool-calling warning) passes the render gate", async () => {
-      const h = build({ members: [createTeamMember("coder", "编码员")], opsStates: { coder: "working" } });
-      h.widget.install(h.ui, h.theme);
-      await vi.advanceTimersByTimeAsync(0);
-      // Install rendered the working fallback: 🔧 default (no color wrap).
-      expect(h.middle()).toContain("🔧");
-      expect(h.middle()).not.toContain("<warning>");
-      h.setWidget.mockClear();
-      // toolcall delta on a fresh member → tool-calling: RAW identical to the
-      // working fallback, styled differs (warning color) — must NOT be gated.
+      // tool-calling (🔧 warning)
       emit(h, "coder", { type: "message_update", assistantMessageEvent: { type: "toolcall_delta" } });
       await vi.advanceTimersByTimeAsync(300);
       expect(h.setWidget.mock.calls.length).toBe(1);
       expect(h.middle()).toContain("<warning>");
+      expect(h.middle()).toContain("🔧");
+
+      // executing: same icon + same color → styled identical → gate skips.
+      // (v2 icon matrix: tool-calling and executing are BOTH 🔧 warning — the
+      // phases stay structurally distinct, the VISUAL does not change.)
+      h.setWidget.mockClear();
+      emit(h, "coder", { type: "tool_execution_start" });
+      await vi.advanceTimersByTimeAsync(300);
+      expect(h.setWidget).not.toHaveBeenCalled();
+      expect(h.middle()).toContain("🔧"); // visual unchanged
+
+      // a DIFFERENT icon/color transition still renders: executing → output ✏️
+      // (toolcall_end closes the arg-generation stream first, then text takes
+      // priority after tool_execution_end — realistic order)
+      emit(h, "coder", { type: "message_update", assistantMessageEvent: { type: "toolcall_end" } });
+      emit(h, "coder", { type: "message_update", assistantMessageEvent: { type: "text_delta" } });
+      emit(h, "coder", { type: "tool_execution_end" });
+      await vi.advanceTimersByTimeAsync(300);
+      expect(h.setWidget.mock.calls.length).toBe(1);
+      expect(h.middle()).toContain("✏️");
+    });
+
+    it("v2 display purity: segments contain only icon + label + percent (no duration/toolname/ellipsis)", async () => {
+      const h = build({ members: [createTeamMember("coder", "编码员")], opsStates: { coder: "working" } });
+      h.widget.install(h.ui, h.theme);
+      await vi.advanceTimersByTimeAsync(0);
+      h.setWidget.mockClear();
+
+      emit(h, "coder", { type: "agent_start" });
+      emit(h, "coder", { type: "message_update", assistantMessageEvent: { type: "thinking_delta" } });
+      await vi.advanceTimersByTimeAsync(300);
+      // no duration: no digits, no s/m units, no ellipsis, no tool names
+      expect(h.middle()).not.toMatch(/\d+/);
+      expect(h.middle()).not.toContain("…");
+      expect(h.middle()).not.toContain("bash");
+
+      emit(h, "coder", { type: "tool_execution_start", toolName: "bash -c make -j8" });
+      await vi.advanceTimersByTimeAsync(300);
+      expect(h.middle()).not.toMatch(/\d+/);
+      expect(h.middle()).not.toContain("…");
+      expect(h.middle()).not.toContain("bash");
+    });
+
+    it("working→tool-calling transition renders (icon+color both change: 💭 default → 🔧 warning)", async () => {
+      const h = build({ members: [createTeamMember("coder", "编码员")], opsStates: { coder: "working" } });
+      h.widget.install(h.ui, h.theme);
+      await vi.advanceTimersByTimeAsync(0);
+      // Install rendered the working fallback: 💭 default (no color wrap).
+      expect(h.middle()).toContain("💭");
+      expect(h.middle()).not.toContain("<warning>");
+      h.setWidget.mockClear();
+      // toolcall delta on a fresh member → tool-calling: icon AND color change
+      // (💭 plain → 🔧 warning) — must render.
+      emit(h, "coder", { type: "message_update", assistantMessageEvent: { type: "toolcall_delta" } });
+      await vi.advanceTimersByTimeAsync(300);
+      expect(h.setWidget.mock.calls.length).toBe(1);
+      expect(h.middle()).toContain("<warning>");
+      expect(h.middle()).toContain("🔧");
+    });
+
+    it("v2.2: working→thinking same-icon transition (💭 default → 💭 accent) passes the render gate — color-only change (B1)", async () => {
+      const h = build({ members: [createTeamMember("coder", "编码员")], opsStates: { coder: "working" } });
+      h.widget.install(h.ui, h.theme);
+      await vi.advanceTimersByTimeAsync(0);
+      // Install rendered the working fallback: 💭 default — RAW identical to
+      // thinking (same icon), the ONLY discriminator is the accent color.
+      expect(h.middle()).toContain("💭");
+      expect(h.middle()).not.toContain("<accent>");
+      h.setWidget.mockClear();
+      // agent_start → thinking 💭 accent: styled differs (color), raw identical
+      // — the styled render gate MUST capture this transition (B1 guard).
+      emit(h, "coder", { type: "agent_start" });
+      await vi.advanceTimersByTimeAsync(300);
+      expect(h.setWidget.mock.calls.length).toBe(1);
+      expect(h.middle()).toContain("💭");
+      expect(h.middle()).toContain("<accent>");
+
+      // thinking → working (thinking_end, same icon): the reverse direction
+      // must also render — accent color disappears.
+      h.setWidget.mockClear();
+      emit(h, "coder", { type: "message_update", assistantMessageEvent: { type: "thinking_end" } });
+      await vi.advanceTimersByTimeAsync(300);
+      expect(h.setWidget.mock.calls.length).toBe(1);
+      expect(h.middle()).toContain("💭");
+      expect(h.middle()).not.toContain("<accent>");
     });
 
     it("S1: process death with an unchanged signature still re-renders promptly (no 30s poll lag)", async () => {
@@ -369,27 +435,6 @@ describe("createTeamStatusWidget", () => {
       expect(h.setWidget).not.toHaveBeenCalled();
     });
 
-    it("N1: duration second boundary triggers exactly one render", async () => {
-      const h = build({ members: [createTeamMember("coder", "编码员")], opsStates: { coder: "working" } });
-      h.widget.install(h.ui, h.theme);
-      await vi.advanceTimersByTimeAsync(0);
-      h.setWidget.mockClear();
-      // t≈0: thinking starts
-      emit(h, "coder", { type: "agent_start" });
-      emit(h, "coder", { type: "message_update", assistantMessageEvent: { type: "thinking_delta" } });
-      await vi.advanceTimersByTimeAsync(300);
-      expect(h.setWidget.mock.calls.length).toBe(1);
-      expect(h.middle()).toContain("0s");
-      h.setWidget.mockClear();
-      // Next second boundary (t≈1300): exactly one new render
-      await vi.advanceTimersByTimeAsync(1000);
-      emit(h, "coder", { type: "message_update", assistantMessageEvent: { type: "thinking_delta" } });
-      emit(h, "coder", { type: "message_update", assistantMessageEvent: { type: "thinking_delta" } });
-      await vi.advanceTimersByTimeAsync(300);
-      expect(h.setWidget.mock.calls.length).toBe(1);
-      expect(h.middle()).toContain("1s");
-    });
-
     it("rapid signature changes within the window merge into a single flush", async () => {
       const h = build({ members: [createTeamMember("coder", "编码员")], opsStates: { coder: "working" } });
       h.widget.install(h.ui, h.theme);
@@ -402,7 +447,7 @@ describe("createTeamStatusWidget", () => {
       emit(h, "coder", { type: "tool_execution_start", toolName: "bash -c make" });
       await vi.advanceTimersByTimeAsync(300);
       expect(h.setWidget.mock.calls.length).toBe(1);
-      expect(h.middle()).toContain("⚙️"); // final state rendered
+      expect(h.middle()).toContain("🔧"); // final state rendered
     });
 
     it("onMemberEvent before install is ignored (no scheduling)", async () => {
@@ -422,7 +467,7 @@ describe("createTeamStatusWidget", () => {
       expect(vi.getTimerCount()).toBeGreaterThan(0); // poll + live refresh pending
       h.widget.uninstall();
       expect(vi.getTimerCount()).toBe(0);
-      // Reinstall after uninstall must render (lastRawKey reset)
+      // Reinstall after uninstall must render (lastRenderKey reset)
       h.widget.install(h.ui, h.theme);
       expect(h.setWidget.mock.calls.length).toBeGreaterThan(0);
     });

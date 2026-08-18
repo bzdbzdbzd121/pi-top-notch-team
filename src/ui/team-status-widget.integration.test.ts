@@ -117,13 +117,13 @@ describe("team-status-widget integration (tracker → widget live path)", () => 
 
     h.emit("coder", { type: "tool_execution_start", toolName: "bash -c make" });
     await vi.advanceTimersByTimeAsync(300);
-    expect(h.middle()).toContain("⚙️");
-    expect(h.middle()).toContain("bash -…");
+    expect(h.middle()).toContain("🔧");
+    expect(h.middle()).not.toContain("bash"); // v2: no tool name
 
     h.emit("coder", { type: "message_update", assistantMessageEvent: { type: "text_delta" } });
     h.emit("coder", { type: "tool_execution_end" });
     await vi.advanceTimersByTimeAsync(300);
-    expect(h.middle()).toContain("📤");
+    expect(h.middle()).toContain("✏️");
 
     h.emit("coder", { type: "agent_end" });
     h.memberOpsStates.set("coder", "idle");
@@ -153,15 +153,23 @@ describe("team-status-widget integration (tracker → widget live path)", () => 
 
     await vi.advanceTimersByTimeAsync(300);
     expect(h.middle()).toContain("💥");
-    expect(h.middle()).not.toContain("⚙️");
+    expect(h.middle()).not.toContain("🔧");
   });
 
-  it("N2: 15s poll keeps duration/pct moving during event-less periods; 30s staleness closes the anti-stuck loop", async () => {
+  it("N2: 15s poll keeps pct moving during event-less periods; 30s staleness closes the anti-stuck loop", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     const statsHandle = {
-      sendCommandAndWait: vi.fn().mockResolvedValue({
-        data: { contextUsage: { percent: 45, tokens: 10, contextWindow: 100 } },
-      }),
+      // install-time query → 45%; every later poll → 47% (a pct CHANGE drives
+      // the render — duration is gone in v2, so N2's poll refresh is exercised
+      // through the percentage, exactly as the render-side gate intends).
+      sendCommandAndWait: vi
+        .fn()
+        .mockResolvedValueOnce({
+          data: { contextUsage: { percent: 45, tokens: 10, contextWindow: 100 } },
+        })
+        .mockResolvedValue({
+          data: { contextUsage: { percent: 47, tokens: 10, contextWindow: 100 } },
+        }),
     };
     const teamCtx = { ...createMockTeamCtx(), getHandle: () => statsHandle };
     const h = createHarness({
@@ -171,29 +179,35 @@ describe("team-status-widget integration (tracker → widget live path)", () => 
     });
     const widget = await h.getWidget();
     widget.install(h.ui, h.theme);
-    await vi.advanceTimersByTimeAsync(0); // install-time initial query settles
+    await vi.advanceTimersByTimeAsync(0); // install-time initial query settles (45%)
 
     h.emit("coder", { type: "agent_start" });
     h.emit("coder", { type: "message_update", assistantMessageEvent: { type: "thinking_delta" } });
     await vi.advanceTimersByTimeAsync(300);
+    expect(h.middle()).toContain("45%");
     h.setWidget.mockClear();
 
-    // 15s later the active poll fires → duration text + pct updated (N2: poll
-    // completion keeps refresh(); the render-side gate only skips no-change).
+    // t≈15300: active poll fires → pct 45→47 → gate passes (poll completion
+    // keeps refresh(), N2 — duration no longer moves, pct change drives it).
     await vi.advanceTimersByTimeAsync(15_000);
-    expect(h.setWidget.mock.calls.length).toBeGreaterThan(0);
+    expect(h.setWidget.mock.calls.length).toBe(1);
     expect(h.middle()).toContain("💭");
-    expect(h.middle()).toContain("15s");
-    expect(h.middle()).toContain("45%");
+    expect(h.middle()).toContain("<accent>"); // thinking: accent 💭
+    expect(h.middle()).toContain("47%");
 
-    // t≈30000 — exactly at the staleness boundary: still thinking.
+    // t≈30300: poll with unchanged pct (47→47) + same phase → gate skips (no churn).
     await vi.advanceTimersByTimeAsync(15_000);
+    expect(h.setWidget.mock.calls.length).toBe(1);
+    expect(h.middle()).toContain("<accent>"); // still thinking (not stale yet)
+
+    // t≈45300: 30s+ since the last delta (t=0) → lazy staleness downgrades to
+    // working 💭 — SAME icon as thinking, the accent color disappears (the
+    // styled gate captures the color-only change; poll is the execution
+    // window of the third anti-stuck loop).
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(h.setWidget.mock.calls.length).toBe(2);
     expect(h.middle()).toContain("💭");
-
-    // t≈45000 — 30s+ since the last delta: lazy staleness downgrades to working.
-    await vi.advanceTimersByTimeAsync(15_000);
-    expect(h.middle()).toContain("🔧");
-    expect(h.middle()).not.toContain("💭");
+    expect(h.middle()).not.toContain("<accent>"); // working: plain 💭
   });
 
   it("N3: parallel stats polling — one poll bounded by max timeout, not 3N", async () => {
@@ -307,11 +321,11 @@ describe("team-status-widget integration (tracker → widget live path)", () => 
     await vi.advanceTimersByTimeAsync(2000);
     expect(h.setWidget).not.toHaveBeenCalled();
 
-    // Change → renders again (⚙️ executing)
+    // Change → renders again (🔧 executing: 💭 accent → 🔧 warning)
     h.emit("coder", { type: "tool_execution_start", toolName: "bash -c make" });
     await vi.advanceTimersByTimeAsync(300);
     expect(h.setWidget.mock.calls.length).toBe(1);
-    expect(h.middle()).toContain("⚙️");
+    expect(h.middle()).toContain("🔧");
   });
 
   it("N6: uninstall leaves no timers behind (poll + live refresh + inflight abort)", async () => {
@@ -343,15 +357,16 @@ describe("team-status-widget integration (tracker → widget live path)", () => 
     widget.install(h.ui, h.theme);
     h.emit("coder", { type: "agent_start" });
 
-    // Warm-up (allocations, module-level lazies)
+    // Warm-up (allocations, module-level lazies) — alternate phases so every
+    // refresh passes the render-side gate (content alternates 💭/🔧).
     for (let i = 0; i < 50; i++) {
-      h.tracker.onEvent("coder", { type: "tool_execution_start", toolName: `tool-${i}` });
+      h.tracker.onEvent("coder", i % 2 === 0 ? { type: "agent_start" } : { type: "tool_execution_start" });
       widget.refresh();
     }
     const N = 500;
     const t0 = performance.now();
     for (let i = 0; i < N; i++) {
-      h.tracker.onEvent("coder", { type: "tool_execution_start", toolName: `tool-${i}` });
+      h.tracker.onEvent("coder", i % 2 === 0 ? { type: "agent_start" } : { type: "tool_execution_start" });
       widget.refresh();
     }
     const perFrameMs = (performance.now() - t0) / N;

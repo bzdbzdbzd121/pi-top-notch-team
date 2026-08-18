@@ -467,7 +467,9 @@ export function registerTlTools(deps: TlToolsDeps): void {
       }
 
       const lines = entries.map(([name, state]) => {
-        const icon = state === "working" ? "🔧"
+        // working 在 list_members 文本输出用 💦（D5 裁决，独立于状态栏——
+        // v2.2 起状态栏 working 兜底为 💭，浮窗同步；此处保持 💦 不改）。
+        const icon = state === "working" ? "💦"
                    : state === "compacting" ? "🗜️"
                    : state === "idle" ? "✅"
                    : state === "crashed" ? "💥"
