@@ -768,21 +768,29 @@ describe("P2 结构共享 + 滚动实时性护栏", () => {
     for (const n of names) expect(state.tabs.find((t) => t.name === n)!.lines.length).toBeGreaterThan(0);
     const rpcBefore = names.reduce((s, n) => s + handles[n].sendCommandAndWait.mock.calls.length, 0);
 
-    // 预热一次 toggle（让 V8 完成该热路径编译 + 主题化缓存就绪）
+    // 预热 3 次 toggle（让 V8 完成该热路径编译 + 主题化缓存就绪；并行测试
+    // 负载下首次测量可能含 JIT/GC 尾音，预热多次后中位数才代表稳态）
+    comp.handleInput("t");
+    comp.handleInput("t");
+    comp.handleInput("t");
+    comp.handleInput("t");
     comp.handleInput("t");
     comp.handleInput("t");
 
-    // 稳态 toggle（思考开 → 关）：4 成员本地重建同步块
+    // 稳态 toggle（思考开 → 关）：4 成员本地重建同步块。
+    // 用中位数而非 min/mean——并行套件负载下个别 GC 尖峰会拉高 min，
+    // 中位数代表稳态成本（CI 可跑）；mean 仍作整体有界断言。
     const samples: number[] = [];
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < 7; i++) {
       const t0 = performance.now();
       comp.handleInput("t");
       samples.push(performance.now() - t0);
       comp.handleInput("t");
     }
-    const min = Math.min(...samples);
+    const sorted = [...samples].sort((a, b) => a - b);
+    const median = sorted[Math.floor(sorted.length / 2)];
     const mean = samples.reduce((a, b) => a + b, 0) / samples.length;
-    expect(min).toBeLessThan(50); // 验收：toggle 首帧 < 50ms
+    expect(median).toBeLessThan(50); // 验收：toggle 首帧 < 50ms（稳态中位数）
     expect(mean).toBeLessThan(100); // 整体有界（GC 尖峰可容忍）
     // 零 RPC：toggle 期间无新增 get_messages
     const rpcAfter = names.reduce((s, n) => s + handles[n].sendCommandAndWait.mock.calls.length, 0);
