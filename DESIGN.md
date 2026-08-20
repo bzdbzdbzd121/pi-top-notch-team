@@ -1254,7 +1254,7 @@ inspector 输入框曾有两个独立的按键故障根因，修复互补、全�
 | 按键 | kitty CSI-u 终端 | modifyOtherKeys 终端 | legacy 终端 | 备注 |
 |------|-----------------|---------------------|-------------|------|
 | `Ctrl+Enter` | steer（`\x1b[13;5u`） | steer（`\x1b[27;5;13~`） | **不可用**（与 Enter 同字节） | 请用 Alt+Enter |
-| `Alt+Enter` | steer（`\x1b[13;3u`） | steer（`\x1b[13;3u`） | steer（`\x1b\r`） | 协议无关，全终端可用 |
+| `Alt+Enter` | steer（`\x1b[13;3u`） | steer（`\x1b[27;3;13~`，CSI 27;mod;key~） | steer（`\x1b\r`） | 协议无关，全终端可用 |
 | `Enter` | auto | auto | auto（`\r`） | 永远可发送（fail-safe） |
 
 已知失效窗口（均 fail-safe，消息仍可经 Enter 发送）：macOS Option 未设 Meta（alt 修饰不上报）、Windows 系统级 Alt+Enter 全屏拦截、kitty 激活但 alt 走 legacy 前缀的混合终端（`\x1b\r` 在 kitty 激活时被识别为 shift+enter、不匹配 alt+enter——此类终端请用 Ctrl+Enter）。
@@ -1268,7 +1268,7 @@ inspector 输入框曾有两个独立的按键故障根因，修复互补、全�
 #### 用户说明（一次性保守提示）
 
 - 忙碌成员：Enter = 排队（follow_up）、Ctrl+Enter/Alt+Enter = 立即转向（steer）；**空闲成员两者相同**（都是 prompt）——不要在空闲时测试按键差异。
-- 裁定方法（10 秒判定所属场景）：① 按 `i` 后打字**是否显示**——不显示 = 场景 K（kitty 激活未解码）；② `od -An -tx1` 观察按 Ctrl+Enter 的字节——`1b 5b 31 33 3b 35 75` = kitty 协议（K）、`0d` = legacy（L）；③ 按发送后看输入框**是否关闭**——关闭 = 消息已发出（L 降级）、未关闭 = 真没发出（K/吞键）。
+- 裁定方法（10 秒判定所属场景）：① 按 `i` 后打字**是否显示**——不显示 = 场景 K（kitty 激活未解码）；② `od -An -tx1` 观察按 Ctrl+Enter 的字节——`1b 5b 31 33 3b 35 75` = kitty 协议（K）、`0d` = legacy（L）；③ 按发送后**以 footer notice 文本为准**：「输入为空」= 未发出（打字没进 buffer，K 场景空文本路径）；「✓ 已发送/已排队/已 steer」= 已发出（L 降级——注意 K 场景空文本时输入框同样会关闭，不能只看输入框状态）；无 notice 且输入框未关闭 = 吞键。
 - 保守建议：不确定终端类型时，**Alt+Enter 或 Enter 永远可用**（steer 或 auto 都保证消息发出）。
 
 ### Files

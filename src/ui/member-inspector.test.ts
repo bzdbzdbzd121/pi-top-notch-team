@@ -375,6 +375,18 @@ describe("MemberInspectorComponent — 场景 L：legacy 终端 steer 可用 + �
     expect(handleA.sendCommand).not.toHaveBeenCalled();
     expect(state.notice).toBe("✗ 无成员可发送");
   });
+
+  it("L9c: 无成员时 Alt+Enter 同样提示（双绑定全覆盖）", () => {
+    const tui = makeTui();
+    const done = vi.fn();
+    const state = new MemberInspectorState([]);
+    const comp = new MemberInspectorComponent(tui, makeTheme(), done, deps, state);
+    comp.handleInput("i");
+    typeText(comp, "hello");
+    comp.handleInput(K.altEnterKitty);
+    expect(handleA.sendCommand).not.toHaveBeenCalled();
+    expect(state.notice).toBe("✗ 无成员可发送");
+  });
 });
 
 describe("MemberInspectorComponent — control commands", () => {
