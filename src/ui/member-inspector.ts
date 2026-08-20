@@ -12,6 +12,7 @@ import {
   canIncrementCache,
   createBodyBuildCache,
   fitLinesIncremental,
+  clearAppendWrapCache,
   buildHeaderLine,
   buildFooterStatusLine,
   truncateLine,
@@ -230,6 +231,13 @@ export class MemberInspectorComponent {
    * flush. Cache is keyed by the exact (history ref, pending length, live
    * ref) triple, so any structural change rebuilds exactly once; the
    * streaming flush (same pieces) reuses the cached array at O(1).
+   *
+   * ⚠️ 键约定（审查 ②）：键用 pending.length 而非 pending 数组引用 —— 依赖
+   * 「pending 内容不可变」约定：pendingCompletions 只通过 completeLiveMessage
+   * push（长度+1）或 reconcilePending/clearStreaming 整体替换（引用变化）
+   * 更新，元素从不原地修改；live 内容由 applyLiveDelta 原地增长，但其引用
+   * 不变且每次 flush 都重新读取，故用 live 引用作键安全。若未来引入对
+   * pending 元素的原地修改，必须同步改键。
    */
   private getBuildMessages(name: string, history: any[], pending: any[], live: any): any[] {
     if (pending.length === 0 && !live) return history; // plain history — no assembly
@@ -284,8 +292,14 @@ export class MemberInspectorComponent {
     // leave a stale-colour body next to freshly-themed chrome. The cost is
     // one full rebuild on the next flush, which happens anyway for width
     // changes.
+    // P2-② (审查必改): the block-level「已 wrap + 已主题化」缓存也必须在
+    // 主题切换时清空 —— themeKey 只含 (color, indent) 不含主题身份，且该
+    // 缓存是模块级（不随 bodyCaches 消失）。否则同宽度主题切换后全量重建
+    // 时，存活的流式 thinking/pending block 命中 warm entry → 已完成行残留
+    // 旧主题色、仅新增行用新主题（混合主题）。
     if (this.disposed) return;
     this.bodyCaches.clear();
+    clearAppendWrapCache();
     for (const tab of this.state.tabs) tab.dirty = true;
     this.scheduleFlush();
   }

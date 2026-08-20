@@ -125,7 +125,23 @@ interface AppendWrapEntry {
   themeKey: string | null;
 }
 
-const appendWrapCache = new WeakMap<object, AppendWrapEntry>();
+let appendWrapCache: WeakMap<object, AppendWrapEntry> = new WeakMap();
+
+/**
+ * P2-② 审查必改：清空模块级 wrap 缓存（含「已 wrap + 已主题化」行）。
+ *
+ * themeKey 只含 (color, indent)，不含主题函数身份（组件 inspectorTheme
+ * 包装器每次访问都重建，身份无意义；P1-③ 将主题视为组件常量）。因此主题
+ * 切换（同宽度）后，仅靠 themeKey 无法感知 —— 若不清空，全量重建时存活
+ * 的流式 thinking/pending block 命中 warm entry，已完成行残留旧主题色、
+ * 仅新增行用新主题（混合主题，持续到消息完成或宽度变化）。
+ *
+ * invalidate()（pi-tui overlay 主题切换/尺寸变化路径）调用本函数；WeakMap
+ * 无 clear()，故以「替换新实例」实现（旧实例随 block 对象 GC）。
+ */
+export function clearAppendWrapCache(): void {
+  appendWrapCache = new WeakMap<object, AppendWrapEntry>();
+}
 
 /**
  * Rope-prefix sample width (P2-⑥, R3-A): guards the append-only trust
@@ -1252,8 +1268,12 @@ export function fitLinesIncremental(
   const staleTail = cache.fitLines.slice(cache.fitLines.length - cache.fitTailLen);
   cache.fitLines.length = cache.fitLines.length - cache.fitTailLen; // drop stale fitted tail
   cache.fitLines.push(...fittedAdded);
+  // ④ 审查建议：changed 驱动「↓ 有更新」闪现 —— 仅当新内容出现在下方时置位。
+  // tail 收缩（内容变短）不是新增内容，不得闪现；前缀增长（fittedAdded 含
+  // 增长段）或同长替换（内容变化）才置位。
   const changed =
-    result.tailLen !== cache.fitTailLen || !sameLineArray(staleTail, fittedAdded);
+    fittedAdded.length > staleTail.length ||
+    (fittedAdded.length === staleTail.length && !sameLineArray(staleTail, fittedAdded));
   cache.fitTailLen = result.tailLen;
   return { lines: cache.fitLines, added: fittedAdded, changed, mode: "incremental" };
 }
