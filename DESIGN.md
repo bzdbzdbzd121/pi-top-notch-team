@@ -1155,8 +1155,8 @@ Overlay: `ctx.ui.custom(component, { overlay: true, overlayOptions: { width: "90
 | `↑` / `↓` / `PgUp` / `PgDn` | Scroll conversation |
 | `End` | Jump to bottom + resume tail-following |
 | `i` / `Enter` | Open input box |
-| `Enter` (in input) | Send: `prompt` when idle, `follow_up` when busy |
-| `Ctrl+Enter` (in input) | Send `steer` (immediate redirect) |
+| `Enter` (in input) | Send: `prompt` when idle, `follow_up` when busy（含字面 `\n` 兜底——kitty 协议激活时 pi-tui 不再将 `\n` 识别为 enter，LF 编码混合终端靠此放行；兜底必须位于任何未来 ctrl+j 分支之后） |
+| `Ctrl+Enter` / `Alt+Enter` (in input) | Send `steer` (immediate redirect). **Ctrl+Enter 依赖终端协议**（kitty CSI-u `\x1b[13;5u` / modifyOtherKeys `\x1b[27;5;13~`）；legacy 终端两者同字节 `\r` 无法区分，**Alt+Enter 是协议无关的 steer 路径**（legacy `\x1b\r` / kitty `\x1b[13;3u`）。空文本或无成员时显式 notice，不再静默 |
 | `e` | Toggle tool call/result detail expansion — **GLOBAL**: flips ALL member tabs (running: RPC refetch; stopped/crashed with cache: local rebuild) |
 | `t` | Toggle thinking block visibility (hidden by default) — **GLOBAL**: flips ALL member tabs |
 | `ctrl+a` | `abort` the active tab's member |
@@ -1236,6 +1236,40 @@ Messages typed into the input box bypass the TL. To keep the team consistent:
 - `/...` text is sent raw — the member's agent-session resolves it as an extension command / skill / prompt-template expansion (verified in pi `dist/core/agent-session.js` `prompt()`)
 - **User interventions are NOT mirrored into the TL session** — no `pi.sendMessage` notification is generated for direct messages, aborts, or compacts. The TL only learns about them indirectly (member replies, `get_member_log`). This keeps the user's direct control channel private from the TL's turn flow.
 - crashed/stopped members reject sends with a footer notice
+
+### 输入键位协议（场景 K/L 双根因）
+
+inspector 输入框曾有两个独立的按键故障根因，修复互补、全量覆盖不同终端类型：
+
+**场景 K（kitty 键盘协议激活，`flags=7` 含 disambiguate）**：所有按键均编码为 CSI-u（按 `a` → `\x1b[97u`）。字符插入分支曾用 `isControlSequence` 拦截一切 ESC 前缀且未解码 → 文字进不去、inputBuffer 恒空 → Ctrl+Enter 读空文本静默关闭、零发送（用户症状"打字不显示 + 发不出去"）。修复：插入分支先经 `decodePrintableKey` 解码（见下方解码纪律）。
+
+**场景 L（legacy 无协议终端）**：Ctrl+Enter 与 Enter 同字节 `\r`，`matchesKey("ctrl+enter")` 零 legacy 回退（原理上不可能——任何回退都会让普通 Enter 误触发 steer）→ 落入 Enter 分支按 auto 发送（steer 语义丢失）；kitty 激活 + LF 编码混合终端下 `\n` 被吞键（pi-tui 的 enter 匹配为 `data==="\r" || (!_kittyProtocolActive && data==="\n")`——kitty 激活后 `\n` 被视为 shift+enter 映射）。修复：alt+enter 双绑定 + `\n` 字面单字节兜底。
+
+#### CSI-u 解码纪律（防再犯硬性约定）
+
+**任何字符插入路径必须经 `decodePrintableKey`（或等价解码）**——inspector 与 pi 主输入框（editor.js）的不一致是本轮 bug 温床：主输入框解码了、inspector 没有。实现注记：`decodePrintableKey` 从 `@earendil-works/pi-tui/dist/keys.js` 深导入（主 index 仅 re-export `decodeKittyPrintable`；上游 editor.js 同样深导入 keys.js）。安全性（实测）：仅纯字符/Shift 字符的 CSI-u 被解码；ctrl/alt 修饰序列与 legacy 原字符返回 undefined → 走原兜底路径；解码分支位于 ctrl+enter/enter 键匹配分支之后（顺序双保险）。
+
+#### 键位协议约束表
+
+| 按键 | kitty CSI-u 终端 | modifyOtherKeys 终端 | legacy 终端 | 备注 |
+|------|-----------------|---------------------|-------------|------|
+| `Ctrl+Enter` | steer（`\x1b[13;5u`） | steer（`\x1b[27;5;13~`） | **不可用**（与 Enter 同字节） | 请用 Alt+Enter |
+| `Alt+Enter` | steer（`\x1b[13;3u`） | steer（`\x1b[13;3u`） | steer（`\x1b\r`） | 协议无关，全终端可用 |
+| `Enter` | auto | auto | auto（`\r`） | 永远可发送（fail-safe） |
+
+已知失效窗口（均 fail-safe，消息仍可经 Enter 发送）：macOS Option 未设 Meta（alt 修饰不上报）、Windows 系统级 Alt+Enter 全屏拦截、kitty 激活但 alt 走 legacy 前缀的混合终端（`\x1b\r` 在 kitty 激活时被识别为 shift+enter、不匹配 alt+enter——此类终端请用 Ctrl+Enter）。
+
+残留限制（显式声明）：kitty 激活 + LF 编码混合终端下 Enter 发送 `\n` 由兜底按 auto 处理（消息发出、非 steer）；Ctrl+Enter 在 legacy 终端按 auto（消息发出、非 steer），需立即转向请用 Alt+Enter。
+
+#### 防误修复说明
+
+**不要为 `ctrl+enter` 添加 legacy 字节回退**（如把 `\r` 也匹配为 ctrl+enter）——legacy 终端下 Ctrl+Enter 与 Enter 同字节，任何回退都会让普通 Enter 误触发 steer。原理不可能，只能依赖终端协议或 Alt+Enter。
+
+#### 用户说明（一次性保守提示）
+
+- 忙碌成员：Enter = 排队（follow_up）、Ctrl+Enter/Alt+Enter = 立即转向（steer）；**空闲成员两者相同**（都是 prompt）——不要在空闲时测试按键差异。
+- 裁定方法（10 秒判定所属场景）：① 按 `i` 后打字**是否显示**——不显示 = 场景 K（kitty 激活未解码）；② `od -An -tx1` 观察按 Ctrl+Enter 的字节——`1b 5b 31 33 3b 35 75` = kitty 协议（K）、`0d` = legacy（L）；③ 按发送后看输入框**是否关闭**——关闭 = 消息已发出（L 降级）、未关闭 = 真没发出（K/吞键）。
+- 保守建议：不确定终端类型时，**Alt+Enter 或 Enter 永远可用**（steer 或 auto 都保证消息发出）。
 
 ### Files
 
@@ -1518,6 +1552,7 @@ tracker 生命周期随 widget install/uninstall（onSessionStart / onSessionEnd
 | 其余（数据来源、状态设计、显示方案、D1–D13 裁决、阶段边界） | — | 全部不变（D1–D13 裁决记录见 §19 与上表；N 系列为实现细节与验收标准，不构成新裁决、不与之冲突） |
 | 可选增强 | O1 时长 tick / 增强 B | 维持可选（**O1 随 v2 撤销**——耗时显示删除后失去载体；增强 B 保留 30s 兜底；O3 窗口参数一次性校准；O4 超宽缓解） |
 | **v2 纯减法简化（用户确认）** | 状态栏含耗时 + 工具名（D10 截断） | **只保留图标+label+百分比**：tracker 删 3 字段（toolName/toolNameTruncated/phaseSince）+ D10/P1/P2/A1 + start/update 合并；widget 删 formatDuration/时长/工具名渲染，签名 `logical|phase`；图标矩阵最终态（working 💭 默认 / tool-calling+executing 🔧 warning / output ✏️ success，v2.2 微调后）；浮窗 stateIcon 💭；list_members 💦（D5，独立保持）；节流/闸门/轮询/防卡死/N6 全部保留；bugfix 方案废弃零回滚（仅文档记录，见 §19 决策演变表） |
+| 输入键位协议修复（场景 K/L，§17） | 字符插入无 CSI-u 解码；Ctrl+Enter 无 legacy 回退 | 插入路径经 `decodePrintableKey`（O(1) 单次正则，每键一次，性能零影响、无渲染路径变更）；alt+enter 双绑定 + `\n` 兜底；完整键位约束表/解码纪律/防误修复说明见 §17 |
 
 ### 风险与对策（性能视角）
 

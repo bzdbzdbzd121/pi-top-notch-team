@@ -675,7 +675,13 @@ export class MemberInspectorComponent {
   private sendInput(mode: "auto" | "steer"): void {
     const tab = this.state.activeTab;
     const text = this.state.inputBuffer.trim();
-    if (!tab) return;
+    if (!tab) {
+      // 静默早退显式化（边界 D）：动态模式 0 成员时浮窗可打开但无成员可发。
+      // 原实现纯 return 零提示——notice 必须配 render 才可见。
+      this.state.notice = "✗ 无成员可发送";
+      this.requestRenderSafe(true);
+      return;
+    }
     if (!text) {
       // 静默路径显式化：空文本直接 close 会让用户觉得"没反应"（kitty 协议
       // 终端下打字进不去时恰会命中这里）——先提示再关闭。

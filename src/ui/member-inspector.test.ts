@@ -347,6 +347,34 @@ describe("MemberInspectorComponent — 场景 L：legacy 终端 steer 可用 + �
     comp.handleInput("i");
     expect(comp.render(80).join("\n")).toContain("alt+Enter");
   });
+
+  it("L9: 无成员（activeTab null）时发送 → notice「✗ 无成员可发送」（不再静默）", () => {
+    // 边界 D：动态模式 0 成员时浮窗可打开但无成员可发——静默早退必须可见。
+    const tui = makeTui();
+    const done = vi.fn();
+    const state = new MemberInspectorState([]);
+    const comp = new MemberInspectorComponent(tui, makeTheme(), done, deps, state);
+    comp.handleInput("i");
+    expect(state.inputOpen).toBe(true);
+    typeText(comp, "hello");
+    comp.handleInput(K.enter);
+    expect(handleA.sendCommand).not.toHaveBeenCalled();
+    expect(state.notice).toBe("✗ 无成员可发送");
+    // notice 渲染可见（footer1）
+    expect(comp.render(80).join("\n")).toContain("✗ 无成员可发送");
+  });
+
+  it("L9b: 无成员时 Ctrl+Enter 同样提示（双绑定都走 sendInput）", () => {
+    const tui = makeTui();
+    const done = vi.fn();
+    const state = new MemberInspectorState([]);
+    const comp = new MemberInspectorComponent(tui, makeTheme(), done, deps, state);
+    comp.handleInput("i");
+    typeText(comp, "hello");
+    comp.handleInput(K.ctrlEnter);
+    expect(handleA.sendCommand).not.toHaveBeenCalled();
+    expect(state.notice).toBe("✗ 无成员可发送");
+  });
 });
 
 describe("MemberInspectorComponent — control commands", () => {
