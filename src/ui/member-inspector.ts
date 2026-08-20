@@ -11,9 +11,9 @@ import {
   buildBodyLinesIncremental,
   canIncrementCache,
   createBodyBuildCache,
+  fitLinesIncremental,
   buildHeaderLine,
   buildFooterStatusLine,
-  fitLinesToWidth,
   truncateLine,
   nextStreamFlushDelay,
   KEY_HINTS_ACTION,
@@ -213,6 +213,34 @@ export class MemberInspectorComponent {
    * renders without waiting for the next get_messages round-trip.
    */
   private lastMessages = new Map<string, any[]>();
+  /**
+   * P2-③: per-tab cached `buildMessages` array (history + pending + live).
+   * Rebuilt only when the pieces actually change (refetch replaces history,
+   * message_end/agent_end change pending/live) — the streaming flush reuses
+   * the same array instead of re-spreading O(history) every 100ms.
+   */
+  private buildMessagesCache = new Map<
+    string,
+    { msgs: any[]; history: any[]; pendingLen: number; live: any }
+  >();
+
+  /**
+   * P2-③: assemble [history, ...pending, ...(live ? [live] : [])] with a
+   * per-tab cached array — incremental appends instead of a full spread per
+   * flush. Cache is keyed by the exact (history ref, pending length, live
+   * ref) triple, so any structural change rebuilds exactly once; the
+   * streaming flush (same pieces) reuses the cached array at O(1).
+   */
+  private getBuildMessages(name: string, history: any[], pending: any[], live: any): any[] {
+    if (pending.length === 0 && !live) return history; // plain history — no assembly
+    const c = this.buildMessagesCache.get(name);
+    if (c && c.history === history && c.pendingLen === pending.length && c.live === live) {
+      return c.msgs;
+    }
+    const msgs = [...history, ...pending, ...(live ? [live] : [])];
+    this.buildMessagesCache.set(name, { msgs, history, pendingLen: pending.length, live });
+    return msgs;
+  }
 
   constructor(
     private tui: any,
@@ -361,6 +389,9 @@ export class MemberInspectorComponent {
     for (const k of this.bodyCaches.keys()) {
       if (!live.has(k)) this.bodyCaches.delete(k);
     }
+    for (const k of this.buildMessagesCache.keys()) {
+      if (!live.has(k)) this.buildMessagesCache.delete(k);
+    }
 
     const bh = bodyHeight();
     for (const tab of this.state.tabs) {
@@ -420,32 +451,37 @@ export class MemberInspectorComponent {
           // Streaming tail: pending completions + the in-progress message are
           // appended after the fetched history (the incremental cache treats
           // the last element as the streaming tail and rebuilds it every
-          // flush — the live path needs no special handling).
-          const live = tab.live;
-          const buildMessages =
-            live || tab.pendingCompletions.length > 0
-              ? [...messages, ...tab.pendingCompletions, ...(live ? [live] : [])]
-              : messages;
+          // flush — the live path needs no special handling). P2-③: the
+          // assembled array is cached per tab — the streaming flush reuses
+          // it instead of re-spreading O(history) every 100ms.
+          const buildMessages = this.getBuildMessages(
+            tab.name,
+            messages,
+            tab.pendingCompletions,
+            tab.live
+          );
           // P1-④: route large FULL rebuilds through the chunked path — the
           // build runs in slices of CHUNK_SIZE messages, yielding to the
           // event loop between slices so key events are never starved by a
           // long synchronous rebuild. Incremental refreshes (the common
           // case) stay synchronous: O(增量) is cheap.
-          const lines = canIncrementCache(cache, buildMessages, opts)
-            ? buildBodyLinesIncremental(cache, buildMessages, opts).lines
+          const raw = canIncrementCache(cache, buildMessages, opts)
+            ? buildBodyLinesIncremental(cache, buildMessages, opts)
             : await this.buildBodyLinesChunked(cache, buildMessages, opts);
           // P1-④/B1: a dirty mark that arrived DURING the fetch (e/t toggle,
           // member activity while the chunked build yields) must not be
           // silently consumed by setTabLines — capture it first, then
           // re-flush once with the fresh opts/messages.
           const pending = tab.dirty;
-          // P1-①: fixed-width the lines AT BUILD TIME (single pass) — render()
-          // then emits them verbatim with zero per-frame width computation.
-          this.state.setTabLines(
-            tab.name,
-            fitLinesToWidth(lines, Math.max(20, this.lastWidth - 2)),
-            bh
+          // P2-①: fit only the new tail (incremental) or everything (full),
+          // then P2-③ local-append into the tab's STABLE lines array
+          // (render() slices it verbatim — zero per-frame width tax).
+          const fitted = fitLinesIncremental(
+            cache,
+            raw,
+            Math.max(20, this.lastWidth - 2)
           );
+          this.state.setTabLines(tab.name, fitted.lines, bh, fitted.changed);
           if (pending) {
             // Re-enqueue: setTabLines consumed the flag, and flushDirty
             // only picks up dirty tabs — restore it so the catch-up flush
@@ -510,18 +546,24 @@ export class MemberInspectorComponent {
         showThinking: this.state.showThinking,
         theme: this.inspectorTheme,
       };
-      const buildMessages = [...messages, ...tab.pendingCompletions];
-      if (tab.live) buildMessages.push(tab.live);
-      const lines = buildBodyLinesIncremental(cache, buildMessages, opts).lines;
+      const buildMessages = this.getBuildMessages(
+        tab.name,
+        messages,
+        tab.pendingCompletions,
+        tab.live
+      );
+      const raw = buildBodyLinesIncremental(cache, buildMessages, opts);
       // Same dirty-flag protection as flushDirty: a markDirty that arrived
       // while we built must not be consumed by setTabLines — restore it so
       // the refetch path still runs.
       const pending = tab.dirty;
-      this.state.setTabLines(
-        tab.name,
-        fitLinesToWidth(lines, Math.max(20, this.lastWidth - 2)),
-        bh
+      // P2-①③: fit only the new tail, local-append into the stable array.
+      const fitted = fitLinesIncremental(
+        cache,
+        raw,
+        Math.max(20, this.lastWidth - 2)
       );
+      this.state.setTabLines(tab.name, fitted.lines, bh, fitted.changed);
       if (pending) {
         tab.dirty = true;
         this.scheduleFlush();
@@ -561,14 +603,19 @@ export class MemberInspectorComponent {
       showThinking: this.state.showThinking,
       theme: this.inspectorTheme,
     };
-    const buildMessages = [...messages, ...tab.pendingCompletions];
-    if (tab.live) buildMessages.push(tab.live);
-    const lines = buildBodyLinesIncremental(cache, buildMessages, opts).lines;
-    this.state.setTabLines(
+    const buildMessages = this.getBuildMessages(
       tab.name,
-      fitLinesToWidth(lines, Math.max(20, this.lastWidth - 2)),
-      bodyHeight()
+      messages,
+      tab.pendingCompletions,
+      tab.live
     );
+    const raw = buildBodyLinesIncremental(cache, buildMessages, opts);
+    const fitted = fitLinesIncremental(
+      cache,
+      raw,
+      Math.max(20, this.lastWidth - 2)
+    );
+    this.state.setTabLines(tab.name, fitted.lines, bodyHeight(), fitted.changed);
     this.requestRenderSafe();
   }
 
@@ -587,7 +634,7 @@ export class MemberInspectorComponent {
     cache: BodyBuildCache,
     messages: any[],
     opts: BuildBodyOptions
-  ): Promise<string[]> {
+  ): Promise<{ lines: string[]; added: string[]; tailLen: number; mode: "full" | "incremental" }> {
     const total = messages.length;
     for (let end = CHUNK_SIZE; end < total; end += CHUNK_SIZE) {
       // Grow the cache to messages[0..end) (first slice = full on a cold
@@ -596,10 +643,10 @@ export class MemberInspectorComponent {
       buildBodyLinesIncremental(cache, messages, opts, end);
       // Yield to the event loop so key events are not starved.
       await new Promise<void>((resolve) => setTimeout(resolve, 0));
-      if (this.disposed) return cache.lines; // overlay closed mid-build
+      if (this.disposed) return { lines: cache.lines, added: [], tailLen: 0, mode: "full" }; // overlay closed mid-build
     }
     // Final slice: whole history, streaming tail included.
-    return buildBodyLinesIncremental(cache, messages, opts).lines;
+    return buildBodyLinesIncremental(cache, messages, opts);
   }
 
   private scheduleStatsPoll(): void {
