@@ -342,7 +342,10 @@ export function truncateLine(text: string, width: number): string {
 export function fitLinesToWidth(lines: string[], width: number): string[] {
   if (width <= 0) return lines;
   return lines.map((l) => {
-    const vw = visibleWidth(l);
+    // P1-① fast path: pure ASCII — width == length, no segmenter needed.
+    // (mirrors truncateLine's fast path; avoids the visibleWidth call +
+    // widthCache lookup entirely for the ASCII majority of body lines)
+    const vw = isPrintableAscii(l) ? l.length : visibleWidth(l);
     if (vw > width) return truncateLine(l, width);
     return vw === width ? l : l + " ".repeat(width - vw);
   });

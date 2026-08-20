@@ -227,6 +227,37 @@ describe("P1-② 字素完整性（VS16/ZWJ 不拆分，有意行为）", () => 
     expect(visibleWidth(over[0])).toBeLessThanOrEqual(6);
     expect(over[0].startsWith("\x1b[36m")).toBe(true); // escape prefix intact
   });
+
+  it("fitLinesToWidth ASCII fast path is byte-identical to the slow path (real pi-tui)", () => {
+    // P1-① fast path: pure-ASCII lines use length directly, skipping the
+    // visibleWidth segmenter/cache entirely. The slow reference (always
+    // visibleWidth) must agree byte-for-byte on every line kind: ASCII,
+    // CJK, mixed, ANSI, tab, empty, over-width.
+    const slowFit = (lines: string[], width: number): string[] => {
+      if (width <= 0) return lines;
+      return lines.map((l) => {
+        const vw = visibleWidth(l);
+        if (vw > width) return truncateLine(l, width);
+        return vw === width ? l : l + " ".repeat(width - vw);
+      });
+    };
+    const corpus = [
+      "hello",
+      "",
+      "  spaced  ",
+      "x".repeat(40),
+      "短",
+      "中文内容行中文内容行",
+      "mixed 中英 mixed",
+      "\x1b[36mcolored\x1b[0m",
+      "\x1b[36m" + "x".repeat(30) + "\x1b[0m",
+      "a\tb",
+      "emoji 👍 ok",
+    ];
+    for (const width of [0, 4, 8, 10, 20, 50]) {
+      expect(fitLinesToWidth(corpus, width)).toEqual(slowFit(corpus, width));
+    }
+  });
 });
 
 // ── Performance (acceptance: 450 messages < 500ms) ───────────
