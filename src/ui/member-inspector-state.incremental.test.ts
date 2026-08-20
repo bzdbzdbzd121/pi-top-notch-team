@@ -296,8 +296,17 @@ describe("P1-③ 增量刷新：边界指纹 + 流式尾部规则", () => {
     expect(r.mode).toBe("incremental");
     expect(r.lines).toEqual(buildBodyLines(grew, opts));
 
+    // 对照：全量重建同样的 405 条消息。用「全新消息对象」构建——否则 wrap
+    // 缓存（P3-① user/toolResult 也缓存）会让全量路径同样 O(1)/消息，比例
+    // 断言变成测量噪声。冷对象强制全量路径真正重做全部 wrap 工作。
+    const freshGrew = grew.map((m: any) => ({
+      ...m,
+      content: Array.isArray(m.content)
+        ? m.content.map((c: any) => ({ ...c }))
+        : m.content,
+    }));
     const t1 = performance.now();
-    buildBodyLines(grew, opts);
+    buildBodyLines(freshGrew, opts);
     const fullTime = performance.now() - t1;
     // Incremental work is proportional to the tail (5 msgs), not the history.
     expect(incTime).toBeLessThan(fullTime / 3);

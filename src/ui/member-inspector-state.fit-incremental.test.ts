@@ -192,4 +192,24 @@ describe("P2 fit 增量（fitLinesIncremental）", () => {
     const fitted = fitLinesIncremental(cache, raw, 0);
     expect(fitted.lines).toEqual(buildBodyLines(CORPUS, opts));
   });
+
+  it("P3: opts 变化（showThinking toggle）→ full 回退但 fitMemo 保留、字节一致", () => {
+    // P3 toggle 本地重建的性能前提：同宽度 full refit 必须复用 fitMemo
+    // （e/t 切换只改 opts 签名，不改宽度；逐行 fit 是纯函数，memo 命中与
+    // 全量 fitLinesToWidth 字节一致）。若 full 路径清空 memo，每次 toggle
+    // 都重付 O(total) fit 成本 → 4×3000 首帧无法 < 50ms。
+    const cache = createBodyBuildCache();
+    const optsOn = mkOpts({ showThinking: true });
+    const optsOff = mkOpts({ showThinking: false });
+    // 首次构建（thinking 开）→ full（冷：fitWidth 0→78 变化，memo 无内容）
+    let fitted = expectFitSameAsFull(cache, CORPUS, optsOn, "full");
+    // 切换 off → full 回退（opts 签名变），但 fitWidth 不变 → memo 保留并填充
+    const off = expectFitSameAsFull(cache, CORPUS, optsOff, "full");
+    expect(off.lines).toEqual(fitLinesToWidth(buildBodyLines(CORPUS, optsOff), FIT_W));
+    expect(cache.fitMemo.size).toBeGreaterThan(0); // 同宽 full refit 逐行 memo 化
+    // 切回 on → 仍字节一致，且 memo 继续命中（不回退为全量重扫）
+    const on = expectFitSameAsFull(cache, CORPUS, optsOn, "full");
+    expect(on.lines).toEqual(fitLinesToWidth(buildBodyLines(CORPUS, optsOn), FIT_W));
+    expect(fitted.lines.length).toBeGreaterThan(0);
+  });
 });

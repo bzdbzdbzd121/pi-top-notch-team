@@ -569,4 +569,227 @@ describe("P2 结构共享 + 滚动实时性护栏", () => {
     expect(all).toContain("«B»");
     expect(all).not.toContain("«A»"); // 无旧主题残留（混合主题 bug 锁定）
   });
+
+  // ── P3: toggle 本地重建 + 刷新调度收敛 ─────────────────────
+  //
+  // ① e/t 切换 → 全 tab 本地重建（零 RPC，running 同样适用；无缓存 tab 保留
+  //    refetch 兜底）② 本地重建后若 tab 仍 dirty 必补一次 flush ③ flushDirty
+  //    只急切刷活跃 tab（switchTab 补刷）+ 在途并发上限 1–2 ④ 窗口关闭补偿
+  //    串行（活跃优先，不并行齐发）
+
+  it("P3-①: running 成员按 t → 本地重建零 RPC（get_messages 不再调用，思考行出现）", async () => {
+    const thinkMsg = {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "让我先分析一下需求" },
+        { type: "text", text: "好的" },
+      ],
+      timestamp: 1,
+    };
+    const handleA = makeHandle();
+    handleA.sendCommandAndWait.mockResolvedValue({ data: { messages: [thinkMsg] } } as any);
+    const deps = makeDeps({ handles: { a: handleA } });
+    const { comp, state } = makeComponent(deps);
+    comp.render(80);
+
+    comp.markDirty("a");
+    await vi.advanceTimersByTimeAsync(600); // 初始 refetch（仅此一次 RPC）
+    expect(handleA.sendCommandAndWait).toHaveBeenCalledTimes(1);
+    expect(state.tabs[0].lines.join("\n")).not.toContain("让我先分析一下需求");
+
+    comp.handleInput("t"); // P3-①: toggle → 本地重建
+    await vi.advanceTimersByTimeAsync(600);
+    expect(handleA.sendCommandAndWait).toHaveBeenCalledTimes(1); // 零新增 RPC
+    expect(state.tabs[0].lines.join("\n")).toContain("让我先分析一下需求"); // 思考行本地重建可见
+
+    // 再切回隐藏：同样零 RPC
+    comp.handleInput("t");
+    await vi.advanceTimersByTimeAsync(600);
+    expect(handleA.sendCommandAndWait).toHaveBeenCalledTimes(1);
+    expect(state.tabs[0].lines.join("\n")).not.toContain("让我先分析一下需求");
+  });
+
+  it("P3-②: 本地重建后若 tab 仍 dirty（切换前已 markDirty）→ 必补一次 flush（消息不丢）", async () => {
+    const handleA = makeHandle();
+    handleA.sendCommandAndWait
+      .mockResolvedValueOnce({ data: { messages: [{ role: "user", content: "旧消息", timestamp: 1 }] } } as any)
+      .mockResolvedValueOnce({ data: { messages: [{ role: "user", content: "旧消息", timestamp: 1 }, { role: "user", content: "切换瞬间到达的新消息", timestamp: 2 }] } } as any);
+    const deps = makeDeps({ handles: { a: handleA } });
+    const { comp, state } = makeComponent(deps);
+    comp.render(80);
+
+    comp.markDirty("a");
+    await vi.advanceTimersByTimeAsync(600); // fetch#1 → cache 就绪
+    expect(state.tabs[0].lines.join("\n")).toContain("旧消息");
+
+    // 新消息在 toggle 前到达（markDirty 置位，flush 尚未跑）
+    comp.markDirty("a");
+    comp.handleInput("t"); // toggle：本地重建显示缓存，但未落地消息必须补刷
+    await vi.advanceTimersByTimeAsync(600);
+    expect(handleA.sendCommandAndWait).toHaveBeenCalledTimes(2); // 补一次 flush
+    expect(state.tabs[0].lines.join("\n")).toContain("切换瞬间到达的新消息"); // 不丢
+  });
+
+  it("P3-③: flushDirty 只急切刷活跃 tab——非活跃 tab 仅置 dirty，switchTab 时补刷", async () => {
+    const handleA = makeHandle();
+    handleA.sendCommandAndWait.mockResolvedValue({ data: { messages: [{ role: "user", content: "a 内容", timestamp: 1 }] } } as any);
+    const handleB = makeHandle();
+    handleB.sendCommandAndWait.mockResolvedValue({ data: { messages: [{ role: "user", content: "b 内容", timestamp: 1 }] } } as any);
+    const deps = makeDeps({
+      handles: { a: handleA, b: handleB },
+    });
+    // 两成员组件（interaction 套件的 makeDeps 单成员）：覆盖 getMembers
+    deps.getMembers = () => [
+      { name: "a", label: "分析员" },
+      { name: "b", label: "编码员" },
+    ];
+    deps.memberOpsStates = new Map([
+      ["a", "working"],
+      ["b", "working"],
+    ]);
+    const tui = makeTui();
+    const done = vi.fn();
+    const state = new MemberInspectorState([
+      { name: "a", label: "分析员" },
+      { name: "b", label: "编码员" },
+    ]);
+    const comp = new MemberInspectorComponent(tui, makeTheme(), done, deps, state);
+    comp.render(80);
+
+    comp.markDirty("a");
+    comp.markDirty("b");
+    await vi.advanceTimersByTimeAsync(600);
+    // 只急切刷活跃 tab（a）：b 保持 dirty、不发起 RPC
+    expect(handleA.sendCommandAndWait).toHaveBeenCalledTimes(1);
+    expect(handleB.sendCommandAndWait).not.toHaveBeenCalled();
+    expect(state.tabs[0].lines.join("\n")).toContain("a 内容");
+    expect(state.tabs[1].dirty).toBe(true);
+
+    // switchTab 到 b → 补刷（单路串行，不并行齐发）
+    comp.handleInput("\x1b[C"); // right
+    await vi.advanceTimersByTimeAsync(600);
+    expect(handleB.sendCommandAndWait).toHaveBeenCalledTimes(1);
+    expect(state.tabs[1].dirty).toBe(false);
+    expect(state.tabs[1].lines.join("\n")).toContain("b 内容");
+  });
+
+  it("P3-④: 窗口关闭补偿串行——多个 dirty 成员只急切刷活跃 tab，无并行 refetch 风暴", async () => {
+    const handleA = makeHandle();
+    handleA.sendCommandAndWait.mockResolvedValue({ data: { messages: [{ role: "user", content: "a 新", timestamp: 2 }] } } as any);
+    const handleB = makeHandle();
+    handleB.sendCommandAndWait.mockResolvedValue({ data: { messages: [{ role: "user", content: "b 新", timestamp: 2 }] } } as any);
+    const deps = makeDeps({
+      handles: { a: handleA, b: handleB },
+    });
+    deps.getMembers = () => [
+      { name: "a", label: "分析员" },
+      { name: "b", label: "编码员" },
+    ];
+    deps.memberOpsStates = new Map([
+      ["a", "working"],
+      ["b", "working"],
+    ]);
+    const tui = makeTui();
+    const done = vi.fn();
+    const state = new MemberInspectorState([
+      { name: "a", label: "分析员" },
+      { name: "b", label: "编码员" },
+    ]);
+    const comp = new MemberInspectorComponent(tui, makeTheme(), done, deps, state);
+    comp.render(80);
+    // 预热：两 tab 都有缓存
+    comp.markDirty("a");
+    await vi.advanceTimersByTimeAsync(600);
+    comp.handleInput("\x1b[C"); // 切到 b
+    await vi.advanceTimersByTimeAsync(600);
+    comp.handleInput("\x1b[D"); // 切回 a
+    const baseA = handleA.sendCommandAndWait.mock.calls.length;
+    const baseB = handleB.sendCommandAndWait.mock.calls.length;
+
+    // 滚动（开交互窗口）→ 两成员同时变 dirty → 窗口关闭补偿
+    comp.handleInput("\x1b[B"); // scroll：进入交互窗口
+    comp.markDirty("a");
+    comp.markDirty("b");
+    await vi.advanceTimersByTimeAsync(3000); // 窗口关闭 → 补偿 flush
+    // 只急切刷活跃 tab（a）；b 保持 dirty 等 switchTab
+    expect(handleA.sendCommandAndWait).toHaveBeenCalledTimes(baseA + 1);
+    expect(handleB.sendCommandAndWait).toHaveBeenCalledTimes(baseB);
+    expect(state.tabs[1].dirty).toBe(true);
+  });
+
+  it("N6: 4 成员 × 3000 条历史 + 思考开：toggle 首帧 < 50ms（真实时钟，无定时器泄漏）", async () => {
+    // P3 验收 ③：N6 式性能护栏——4 成员全 tab 本地重建的 toggle 首帧必须
+    // 毫秒级（< 50ms 上界，CI 可跑）。用 min-of-N 断言稳态成本（GC 尖峰
+    // 不算算法退化）。toggle 本地重建应零 RPC。
+    vi.useRealTimers();
+    const history = buildThinkingMsgs(3000, 10);
+    const names = ["a", "b", "c", "d"];
+    const handles = Object.fromEntries(
+      names.map((n) => [
+        n,
+        makeHandle(),
+      ])
+    );
+    for (const n of names) {
+      handles[n].sendCommandAndWait.mockResolvedValue({ data: { messages: history } } as any);
+    }
+    const deps = makeDeps({ handles } as any);
+    deps.getMembers = () => names.map((n) => ({ name: n, label: n }));
+    deps.memberOpsStates = new Map(names.map((n) => [n, "working"]));
+    const state = new MemberInspectorState(names.map((n) => ({ name: n, label: n })));
+    const comp = new MemberInspectorComponent(makeTui(), makeTheme(), vi.fn(), deps, state);
+    comp.render(80);
+
+    // 预热：逐 tab 切过去触发初始 fetch（active-only eager），全 tab 缓存就绪。
+    // 用「fetch 完成 + 行已构建」而非固定延时——并行测试负载下 chunked 全量
+    // 构建（多次 setTimeout(0) 让出）可能超过固定等待，导致后续 toggle 测到
+    // 冷路径（refetch + 全量重建），产生假性超时。
+    for (const n of names) {
+      comp.markDirty(state.activeTab!.name);
+      const tabName = state.activeTab!.name;
+      await (async () => {
+        for (let i = 0; i < 400; i++) {
+          if (!(comp as any).fetching.has(tabName)) break;
+          await new Promise((r) => setTimeout(r, 10));
+        }
+      })();
+      await (async () => {
+        for (let i = 0; i < 400; i++) {
+          const t = state.tabs.find((x) => x.name === tabName);
+          if (t && t.lines.length > 0 && !t.dirty) break;
+          await new Promise((r) => setTimeout(r, 10));
+        }
+      })();
+      comp.handleInput("\x1b[C"); // 切到下一个
+    }
+    comp.handleInput("\x1b[D");
+    comp.handleInput("\x1b[D");
+    comp.handleInput("\x1b[D"); // 切回 a（active）
+    for (const n of names) expect(state.tabs.find((t) => t.name === n)!.lines.length).toBeGreaterThan(0);
+    const rpcBefore = names.reduce((s, n) => s + handles[n].sendCommandAndWait.mock.calls.length, 0);
+
+    // 预热一次 toggle（让 V8 完成该热路径编译 + 主题化缓存就绪）
+    comp.handleInput("t");
+    comp.handleInput("t");
+
+    // 稳态 toggle（思考开 → 关）：4 成员本地重建同步块
+    const samples: number[] = [];
+    for (let i = 0; i < 5; i++) {
+      const t0 = performance.now();
+      comp.handleInput("t");
+      samples.push(performance.now() - t0);
+      comp.handleInput("t");
+    }
+    const min = Math.min(...samples);
+    const mean = samples.reduce((a, b) => a + b, 0) / samples.length;
+    expect(min).toBeLessThan(50); // 验收：toggle 首帧 < 50ms
+    expect(mean).toBeLessThan(100); // 整体有界（GC 尖峰可容忍）
+    // 零 RPC：toggle 期间无新增 get_messages
+    const rpcAfter = names.reduce((s, n) => s + handles[n].sendCommandAndWait.mock.calls.length, 0);
+    expect(rpcAfter).toBe(rpcBefore);
+    // 无定时器泄漏：toggle 本地重建后不应残留定时器（无 pending flush）
+    await new Promise((r) => setTimeout(r, 20));
+    expect((comp as any).refreshTimer).toBeNull();
+    expect((comp as any).streamTimer).toBeNull();
+  });
 });

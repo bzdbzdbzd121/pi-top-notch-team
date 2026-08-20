@@ -1157,8 +1157,8 @@ Overlay: `ctx.ui.custom(component, { overlay: true, overlayOptions: { width: "90
 | `i` / `Enter` | Open input box |
 | `Enter` (in input) | Send: `prompt` when idle, `follow_up` when busy（含字面 `\n` 兜底——kitty 协议激活时 pi-tui 不再将 `\n` 识别为 enter，LF 编码混合终端靠此放行；兜底必须位于任何未来 ctrl+j 分支之后） |
 | `Ctrl+Enter` / `Alt+Enter` (in input) | Send `steer` (immediate redirect). **Ctrl+Enter 依赖终端协议**（kitty CSI-u `\x1b[13;5u` / modifyOtherKeys `\x1b[27;5;13~`）；legacy 终端两者同字节 `\r` 无法区分，**Alt+Enter 是协议无关的 steer 路径**（legacy `\x1b\r` / kitty `\x1b[13;3u`）。空文本或无成员时显式 notice，不再静默 |
-| `e` | Toggle tool call/result detail expansion — **GLOBAL**: flips ALL member tabs (running: RPC refetch; stopped/crashed with cache: local rebuild) |
-| `t` | Toggle thinking block visibility (hidden by default) — **GLOBAL**: flips ALL member tabs |
+| `e` | Toggle tool call/result detail expansion — **GLOBAL**: flips ALL member tabs (P3-①: 全 tab 本地重建零 RPC——running/stopped/crashed 同样适用，lastMessages 为空的 tab 保留 refetch 兜底) |
+| `t` | Toggle thinking block visibility (hidden by default) — **GLOBAL**: flips ALL member tabs (P3-①: 同 `e`——本地重建零 RPC) |
 | `ctrl+a` | `abort` the active tab's member |
 | `ctrl+b` / `ctrl+shift+a` | `abort` ALL executing members (working/compacting) in one shot; idle/stopped/crashed are skipped. `ctrl+shift+a` requires Kitty keyboard protocol — legacy terminals send the same byte as `ctrl+a` (single abort), so `ctrl+b` remains the all-terminal key |
 | `ctrl+o` | `compact` the active tab's member (NOT ctrl+m — indistinguishable from Enter in terminals) |
@@ -1214,7 +1214,7 @@ it — a message never vanishes between `message_end` and the refetch, and
 interleaved toolResult messages between completions). `agent_end` clears the
 live tail.
 
-**2. Refetch path (completed content — unchanged):**
+**2. Refetch path (completed content — P3-③ 只急切刷活跃 tab):**
 
 ```
 Member RPC event (tool_execution_end / message_end / ...)
@@ -1227,6 +1227,19 @@ Member RPC event (tool_execution_end / message_end / ...)
 
 Context usage (footer %): separate 5s poll via RPC get_session_stats.
 ```
+
+**P3 刷新调度收敛（阶段 3）**：
+- **e/t 全局切换 = 全 tab 本地重建（零 RPC）**（P3-①）：running 成员同样适用——
+  `lastMessages` 是权威缓存，与 stopped/crashed 路径同款 `rebuildTabFromCache`；
+  无缓存的 tab 保留 dirty → refetch 兜底；在途 refetch 拥有该 tab（fetching set）
+  → 跳过本地重建（B1/T5 契约：dirty 保留由在途 pending 捕获触发补刷）。
+  切换前已 dirty（未落地消息）→ 本地重建后必补一次 flush（P3-②，消息不丢）。
+  同宽度 full refit 复用 fitMemo（逐行 memo 化，字节一致）+ user/toolResult
+  消息 wrap/提取结果缓存 → 4 成员 × 3000 条 toggle 首帧 < 50ms（N6 护栏锁定）。
+- **flushDirty 只急切刷活跃 tab**（P3-③）：非活跃 tab 仅置 dirty，switchTab 时
+  补刷（单路串行）；在途 refetch 并发上限 1–2（MAX_IN_FLIGHT_REFETCH）。
+- **窗口关闭补偿串行化**（P3-④）：交互窗口关闭后的补偿 flush 只刷活跃 tab，
+  不并行齐发——滚动停止后不再有 N 路并行全量 refetch 风暴。
 
 ### Direct Intervention Semantics
 

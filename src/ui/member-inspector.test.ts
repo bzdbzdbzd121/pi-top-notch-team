@@ -582,7 +582,7 @@ describe("MemberInspectorComponent — navigation & refresh", () => {
     expect(handleA.sendCommandAndWait).not.toHaveBeenCalled();
   });
 
-  it("T2: 'e' toggles expansion GLOBALLY — one keypress refetches ALL members with expanded rendering", async () => {
+  it("T2: 'e' toggles expansion GLOBALLY — active tab local rebuild with expanded rendering (zero RPC, P3)", async () => {
     const toolMsg = {
       role: "assistant",
       content: [{ type: "toolCall", id: "1", name: "read", arguments: { path: "a.ts" } }],
@@ -594,28 +594,31 @@ describe("MemberInspectorComponent — navigation & refresh", () => {
     handleB.sendCommandAndWait.mockResolvedValue({ data: { messages: [toolMsg] } } as any);
     const deps = makeDeps({ handles: { a: handleA, b: handleB }, opStates: { a: "working", b: "working" } });
     const { comp, state } = makeComponent(deps);
+    comp.render(80);
 
-    // Baseline: both tabs fetched collapsed (no expanded JSON)
+    // Baseline: active tab a fetched collapsed (no expanded JSON); b 非活跃仅置
+    // dirty（P3-③ 只急切刷活跃 tab，switchTab 时补刷）
     comp.markDirty("a");
     comp.markDirty("b");
     await vi.advanceTimersByTimeAsync(600);
+    expect(handleA.sendCommandAndWait).toHaveBeenCalledTimes(1);
+    expect(handleB.sendCommandAndWait).not.toHaveBeenCalled();
     expect(state.tabs[0].lines.join("\n")).not.toContain('"path"');
-    expect(state.tabs[1].lines.join("\n")).not.toContain('"path"');
+    expect(state.tabs[1].dirty).toBe(true);
 
     comp.handleInput("e");
     expect(state.expanded).toBe(true);
     await vi.advanceTimersByTimeAsync(600);
-    // N-way refetch from ONE keypress — both members rebuilt
-    expect(handleA.sendCommandAndWait).toHaveBeenCalledTimes(2);
-    expect(handleB.sendCommandAndWait).toHaveBeenCalledTimes(2);
-    // BOTH tabs rendered with the global expanded value
+    // P3-①: toggle → 本地重建，零 RPC（a 仍只有初始 1 次 get_messages；b 无缓存不拉取）
+    expect(handleA.sendCommandAndWait).toHaveBeenCalledTimes(1);
+    expect(handleB.sendCommandAndWait).not.toHaveBeenCalled();
+    // Active tab rendered with the global expanded value via local rebuild
     expect(state.tabs[0].lines.join("\n")).toContain('"path"');
-    expect(state.tabs[1].lines.join("\n")).toContain('"path"');
     // Footer hint reflects the global value
     expect(comp.render(80).join("\n")).toContain("e 隐藏工具详情");
   });
 
-  it("T2b: 't' toggles thinking visibility GLOBALLY — all member tabs switch together", async () => {
+  it("T2b: 't' toggles thinking visibility GLOBALLY — all member tabs switch together (local rebuild, P3)", async () => {
     const thinkMsg = {
       role: "assistant",
       content: [
@@ -630,18 +633,28 @@ describe("MemberInspectorComponent — navigation & refresh", () => {
     handleB.sendCommandAndWait.mockResolvedValue({ data: { messages: [thinkMsg] } } as any);
     const deps = makeDeps({ handles: { a: handleA, b: handleB }, opStates: { a: "working", b: "working" } });
     const { comp, state } = makeComponent(deps);
+    comp.render(80);
 
-    // Default: thinking hidden on BOTH tabs
+    // 预热：两 tab 都先有缓存（分别切到各 tab 触发初始 fetch）
     comp.markDirty("a");
+    await vi.advanceTimersByTimeAsync(600);
+    comp.handleInput(K.right); // 切到 b
     comp.markDirty("b");
     await vi.advanceTimersByTimeAsync(600);
+    comp.handleInput(K.left); // 切回 a
+
+    // Default: thinking hidden on BOTH tabs
     expect(state.tabs[0].lines.join("\n")).not.toContain("让我先分析一下需求");
     expect(state.tabs[1].lines.join("\n")).not.toContain("让我先分析一下需求");
 
-    // Toggle on → both tabs refetch and render the thinking block
+    // Toggle on → both tabs locally rebuilt and render the thinking block (zero RPC)
+    const baseA = handleA.sendCommandAndWait.mock.calls.length;
+    const baseB = handleB.sendCommandAndWait.mock.calls.length;
     comp.handleInput("t");
     expect(state.showThinking).toBe(true);
     await vi.advanceTimersByTimeAsync(600);
+    expect(handleA.sendCommandAndWait).toHaveBeenCalledTimes(baseA); // 零新增 RPC
+    expect(handleB.sendCommandAndWait).toHaveBeenCalledTimes(baseB);
     expect(state.tabs[0].lines.join("\n")).toContain("让我先分析一下需求");
     expect(state.tabs[1].lines.join("\n")).toContain("让我先分析一下需求");
 
@@ -677,6 +690,11 @@ describe("MemberInspectorComponent — navigation & refresh", () => {
     ];
     await vi.advanceTimersByTimeAsync(600); // flush → syncMembers picks up "c"
     expect(state.tabs).toHaveLength(3);
+    // P3-③: 新成员非活跃 → 仅置 dirty，switchTab 时补刷
+    expect(state.tabs[2].dirty).toBe(true);
+    comp.handleInput(K.right); // 切到 b
+    comp.handleInput(K.right); // 切到 c → 补刷
+    await vi.advanceTimersByTimeAsync(600);
     expect(handleC.sendCommandAndWait).toHaveBeenCalled();
     // The new tab renders with the global expanded value — no per-tab field
     // to drift back to the default false
@@ -866,7 +884,7 @@ describe("MemberInspectorComponent — render", () => {
     expect(callsSmall).toBeGreaterThan(0); // chrome lines still measured
   });
 
-  it("P1-①: invalidate() marks ALL tabs dirty and schedules a rebuild", async () => {
+  it("P1-①: invalidate() marks ALL tabs dirty and schedules a rebuild (P3: 只急切刷活跃 tab)", async () => {
     vi.useFakeTimers();
     try {
       const handleA = makeHandle();
@@ -883,11 +901,17 @@ describe("MemberInspectorComponent — render", () => {
       expect(state.tabs[0].dirty).toBe(true);
       expect(state.tabs[1].dirty).toBe(true);
 
-      // The scheduled rebuild refetches and rebuilds lines (throttled)
+      // P3-③: 只急切刷活跃 tab（a）；非活跃 b 保持 dirty，switchTab 时补刷
       await vi.advanceTimersByTimeAsync(600);
       expect(handleA.sendCommandAndWait).toHaveBeenCalled();
-      expect(handleB.sendCommandAndWait).toHaveBeenCalled();
+      expect(handleB.sendCommandAndWait).not.toHaveBeenCalled();
       expect(state.tabs[0].dirty).toBe(false);
+      expect(state.tabs[1].dirty).toBe(true);
+
+      // switchTab 到 b → 补刷
+      comp.handleInput(K.right);
+      await vi.advanceTimersByTimeAsync(600);
+      expect(handleB.sendCommandAndWait).toHaveBeenCalled();
       expect(state.tabs[1].dirty).toBe(false);
     } finally {
       vi.useRealTimers();
