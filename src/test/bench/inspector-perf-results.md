@@ -13,6 +13,26 @@
    - 模式 B（仅末尾访问）：5.8µs；模式 C（数组 push+join）：7.7µs（前一轮实测）——访问推迟后几乎零成本。
    - 结论：V8 对 `acc += delta` 后立即 `startsWith/slice` 的形态**每次重新 flatten ConsString**，未缓存。当前 `wrapAppendOnly` 的守卫（`text.startsWith(e.text)` + `text.slice(e.text.length)`）在长流（30KB+）下存在 O(T²) 隐患 → rope 项**追加专项**（阶段 2 完成后按基准驱动评估是否落地）。
 
+## P2 复测结论（阶段 2 唯一主修复，2026-08-20）
+
+**P2 增量 flush（同语料，fitLinesIncremental + 结构共享）：3000 条历史单次 flush 11–28µs，对比 P1 基线 52–72ms —— 提速约 2–3 个数量级，验收目标 <1ms 达成（余量 35–90×）**。
+
+| n（消息数） | width | P1 flush（全量 fit） | P2 flush（fit 增量） | 降幅 |
+|---|---|---|---|---|
+| 200 | 80 | 503µs | 25.9µs | 19× |
+| 1500 | 80 | 28.7ms | 29.8µs | 963× |
+| 3000 | 80 | 55.7ms | 25.3µs | 2202× |
+| 200 | 100 | 78µs | 23.7µs | 3× |
+| 1500 | 100 | 31.3ms | 27.4µs | 1141× |
+| 3000 | 100 | 64.6ms | 28.4µs | 2275× |
+| 200 | 120 | 49µs | 6.3µs | 8× |
+| 1500 | 120 | 34.0ms | 13.6µs | 2500× |
+| 3000 | 120 | 71.2ms | 11.0µs | 6473× |
+
+> 3000 条宽 100 列的 P2 flush 28.4µs 含：增量 raw build（仅 3 条新消息尾段）+ fit 增量（只 fit 尾段，fitMemo 命中重复行）+ 结构共享局部追加（无 concat 全量拷贝）。字节一致性由三套 byte-identical 套件 + fit 增量一致性用例全绿保证。
+
+**R3-A rope 项落地（⑥）**：wrapAppendOnly 守卫改为 rope 安全四分支——引用相等 O(1) / 收缩 O(1) / 同长重写全量比较（罕见）/ 增长仅采样 32 字符前缀 + slice 增量提取（V8 对 ConsString tail slice 有 SlicedString 优化，实测 0.09ms/100 步 vs startsWith 0.23ms）。每帧不再对完整累积文本做 startsWith → 长流 O(T²) 隐患消除。真实路径下同一 block 对象只追加（applyAssistantDelta）、重写以新对象到达（refetch），采样守卫属防御性双保险；同长重写仍有全量比较兜底。
+
 ## 主基准数据（本机实测，最终一轮）
 
 语料：CJK 高密度（user/assistant/thinking 全 CJK，thinking 合计 ≈30KB UTF-8 = 10K CJK 字符），`showThinking: true`，IDENTITY_THEME。

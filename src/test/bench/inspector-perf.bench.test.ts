@@ -9,6 +9,10 @@ import { describe, it, expect } from "vitest";
 //      计时）→ 判定 V8 是否已 flatten ConsString（rope），据此决定 rope 项
 //      永久关闭或追加专项。
 //
+// P2 阶段 2 复测（fit 增量 + 主题化行缓存 + 数组物化）：
+//   同语料同宽度下对比「旧路径（全量 fit）」与「新路径（fitLinesIncremental
+//   + 结构共享）」，验收目标：3000 条历史 + 思考开，单次 flush < 1ms。
+//
 // 运行方式（默认 npm test 整文件跳过，不污染常规测试）：
 //   BENCH=1 npx vitest run src/test/bench/inspector-perf.bench.test.ts
 //
@@ -20,6 +24,7 @@ import {
   buildBodyLines,
   buildBodyLinesIncremental,
   createBodyBuildCache,
+  fitLinesIncremental,
   fitLinesToWidth,
   IDENTITY_THEME,
   type BuildBodyOptions,
@@ -170,6 +175,29 @@ describe.runIf(BENCH)("P1 inspector perf bench (BENCH=1)", () => {
         console.log(
           `n=${n} (${lines.length} 行): flush ${fmt(flush)} (fit ${fmt(fit)}) | refetch ${fmtKB(payloadBytes)} | 冷重建 ${fmt(cold)}`
         );
+      }
+    }
+
+    // ── P2 复测：同语料下 fit 增量路径（阶段 2 主修复）──
+    // 验收目标：3000 条历史 + 思考开，单次 flush < 1ms（P1 基线 ≈52–72ms）。
+    console.log("\n=== P2 复测：fitLinesIncremental 增量 flush（同语料）===");
+    for (const width of widths) {
+      const opts = optsFor(width);
+      const fitWidth = width;
+      for (const n of [200, 1500, 3000]) {
+        const msgs = buildHistory(n, THINKING_CHARS);
+        const cache = createBodyBuildCache();
+        const baseMsgs = msgs.slice(0, n - 3);
+        const liveTail = msgs.slice(n - 3);
+        // 预热：一次完整构建（冷路径，chunked 不在此测）
+        buildBodyLinesIncremental(cache, baseMsgs, opts);
+        fitLinesIncremental(cache, buildBodyLinesIncremental(cache, baseMsgs, opts), fitWidth);
+        // 稳态增量 flush（新路径：只 fit 尾段 + 结构共享局部追加）
+        const flushP2 = benchMs(() => {
+          const raw = buildBodyLinesIncremental(cache, [...baseMsgs, ...liveTail], opts);
+          fitLinesIncremental(cache, raw, fitWidth);
+        });
+        console.log(`n=${n}: P2 flush ${fmt(flushP2)}（P1 基线 flush 见上，目标 <1ms）`);
       }
     }
     expect(true).toBe(true); // 基准仅记录数据，不断言阈值（阶段 2 才设硬阈值）
