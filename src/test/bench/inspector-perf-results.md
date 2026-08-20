@@ -58,3 +58,17 @@ BENCH=1 npx vitest run src/test/bench/inspector-perf.bench.test.ts
 ```
 
 默认 `npm test` 下整文件跳过（`describe.runIf(process.env.BENCH === "1")`），不污染常规测试。
+
+## P3 toggle 本地重建（阶段 3，N6 护栏实测）
+
+语料同主基准（CJK 高密度，3000 条 ≈ 9000-9750 行，thinking ≈30KB），4 成员组件级路径，思考开。
+
+| 指标 | 实现前（P2 末尾） | P3 后 | 说明 |
+|---|---|---|---|
+| 4×3000 toggle 首帧 | ~225-290ms（N 路并行 refetch + 全量重建） | **min 20-31ms / mean ~25ms**（本地重建零 RPC） | N6 护栏验收 < 50ms；稳态样本实测 |
+| toggle 期间 get_messages | 4 次（每成员 1 次全量拉取） | **0 次** | P3-① 零 RPC（mock 断言） |
+| 同宽度 full refit fit | 全量 fitLinesToWidth（~50-70ms/成员） | 逐行 fitMemo 命中（~0.05-4ms/成员） | 只改 opts 签名不改宽度 → memo 复用 |
+| user 消息原始重建 | wrapText 全量重扫（~20ms/成员） | wrapAppendOnly 缓存（block=消息对象） | 不可变历史，字节一致 |
+| toolResult 原始重建 | extractText+正则+truncateLine（~7ms/成员） | WeakMap 缓存提取结果（~0.1ms） | CJK 首行 unique 字符串 miss 宽缓存 |
+
+**P3 刷新调度收敛**：flushDirty 只急切刷活跃 tab（非活跃仅置 dirty，switchTab 补刷，单路串行）；在途 refetch 并发上限 2；窗口关闭补偿不再 N 路并行齐发（P3-④ mock 断言）。
