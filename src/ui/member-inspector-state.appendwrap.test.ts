@@ -1,9 +1,11 @@
 import { describe, it, expect } from "vitest";
 import {
   wrapAppendOnly,
+  wrapAppendOnlyThemed,
   wrapText,
   nextStreamFlushDelay,
   buildBodyLines,
+  IDENTITY_THEME,
 } from "./member-inspector-state";
 
 // ── wrapAppendOnly (P2 streaming-tail wrap cache) ──────────
@@ -159,6 +161,115 @@ describe("wrapAppendOnly", () => {
     const full = performance.now() - t1;
     // O(T) vs O(T²): the margin is algorithmic, not constant-factor.
     expect(inc).toBeLessThan(full / 3);
+  });
+
+  it("R3-A rope guard: growth feeds only the delta, no per-flush full-text scan", () => {
+    // P2-⑥ (R3-A): the old guard did text.startsWith(e.text) every flush,
+    // flattening the growing ConsString → O(T²) over a stream. The rope-safe
+    // guard samples a bounded prefix (char-index access navigates the rope
+    // without flattening). Same append-only corpus must stay byte-identical
+    // AND the accumulated cost must stay far below a full rewrap.
+    const block = { type: "thinking", thinking: "" };
+    const delta = "我们需要仔细分析这个函数的实现逻辑，考虑边界条件与异常处理路径，确保重构后的代码行为与原始版本完全一致。";
+    let text = "";
+    const t0 = performance.now();
+    for (let i = 0; i < 200; i++) {
+      text += delta;
+      expect(wrapAppendOnly(block, text, 100)).toEqual(wrapText(text, 100));
+    }
+    const inc = performance.now() - t0;
+    // 200 × ~60-char CJK deltas ≈ 12K chars: the guard must not scan the
+    // whole accumulated text per flush (that would flatten the ConsString
+    // every call). Keep a generous ceiling — the point is byte-identity +
+    // no pathological blowup, not a tight timing bound.
+    expect(inc).toBeLessThan(2000);
+    // Sanity: the corpus is large enough that a per-flush full scan would
+    // visibly exceed the sampled guard (assert relative, not absolute).
+    const fullStart = performance.now();
+    wrapText(text, 100);
+    const oneFull = performance.now() - fullStart;
+    expect(inc / 200).toBeLessThan(oneFull * 4);
+  });
+
+  it("same-length rewrite still resets (full compare on the rare path)", () => {
+    const block = { type: "thinking", thinking: "" };
+    wrapAppendOnly(block, "abcdef", 40);
+    // Same length, different content → must rebuild, not serve stale cache.
+    expect(wrapAppendOnly(block, "abcyzz", 40)).toEqual(wrapText("abcyzz", 40));
+    // …and the rebuilt state continues to grow append-only afterwards.
+    expect(wrapAppendOnly(block, "abcyzz追加", 40)).toEqual(wrapText("abcyzz追加", 40));
+  });
+
+  it("growth with a rewritten prefix (beyond sample window) is documented trade-off: same-prefix growth stays cached", () => {
+    const block = { type: "thinking", thinking: "" };
+    wrapAppendOnly(block, "前缀内容", 40);
+    // Same prefix + growth → append-only path (no rebuild).
+    expect(wrapAppendOnly(block, "前缀内容追加", 40)).toEqual(wrapText("前缀内容追加", 40));
+  });
+});
+
+describe("wrapAppendOnlyThemed (P2-② block 级主题化行缓存)", () => {
+  it("themed lines equal manual theme.fg per line (byte-identical)", () => {
+    const block = { type: "thinking", thinking: "" };
+    const text = "第一段思考内容\n第二段更长更详细的内容，包含中英文 mixed content，以及一些边界情况说明。";
+    const w = wrapAppendOnlyThemed(block, text, 30, IDENTITY_THEME, "dim", "    ");
+    const manual = wrapAppendOnly(block, text, 30).map((l) => IDENTITY_THEME.fg("dim", `    ${l}`));
+    expect([...w.lines, w.cur]).toEqual(manual);
+    expect(w.cur).toBe(manual[manual.length - 1]);
+  });
+
+  it("streaming growth themes only the delta (added), old lines cached", () => {
+    const block = { type: "thinking", thinking: "" };
+    let text = "第一步 ";
+    const w1 = wrapAppendOnlyThemed(block, text, 30, IDENTITY_THEME, "dim", "    ");
+    const added1 = w1.added.length;
+    expect(added1).toBe(w1.lines.length); // first call themes everything
+
+    text += "第二步的增量内容，足以换行并产生新的 wrapped lines。";
+    const w2 = wrapAppendOnlyThemed(block, text, 30, IDENTITY_THEME, "dim", "    ");
+    // Byte-identical to re-theming everything from scratch.
+    const manual = wrapAppendOnly(block, text, 30).map((l) => IDENTITY_THEME.fg("dim", `    ${l}`));
+    expect([...w2.lines, w2.cur]).toEqual([...manual]);
+    // Only the delta was themed this call.
+    expect(w2.added.length).toBeGreaterThan(0);
+    expect(w2.added.length).toBeLessThanOrEqual(manual.length - added1 + 1);
+    // The lines array is STABLE (same reference across calls — no full spread).
+    expect(w2.lines).toBe(w1.lines);
+  });
+
+  it("theming config change (color/indent) re-themes all lines", () => {
+    const block = { type: "thinking", thinking: "" };
+    wrapAppendOnlyThemed(block, "内容", 40, IDENTITY_THEME, "dim", "    ");
+    const w = wrapAppendOnlyThemed(block, "内容", 40, IDENTITY_THEME, "accent", "  ");
+    const manual = wrapAppendOnly(block, "内容", 40).map((l) => IDENTITY_THEME.fg("accent", `  ${l}`));
+    expect([...w.lines, w.cur]).toEqual([...manual]);
+  });
+
+  it("width change rebuilds both wrap state and themed cache", () => {
+    const block = { type: "thinking", thinking: "" };
+    const text = "中文换行测试内容，用于宽度变化后的重新换行与重新主题化。";
+    const w1 = wrapAppendOnlyThemed(block, text, 20, IDENTITY_THEME, "dim", "    ");
+    const w2 = wrapAppendOnlyThemed(block, text, 30, IDENTITY_THEME, "dim", "    ");
+    expect([...w2.lines, w2.cur]).toEqual(
+      wrapText(text, 30).map((l) => IDENTITY_THEME.fg("dim", `    ${l}`))
+    );
+    expect(w2.lines).not.toBe(w1.lines);
+  });
+
+  it("buildBodyLines over a mutating live thinking block stays byte-identical with theming", () => {
+    const live: any = { role: "assistant", content: [{ type: "thinking", thinking: "" }] };
+    const opts = { width: 60, expanded: false, showThinking: true, theme: IDENTITY_THEME };
+    let acc = "";
+    for (const d of ["第一步思考 ", "第二步更深入的分析，包含一些细节 ", "第三步\n换行后的结论"]) {
+      acc += d;
+      live.content[0].thinking = acc;
+      const viaCache = buildBodyLines([live], opts).join("\n");
+      const fresh = buildBodyLines(
+        [{ role: "assistant", content: [{ type: "thinking", thinking: acc }] }],
+        opts
+      ).join("\n");
+      expect(viaCache).toBe(fresh);
+    }
   });
 });
 

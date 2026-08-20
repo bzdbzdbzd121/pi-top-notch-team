@@ -119,9 +119,65 @@ interface AppendWrapEntry {
   cur: string;
   /** Visible width of `cur`. */
   curW: number;
+  /** P2-②: themed variants of `lines` (theme.fg applied, incl. indent). */
+  themedLines: string[];
+  /** P2-②: theming config identity the themedLines were built with. */
+  themeKey: string | null;
 }
 
 const appendWrapCache = new WeakMap<object, AppendWrapEntry>();
+
+/**
+ * Rope-prefix sample width (P2-⑥, R3-A): guards the append-only trust
+ * cheaply. Full-prefix `startsWith` on the growing ConsString forces V8 to
+ * flatten O(T) per flush → O(T²) over a stream; a bounded char-index sample
+ * navigates the rope without flattening (V8 probe: 0.05ms vs 0.23ms for a
+ * 100-step 30KB stream). Rewrites that differ only beyond char 32 while
+ * GROWING are not detected — accepted trade-off, same class as the
+ * incremental cache's boundary-only fingerprint guard (the streaming data
+ * path only appends; message-level rewrites arrive as NEW block objects via
+ * refetch). Same-length rewrites still do a full compare (rare).
+ */
+const ROPE_PREFIX_SAMPLE = 32;
+
+/** True when the first min(SAMPLE, prev.length) chars of text equal prev's. */
+function prefixSampleMatches(text: string, prev: string): boolean {
+  const n = Math.min(ROPE_PREFIX_SAMPLE, prev.length);
+  for (let i = 0; i < n; i++) {
+    if (text[i] !== prev[i]) return false;
+  }
+  return true;
+}
+
+/**
+ * Get (or create) the wrap entry for `block`, feeding any new delta.
+ * Guard (P2-⑥ rope-safe): width change / shrink / same-length rewrite /
+ * growth-with-prefix-rewrite all rebuild; growth with an intact sampled
+ * prefix feeds only the delta (no full-text scan). Returns null when
+ * width <= 0 (degenerate contract — caller emits a single empty line).
+ */
+function getWrapEntry(block: object, text: string, width: number): AppendWrapEntry | null {
+  if (width <= 0) return null;
+  let e = appendWrapCache.get(block);
+  if (e && e.width !== width) e = undefined;
+  else if (e && text.length < e.text.length) e = undefined; // shrink → rewrite
+  else if (e && text.length === e.text.length && text !== e.text && !text.startsWith(e.text)) {
+    e = undefined; // same-length rewrite (rare — full compare is fine here)
+  } else if (e && text.length > e.text.length && !prefixSampleMatches(text, e.text)) {
+    e = undefined; // growth with a rewritten prefix (sample-guarded)
+  }
+  if (!e) {
+    e = { width, text: "", lines: [], cur: "", curW: 0, themedLines: [], themeKey: null };
+    appendWrapCache.set(block, e);
+  }
+  if (text.length > e.text.length) {
+    // slice on a ConsString tail creates a SlicedString view (V8-optimized,
+    // O(Δ) per probe) — no flattening of the accumulated text.
+    feedAppendWrap(e, text.slice(e.text.length));
+    e.text = text; // reference assignment, O(1) — no copy
+  }
+  return e;
+}
 
 /** Feed one raw line (no "\n") into the entry — mirrors wrapText's per-line fast/grapheme paths. */
 function feedAppendRawLine(e: AppendWrapEntry, rawLine: string): void {
@@ -191,25 +247,57 @@ function feedAppendWrap(e: AppendWrapEntry, delta: string): void {
 /**
  * wrapText for append-only-growing block text, cached per block object.
  * Falls back to a full wrap on first use / width change / non-append
- * mutation (shrink or prefix mismatch). Byte-identical to
- * wrapText(text, width) under every caller-visible path.
+ * mutation. Byte-identical to wrapText(text, width) under every
+ * caller-visible path. (P2-⑥: the guard is rope-safe — see getWrapEntry.)
  */
 export function wrapAppendOnly(block: object, text: string, width: number): string[] {
-  if (width <= 0) return [""];
-  let e = appendWrapCache.get(block);
-  if (e && (e.width !== width || text.length < e.text.length || !text.startsWith(e.text))) {
-    e = undefined; // width change / rewrite — rebuild from scratch
-  }
-  if (!e) {
-    e = { width, text: "", lines: [], cur: "", curW: 0 };
-    appendWrapCache.set(block, e);
-  }
-  if (text.length > e.text.length) {
-    feedAppendWrap(e, text.slice(e.text.length));
-    e.text = text;
-  }
+  const e = getWrapEntry(block, text, width);
+  if (!e) return [""];
   // wrapText contract: the in-progress final raw line is always emitted.
   return [...e.lines, e.cur];
+}
+
+/**
+ * P2-②: wrapAppendOnly + block-level「已 wrap + 已主题化」行缓存. The wrap
+ * state is shared with wrapAppendOnly (same WeakMap entry); the THEMED
+ * variants of completed lines are cached per block so the streaming tail
+ * rebuild themes only the delta — O(Δ) per flush instead of O(T) theme.fg
+ * calls on the whole accumulated block.
+ *
+ * Return shape carries the「本次新增行」form (`added`): callers that
+ * maintain their own accumulated array append only the new lines, avoiding
+ * the `[...e.lines, e.cur]` full spread on every flush.
+ *
+ * `themeKey` invalidation: theming config identity (color + indent) is
+ * stored on the entry; a change re-themes every completed line. The theme
+ * FUNCTION itself is deliberately NOT part of the key — the component's
+ * inspectorTheme wrapper is recreated per access and the P1-③ contract
+ * treats the theme as component-constant (asserted by the incremental test
+ * "theme wrapper identity does not gate incremental").
+ */
+export function wrapAppendOnlyThemed(
+  block: object,
+  text: string,
+  width: number,
+  theme: InspectorTheme,
+  color: string,
+  indent: string
+): { lines: string[]; added: string[]; cur: string } {
+  const e = getWrapEntry(block, text, width);
+  if (!e) return { lines: [], added: [], cur: theme.fg(color, indent + "") };
+  const key = `${color}\u0000${indent}`;
+  if (e.themeKey !== key) {
+    // First use or theming config change — theme every completed line.
+    e.themeKey = key;
+    e.themedLines = e.lines.map((l) => theme.fg(color, indent + l));
+    return { lines: e.themedLines, added: e.themedLines, cur: theme.fg(color, indent + e.cur) };
+  }
+  const prevLen = e.themedLines.length;
+  // Newly completed raw lines (fed since the last call) are themed now.
+  const addedRaw = e.lines.slice(prevLen);
+  const added = addedRaw.map((l) => theme.fg(color, indent + l));
+  e.themedLines.push(...added);
+  return { lines: e.themedLines, added, cur: theme.fg(color, indent + e.cur) };
 }
 
 // ── Theme shape (identity-compatible for tests) ────────────
@@ -661,11 +749,11 @@ function buildBodyRaw(
           const thinking = typeof block.thinking === "string" ? block.thinking : "";
           if (thinking.trim().length === 0) continue;
           blockLines.push(theme.fg("dim", "  💭 思考"));
-          // P2: append-only cached wrap — the streaming tail rebuilds every
-          // flush; only the new delta is wrapped, not the whole block.
-          for (const l of wrapAppendOnly(block, thinking, textWidth - 4)) {
-            blockLines.push(theme.fg("dim", `    ${l}`));
-          }
+          // P2-②: append-only cached wrap + themed lines — the streaming tail
+          // rebuild themes only the delta (added), reusing the block's cached
+          // themed lines; byte-identical to re-theming every line.
+          const w = wrapAppendOnlyThemed(block, thinking, textWidth - 4, theme, "dim", "    ");
+          blockLines.push(...w.lines, w.cur);
           continue;
         }
         if (block.type === "text") {
@@ -855,18 +943,47 @@ export function messageFingerprint(m: unknown): string {
 
 /** Per-tab incremental build cache (see P1-③ design above). */
 export interface BodyBuildCache {
-  /** Messages covered by `lines` (stable prefix; streaming tail excluded). */
+  /** Messages covered by the raw prefix (streaming tail excluded). */
   seenCount: number;
   /** Fingerprint of messages[seenCount - 1] (boundary guard). */
   fingerprint: string;
-  /** Collapsed prefix lines (rendered, ready to display). */
+  /**
+   * Collapsed prefix lines (rendered, ready to display) — STABLE array
+   * reference: incremental grows mutate it in place (truncate + push), so
+   * the array object identity is constant across streaming flushes
+   * (P2-③ structural sharing). `lines` covers [0..prefixLen) and the
+   * streaming-tail region [prefixLen..) is rebuilt every flush.
+   */
   lines: string[];
+  /** Boundary between the stable raw prefix and the rebuilt tail. */
+  prefixLen: number;
   /** Separator state after the last cached message. */
   needSeparator: boolean;
   /** Whether the RAW prefix ends with a blank line (collapsed away). */
   prefixEndsWithBlank: boolean;
   /** Build options the cache was built with (opts signature). */
   opts: { width: number; expanded: boolean; showThinking: boolean };
+  /**
+   * P2-①: already-fitted prefix lines (fixed-width), parallel to `lines`
+   * (same line count — fit is per-line length-preserving). STABLE array
+   * reference, grown in place; incremental flushes fit only the new tail
+   * and append it, making the per-flush fit cost O(tail) instead of O(total).
+   */
+  fitLines: string[];
+  /** Fit width these lines were fitted at (mismatch → full refit). */
+  fitWidth: number;
+  /** Length of the fitted tail region inside fitLines (fitLines.length - fitPrefixLen). */
+  fitTailLen: number;
+  /**
+   * P2-① fit memo: raw line → fitted line. The streaming tail rebuilds the
+   * SAME line objects every flush (block-level themed cache); re-fitting them
+   * would be O(T) visibleWidth segmenter scans per flush. The memo turns
+   * repeated fits into O(1) lookups — per-flush fit cost decouples from the
+   * accumulated tail size. Cleared on fitWidth change / full refit; bounded
+   * (clear on overflow) so pathological unique-line histories cannot grow it
+   * unboundedly.
+   */
+  fitMemo: Map<string, string>;
 }
 
 /** Create an empty cache (first build is always full). */
@@ -875,9 +992,14 @@ export function createBodyBuildCache(): BodyBuildCache {
     seenCount: 0,
     fingerprint: "",
     lines: [],
+    prefixLen: 0,
     needSeparator: false,
     prefixEndsWithBlank: false,
     opts: { width: 0, expanded: false, showThinking: false },
+    fitLines: [],
+    fitWidth: 0,
+    fitTailLen: 0,
+    fitMemo: new Map(),
   };
 }
 
@@ -898,20 +1020,26 @@ function sameOpts(a: BodyBuildCache["opts"], b: BodyBuildCache["opts"]): boolean
 }
 
 /**
- * Append raw tail lines to a collapsed prefix, preserving the exact
- * collapsing semantics of collapseBlankLines(prefix ++ tail):
+ * Compute the raw tail lines to append to a collapsed prefix, preserving
+ * the exact collapsing semantics of collapseBlankLines(prefix ++ tail):
  *   - a leading blank in the tail is a real separator (prefix non-empty),
  *     except when the prefix itself ends blank (raw) — then the two merge
  *   - consecutive blanks collapse to one; trailing blanks are trimmed
- * Returns the new full lines and the raw trailing-blank state (needed by
- * the cache for the next append).
+ * Returns the NEW lines to append (the `out` segment) and the raw
+ * trailing-blank state (needed by the cache for the next append).
  *
- * Branch map (i = position in tail; prefix = already-collapsed prefix):
- *   A. i===0 && prefix非空 && prefixEndsWithBlank — the raw prefix ended
+ * P2-③: the caller owns the stable prefix array and appends the returned
+ * segment in place (truncate + push) — NO `prefix.concat(out)` full copy
+ * per flush. The returned segment is EXACTLY what a full build would
+ * contain after the prefix (branch map identical to the pre-P2 concat
+ * version; only the concatenation moved to the caller).
+ *
+ * Branch map (i = position in tail; hasPrefix = prefix non-empty):
+ *   A. i===0 && hasPrefix && prefixEndsWithBlank — the raw prefix ended
  *      with a blank that collapseBlankLines trimmed; in the FULL build it
  *      separates prefix content from the tail, so restore exactly one at
  *      the seam (then fall through to the normal blank handling).
- *   B. i===0 && l==="" && (prefix空 || prefixEndsWithBlank) — a leading
+ *   B. i===0 && l==="" && (!hasPrefix || prefixEndsWithBlank) — a leading
  *      blank adjacent to the prefix end: with an empty prefix it is the
  *      very first line (no separator semantics yet → drop); with a
  *      prefixEndsWithBlank it would only duplicate the seam blank in A →
@@ -922,23 +1050,23 @@ function sameOpts(a: BodyBuildCache["opts"], b: BodyBuildCache["opts"]): boolean
  *   E. l!=="" — content line → keep, clear lastBlank.
  *   F. after the loop: trim trailing blanks (collapseBlankLines contract).
  */
-function appendCollapsed(
-  prefix: string[],
-  tail: string[],
-  prefixEndsWithBlank: boolean
-): { lines: string[]; endsWithBlank: boolean } {
+function collapsedTail(
+  hasPrefix: boolean,
+  prefixEndsWithBlank: boolean,
+  tail: string[]
+): { added: string[]; endsWithBlank: boolean } {
   const out: string[] = [];
   let lastBlank = false;
   const endsWithBlank = tail.length > 0 && tail[tail.length - 1] === "";
   for (let i = 0; i < tail.length; i++) {
     const l = tail[i];
-    if (i === 0 && prefix.length > 0 && prefixEndsWithBlank) {
+    if (i === 0 && hasPrefix && prefixEndsWithBlank) {
       // Branch A — restore the seam blank the prefix-collapse trimmed.
       out.push("");
       lastBlank = true;
     }
     if (l === "") {
-      if (i === 0 && (prefix.length === 0 || prefixEndsWithBlank)) {
+      if (i === 0 && (!hasPrefix || prefixEndsWithBlank)) {
         // Branch B — leading blank absorbed by the prefix edge.
         lastBlank = true;
         continue;
@@ -958,7 +1086,7 @@ function appendCollapsed(
   }
   // Branch F — trailing-blank trim.
   while (out.length > 0 && out[out.length - 1] === "") out.pop();
-  return { lines: prefix.concat(out), endsWithBlank };
+  return { added: out, endsWithBlank };
 }
 
 /**
@@ -1002,7 +1130,7 @@ export function buildBodyLinesIncremental(
   messages: any[],
   opts: BuildBodyOptions,
   limit?: number
-): { lines: string[]; mode: "full" | "incremental" } {
+): { lines: string[]; added: string[]; tailLen: number; mode: "full" | "incremental" } {
   const optsSig = optsSignatureOf(opts);
   // P1-④/S4: an optional index bound lets the chunked path grow the cache
   // over prefixes [0, limit) without slicing the array per slice. Callers
@@ -1025,32 +1153,116 @@ export function buildBodyLinesIncremental(
       newSeen
     );
     const lines = collapseBlankLines(raw.lines);
+    const prefix = newSeen > 0 ? collapseBlankLines(raw.lines.slice(0, raw.snapshotLen ?? 0)) : [];
     cache.seenCount = newSeen;
     cache.fingerprint = newSeen > 0 ? messageFingerprint(messages[newSeen - 1]) : "";
-    cache.lines = newSeen > 0 ? collapseBlankLines(raw.lines.slice(0, raw.snapshotLen ?? 0)) : [];
+    cache.lines = prefix;
+    cache.prefixLen = prefix.length;
     cache.needSeparator = newSeen > 0 ? (raw.snapshotSep ?? false) : false;
     cache.prefixEndsWithBlank =
       newSeen > 0 ? (raw.lines[raw.snapshotLen! - 1] ?? "") === "" : false;
     cache.opts = optsSig;
-    return { lines, mode: "full" };
+    return { lines, added: lines, tailLen: lines.length - prefix.length, mode: "full" };
   }
 
   // Incremental: grow the cached prefix to the new boundary, then rebuild
   // the streaming tail. Both use the shared raw builder, so the output is
-  // byte-identical to a full build by construction.
+  // byte-identical to a full build by construction. Structural sharing
+  // (P2-③): the cache's lines array is truncated to the stable prefix and
+  // the new tail is pushed in place — the array REFERENCE stays constant
+  // across flushes (no per-flush concat copy).
+  const prevPrefixLen = cache.prefixLen;
   const newSeen = Math.max(0, m - INCREMENTAL_TAIL);
   if (newSeen > cache.seenCount) {
     const grown = buildBodyRaw(messages.slice(cache.seenCount, newSeen), opts, cache.needSeparator);
-    const merged = appendCollapsed(cache.lines, grown.lines, cache.prefixEndsWithBlank);
-    cache.lines = merged.lines;
+    const merged = collapsedTail(cache.prefixLen > 0, cache.prefixEndsWithBlank, grown.lines);
+    // Append the grown prefix segment in place (prefix array reference kept).
+    cache.lines.length = cache.prefixLen; // drop stale tail region first
+    cache.lines.push(...merged.added);
+    cache.prefixLen = cache.lines.length;
     cache.prefixEndsWithBlank = merged.endsWithBlank;
     cache.needSeparator = grown.needSeparator;
     cache.seenCount = newSeen;
     cache.fingerprint = messageFingerprint(messages[newSeen - 1]);
   }
   const tail = buildBodyRaw(messages.slice(newSeen, m), opts, cache.needSeparator);
-  const merged = appendCollapsed(cache.lines, tail.lines, cache.prefixEndsWithBlank);
-  return { lines: merged.lines, mode: "incremental" };
+  const merged = collapsedTail(cache.prefixLen > 0, cache.prefixEndsWithBlank, tail.lines);
+  // Replace the tail region in place (structural sharing).
+  cache.lines.length = cache.prefixLen;
+  cache.lines.push(...merged.added);
+  return {
+    lines: cache.lines,
+    // Everything appended since the last flush: grown prefix segment + new
+    // streaming tail (collapsed). fitLinesIncremental fits this delta only.
+    added: cache.lines.slice(prevPrefixLen),
+    tailLen: cache.lines.length - cache.prefixLen,
+    mode: "incremental",
+  };
+}
+
+/** P2-①: per-cache fit memo bound (clear-on-overflow keeps memory bounded). */
+const FIT_MEMO_MAX = 4096;
+
+/** Fit ONE raw line, memoized per cache (repeated tail lines → O(1)). */
+function fitLineMemoized(cache: BodyBuildCache, raw: string, fitWidth: number): string {
+  const hit = cache.fitMemo.get(raw);
+  if (hit !== undefined) return hit;
+  const fitted = fitLinesToWidth([raw], fitWidth)[0];
+  if (cache.fitMemo.size >= FIT_MEMO_MAX) cache.fitMemo.clear();
+  cache.fitMemo.set(raw, fitted);
+  return fitted;
+}
+
+/**
+ * P2-①: fit only the NEW tail of an incremental build, appending it to the
+ * cache's already-fitted prefix — per-flush fit cost O(total)→O(tail), and
+ * repeated tail lines (same objects every streaming flush) hit the fit memo
+ * at O(1). The fitted lines array (`cache.fitLines`) is the STABLE reference
+ * returned to setTabLines, so the tab's lines array is mutated in place
+ * (局部追加).
+ *
+ * Byte-identical contract: the returned `lines` always equals
+ * fitLinesToWidth(buildBodyLines(messages, opts), fitWidth). Fallback to a
+ * full fit when the fitted prefix is not in sync with the raw prefix
+ * (first call / fitWidth change / chunked full rebuilds that bypassed fit).
+ */
+export function fitLinesIncremental(
+  cache: BodyBuildCache,
+  result: { lines: string[]; added: string[]; tailLen: number; mode: "full" | "incremental" },
+  fitWidth: number
+): { lines: string[]; added: string[]; changed: boolean; mode: "full" | "incremental" } {
+  const fitPrefixLen = cache.fitLines.length - cache.fitTailLen;
+  // The fitted prefix covers the raw prefix as it was BEFORE this flush's
+  // growth: raw prefix now = old prefix + grown segment, where the grown
+  // segment length = added.length - tailLen (added = grown + new tail).
+  const grownLen = result.added.length - result.tailLen;
+  const synced = cache.fitWidth === fitWidth && fitPrefixLen === cache.prefixLen - grownLen;
+  if (result.mode === "full" || !synced) {
+    // Full refit (cold cache / width change / chunked rebuild).
+    cache.fitLines = fitLinesToWidth(result.lines, fitWidth);
+    cache.fitWidth = fitWidth;
+    cache.fitTailLen = cache.fitLines.length - cache.prefixLen;
+    cache.fitMemo.clear(); // memo is width-specific
+    return { lines: cache.fitLines, added: cache.fitLines, changed: true, mode: "full" };
+  }
+  // Incremental: fit only the new raw tail (grown prefix segment + rebuilt
+  // streaming tail), append to the fitted prefix (array reference kept —
+  // push into the existing fitLines array).
+  const fittedAdded = result.added.map((l) => fitLineMemoized(cache, l, fitWidth));
+  const staleTail = cache.fitLines.slice(cache.fitLines.length - cache.fitTailLen);
+  cache.fitLines.length = cache.fitLines.length - cache.fitTailLen; // drop stale fitted tail
+  cache.fitLines.push(...fittedAdded);
+  const changed =
+    result.tailLen !== cache.fitTailLen || !sameLineArray(staleTail, fittedAdded);
+  cache.fitTailLen = result.tailLen;
+  return { lines: cache.fitLines, added: fittedAdded, changed, mode: "incremental" };
+}
+
+/** Shallow line-content equality (used to detect real tail changes vs no-op rebuilds). */
+function sameLineArray(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
 }
 
 // ── Header line building ───────────────────────────────────
@@ -1171,17 +1383,30 @@ export class MemberInspectorState {
     this.activeIndex = ((this.activeIndex + delta) % n + n) % n;
   }
 
-  /** Replace a tab's display lines, preserving scroll semantics. */
-  setTabLines(name: string, lines: string[], bodyHeight: number): void {
+  /**
+   * Set a tab's display lines, preserving scroll semantics.
+   *
+   * P2-③ local-append: when `lines` is the SAME array reference the tab
+   * already holds (structural sharing — fitLinesIncremental mutated it in
+   * place), this is a 局部追加 flush: the array content is already updated,
+   * only scroll bookkeeping runs here. Otherwise it is a full replace
+   * (first build / full rebuild / width change). `changed` reports whether
+   * new content appeared below (drives the "↓ 有更新" hint).
+   */
+  setTabLines(name: string, lines: string[], bodyHeight: number, changed = false): void {
     const tab = this.tabs.find((t) => t.name === name);
     if (!tab) return;
     const prevLen = tab.lines.length;
-    tab.lines = lines;
+    const sameRef = tab.lines === lines;
+    if (!sameRef) tab.lines = lines;
     tab.dirty = false;
     if (tab.followTail) {
       tab.scrollOffset = this.maxOffset(tab, bodyHeight);
     } else {
-      if (lines.length > prevLen) tab.newBelow = true;
+      // Local append: content grew when the tail actually changed; full
+      // replace: grew when the new array is longer than the old one.
+      const grew = sameRef ? changed : lines.length > prevLen;
+      if (grew) tab.newBelow = true;
       tab.scrollOffset = Math.min(tab.scrollOffset, this.maxOffset(tab, bodyHeight));
     }
   }

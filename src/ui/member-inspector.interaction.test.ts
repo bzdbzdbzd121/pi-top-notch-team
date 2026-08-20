@@ -395,3 +395,133 @@ describe("P1-④ 交互感知刷新抑制（挂起 + 补刷 + 分片）", () => 
     expect(state.tabs[0].lines.length).toBe(0); // no late commit
   });
 });
+
+// ── P2 验收：结构共享断言（⑤）+ 滚动实时性护栏（④）────────
+
+function buildThinkingMsgs(n: number, thinkingPerMsg: number): any[] {
+  const msgs: any[] = [];
+  for (let i = 0; i < n; i++) {
+    if (i % 3 === 0) {
+      msgs.push({ role: "user", content: `问题 ${i}: 请分析模块 ${i} 的实现`, timestamp: i });
+    } else if (i % 3 === 1) {
+      msgs.push({
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "让我们仔细分析这个函数的实现逻辑，考虑边界条件与异常处理路径。".repeat(thinkingPerMsg) },
+          { type: "text", text: `分析完成：模块 ${i}` },
+        ],
+        timestamp: i,
+      });
+    } else {
+      msgs.push({ role: "toolResult", toolName: "bash", content: [{ type: "text", text: `输出 ${i}` }], timestamp: i });
+    }
+  }
+  return msgs;
+}
+
+describe("P2 结构共享 + 滚动实时性护栏", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("⑤ 流式 flush 期间 lines 前缀数组引用不变（整体替换次数 ≈ 0，仅尾部区段更新）", async () => {
+    const handleA = makeHandle();
+    // 3000 条历史 + 30KB thinking（1000 条 thinking 消息 × 10 句 ≈ 30KB CJK）
+    const history = buildThinkingMsgs(3000, 10);
+    handleA.sendCommandAndWait.mockResolvedValue({ data: { messages: history } } as any);
+    const deps = makeDeps({ handles: { a: handleA } });
+    const { comp, state } = makeComponent(deps);
+    comp.render(80);
+    comp.markDirty("a");
+    await vi.advanceTimersByTimeAsync(600);
+
+    const tab = state.tabs[0];
+    expect(tab.lines.length).toBeGreaterThan(0);
+    const refBefore = tab.lines; // 结构共享：同一数组对象
+    const lenBefore = tab.lines.length;
+
+    // 流式 flush：live 消息增长，仅尾部区段更新
+    state.setLiveMessage("a", { role: "assistant", content: [{ type: "text", text: "" }] });
+    for (const d of ["增量一，内容逐渐增长。", "增量二，继续追加更多内容。", "增量三，收尾完成。"]) {
+      state.applyLiveDelta("a", { type: "text_delta", contentIndex: 0, delta: d });
+      comp.markDirty("a");
+      await vi.advanceTimersByTimeAsync(600);
+    }
+    // 数组引用恒常（P2-③ 局部追加，未整体替换）—— 同一对象、内容增长
+    expect(state.tabs[0].lines).toBe(refBefore);
+    expect(state.tabs[0].lines.length).toBeGreaterThan(lenBefore);
+  });
+
+  it("④ 3000 条历史 + 思考流：增量 flush 同步块 < 5ms、render < 16ms（真实时钟）", async () => {
+    // 用真实时钟测量（fake timers 下 performance.now 被 mock，无法测时长）。
+    // 历史 + live 已就绪，仅测「增量 flush + 局部追加 + render」同步块。
+    vi.useRealTimers();
+    const history = buildThinkingMsgs(3000, 10);
+    const state = new MemberInspectorState([{ name: "a", label: "分析员" }]);
+    // 预热：等价于一次已完成的冷构建（3000 条历史 + 30KB thinking）
+    const { buildBodyLinesIncremental, fitLinesIncremental, createBodyBuildCache } = await import("./member-inspector-state");
+    const cache = createBodyBuildCache();
+    const opts = { width: 76, expanded: false, showThinking: true, theme: { fg: (_c: string, t: string) => t } as any };
+    const live = { role: "assistant", content: [{ type: "thinking", thinking: "我们需要仔细分析这个函数的实现逻辑，考虑边界条件与异常处理路径。".repeat(600) }] };
+    const msgs = [...history, live];
+    let raw = buildBodyLinesIncremental(cache, msgs, opts);
+    let fitted = fitLinesIncremental(cache, raw, 78);
+    state.setTabLines("a", fitted.lines, 30);
+
+    // 预热一次（首个增量 flush 会包含全量构建后的 GC/代码编译尾音，非稳态）
+    live.content[0].thinking += "预热增量：让 V8 完成该热路径的编译与内存整理。";
+    raw = buildBodyLinesIncremental(cache, msgs, opts);
+    fitted = fitLinesIncremental(cache, raw, 78);
+    state.setTabLines("a", fitted.lines, 30, fitted.changed);
+
+    // 流式增量 flush（思考流继续增长）：稳态同步块必须远小于 5ms 上界。
+    // 用 min 断言稳态成本（个别 GC 尖峰不算算法退化）+ mean 断言整体有界。
+    const flushSamples: number[] = [];
+    const renderSamples: number[] = [];
+    for (let i = 0; i < 30; i++) {
+      live.content[0].thinking += `追加增量 ${i}：继续深入分析边界条件与异常处理路径，保证实现正确。`;
+      const t0 = performance.now();
+      raw = buildBodyLinesIncremental(cache, msgs, opts);
+      fitted = fitLinesIncremental(cache, raw, 78);
+      state.setTabLines("a", fitted.lines, 30, fitted.changed);
+      flushSamples.push(performance.now() - t0);
+      const t1 = performance.now();
+      state.tabs[0].lines.slice(state.tabs[0].scrollOffset, state.tabs[0].scrollOffset + 30); // render 可见切片
+      renderSamples.push(performance.now() - t1);
+    }
+    const minFlush = Math.min(...flushSamples);
+    const meanFlush = flushSamples.reduce((a, b) => a + b, 0) / flushSamples.length;
+    expect(minFlush).toBeLessThan(2); // 验收 ④：稳态 flush 同步块 < 2ms（设计目标 <1ms）
+    expect(meanFlush).toBeLessThan(5); // 整体均值有界（GC 尖峰可容忍）
+    const minRender = Math.min(...renderSamples);
+    expect(minRender).toBeLessThan(16); // 验收 ④：单帧交互 render < 16ms
+    // 结构共享断言（⑤）同步覆盖
+    expect(fitted.lines).toBe(cache.fitLines);
+  });
+
+  it("P2-③ buildMessages 缓存：流式 flush 不重新展开 O(history) 数组", async () => {
+    const handleA = makeHandle();
+    const history = buildThinkingMsgs(500, 5);
+    handleA.sendCommandAndWait.mockResolvedValue({ data: { messages: history } } as any);
+    const deps = makeDeps({ handles: { a: handleA } });
+    const { comp, state } = makeComponent(deps);
+    comp.render(80);
+    comp.markDirty("a");
+    await vi.advanceTimersByTimeAsync(600);
+
+    // 流式 flush：live 引用稳定 → getBuildMessages 命中缓存（无 spread）
+    state.setLiveMessage("a", { role: "assistant", content: [{ type: "thinking", thinking: "" }] });
+    const cached = (comp as any).getBuildMessages("a", history, [], state.tabs[0].live);
+    const same = (comp as any).getBuildMessages("a", history, [], state.tabs[0].live);
+    expect(cached).toBe(same); // 同一数组引用 —— 不重新展开
+
+    // pending/live 变化 → 重建一次
+    state.completeLiveMessage("a", { role: "assistant", content: [{ type: "text", text: "完成" }] });
+    const rebuilt = (comp as any).getBuildMessages("a", history, state.tabs[0].pendingCompletions, state.tabs[0].live);
+    expect(rebuilt).not.toBe(cached);
+    expect(rebuilt.length).toBe(history.length + 1);
+  });
+});
