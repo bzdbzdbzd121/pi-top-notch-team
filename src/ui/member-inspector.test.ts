@@ -44,6 +44,9 @@ const K = {
   ctrlB: "\x02",
   ctrlShiftA: "\x1b[65;6u", // kitty CSI-u: 'A' + ctrl+shift
   ctrlO: "\x0f",
+  // kitty CSI-u printable sequences (keyboard protocol flag 1 active)
+  kittyA: "\x1b[97u", // kitty 'a'
+  kittyShiftA: "\x1b[65;1u", // kitty 'A' (shift, shifted keycode reported)
 };
 
 // ── Mocks ──────────────────────────────────────────────────
@@ -183,6 +186,62 @@ describe("MemberInspectorComponent — input & send", () => {
     expect(done).not.toHaveBeenCalled();
     comp.handleInput(K.esc);
     expect(done).toHaveBeenCalledWith(null);
+  });
+});
+
+describe("MemberInspectorComponent — 场景 K：kitty CSI-u 解码（阶段 1）", () => {
+  let deps: any;
+  let handleA: any;
+
+  beforeEach(() => {
+    handleA = makeHandle();
+    deps = makeDeps({
+      handles: { a: handleA },
+      opStates: { a: "idle", b: "idle" },
+    });
+  });
+
+  it("K1: kitty CSI-u 字母可插入（\\x1b[97u → 'a'）", () => {
+    const { comp, state } = makeComponent(deps);
+    comp.handleInput("i");
+    comp.handleInput(K.kittyA);
+    expect(state.inputBuffer).toBe("a");
+  });
+
+  it("K2: 完整流 — kitty 打字后 Ctrl+Enter 发送 steer 且携带内容", () => {
+    deps.memberOpsStates.set("a", "working");
+    const { comp, state } = makeComponent(deps);
+    comp.handleInput("i");
+    comp.handleInput(K.kittyA); // kitty 'a'
+    comp.handleInput(K.ctrlEnter); // kitty ctrl+enter
+    expect(handleA.sendCommand).toHaveBeenCalledTimes(1);
+    const cmd = handleA.sendCommand.mock.calls[0][0];
+    expect(cmd.type).toBe("steer");
+    expect(cmd.message).toContain("a");
+    expect(state.inputOpen).toBe(false);
+  });
+
+  it("K3: 空 buffer 时 Ctrl+Enter 不发送且提示「输入为空」（不再静默）", () => {
+    const { comp, state } = makeComponent(deps);
+    comp.handleInput("i");
+    comp.handleInput(K.ctrlEnter);
+    expect(handleA.sendCommand).not.toHaveBeenCalled();
+    expect(state.inputOpen).toBe(false);
+    expect(state.notice).toBe("输入为空");
+  });
+
+  it("K4: kitty shift 字母解码（\\x1b[65;1u → 'A'，与主输入框一致）", () => {
+    const { comp, state } = makeComponent(deps);
+    comp.handleInput("i");
+    comp.handleInput(K.kittyShiftA);
+    expect(state.inputBuffer).toBe("A");
+  });
+
+  it("K5: legacy 原字符直插回归（'a' 不经解码，兜底路径零影响）", () => {
+    const { comp, state } = makeComponent(deps);
+    comp.handleInput("i");
+    comp.handleInput("a");
+    expect(state.inputBuffer).toBe("a");
   });
 });
 

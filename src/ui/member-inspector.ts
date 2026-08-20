@@ -1,4 +1,9 @@
 import { matchesKey, Key, visibleWidth } from "@earendil-works/pi-tui";
+// CSI-u 解码纪律：任何字符插入路径必须经 decodePrintableKey（与 pi 主输入框
+// editor.js 一致——它同样深导入 keys.js）。主 index 只 re-export 了
+// decodeKittyPrintable；deep import 覆盖 kitty CSI-u + modifyOtherKeys 两种
+// 协议，且与上游 editor 行为完全对齐（一致性即正确性）。
+import { decodePrintableKey } from "@earendil-works/pi-tui/dist/keys.js";
 import type { MemberProcessHandle } from "../process/member-process";
 import type { MemberOperationalState } from "../session/context";
 import {
@@ -672,6 +677,9 @@ export class MemberInspectorComponent {
     const text = this.state.inputBuffer.trim();
     if (!tab) return;
     if (!text) {
+      // 静默路径显式化：空文本直接 close 会让用户觉得"没反应"（kitty 协议
+      // 终端下打字进不去时恰会命中这里）——先提示再关闭。
+      this.state.notice = "输入为空";
       this.state.closeInput();
       this.requestRenderSafe(true);
       return;
@@ -809,8 +817,18 @@ export class MemberInspectorComponent {
         this.state.closeInput();
         this.sendControl("compact");
         return;
-      } else if (data.length >= 1 && !isControlSequence(data)) {
-        this.state.insertInput(data);
+      } else {
+        // CSI-u 解码（场景 K 主线）：kitty 键盘协议 flag 1（disambiguate）激活后
+        // 所有按键均编码为 CSI-u（按 a → \x1b[97u），不解码则文字永远进不去。
+        // decodePrintableKey 仅接受纯字符/Shift 字符：ctrl/alt 修饰序列返回
+        // undefined（不劫持上方的 ctrl+enter/enter 匹配——分支顺序双保险），
+        // legacy 原字符也返回 undefined（走下方兜底，零影响）。
+        const printable = decodePrintableKey(data);
+        if (printable !== undefined) {
+          this.state.insertInput(printable); // kitty CSI-u / modifyOtherKeys 字符 → 解码后插入
+        } else if (data.length >= 1 && !isControlSequence(data)) {
+          this.state.insertInput(data); // legacy 原字符兜底（零影响）
+        }
       }
       this.requestRenderSafe(true);
       return;
