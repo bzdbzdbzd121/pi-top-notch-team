@@ -128,6 +128,17 @@ interface AppendWrapEntry {
 let appendWrapCache: WeakMap<object, AppendWrapEntry> = new WeakMap();
 
 /**
+ * P3-①: toolResult 消息内容缓存（extractText + 首行归一化）。消息对象是
+ * 不可变历史，e/t toggle 全量重建时内容不变——WeakMap keyed by 消息对象，
+ * 命中 O(1)，避免每帧重复数组 map + split + 正则。与 appendWrapCache 同
+ * 生命周期（消息对象死亡即回收）。
+ */
+const toolResultTextCache = new WeakMap<
+  object,
+  { text: string; firstLine: string; suffix: string; suffixWidth: number }
+>();
+
+/**
  * P2-② 审查必改：清空模块级 wrap 缓存（含「已 wrap + 已主题化」行）。
  *
  * themeKey 只含 (color, indent)，不含主题函数身份（组件 inspectorTheme
@@ -730,6 +741,7 @@ function buildBodyRaw(
   const theme = opts.theme ?? IDENTITY_THEME;
   const lines: string[] = [];
   const textWidth = Math.max(10, width - 2);
+
   let needSeparator = initialNeedSeparator; // blank before next user/assistant block
   let snapshotLen: number | undefined;
   let snapshotSep: boolean | undefined;
@@ -746,7 +758,11 @@ function buildBodyRaw(
     if (m.role === "user") {
       blockLines.push(theme.fg("accent", "● user"));
       const text = extractText(m.content);
-      for (const l of wrapText(text, textWidth)) blockLines.push(l);
+      // P3-①: user 消息是不可变历史 → 用 wrapAppendOnly（block = 消息对象）
+      // 缓存 wrap 结果。e/t toggle 全量重建时命中缓存 O(1)，不再每帧
+      // wrapText 全量重扫（3000 条历史里 user 消息是原始重建的最大成本）。
+      // 字节一致：wrapAppendOnly 输出 == wrapText 输出（appendwrap 套件锁定）。
+      for (const l of wrapAppendOnly(m, text, textWidth)) blockLines.push(l);
       if (blockLines.length > 0) {
         if (needSeparator) lines.push("");
         lines.push(...blockLines);
@@ -847,12 +863,32 @@ function buildBodyRaw(
     if (m.role === "toolResult") {
       const icon = m.isError ? "✗" : "✓";
       const color = m.isError ? "error" : "muted";
-      const text = extractText(m.content);
-      const firstLine = text.split("\n").find((l: string) => l.trim().length > 0) ?? "";
-      const suffix = firstLine ? ` ${truncateLine(firstLine.replace(/\s+/g, " "), Math.max(10, textWidth - 14))}` : "";
+      // P3-①: toolResult 是不可变历史消息 → 缓存 extractText + 首行归一化
+      // 结果（WeakMap keyed by 消息对象）。e/t toggle 全量重建时命中缓存
+      // O(1)，不再每帧重复 extractText 数组 map + split + 正则（3000 条
+      // 历史里 toolResult 是原始重建的最大成本之一）。truncateLine 仍按
+      // 当前宽度执行（宽度相关，不入缓存）；展开行（expanded）按需新算。
+      let cached = toolResultTextCache.get(m);
+      if (!cached) {
+        const text = extractText(m.content);
+        const firstLine = text.split("\n").find((l: string) => l.trim().length > 0) ?? "";
+        cached = { text, firstLine: firstLine.replace(/\s+/g, " "), suffix: "", suffixWidth: 0 };
+        toolResultTextCache.set(m, cached);
+      }
+      // truncateLine 结果也缓存（宽度在 toggle 间稳定，仅 resize 时按新宽度重算）。
+      // CJK 首行 unique 字符串会 miss visibleWidth 的 512 宽缓存并走 segmenter——
+      // 这是 toolResult 分支逐消息的最大成本，缓存后 O(1)。
+      const truncWidth = Math.max(10, textWidth - 14);
+      if (cached.suffixWidth !== truncWidth) {
+        cached.suffix = cached.firstLine
+          ? ` ${truncateLine(cached.firstLine, truncWidth)}`
+          : "";
+        cached.suffixWidth = truncWidth;
+      }
+      const suffix = cached.suffix;
       lines.push(theme.fg(color, `  ${icon} ${m.toolName ?? "tool"}${suffix}`));
-      if (expanded && text) {
-        const contentLines = wrapText(text, textWidth - 4).slice(0, EXPANDED_RESULT_MAX_LINES);
+      if (expanded && cached.text) {
+        const contentLines = wrapText(cached.text, textWidth - 4).slice(0, EXPANDED_RESULT_MAX_LINES);
         for (const cl of contentLines) lines.push(theme.fg("dim", `    ${cl}`));
       }
       needSeparator = true;
@@ -1254,11 +1290,22 @@ export function fitLinesIncremental(
   const grownLen = result.added.length - result.tailLen;
   const synced = cache.fitWidth === fitWidth && fitPrefixLen === cache.prefixLen - grownLen;
   if (result.mode === "full" || !synced) {
-    // Full refit (cold cache / width change / chunked rebuild).
-    cache.fitLines = fitLinesToWidth(result.lines, fitWidth);
+    // Full refit (cold cache / width change / chunked rebuild / opts
+    // signature change like e/t toggle). P3-①: when the width is UNCHANGED
+    // (e.g. toggle — only opts changed), reuse the per-line fit memo: the
+    // toggle rebuilds the SAME raw lines minus/plus thinking/expanded
+    // blocks, so most lines hit the memo at O(1) and only new/removed
+    // blocks pay the visibleWidth fit cost. Byte-identical to a wholesale
+    // fit (fitLinesToWidth is a per-line pure map). Width change → clear
+    // the memo (width-specific) and fit wholesale.
+    if (cache.fitWidth === fitWidth) {
+      cache.fitLines = result.lines.map((l) => fitLineMemoized(cache, l, fitWidth));
+    } else {
+      cache.fitLines = fitLinesToWidth(result.lines, fitWidth);
+      cache.fitMemo.clear(); // memo is width-specific
+    }
     cache.fitWidth = fitWidth;
     cache.fitTailLen = cache.fitLines.length - cache.prefixLen;
-    cache.fitMemo.clear(); // memo is width-specific
     return { lines: cache.fitLines, added: cache.fitLines, changed: true, mode: "full" };
   }
   // Incremental: fit only the new raw tail (grown prefix segment + rebuilt

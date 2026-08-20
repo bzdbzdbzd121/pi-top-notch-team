@@ -88,6 +88,8 @@ const RPC_TIMEOUT_MS = 3000;
  * the window closes.
  */
 const INTERACTION_GRACE_MS = 800;
+/** P3-③: 在途 refetch 并发上限（活跃 tab 优先，切 tab 时最多 1–2 路）。 */
+const MAX_IN_FLIGHT_REFETCH = 2;
 /**
  * P1-④: full-rebuild slice size. A full rebuild of a huge history is
  * executed in slices of this many messages, yielding to the event loop
@@ -375,6 +377,42 @@ export class MemberInspectorComponent {
     return Date.now() - this.lastInteractionAt < INTERACTION_GRACE_MS;
   }
 
+  /**
+   * P3-①: e/t 全局切换 → 全 tab 本地重建（零 RPC）。running 成员同样适用
+   * （lastMessages 是权威缓存，本地重建与 stopped/crashed 路径同款）；
+   * lastMessages 为空的 tab 保留 dirty → refetch 兜底。在途 refetch 拥有
+   * 该 tab（fetching set）→ 跳过本地重建，保持 dirty，由在途 fetch 的
+   * pending 捕获触发补刷（B1/T5 契约不变）。
+   *
+   * P3-②: 本地重建后若 tab 仍 dirty（重建期间新活动到达，或切换前已有
+   * 未落地消息）必补一次 flush——覆盖切换瞬间未落地消息不丢。
+   * `preDirty` 是 toggle 调用前捕获的 dirty 集合（toggle 本身会把所有
+   * tab 置 dirty，必须与「切换前已有的未落地消息」区分）。
+   */
+  private rebuildAllTabsFromCache(preDirty: ReadonlySet<string>): void {
+    let needsFlush = false;
+    for (const tab of this.state.tabs) {
+      if (this.fetching.has(tab.name)) {
+        // 在途 refetch 拥有该 tab：不本地重建，dirty 保留（B1/T5 契约）
+        needsFlush = true;
+        continue;
+      }
+      if (this.lastMessages.has(tab.name)) {
+        this.rebuildTabFromCache(tab); // 消费 dirty（含 toggle 置的）
+        if (preDirty.has(tab.name)) {
+          // P3-②: 切换前已有未落地消息 → 本地重建看不到 → 补一次 flush
+          tab.dirty = true;
+          needsFlush = true;
+        }
+      } else {
+        // 无缓存 → refetch 兜底
+        tab.dirty = true;
+        needsFlush = true;
+      }
+    }
+    if (needsFlush) this.scheduleFlush();
+  }
+
   /** Refetch messages for all dirty tabs with running processes. */
   private flushDirty(): void {
     if (this.disposed) return;
@@ -408,6 +446,9 @@ export class MemberInspectorComponent {
     }
 
     const bh = bodyHeight();
+    // P3-③: 只急切刷活跃 tab。非活跃 tab 仅置 dirty（switchTab 时补刷），
+    // 窗口关闭补偿因此天然串行（活跃优先、不并行齐发）。
+    const activeName = this.state.activeTab?.name;
     for (const tab of this.state.tabs) {
       if (!tab.dirty || this.fetching.has(tab.name)) continue;
       const handle = this.deps.getHandle(tab.name);
@@ -424,6 +465,10 @@ export class MemberInspectorComponent {
         }
         continue;
       }
+      // P3-③: 非活跃 tab 不急切 refetch——保持 dirty，等 switchTab 补刷
+      if (tab.name !== activeName) continue;
+      // P3-③: 在途 refetch 并发上限（活跃 tab 切换时最多 1–2 路在途）
+      if (this.fetching.size >= MAX_IN_FLIGHT_REFETCH) continue;
       this.fetching.add(tab.name);
       // Consume the dirty mark NOW — marks arriving DURING the fetch
       // (e/t toggle, member activity in the chunked-build yield gaps)
@@ -921,9 +966,13 @@ export class MemberInspectorComponent {
       // P2: inactive tabs skip streaming rebuilds — catch up the newly
       // active tab's live tail immediately (O(Δ) via the wrap cache).
       this.flushStreaming();
+      // P3-③: switchTab 时补刷——新活跃 tab 若 dirty（含非活跃期积压的
+      // markDirty）则急切 refetch；只刷它，不并行齐发。
+      this.scheduleFlush();
     } else if (matchesKey(data, Key.right)) {
       this.state.switchTab(1);
       this.flushStreaming();
+      this.scheduleFlush();
     } else if (matchesKey(data, Key.up)) {
       this.state.scrollBy(-3, bh);
     } else if (matchesKey(data, Key.down)) {
@@ -937,15 +986,25 @@ export class MemberInspectorComponent {
     } else if (matchesKey(data, "i") || matchesKey(data, Key.enter)) {
       this.state.openInput();
     } else if (matchesKey(data, "e")) {
+      // P3-②: 捕获切换前的 dirty（未落地消息信号）——toggle 本身会把所有
+      // tab 置 dirty，本地重建会消费它；只有「切换前已 dirty」才需要补刷。
+      const preDirty = new Set(
+        this.state.tabs.filter((t) => t.dirty).map((t) => t.name)
+      );
       this.state.toggleExpand();
       // P1-④/S1: the expand intent is explicit — clear the interaction
       // window so the refresh runs immediately, even mid-scroll.
       this.lastInteractionAt = 0;
-      this.scheduleFlush();
+      // P3-①: 本地重建零 RPC（全 tab，含 running）；dirty 补刷见 rebuildAllTabsFromCache
+      this.rebuildAllTabsFromCache(preDirty);
     } else if (matchesKey(data, "t")) {
+      const preDirty = new Set(
+        this.state.tabs.filter((t) => t.dirty).map((t) => t.name)
+      );
       this.state.toggleThinking();
       this.lastInteractionAt = 0;
-      this.scheduleFlush();
+      // P3-①: 本地重建零 RPC（全 tab，含 running）
+      this.rebuildAllTabsFromCache(preDirty);
     } else if (matchesKey(data, "ctrl+a")) {
       this.sendControl("abort");
       return;
