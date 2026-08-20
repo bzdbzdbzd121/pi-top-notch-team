@@ -471,11 +471,22 @@ describe("P2 结构共享 + 滚动实时性护栏", () => {
     let fitted = fitLinesIncremental(cache, raw, 78);
     state.setTabLines("a", fitted.lines, 30);
 
+    // 真实 render 路径（P2-④ 加强：非 lines.slice 代理——含主题/边框/头部/可见切片）
+    const comp = new MemberInspectorComponent(
+      makeTui(),
+      makeTheme(),
+      vi.fn(),
+      makeDeps({}),
+      state
+    );
+    comp.render(80); // 预热：锁定 lastWidth（render 样本不含 width-change 分支）
+
     // 预热一次（首个增量 flush 会包含全量构建后的 GC/代码编译尾音，非稳态）
     live.content[0].thinking += "预热增量：让 V8 完成该热路径的编译与内存整理。";
     raw = buildBodyLinesIncremental(cache, msgs, opts);
     fitted = fitLinesIncremental(cache, raw, 78);
     state.setTabLines("a", fitted.lines, 30, fitted.changed);
+    comp.render(80);
 
     // 流式增量 flush（思考流继续增长）：稳态同步块必须远小于 5ms 上界。
     // 用 min 断言稳态成本（个别 GC 尖峰不算算法退化）+ mean 断言整体有界。
@@ -489,7 +500,7 @@ describe("P2 结构共享 + 滚动实时性护栏", () => {
       state.setTabLines("a", fitted.lines, 30, fitted.changed);
       flushSamples.push(performance.now() - t0);
       const t1 = performance.now();
-      state.tabs[0].lines.slice(state.tabs[0].scrollOffset, state.tabs[0].scrollOffset + 30); // render 可见切片
+      comp.render(80); // 真实 render（主题 fg + 边框 + 头部 + 可见切片）
       renderSamples.push(performance.now() - t1);
     }
     const minFlush = Math.min(...flushSamples);
@@ -497,7 +508,7 @@ describe("P2 结构共享 + 滚动实时性护栏", () => {
     expect(minFlush).toBeLessThan(2); // 验收 ④：稳态 flush 同步块 < 2ms（设计目标 <1ms）
     expect(meanFlush).toBeLessThan(5); // 整体均值有界（GC 尖峰可容忍）
     const minRender = Math.min(...renderSamples);
-    expect(minRender).toBeLessThan(16); // 验收 ④：单帧交互 render < 16ms
+    expect(minRender).toBeLessThan(16); // 验收 ④：单帧交互 render < 16ms（真实路径）
     // 结构共享断言（⑤）同步覆盖
     expect(fitted.lines).toBe(cache.fitLines);
   });
@@ -523,5 +534,39 @@ describe("P2 结构共享 + 滚动实时性护栏", () => {
     const rebuilt = (comp as any).getBuildMessages("a", history, state.tabs[0].pendingCompletions, state.tabs[0].live);
     expect(rebuilt).not.toBe(cached);
     expect(rebuilt.length).toBe(history.length + 1);
+  });
+
+  it("P2-② 主题切换（invalidate）：存活的流式 thinking block 全部行使用新主题，无旧主题残留", async () => {
+    // 审查必改：themeKey 只含 (color, indent) 不含主题身份；主题切换（同宽度）
+    // 后 invalidate 只清 bodyCaches，若 appendWrapCache 不清，全量重建时流式
+    // block 命中 warm entry → 已完成行残留旧主题色（混合主题）。
+    const themeA = { fg: (_c: string, t: string) => `«A»${t}«/A»`, bold: (t: string) => t };
+    const themeB = { fg: (_c: string, t: string) => `«B»${t}«/B»`, bold: (t: string) => t };
+    const handleA = makeHandle();
+    handleA.sendCommandAndWait.mockResolvedValue({ data: { messages: [] } } as any);
+    const deps = makeDeps({ handles: { a: handleA } });
+    const tui = makeTui();
+    const done = vi.fn();
+    const state = new MemberInspectorState([{ name: "a", label: "分析员" }]);
+    state.showThinking = true;
+    const comp = new MemberInspectorComponent(tui, themeA, done, deps, state);
+    comp.render(80);
+    // 流式 thinking block：文本足够长以产生已完成的 wrapped 行（主题 A）
+    state.setLiveMessage("a", { role: "assistant", content: [{ type: "thinking", thinking: "" }] });
+    state.applyLiveDelta("a", {
+      type: "thinking_delta",
+      contentIndex: 0,
+      delta: "第一段思考内容，足够长以换行。第二段更详细的内容也够长。".repeat(4),
+    });
+    comp.markDirty("a");
+    await vi.advanceTimersByTimeAsync(600);
+    expect(state.tabs[0].lines.join("")).toContain("«A»");
+    // 主题切换（同宽度）→ invalidate 路径
+    (comp as any).theme = themeB;
+    comp.invalidate();
+    await vi.advanceTimersByTimeAsync(600);
+    const all = state.tabs[0].lines.join("");
+    expect(all).toContain("«B»");
+    expect(all).not.toContain("«A»"); // 无旧主题残留（混合主题 bug 锁定）
   });
 });

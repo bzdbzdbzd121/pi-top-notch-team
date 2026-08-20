@@ -172,6 +172,19 @@ describe("P2 fit 增量（fitLinesIncremental）", () => {
     expect(fitted.changed).toBe(false);
   });
 
+  it("④ tail 收缩（尾部内容变短）→ changed=false，不触发「↓ 有更新」闪现", () => {
+    const cache = createBodyBuildCache();
+    const opts = mkOpts();
+    const long: any[] = [userMsg("开始"), assistantMsg([textBlock("第一行\n第二行\n第三行\n第四行\n第五行")])];
+    expectFitSameAsFull(cache, long, opts, "full");
+    const grown = expectFitSameAsFull(cache, long, opts, "incremental");
+    expect(grown.changed).toBe(false); // 同内容重复
+    // 尾部消息被更短的版本替换（如消息最终落定后只保留摘要）
+    long[1].content[0].text = "短";
+    const shrunk = expectFitSameAsFull(cache, long, opts, "incremental");
+    expect(shrunk.changed).toBe(false); // 收缩不是新增内容，不得闪现
+  });
+
   it("fitWidth <= 0 退化：fitLines 原样返回（与 fitLinesToWidth 一致）", () => {
     const cache = createBodyBuildCache();
     const opts = mkOpts();

@@ -5,7 +5,9 @@ import {
   wrapText,
   nextStreamFlushDelay,
   buildBodyLines,
+  clearAppendWrapCache,
   IDENTITY_THEME,
+  type InspectorTheme,
 } from "./member-inspector-state";
 
 // ── wrapAppendOnly (P2 streaming-tail wrap cache) ──────────
@@ -206,6 +208,26 @@ describe("wrapAppendOnly", () => {
     // Same prefix + growth → append-only path (no rebuild).
     expect(wrapAppendOnly(block, "前缀内容追加", 40)).toEqual(wrapText("前缀内容追加", 40));
   });
+
+  it("R3-A 失效窗口锁定：增长且 32 字符采样前缀相同、其后被重写 → 不重建（文档化权衡）", () => {
+    const block = { type: "thinking", thinking: "" };
+    const prefix = "A".repeat(32); // 采样窗口 = 前 32 字符
+    wrapAppendOnly(block, prefix + "旧尾部内容", 100);
+    // 增长 + 前 32 字符相同、32 字符之后被重写：采样守卫判定为追加，不重建。
+    const t2 = prefix + "新尾部内容，完全不同";
+    const out = wrapAppendOnly(block, t2, 100);
+    // 失效窗口锁定：输出 ≠ 全量重排（旧尾部残留 + 新尾部追加合并）。
+    expect(out).not.toEqual(wrapText(t2, 100));
+    expect(out.join("")).toContain("旧尾部内容"); // 旧尾部残留在行内（未被重排）
+  });
+
+  it("R3-A 采样窗口内重写（前 32 字符被改写）→ 重建，字节一致", () => {
+    const block = { type: "thinking", thinking: "" };
+    wrapAppendOnly(block, "A".repeat(32) + "旧尾部", 100);
+    const t2 = "B".repeat(32) + "新尾部，更长一些";
+    // 增长 + 采样窗口内前缀被改写 → 采样守卫检测到 → 重建 → 字节一致。
+    expect(wrapAppendOnly(block, t2, 100)).toEqual(wrapText(t2, 100));
+  });
 });
 
 describe("wrapAppendOnlyThemed (P2-② block 级主题化行缓存)", () => {
@@ -254,6 +276,31 @@ describe("wrapAppendOnlyThemed (P2-② block 级主题化行缓存)", () => {
       wrapText(text, 30).map((l) => IDENTITY_THEME.fg("dim", `    ${l}`))
     );
     expect(w2.lines).not.toBe(w1.lines);
+  });
+
+  it("主题切换（clearAppendWrapCache）：同 block 全部行使用新主题，无旧主题残留", () => {
+    // P2-② 审查必改：themeKey 只含 (color, indent)，不含主题函数身份；
+    // 主题切换（同宽度）后全量重建时，存活的流式 block 若命中 warm entry
+    // 会残留旧主题色。clearAppendWrapCache() 是 invalidate() 的清理路径。
+    const block = { type: "thinking", thinking: "" };
+    const themeA: InspectorTheme = { fg: (_c, t) => `«A»${t}«/A»` };
+    const themeB: InspectorTheme = { fg: (_c, t) => `«B»${t}«/B»` };
+    const text = "第一段思考内容\n第二段更长更详细的内容，包含中英文 mixed content。";
+    const w1 = wrapAppendOnlyThemed(block, text, 30, themeA, "dim", "    ");
+    expect([...w1.lines, w1.cur].join("")).toContain("«A»");
+    // 主题切换：invalidate() 调用 clearAppendWrapCache() 清空全部 wrap 缓存
+    clearAppendWrapCache();
+    const w2 = wrapAppendOnlyThemed(block, text, 30, themeB, "dim", "    ");
+    const all = [...w2.lines, w2.cur].join("");
+    expect(all).toContain("«B»");
+    expect(all).not.toContain("«A»"); // 无旧主题残留（混合主题 bug 锁定）
+    // 且与全新 block 手动全量主题化字节一致
+    const manual = wrapAppendOnly(
+      { type: "thinking", thinking: "" },
+      text,
+      30
+    ).map((l) => themeB.fg("dim", `    ${l}`));
+    expect([...w2.lines, w2.cur]).toEqual(manual);
   });
 
   it("buildBodyLines over a mutating live thinking block stays byte-identical with theming", () => {
