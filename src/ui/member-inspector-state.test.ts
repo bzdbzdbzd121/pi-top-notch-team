@@ -3,8 +3,10 @@ import { describe, it, expect, vi } from "vitest";
 // ── Mock pi-tui (same pattern as other ui tests) ──────────
 
 vi.mock("@earendil-works/pi-tui", () => ({
-  visibleWidth: (text: string) => text.length,
+  visibleWidth: vi.fn((text: string) => text.length),
 }));
+
+import { visibleWidth } from "@earendil-works/pi-tui";
 
 import {
   MemberInspectorState,
@@ -159,6 +161,22 @@ describe("fitLinesToWidth", () => {
   it("degenerates to identity when width <= 0", () => {
     expect(fitLinesToWidth(["a", "bb"], 0)).toEqual(["a", "bb"]);
     expect(fitLinesToWidth(["a"], -3)).toEqual(["a"]);
+  });
+
+  it("纯 ASCII 行走快路径：直接取 length，不调用 visibleWidth", () => {
+    const vw = vi.mocked(visibleWidth);
+    vw.mockClear();
+    const out = fitLinesToWidth(["hello", "world", ""], 10);
+    expect(out).toEqual(["hello     ", "world     ", "          "]);
+    expect(vw).not.toHaveBeenCalled();
+  });
+
+  it("CJK/ANSI/tab 行仍走 visibleWidth（宽度语义不变）", () => {
+    const vw = vi.mocked(visibleWidth);
+    vw.mockClear();
+    fitLinesToWidth(["你好", "\x1b[36mhi\x1b[0m", "a\tb"], 6);
+    // 非 ASCII 行必须仍调用 visibleWidth（fast path 只豁免纯 ASCII）
+    expect(vw).toHaveBeenCalled();
   });
 });
 
