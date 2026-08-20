@@ -5,7 +5,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 // The per-frame width-tax test counts visibleWidth calls via a wrapper that
 // forwards everything else untouched.
 
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { visibleWidth, setKittyProtocolActive } from "@earendil-works/pi-tui";
 
 // Per-frame width-tax counter (P1-① acceptance #1). The wrapper forwards to
 // the real implementation; only the call count is tracked.
@@ -25,7 +25,12 @@ import {
   MemberInspectorComponent,
   USER_DIRECT_PREFIX,
 } from "./member-inspector";
-import { MemberInspectorState, fitLinesToWidth, buildBodyLines } from "./member-inspector-state";
+import {
+  MemberInspectorState,
+  fitLinesToWidth,
+  buildBodyLines,
+  INPUT_HINTS,
+} from "./member-inspector-state";
 
 // ── Key sequences (real terminal encodings) ────────────────
 
@@ -47,6 +52,11 @@ const K = {
   // kitty CSI-u printable sequences (keyboard protocol flag 1 active)
   kittyA: "\x1b[97u", // kitty 'a'
   kittyShiftA: "\x1b[65;1u", // kitty 'A' (shift, shifted keycode reported)
+  kittyAltA: "\x1b[97;3u", // kitty alt+a (must NOT be inserted)
+  altEnterLegacy: "\x1b\r", // legacy alt+enter
+  altEnterKitty: "\x1b[13;3u", // kitty alt+enter
+  ctrlEnterModifyOther: "\x1b[27;5;13~", // xterm modifyOtherKeys ctrl+enter
+  lf: "\n",
 };
 
 // ── Mocks ──────────────────────────────────────────────────
@@ -217,7 +227,8 @@ describe("MemberInspectorComponent — 场景 K：kitty CSI-u 解码（阶段 1�
     expect(handleA.sendCommand).toHaveBeenCalledTimes(1);
     const cmd = handleA.sendCommand.mock.calls[0][0];
     expect(cmd.type).toBe("steer");
-    expect(cmd.message).toContain("a");
+    // 精确匹配：直发前缀协议 + 解码后的内容（无多余空白/字符）
+    expect(cmd.message).toBe(`${USER_DIRECT_PREFIX}\n` + "a");
     expect(state.inputOpen).toBe(false);
   });
 
@@ -237,11 +248,104 @@ describe("MemberInspectorComponent — 场景 K：kitty CSI-u 解码（阶段 1�
     expect(state.inputBuffer).toBe("A");
   });
 
+  it("K6: 修饰序列不插入（\\x1b[97;3u kitty alt+a → undefined，不劫持）", () => {
+    // 解码安全锁定：decodePrintableKey 拒绝 alt 修饰序列，字符插入分支
+    // 不得把 alt+字母 当成纯字符插入。
+    const { comp, state } = makeComponent(deps);
+    comp.handleInput("i");
+    comp.handleInput(K.kittyAltA);
+    expect(state.inputBuffer).toBe("");
+  });
+
   it("K5: legacy 原字符直插回归（'a' 不经解码，兜底路径零影响）", () => {
     const { comp, state } = makeComponent(deps);
     comp.handleInput("i");
     comp.handleInput("a");
     expect(state.inputBuffer).toBe("a");
+  });
+});
+
+describe("MemberInspectorComponent — 场景 L：legacy 终端 steer 可用 + 吞键兜底（阶段 2）", () => {
+  let deps: any;
+  let handleA: any;
+
+  beforeEach(() => {
+    handleA = makeHandle();
+    deps = makeDeps({
+      handles: { a: handleA },
+      opStates: { a: "working", b: "idle" },
+    });
+  });
+  afterEach(() => {
+    // 恢复 kitty 协议模块级状态，避免污染其他用例
+    setKittyProtocolActive(false);
+  });
+
+  /** 完整路径：i 打开 → 打字 → 按键发送。 */
+  const pressAfterTyping = (comp: MemberInspectorComponent, seq: string) => {
+    comp.handleInput("i");
+    typeText(comp, "立即转向");
+    comp.handleInput(seq);
+  };
+
+  it("L1: \\r → auto（回归锁定：普通 Enter 永不 steer）", () => {
+    const { comp } = makeComponent(deps);
+    pressAfterTyping(comp, K.enter);
+    const cmd = handleA.sendCommand.mock.calls[0][0];
+    expect(cmd.type).toBe("follow_up");
+  });
+
+  it("L2: \\x1b\\r → steer（legacy alt+enter）", () => {
+    const { comp } = makeComponent(deps);
+    pressAfterTyping(comp, K.altEnterLegacy);
+    const cmd = handleA.sendCommand.mock.calls[0][0];
+    expect(cmd.type).toBe("steer");
+  });
+
+  it("L3: \\x1b[13;3u → steer（kitty alt+enter）", () => {
+    const { comp } = makeComponent(deps);
+    pressAfterTyping(comp, K.altEnterKitty);
+    const cmd = handleA.sendCommand.mock.calls[0][0];
+    expect(cmd.type).toBe("steer");
+  });
+
+  it("L4: \\x1b[13;5u → steer（kitty ctrl+enter，保留）", () => {
+    const { comp } = makeComponent(deps);
+    pressAfterTyping(comp, K.ctrlEnter);
+    const cmd = handleA.sendCommand.mock.calls[0][0];
+    expect(cmd.type).toBe("steer");
+  });
+
+  it("L5: \\x1b[27;5;13~ → steer（modifyOtherKeys ctrl+enter）", () => {
+    const { comp } = makeComponent(deps);
+    pressAfterTyping(comp, K.ctrlEnterModifyOther);
+    const cmd = handleA.sendCommand.mock.calls[0][0];
+    expect(cmd.type).toBe("steer");
+  });
+
+  it("L6: \\n → auto（吞键兜底，非 kitty 下幂等）", () => {
+    const { comp } = makeComponent(deps);
+    pressAfterTyping(comp, K.lf);
+    const cmd = handleA.sendCommand.mock.calls[0][0];
+    expect(cmd.type).toBe("follow_up");
+  });
+
+  it("L7: kitty 协议激活时 \\n 仍 → auto（LF 编码终端吞键兜底）", () => {
+    // kitty 激活后 pi-tui 不再把 \n 识别为 enter（视为 shift+enter 映射）——
+    // 若不兜底，LF 编码混合终端下 \n 被吞（字面无反应）。
+    setKittyProtocolActive(true);
+    const { comp } = makeComponent(deps);
+    pressAfterTyping(comp, K.lf);
+    expect(handleA.sendCommand).toHaveBeenCalledTimes(1);
+    const cmd = handleA.sendCommand.mock.calls[0][0];
+    expect(cmd.type).toBe("follow_up");
+  });
+
+  it("L8: INPUT_HINTS 文案含 alt+Enter（双绑定可见）", () => {
+    expect(INPUT_HINTS).toContain("alt+Enter");
+    const { comp } = makeComponent(deps);
+    comp.handleInput("i");
+    expect(comp.render(80).join("\n")).toContain("alt+Enter");
   });
 });
 
@@ -969,7 +1073,7 @@ describe("MemberInspectorComponent — render", () => {
     expect(joined).not.toContain("切换成员");
     // …and action hints replaced by input-mode hints
     expect(joined).toContain("Enter 发送");
-    expect(joined).toContain("ctrl+Enter 立即转向");
+    expect(joined).toContain("ctrl+Enter/alt+Enter 立即转向");
     expect(joined).toContain("Esc 取消");
     expect(joined).not.toContain("Esc 关闭");
   });

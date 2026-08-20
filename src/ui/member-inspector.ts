@@ -795,10 +795,20 @@ export class MemberInspectorComponent {
     if (this.state.inputOpen) {
       if (matchesKey(data, Key.escape)) {
         this.state.closeInput();
-      } else if (matchesKey(data, "ctrl+enter")) {
+      } else if (
+        matchesKey(data, "ctrl+enter") ||
+        matchesKey(data, "alt+enter")
+      ) {
+        // 双绑定（场景 L）：ctrl+enter 依赖终端协议（kitty CSI-u /
+        // modifyOtherKeys），legacy 终端两者同字节（\r）不可区分——alt+enter
+        // 提供协议无关的 steer 路径。steer 分支必须先于 enter 分支。
         this.sendInput("steer");
         return; // sendInput already renders
-      } else if (matchesKey(data, Key.enter)) {
+      } else if (matchesKey(data, Key.enter) || data === "\n") {
+        // `\n` 兜底：kitty 协议激活后 pi-tui 不再将 `\n` 识别为 enter（被当作
+        // shift+enter 映射），LF 编码混合终端下会吞键——字面单字节兜底放行。
+        // 非 kitty 下 matchesKey 已覆盖，此处幂等。
+        // ⚠️ 必须位于任何未来 ctrl+j 分支之后（legacy 终端 ctrl+j 即 \n）。
         this.sendInput("auto");
         return;
       } else if (matchesKey(data, Key.backspace)) {
