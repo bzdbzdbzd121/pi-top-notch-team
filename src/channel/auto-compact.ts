@@ -64,8 +64,28 @@ export interface AutoCompactRuntime {
    * Timeout / failure / non-success response → `{ ok: false, error }`
    * (fail-open). `name` is retained for interface consistency with the
    * barrier and future per-member diagnostics.
+   *
+   * Registers an in-flight lease for the duration of the call (see
+   * `hasInFlightCompaction`): the compaction_end event branch defers to the
+   * lease-owning flow while it is held, because the member emits
+   * compaction_end BEFORE the compact response.
    */
   compactNow(name: string, handle: MemberProcessHandle, cfg: ResolvedAutoCompact): Promise<CompactResult>;
+  /**
+   * True while a compactNow call for the member is awaiting its RPC response
+   * (the lease is in flight). The compaction_end branch returns early in
+   * this state — the lease-owning flow (inline finally / batch barrier)
+   * handles the exit and the ORDERED flush. Only lease-expired heartbeats
+   * (timeout already settled the lease) fall through.
+   */
+  hasInFlightCompaction(name: string): boolean;
+  /**
+   * Record that a compaction_end heartbeat arrived while the member's compact
+   * lease was in flight. A subsequent near-miss lease timeout (the heartbeat
+   * arrived but the response was delayed past the lease) must NOT record a
+   * stale timeout mark — the compaction actually finished.
+   */
+  markCompactionEndDuringLease(name: string): void;
   /**
    * Exit compacting (compacting → idle). Called in `finally` so the state is
    * reset on success, failure AND interruption. Does NOT flush — flushing is
@@ -127,6 +147,20 @@ export function createAutoCompactRuntime(
    * branch consumes the mark to notify the TL.
    */
   const compactionTimeouts = new Map<string, number>();
+  /**
+   * In-flight compactNow leases (per member) — set on entry, cleared on
+   * settle. The compaction_end branch checks this to defer exit+flush to the
+   * lease-owning flow (review fix: the member emits compaction_end BEFORE
+   * the compact response, so every in-lease success hits this window).
+   */
+  const inFlightCompactions = new Set<string>();
+  /**
+   * Per-member timestamp of a compaction_end heartbeat observed while the
+   * lease was in flight (near-miss detection, review fix 建议 1). Scoped to
+   * the current lease: set by the branch, read in compactNow's timeout
+   * catch, cleared on lease settle.
+   */
+  const compactionEndDuringLease = new Map<string, number>();
 
   return {
     async queryStats(
@@ -167,6 +201,13 @@ export function createAutoCompactRuntime(
       handle: MemberProcessHandle,
       cfg: ResolvedAutoCompact
     ): Promise<CompactResult> {
+      // Register the lease BEFORE any await: the compaction_end branch uses
+      // hasInFlightCompaction to defer exit+flush to this call's owner
+      // (inline finally / batch barrier). The member emits compaction_end
+      // before the compact response, so a healthy in-lease compaction always
+      // hits the branch while the lease is held.
+      inFlightCompactions.add(name);
+      const leaseStart = Date.now();
       try {
         const compactResp = await handle.sendCommandAndWait(
           { type: "compact" },
@@ -182,17 +223,36 @@ export function createAutoCompactRuntime(
       } catch (err) {
         // Timeout / RPC failure — fail-open, but keep the real reason for
         // honest notifications (matches the pre-refactor inline behavior).
-        // A TIMEOUT additionally records the lease-expired mark: the
-        // member-side compaction may still be running, and the
-        // compaction_end event branch uses the mark to notify the TL when
-        // it actually finishes (租约 vs 心跳 — the lease expiry says
-        // nothing about the member-side state). Non-timeout failures mean
-        // the compaction RPC already settled on the member side — no mark.
-        if (err instanceof Error && err.message.includes("timed out")) {
+        // A TIMEOUT records the lease-expired mark ONLY when no compaction_end
+        // heartbeat was observed during this lease (租约 vs 心跳 — the lease
+        // expiry says nothing about the member-side state). If the heartbeat
+        // DID arrive, the compaction actually finished and the response is
+        // merely delayed — recording a mark would linger and mis-fire on the
+        // NEXT compaction's compaction_end with a stale timestamp (review
+        // fix 建议 1: near-miss race). Non-timeout failures mean the
+        // compaction RPC already settled on the member side — no mark.
+        const heartbeatSeen =
+          (compactionEndDuringLease.get(name) ?? 0) >= leaseStart;
+        if (
+          err instanceof Error &&
+          err.message.includes("timed out") &&
+          !heartbeatSeen
+        ) {
           compactionTimeouts.set(name, Date.now());
         }
         return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      } finally {
+        inFlightCompactions.delete(name);
+        compactionEndDuringLease.delete(name);
       }
+    },
+
+    hasInFlightCompaction(name: string): boolean {
+      return inFlightCompactions.has(name);
+    },
+
+    markCompactionEndDuringLease(name: string): void {
+      compactionEndDuringLease.set(name, Date.now());
     },
 
     async queryCompactionState(

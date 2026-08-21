@@ -209,6 +209,13 @@ export function createMemberEventHandler(
   memberName: string,
   deps: EventHandlerDeps
 ): (event: any) => void {
+  // Per-member state-event generation (review fix 建议 2): bumped on every
+  // state-affecting event (agent_start / agent_end / process_exit /
+  // process_error). The async rejection correction captures it at rejection
+  // time and skips applying when it changed — a newer authority (a real turn
+  // / a crash) owns the state while the get_state answer was in flight.
+  let stateGeneration = 0;
+
   return (event: any) => {
     const {
       memberOpsStates: states,
@@ -271,8 +278,15 @@ export function createMemberEventHandler(
       // State correction: ask the member (get_state.isCompacting) instead of
       // guessing — the most common rejection cause is a compaction still
       // running on the member side (the TL-side timeout lease expired while
-      // the member-side compaction continued). Async, fail-open.
-      void correctStateAfterPromptRejection(memberName, deps);
+      // the member-side compaction continued). Async, fail-open. The snapshot
+      // pins the state + generation at rejection time so a STALE query answer
+      // (a real turn / a crash arriving during the ≤3s window) never
+      // overwrites newer state (review fix 建议 2).
+      const stateSnapshot = {
+        state: states.get(memberName) ?? "idle",
+        generation: stateGeneration,
+      };
+      void correctStateAfterPromptRejection(memberName, deps, stateSnapshot, () => stateGeneration);
       return;
     }
 
@@ -289,6 +303,22 @@ export function createMemberEventHandler(
     if (event.type === "compaction_end") {
       const runtime = deps.autoCompact;
       if (!runtime) return; // no shared runtime → nothing to reset/flush
+      // In-flight lease: the member emits compaction_end BEFORE the compact
+      // response (agent-session.js emits, rpc-mode.js writes the response
+      // afterwards), so during a healthy in-lease compaction this branch runs
+      // while compactNow still awaits the response. The lease-owning flow
+      // (inline finally / batch barrier) owns the exit (endCompaction) and
+      // the ORDERED flush (current message first, then pending FIFO) —
+      // acting here would (a) invert the dispatch order (pending B before
+      // the triggering A) and (b) reset compacting early, opening a
+      // double-compaction window before the response settles (review fix,
+      // 重要). Defer: record the heartbeat (a near-miss lease timeout must
+      // not record a stale mark) and return. Only lease-expired heartbeats
+      // (timeout already settled the lease) fall through to the exit+flush.
+      if (runtime.hasInFlightCompaction(memberName)) {
+        runtime.markCompactionEndDuringLease(memberName);
+        return;
+      }
       // Timeout scenario: a compactNow lease expired earlier for this
       // member; the member-side compaction has now ACTUALLY finished.
       // The mark is consumed exactly once — the TL is notified (the normal
@@ -318,6 +348,9 @@ export function createMemberEventHandler(
 
     // ── Member operational state tracking (via pure state machine) ──
     if (event.type === "agent_start") {
+      // Bump the state-generation: a real turn is the newest authority — the
+      // async rejection correction must not overwrite its state (建议 2).
+      stateGeneration++;
       states.set(memberName, transitionState(states.get(memberName) ?? "idle", { type: "task_started" }));
 
       // Cancel any pending auto-reply — more turns are coming
@@ -328,6 +361,8 @@ export function createMemberEventHandler(
       return;
     }
     if (event.type === "agent_end") {
+      // Bump the state-generation (see agent_start).
+      stateGeneration++;
       states.set(memberName, transitionState(states.get(memberName) ?? "idle", { type: "task_completed" }));
 
       // Agent turn ended. If member has a pending TL request and didn't
@@ -429,6 +464,8 @@ export function createMemberEventHandler(
     // Handle process exit
     if (event.type === "process_exit") {
       const exitMemberName = event.memberName;
+      // Bump the state-generation (see agent_start).
+      stateGeneration++;
       // Clean up auto-reply tracking for this member
       cancelPendingAutoReply(exitMemberName, deps);
       deps.perTurnReplied?.delete(exitMemberName);
@@ -476,6 +513,8 @@ export function createMemberEventHandler(
 
     if (event.type === "process_error") {
       const errMemberName = event.memberName;
+      // Bump the state-generation (see agent_start).
+      stateGeneration++;
       // Clean up auto-reply tracking
       cancelPendingAutoReply(errMemberName, deps);
       deps.perTurnReplied?.delete(errMemberName);
@@ -518,10 +557,23 @@ export function createMemberEventHandler(
  *   task_completed — a re-dispatch is then safe).
  * - query failure          → idle (conservative) + notify.
  * - handle / runtime unavailable → no-op (cannot query; leave as-is).
+ *
+ * Staleness guard (review fix 建议 2): the query window is up to 3s. If a
+ * real turn (agent_start/agent_end) or a process exit arrives during it,
+ * the answer is STALE — applying it would overwrite the newer state (e.g.
+ * a false idle over a running turn, releasing the wait tools early; or a
+ * stale compacting over a new prompt). Apply only when the state is
+ * unchanged since the rejection AND no state-affecting event arrived.
+ * Note: compaction_end is deliberately NOT counted — FIFO guarantees the
+ * query answer was written before it, and counting it would strand the
+ * settled-lease heartbeat flow in `working` (the branch's endCompaction is
+ * a no-op on working; only the query answer can close it).
  */
 async function correctStateAfterPromptRejection(
   memberName: string,
-  deps: EventHandlerDeps
+  deps: EventHandlerDeps,
+  snapshot: { state: MemberOperationalState; generation: number },
+  getCurrentGeneration: () => number
 ): Promise<void> {
   const handle = deps.memberHandles?.get(memberName);
   const runtime = deps.autoCompact;
@@ -529,6 +581,9 @@ async function correctStateAfterPromptRejection(
 
   const isCompacting = await runtime.queryCompactionState(memberName, handle);
   const states = deps.memberOpsStates;
+  // Staleness guard: skip when a newer authority took over the state.
+  if ((states.get(memberName) ?? "idle") !== snapshot.state) return;
+  if (getCurrentGeneration() !== snapshot.generation) return;
   if (isCompacting === true) {
     states.set(
       memberName,

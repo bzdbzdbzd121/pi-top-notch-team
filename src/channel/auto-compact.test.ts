@@ -494,3 +494,65 @@ describe("auto-compact runtime compaction timeout marks", () => {
     expect(rt.takeCompactionTimeout("worker")).toBeUndefined();
   });
 });
+
+// ── in-flight lease tracking (review fix) ──────────────────
+// Upstream ordering fact: the member emits compaction_end BEFORE it writes
+// the compact response (agent-session.js emits, rpc-mode.js writes the
+// response afterwards). The compaction_end branch must therefore defer to
+// the lease-owning flow while compactNow is in flight — this tracking
+// powers that guard.
+
+describe("auto-compact runtime in-flight lease tracking", () => {
+  it("hasInFlightCompaction is true while compactNow runs and false after settle", async () => {
+    const rt = makeRuntime();
+    let resolveCompact!: (v: any) => void;
+    const handle = makeHandle() as unknown as MemberProcessHandle;
+    handle.sendCommandAndWait = vi.fn().mockReturnValue(
+      new Promise((r) => { resolveCompact = r; })
+    );
+
+    const p = rt.compactNow("worker", handle, enabledCfg);
+    expect(rt.hasInFlightCompaction("worker")).toBe(true);
+
+    resolveCompact!({ type: "response", command: "compact", success: true, data: {} });
+    await p;
+    expect(rt.hasInFlightCompaction("worker")).toBe(false);
+  });
+
+  it("hasInFlightCompaction clears on rejection settle too", async () => {
+    const rt = makeRuntime();
+    const handle = makeHandle() as unknown as MemberProcessHandle;
+    handle.sendCommandAndWait = vi.fn().mockRejectedValue(new Error("RPC connection lost"));
+
+    await rt.compactNow("worker", handle, enabledCfg);
+
+    expect(rt.hasInFlightCompaction("worker")).toBe(false);
+  });
+
+  it("hasInFlightCompaction is false when no lease is running", async () => {
+    const rt = makeRuntime();
+    expect(rt.hasInFlightCompaction("worker")).toBe(false);
+  });
+
+  it("near-miss: a compaction_end observed during the lease suppresses the stale timeout mark", async () => {
+    // The heartbeat (compaction_end) arrived while the lease was in flight —
+    // the compaction actually FINISHED and the response is merely delayed
+    // (large summary). The lease timeout must NOT record a mark: a lingering
+    // mark would mis-fire on the NEXT compaction's compaction_end with a
+    // stale timestamp (false 「压缩已于 N 分钟后结束」 notification).
+    const rt = makeRuntime();
+    let rejectCompact!: (e: Error) => void;
+    const handle = makeHandle() as unknown as MemberProcessHandle;
+    handle.sendCommandAndWait = vi.fn().mockReturnValue(
+      new Promise((_, rej) => { rejectCompact = rej; })
+    );
+
+    const p = rt.compactNow("worker", handle, enabledCfg);
+    rt.markCompactionEndDuringLease("worker"); // heartbeat while the lease is in flight
+    rejectCompact!(new Error('Command to "worker" timed out after 600000ms'));
+
+    const result = await p;
+    expect(result.ok).toBe(false);
+    expect(rt.takeCompactionTimeout("worker")).toBeUndefined();
+  });
+});

@@ -815,6 +815,62 @@ describe("createMemberEventHandler prompt rejection state correction (Phase 1)",
     expect(content).toContain("已丢失");
     expect(content).not.toContain("已直接派发");
   });
+
+  // ── review fix（建议 2）：查询窗口内新状态不被陈旧答案覆盖 ──
+  // The get_state query takes up to 3s. If a real turn starts (agent_start)
+  // or the process dies during that window, the answer is STALE — applying
+  // it would overwrite the newer state (e.g. a false idle over a running
+  // turn, releasing the wait tools early). The correction applies only when
+  // the state is unchanged since the rejection AND no state-affecting event
+  // arrived.
+
+  it("skips the correction when a real turn started during the get_state window (stale answer must not overwrite working)", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const { createAutoCompactRuntime } = await import("./auto-compact");
+    const deps = createMockDeps();
+    let resolveQuery!: (v: any) => void;
+    const handle = {
+      sendCommand: vi.fn(),
+      sendCommandAndWait: vi.fn().mockReturnValue(new Promise((r) => { resolveQuery = r; })),
+    };
+    deps.memberHandles.set("worker", handle as any);
+    deps.autoCompact = createAutoCompactRuntime(deps.memberOpsStates);
+    deps.memberOpsStates.set("worker", "working"); // rejection leftover
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    handler(rejection("boom")); // get_state query in flight
+    // A real turn starts while the query is pending.
+    handler({ type: "agent_start" });
+    resolveQuery!(getStateResponse(false)); // stale: isCompacting=false
+
+    await new Promise((r) => setTimeout(r, 0)); // let the correction settle
+    // The stale answer must NOT reset the running turn's working to idle.
+    expect(deps.memberOpsStates.get("worker")).toBe("working");
+    expect(deps.pi.sendMessage).toHaveBeenCalledTimes(1); // rejection notice only
+  });
+
+  it("skips the conservative-idle fallback when a turn started during the query window", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const { createAutoCompactRuntime } = await import("./auto-compact");
+    const deps = createMockDeps();
+    const handle = {
+      sendCommand: vi.fn(),
+      sendCommandAndWait: vi.fn().mockRejectedValue(new Error("timeout")),
+    };
+    deps.memberHandles.set("worker", handle as any);
+    deps.autoCompact = createAutoCompactRuntime(deps.memberOpsStates);
+    deps.memberOpsStates.set("worker", "working");
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    handler(rejection("boom"));
+    handler({ type: "agent_start" });
+    await vi.waitFor(() => expect(handle.sendCommandAndWait).toHaveBeenCalled());
+    await new Promise((r) => setTimeout(r, 0));
+
+    // No conservative idle + no extra notice: the running turn owns the state.
+    expect(deps.memberOpsStates.get("worker")).toBe("working");
+    expect(deps.pi.sendMessage).toHaveBeenCalledTimes(1);
+  });
 });
 
 // ── compaction_end consumer branch (Phase 1: 事件驱动出口) ──
@@ -913,6 +969,88 @@ describe("createMemberEventHandler compaction_end branch (Phase 1)", () => {
     handler({ type: "compaction_end" });
 
     expect(deps.memberOpsStates.get("worker")).toBe("compacting"); // untouched
+    expect(deps.pi.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("defers exit+flush while the compact lease is in flight — the owning flow keeps the locked order (review fix)", async () => {
+    // Upstream ordering fact: the member emits compaction_end BEFORE the
+    // compact response (agent-session.js emits, rpc-mode.js writes the
+    // response afterwards). During a healthy in-lease compaction this branch
+    // therefore runs while compactNow still awaits the response. It must NOT
+    // reset/flush here — the inline finally owns the exit (endCompaction)
+    // and the ORDERED flush (current message A first, then pending FIFO):
+    //   (a) acting here would dispatch queued B before the triggering A
+    //       (order inversion, violates the locked dispatch contract);
+    //   (b) resetting compacting early opens a double-compaction window
+    //       before the response settles (exactly what 1.2 eliminates).
+    const enabledCfg = {
+      enabled: true,
+      thresholdPercent: 80,
+      thresholdTokens: undefined,
+      timeoutMinutes: 10,
+      percentIsDefaultFallback: false,
+    };
+    const { createMemberEventHandler, createSendToMember } = await loadModule();
+    const { createAutoCompactRuntime } = await import("./auto-compact");
+    const deps = createMockDeps({ getAutoCompact: () => enabledCfg });
+    const runtime = createAutoCompactRuntime(deps.memberOpsStates);
+    deps.autoCompact = runtime;
+    let resolveCompact!: (v: any) => void;
+    const compactPromise = new Promise((r) => { resolveCompact = r; });
+    const handle = {
+      sendCommand: vi.fn(),
+      sendCommandAndWait: vi.fn().mockImplementation((cmd: any) => {
+        if (cmd.type === "get_session_stats") {
+          return Promise.resolve({
+            type: "response",
+            command: "get_session_stats",
+            success: true,
+            data: { contextUsage: { percent: 92, tokens: 184000, contextWindow: 200000 } },
+          });
+        }
+        return compactPromise;
+      }),
+    };
+    deps.memberHandles.set("worker", handle as any);
+    deps.memberOpsStates.set("worker", "idle");
+
+    const send = createSendToMember(deps as any);
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    // A triggers the inline compaction (stats + compact in flight).
+    send("worker", { ...makeMsg("A"), content: "Current task A" });
+    await vi.waitFor(() => expect(deps.memberOpsStates.get("worker")).toBe("compacting"));
+    // Wait until the compact lease is actually registered (in production the
+    // command write precedes any member-side event, so the lease always
+    // precedes compaction_end; the microtask resume needs an explicit wait in
+    // the test).
+    await vi.waitFor(() => expect(runtime.hasInFlightCompaction("worker")).toBe(true));
+    // B arrives mid-compaction → queued, not sent.
+    send("worker", { ...makeMsg("B"), content: "Queued task B" });
+    expect(handle.sendCommand).not.toHaveBeenCalled();
+
+    // The heartbeat arrives BEFORE the compact response (upstream order).
+    handler({ type: "compaction_end" });
+
+    // In-flight lease → defer: no early reset, no early flush.
+    expect(deps.memberOpsStates.get("worker")).toBe("compacting");
+    expect(handle.sendCommand).not.toHaveBeenCalled();
+    // (b) a new dispatch during the window still queues — no second compact.
+    send("worker", { ...makeMsg("C"), content: "Queued task C" });
+    expect(handle.sendCommandAndWait).toHaveBeenCalledTimes(2); // stats + compact only
+    expect(handle.sendCommand).not.toHaveBeenCalled();
+
+    // The response settles → the inline finally owns the exit + ordered flush.
+    resolveCompact!({ type: "response", command: "compact", success: true, data: {} });
+    await vi.waitFor(() => expect(handle.sendCommand).toHaveBeenCalledTimes(3));
+
+    const prompts = handle.sendCommand.mock.calls.map((c: any[]) => c[0].message as string);
+    expect(prompts[0]).toContain("Current task A");
+    expect(prompts[1]).toContain("Queued task B");
+    expect(prompts[2]).toContain("Queued task C");
+    expect(deps.memberOpsStates.get("worker")).toBe("working");
+    expect(runtime.flushPending("worker")).toEqual([]);
+    // Normal path stays silent.
     expect(deps.pi.sendMessage).not.toHaveBeenCalled();
   });
 
