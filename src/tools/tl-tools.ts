@@ -829,8 +829,12 @@ async function runBatchCompactionBarrier(
     // either way (fail-open).
     runtime.beginCompaction(name);
     const compactResult = await runtime.compactNow(name, handle, cfg);
-    if (compactResult.ok || !compactResult.timedOut) {
-      // Settled via the compact response (success or member-side failure).
+    if (compactResult.ok || !compactResult.timedOut || compactResult.settledByHeartbeat) {
+      // Settled via the compact response (success or member-side failure)
+      // OR via a compaction_end heartbeat processed during the lease
+      // (审查建议 3 near-miss: the response is merely delayed — the heartbeat
+      // proves the compaction finished; close in-loop instead of leaving the
+      // state compacting for the fallback watcher's first poll).
       runtime.endCompaction(name);
       attempted.add(name);
     }

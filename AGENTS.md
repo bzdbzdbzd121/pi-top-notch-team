@@ -243,6 +243,16 @@ src/
     - **2.4 批屏障接线 + attempted 语义修正（alpha P2）**：屏障超时 → 保持 compacting、不 endCompaction、**不计 attempt**（批消息 commit 后经 compacting 分支入 pending + 自动启动 watcher，等待计入 batchMaxWaitMinutes 预算）；`skipAutoCompact` 仅绑定「压缩已结清」——compact 响应（成功/非超时失败）或 compaction_end（runtime 心跳计数 `markCompactionEnd`/`getCompactionEndCount`，屏障按等待期/循环期增量判定，toWait 成员同规则）→ 打标；超时未结清 → 不打标（等待流程接管，不再跳过压缩检查）。事件结清打标同时闭合 E12 竞态（屏障期间事件到达的成员被打标，杜绝 commit 后第二个压缩）。
     - **测试（17 新用例，全量 1108 通过）**：F11 全链（超时→心跳→flush→派发不被拒，全程 1 个 compact RPC=E12）、事件丢失→轮询补发、二次超时→放弃+resolve+通知、进程退出×3（崩溃/主动停止/process_error）清 pending、批屏障超时（不打标+状态保持+E1 顺序）/屏障期事件结清（打标）/toWait 事件结清（打标）、waitCompactionIdle 全形态、心跳计数。E1/E12/E15 核对（§22 清单）；既有「超时→fail-open→派发」用例按新语义更新。
     - **文档精度修正（审查遗留）**：「FIFO 保证查询答案先于事件写出」措辞精确化——true 恒先于事件（查询时仍在压缩 → 响应先写出）、false 可后至（查询时已结束，后至 false 恰为正常闭合路径）；`compaction_end` 不计入代际的理由以此为准。
+31. **Phase 3（ADR-0006）+ 审查建议三修** — 上游 `abort_compaction` RPC 提案以 ADR 交付（无本地代码），顺带落地审查员 3 个建议级修复（含 TDD 测试）：\n
+    - **ADR-0006（Phase 3 交付物）**：`docs/adr/0006-pi-upstream-abort-compaction-rpc.md`——pi 0.84.2 dist 实读证据：`agent-session.abortCompaction()` 方法已存在（~1488 行，abort `_compactionAbortController`+`_autoCompactionAbortController`）、在飞压缩确实响应 abort（~1429 行抛 "Compaction cancelled"）、`abort` RPC 命令只调 `session.abort()` 不碰压缩 controller（rpc-mode.js ~329）、`compact`/`get_state` 命令入口已存在（~416/~349）。成本 ~3 行接线；abort 后 compaction_end 照常发出，扩展侧心跳分支零改动消费。**不依赖上游**：Phase 2 三出口已兜住场景，ADR 仅提供「取消」升级路径。
+
+    - **建议 1（waitCompactionIdle 重排 unref）**：`pollOnce` 内重排定时器提取 `schedulePoll()` 辅助（初始 + 每次重排统一 unref）——Esc 中断后卡死压缩的轮询不再持有事件循环至预算耗尽。测试：fake-clock 包装 setTimeout 断言 3 次调度（初始+两次重排）全部 unref。
+
+    - **建议 2（超时路径消息顺序反转）**：`queueDuringCompaction(name, msg, front?)` 增加 front 参数（unshift）；内联超时分支的**触发消息 A** 经 `queueDuringStuckCompaction(..., front=true)` 入队头部——B/C 压缩期间先到者保持 FIFO 在 A 后，flush 顺序与成功路径一致（A 先、pending FIFO 后）；压缩期间新到达消息走默认尾部（FIFO 不反转）。测试：runtime 级 front/false 两用例 + 全链路（B/C 先到→A 超时插头→compaction_end→sendCommand 顺序 A/B/C）。
+
+    - **建议 3（near-miss ~30s 有界延迟）**：`CompactResult` 增加 `settledByHeartbeat?: boolean`（仅 timedOut 分支、仅近失时置位）——租约内心跳已到 + 超时 settle = 压缩**已结清**（响应只是延迟）：内联路径落入静默 settled 路径（不 notify、不入队、不启 watcher）直接 endCompaction+派发；批屏障 in-loop 同步闭合（`ok || !timedOut || settledByHeartbeat` → endCompaction+打标，commit 时成员已 idle 直接派发，零 watcher 轮询）。取消「近失需等首轮轮询才 close+flush」的 ~30s 延迟。
+
+    - **测试（6 新用例 + 2 更新，全量 1114 通过）**：settledByHeartbeat 置位（near-miss 用例更新断言）/缺位（新）、queue front/false 两向（新）、重排 unref 计数（新）、内联近失全链——零 notify/零 pending/直接派发（新）、stuck 顺序全链 A/B/C（新）；批屏障近失用例更新（状态 compacting→idle）。
 
 ## Dependency Injection Pattern
 
@@ -564,6 +574,7 @@ TL: 监控进展、协调异常、write_shared_context 更新共享上下文（�
 - `docs/adr/0003-agent-initiated-team-sessions.md` — Agent-initiated sessions via load-time `start_team_session`
 - `docs/adr/0004-team-session-resume.md` — Team session resume: member session persistence + manifest + /team resume
 - `docs/adr/0005-pi-upstream-truncation-marking.md` — Upstream framework truncation marking proposal (finalize-time detection + length-protection extension + oneOf error de-noising; non-blocking, for pi upstream issue)
+- `docs/adr/0006-pi-upstream-abort-compaction-rpc.md` — Upstream `abort_compaction` RPC proposal (`agent-session.abortCompaction()` exists but is not reachable over RPC; ~3-line wiring in rpc-mode.js; non-blocking, for pi upstream issue)
 
 ## Design Document
 

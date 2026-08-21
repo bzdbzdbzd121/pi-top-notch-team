@@ -541,9 +541,10 @@ describe("team_send_and_wait batch barrier (phase 3)", () => {
 
       // Settled via compaction_end → attempted → a's message IS marked.
       expect(enqueuedFor(messageQueue, "a")[0].skipAutoCompact).toBe(true);
-      // The state stays compacting (the branch deferred; the watcher closes
-      // it once the queue holds the messages).
-      expect(memberOpsStates.get("a")).toBe("compacting");
+      // 审查建议 3: settledByHeartbeat lets the barrier close the lifecycle
+      // IN-LOOP — a is idle at COMMIT, so its message dispatches directly
+      // (no fallback-watcher round for the deferred heartbeat).
+      expect(memberOpsStates.get("a")).toBe("idle");
     } finally {
       vi.useRealTimers();
     }

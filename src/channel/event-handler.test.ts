@@ -1518,6 +1518,93 @@ describe("createSendToMember auto-compaction", () => {
     expect(runtime.flushPending("worker")).toEqual([]);
   });
 
+  it("Phase 3 (审查建议 3): near-miss — heartbeat during lease + timeout settle → immediate dispatch, no queue/watcher/notify", async () => {
+    // The member-side compaction FINISHED while the lease was in flight
+    // (the compact response is merely delayed). The heartbeat (recorded by
+    // the deferred branch) proves settlement — the inline flow closes the
+    // lifecycle and dispatches A immediately: no 任务已排队 notify, no
+    // pending queue, no 30s fallback-watcher round.
+    const { createMemberEventHandler, createSendToMember } = await loadModule();
+    const { createAutoCompactRuntime } = await import("./auto-compact");
+    const deps = createMockDeps({ getAutoCompact: () => ({ ...enabledCfg, timeoutMinutes: 1 }) }) as any;
+    const runtime = createAutoCompactRuntime(deps.memberOpsStates);
+    deps.autoCompact = runtime;
+    let rejectCompact!: (e: Error) => void;
+    const handle = {
+      sendCommand: vi.fn(),
+      sendCommandAndWait: vi.fn().mockImplementation((cmd: any) => {
+        if (cmd.type === "get_session_stats") return Promise.resolve(usageResponse(92, 184000));
+        return new Promise((_, rej) => { rejectCompact = rej; });
+      }),
+    };
+    deps.memberHandles.set("worker", handle as any);
+    deps.memberOpsStates.set("worker", "idle");
+
+    const send = createSendToMember(deps);
+    const handler = createMemberEventHandler("worker", deps as any);
+    send("worker", { ...makeMsg(), content: "Near-miss task" });
+    await vi.waitFor(() => expect(runtime.hasInFlightCompaction("worker")).toBe(true));
+
+    // Heartbeat arrives while the lease is in flight (deferred mark), then
+    // the lease expires with the response still delayed.
+    handler({ type: "compaction_end" });
+    rejectCompact!(new Error('Command to "worker" timed out after 60000ms'));
+
+    await vi.waitFor(() => expect(handle.sendCommand).toHaveBeenCalled());
+    expect(handle.sendCommand).toHaveBeenCalledWith(
+      expect.objectContaining({ message: expect.stringContaining("Near-miss task") })
+    );
+    expect(deps.memberOpsStates.get("worker")).toBe("working");
+    // Settled paths are silent — the queue/notify timeout branch never ran.
+    expect(deps.pi.sendMessage).not.toHaveBeenCalled();
+    expect(runtime.flushPending("worker")).toEqual([]);
+  });
+
+  it("Phase 3 (审查建议 2): stuck-compaction order — trigger A unshifts to the HEAD, then B/C FIFO", async () => {
+    // B/C arrive while the compaction is running → queued FIFO. A's lease
+    // then expires → A lands at the HEAD (it triggered the compaction; the
+    // success-path order is A first, then pending FIFO). The flush must be
+    // A, B, C — not B, C, A.
+    const { createMemberEventHandler, createSendToMember } = await loadModule();
+    const { createAutoCompactRuntime } = await import("./auto-compact");
+    const deps = createMockDeps({ getAutoCompact: () => ({ ...enabledCfg, timeoutMinutes: 1 }) }) as any;
+    const runtime = createAutoCompactRuntime(deps.memberOpsStates);
+    deps.autoCompact = runtime;
+    let rejectCompact!: (e: Error) => void;
+    const handle = {
+      sendCommand: vi.fn(),
+      sendCommandAndWait: vi.fn().mockImplementation((cmd: any) => {
+        if (cmd.type === "get_session_stats") return Promise.resolve(usageResponse(92, 184000));
+        return new Promise((_, rej) => { rejectCompact = rej; });
+      }),
+    };
+    deps.memberHandles.set("worker", handle as any);
+    deps.memberOpsStates.set("worker", "idle");
+
+    const send = createSendToMember(deps);
+    const handler = createMemberEventHandler("worker", deps as any);
+    send("worker", { ...makeMsg(), content: "A: trigger" });
+    await vi.waitFor(() => expect(runtime.hasInFlightCompaction("worker")).toBe(true));
+
+    // B/C arrive during the compaction (compacting branch, lease held).
+    send("worker", { ...makeMsg(), content: "B: mid-compaction" });
+    send("worker", { ...makeMsg(), content: "C: mid-compaction" });
+
+    // A's lease expires → queued at the FRONT (unshift).
+    rejectCompact!(new Error('Command to "worker" timed out after 60000ms'));
+    await vi.waitFor(() => expect(deps.pi.sendMessage).toHaveBeenCalled()); // 任务已排队
+
+    // compaction_end flushes in the success-path order: A, then B/C FIFO.
+    handler({ type: "compaction_end" });
+    const sent = handle.sendCommand.mock.calls.map((c: any[]) => c[0].message);
+    expect(sent).toHaveLength(3);
+    expect(sent[0]).toContain("A: trigger");
+    expect(sent[1]).toContain("B: mid-compaction");
+    expect(sent[2]).toContain("C: mid-compaction");
+    expect(deps.memberOpsStates.get("worker")).toBe("working");
+    expect(runtime.flushPending("worker")).toEqual([]);
+  });
+
   it("Phase 2: event lost → the 30s poll fallback flushes the queued message (waitCompactionIdle)", async () => {
     const { createMemberEventHandler, createSendToMember } = await loadModule();
     const { createAutoCompactRuntime } = await import("./auto-compact");

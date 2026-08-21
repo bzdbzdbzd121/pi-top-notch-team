@@ -1667,3 +1667,31 @@ tracker 生命周期随 widget install/uninstall（onSessionStart / onSessionEnd
 ### 验收对照
 
 压缩超时后成员状态恒为 compacting（诚实）✓；wait 类工具 deadline 诊断 + 压缩结束自动恢复 ✓（Phase 1）；四场景（成功/失败/事件丢失/进程重启）积压消息零丢失补发 ✓；压缩永不结束 → 放弃+通知+无永久孤儿+无工具无限卡 ✓；批路径与内联一致（同一 queue/watcher 机制）✓；E1/E12/E15 核对通过 ✓；全量测试绿色 ✓。
+
+## 23. Phase 3：上游 abort_compaction ADR + 审查建议三修
+
+### 23.1 交付物（ADR-0006，无本地代码）
+
+`docs/adr/0006-pi-upstream-abort-compaction-rpc.md` — 上游 `abort_compaction` RPC 提案。核心证据（pi 0.84.2 dist 实读）：`agent-session.abortCompaction()` 已存在（~1488），在飞压缩响应 abort（~1429 抛 "Compaction cancelled"），`abort` RPC 不触碰压缩 controller，`compact`/`get_state` 命令入口已具——成本 ~3 行接线。abort 后 compaction_end 照常发出，扩展侧心跳分支零改动消费。二次超时通知文案的升级路径（「请 stop_member」→「可先 abort_compaction」）记录在 ADR 中，依赖上游合入后另行评估。
+
+### 23.2 审查建议 1：waitCompactionIdle 重排 unref
+
+`pollOnce` 内 `timer = setTimeout(...)` 重排处未 unref——初始定时器 unref 了，重排的没有；Esc 中断后卡死压缩的轮询链持有事件循环至预算耗尽。修复：提取 `schedulePoll()` 辅助（`setTimeout` + `typeof unref === "function"` 守卫），初始与每次重排统一走它。测试：fake-clock 包装 globalThis.setTimeout 记录每次创建的 timer 的 unref 调用，断言 3 次调度（初始 + 30s/60s 两次重排）全部 unref（90s 预算耗尽轮不重排）。
+
+### 23.3 审查建议 2：超时路径消息顺序反转（front 插队）
+
+场景：触发消息 A 触发压缩检查 → B、C 在压缩期间到达（compacting 分支 queueDuringCompaction push → [B, C]）→ A 的租约超时 → queueDuringStuckCompaction 追加 → [B, C, A]，flush 顺序 B、C、A，与成功路径「A 先、pending FIFO 后」不一致。修复：`queueDuringCompaction(name, msg, front?)` 增加 front 参数（unshift）；内联超时分支传 `front=true`（A 插队头部 → [A, B, C]）；压缩期间新到达消息（compacting 分支/屏障 commit 后经 sendToMember）保持默认尾部——**只有触发消息插队，其余仍 FIFO**，与成功路径顺序完全对齐。测试：runtime 级 front/false 两向 + 全链路 sendCommand 顺序断言。
+
+### 23.4 审查建议 3：near-miss ~30s 有界延迟（settledByHeartbeat）
+
+场景：心跳（compaction_end）在租约内到达（in-flight 守卫仅记录、分支不复位）→ 租约随后超时 → 消息入 pending + watcher 启动 → 需等首轮轮询（30s）才 close+flush——但心跳已证明压缩结束，30s 纯延迟。修复：`compactNow` 超时 catch 中 near-miss（`heartbeatSeen`）时返回 `settledByHeartbeat: true`（仅此分支置位；timeout mark 依旧抑制）：
+
+- **内联路径**：`!ok && timedOut && !settledByHeartbeat` 才是超时排队分支；settledByHeartbeat 落入静默 settled 路径（endCompaction → 派发 A → flush），零 notify、零 pending、零 watcher；
+- **批屏障**：in-loop 结算判定改为 `ok || !timedOut || settledByHeartbeat` → endCompaction + 打标——commit 时成员已 idle，批消息直接派发，零 watcher 轮询；
+- 非近失超时（无心跳）行为完全不变（保持 compacting + 入队 + watcher）。
+
+测试：runtime 置位/缺位两向、内联近失全链（零通知/零 pending/立即派发）、批屏障近失断言更新（状态 compacting→idle）。既有 near-miss mark 抑制测试更新为同时断言 settledByHeartbeat。
+
+### 验收对照
+
+超时触发消息在积压队列中的位置与成功路径一致（A 先、FIFO 后）✓；near-miss 场景取消 30s watcher 延迟（内联与批路径均即时结算）✓；非近失超时行为零回归（F11 全链/事件丢失轮询/二次超时放弃测试保持绿色）✓；轮询定时器全链 unref（Esc 中断零泄漏）✓；ADR-0006 交付（上游事实带行号证据）✓；全量测试绿色（1114 通过）✓。

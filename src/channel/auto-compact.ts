@@ -38,6 +38,16 @@ export type CompactResult =
        * settled on the member side (safe to dispatch).
        */
       timedOut: boolean;
+      /**
+       * Phase 3 (审查建议 3, near-miss): true when the lease expired BUT a
+       * compaction_end heartbeat was processed during the lease — the
+       * member-side compaction actually FINISHED and the compact response is
+       * merely delayed. The caller closes the lifecycle and dispatches
+       * immediately (the queue/watcher path is unnecessary). The timeout
+       * mark is NOT recorded in this case (no stale notification on the next
+       * compaction). Only present on the timedOut branch.
+       */
+      settledByHeartbeat?: boolean;
     };
 
 /** Result of the waitCompactionIdle fallback poll (Phase 2). */
@@ -141,8 +151,13 @@ export interface AutoCompactRuntime {
    * defensive invariant: queuing on a non-compacting member would orphan the
    * message (nothing would ever flush it). The inline dispatch path checks
    * the state first and always gets true.
+   *
+   * `front` (审查建议 2): places the message at the HEAD instead of the tail.
+   * Used by the stuck-compaction path for the trigger message whose lease
+   * expired AFTER later arrivals were queued — its natural position is the
+   * head (the success path dispatches it before the pending FIFO).
    */
-  queueDuringCompaction(name: string, msg: TeamMessage): boolean;
+  queueDuringCompaction(name: string, msg: TeamMessage, front?: boolean): boolean;
   /**
    * Query the member's compaction state via get_state (isCompacting).
    * 3s timeout, fail-open → null on any failure/timeout. Used by the
@@ -295,13 +310,23 @@ export function createAutoCompactRuntime(
         // NEXT compaction's compaction_end with a stale timestamp (review
         // fix 建议 1: near-miss race). Non-timeout failures mean the
         // compaction RPC already settled on the member side — no mark.
+        // 建议 3: the near-miss heartbeat also proves SETTLEMENT — the result
+        // carries settledByHeartbeat so the caller dispatches immediately
+        // instead of queueing into the fallback watcher.
         const heartbeatSeen =
           (compactionEndCounts.get(name) ?? 0) > endCountAtLeaseStart;
         const timedOut = reason.includes("timed out");
         if (timedOut && !heartbeatSeen) {
           compactionTimeouts.set(name, Date.now());
         }
-        return { ok: false, error: reason, timedOut };
+        return {
+          ok: false,
+          error: reason,
+          timedOut,
+          // Present only when the near-miss actually occurred (heartbeat
+          // during lease + lease expiry) — absent otherwise.
+          ...(timedOut && heartbeatSeen ? { settledByHeartbeat: true } : {}),
+        };
       } finally {
         inFlightCompactions.delete(name);
       }
@@ -327,6 +352,15 @@ export function createAutoCompactRuntime(
       const deadline = Date.now() + budgetMs;
       return new Promise<WaitCompactionIdleResult>((resolve) => {
         let settled = false;
+        // 审查建议 1: EVERY scheduled poll timer must be unref'd — the rearm
+        // inside pollOnce included. A stuck compaction abandoned by Esc must
+        // not hold the extension process open until the budget expires (the
+        // initial timer was already unref'd; the rearm must match).
+        const schedulePoll = (): NodeJS.Timeout => {
+          const t = setTimeout(pollOnce, WAIT_COMPACTION_POLL_MS);
+          if (typeof t.unref === "function") t.unref();
+          return t;
+        };
         const pollOnce = async (): Promise<void> => {
           if (settled) return;
           // Operational state first: a process exit / intentional stop has
@@ -350,10 +384,9 @@ export function createAutoCompactRuntime(
             resolve({ ok: false, error: "压缩超时上限" });
             return;
           }
-          timer = setTimeout(pollOnce, WAIT_COMPACTION_POLL_MS);
+          timer = schedulePoll();
         };
-        let timer: NodeJS.Timeout = setTimeout(pollOnce, WAIT_COMPACTION_POLL_MS);
-        if (typeof timer.unref === "function") timer.unref();
+        let timer: NodeJS.Timeout = schedulePoll();
       });
     },
 
@@ -382,13 +415,14 @@ export function createAutoCompactRuntime(
       );
     },
 
-    queueDuringCompaction(name: string, msg: TeamMessage): boolean {
+    queueDuringCompaction(name: string, msg: TeamMessage, front = false): boolean {
       // Defensive invariant: only queue while the member is actually
       // compacting. Queuing otherwise would orphan the message — nothing
       // would ever flush it (flushPending only runs after a compaction).
       if (memberOpsStates.get(name) !== "compacting") return false;
       const pending = pendingDuringCompaction.get(name) ?? [];
-      pending.push(msg);
+      if (front) pending.unshift(msg);
+      else pending.push(msg);
       pendingDuringCompaction.set(name, pending);
       return true;
     },

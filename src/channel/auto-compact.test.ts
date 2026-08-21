@@ -322,6 +322,31 @@ describe("auto-compact runtime queueDuringCompaction + flushPending", () => {
     expect(flushed).toEqual([msg1, msg2, msg3]);
   });
 
+  it("front option places the message at the HEAD (审查建议 2: stuck-compaction order — trigger A before B/C)", async () => {
+    // B/C arrive while the compaction is running (queued FIFO). The trigger
+    // message A then times out — its natural position is the HEAD: the
+    // success path dispatches A first, then the pending FIFO. Without the
+    // front option the flush would be B, C, A (order inversion).
+    const rt = compactingRuntime();
+    rt.queueDuringCompaction("worker", makeMsg("b"));
+    rt.queueDuringCompaction("worker", makeMsg("c"));
+
+    expect(rt.queueDuringCompaction("worker", makeMsg("a"), true)).toBe(true);
+
+    expect(rt.flushPending("worker").map((m) => m.id)).toEqual(["a", "b", "c"]);
+  });
+
+  it("front option keeps the normal FIFO when false (default: back of the queue)", async () => {
+    const rt = compactingRuntime();
+    rt.queueDuringCompaction("worker", makeMsg("a"), true); // A already at the head
+
+    // New arrivals during the stuck compaction stay FIFO at the back.
+    expect(rt.queueDuringCompaction("worker", makeMsg("b"))).toBe(true);
+    expect(rt.queueDuringCompaction("worker", makeMsg("c"), false)).toBe(true);
+
+    expect(rt.flushPending("worker").map((m) => m.id)).toEqual(["a", "b", "c"]);
+  });
+
   it("returns false and does NOT queue when the member is not compacting", async () => {
     // Defensive invariant: queuing on a non-compacting member would orphan
     // the message — nothing would ever flush it.
@@ -559,8 +584,32 @@ describe("auto-compact runtime in-flight lease tracking", () => {
 
     const result = await p;
     expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.timedOut).toBe(true);
+    if (!result.ok) {
+      expect(result.timedOut).toBe(true);
+      // 建议 3: the heartbeat proves the compaction SETTLED — the caller
+      // closes the lifecycle and dispatches immediately (no queue/watcher).
+      expect(result.settledByHeartbeat).toBe(true);
+    }
     expect(rt.takeCompactionTimeout("worker")).toBeUndefined();
+  });
+
+  it("non-near-miss timeout: settledByHeartbeat stays undefined (lease expired, no heartbeat)", async () => {
+    const rt = makeRuntime();
+    let rejectCompact!: (e: Error) => void;
+    const handle = makeHandle() as unknown as MemberProcessHandle;
+    handle.sendCommandAndWait = vi.fn().mockReturnValue(
+      new Promise((_, rej) => { rejectCompact = rej; })
+    );
+
+    const p = rt.compactNow("worker", handle, enabledCfg);
+    rejectCompact!(new Error('Command to "worker" timed out after 600000ms'));
+
+    const result = await p;
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.timedOut).toBe(true);
+      expect(result.settledByHeartbeat).toBeUndefined();
+    }
   });
 });
 
@@ -692,6 +741,42 @@ describe("auto-compact runtime waitCompactionIdle", () => {
       const p = rt.waitCompactionIdle("worker", handle, 90_000);
       // 30s + 60s polls say still running; the 90s poll checks the deadline
       await vi.advanceTimersByTimeAsync(POLL * 3 + 1);
+      await expect(p).resolves.toEqual({ ok: false, error: expect.stringContaining("上限") });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("rearms the poll timer unref'd at every reschedule (审查建议 1: Esc 中断后不持有事件循环)", async () => {
+    // The INITIAL timer was already unref'd; the rearm inside pollOnce must
+    // be unref'd too — otherwise a stuck compaction abandoned by Esc holds
+    // the extension process open until the budget expires.
+    const states = new Map<string, MemberOperationalState>([["worker", "compacting"]]);
+    const rt = makeRuntime(states);
+    const handle = makeHandle() as unknown as MemberProcessHandle;
+    handle.sendCommandAndWait = vi.fn().mockResolvedValue(getStateResponse(true));
+
+    vi.useFakeTimers();
+    try {
+      // Wrap the fake-clock setTimeout: record every timer's unref call.
+      const originalSetTimeout = globalThis.setTimeout.bind(globalThis);
+      const unrefSpy = vi.fn();
+      vi.spyOn(globalThis, "setTimeout").mockImplementation(((
+        fn: any,
+        ms?: any,
+        ...args: any[]
+      ) => {
+        const t: any = originalSetTimeout(fn, ms, ...args);
+        if (t && typeof t.unref === "function") t.unref = unrefSpy;
+        return t;
+      }) as any);
+
+      const p = rt.waitCompactionIdle("worker", handle, 90_000);
+      // Polls at 30s and 60s rearm (still running); the 90s poll checks the
+      // deadline and settles WITHOUT rearming. Every scheduled timer — the
+      // initial one plus both rearms — must be unref'd.
+      await vi.advanceTimersByTimeAsync(POLL * 3 + 1);
+      expect(unrefSpy).toHaveBeenCalledTimes(3);
       await expect(p).resolves.toEqual({ ok: false, error: expect.stringContaining("上限") });
     } finally {
       vi.useRealTimers();

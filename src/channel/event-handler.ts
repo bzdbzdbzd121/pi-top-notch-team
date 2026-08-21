@@ -835,13 +835,20 @@ export function createSendToMember(
    * already ran — e.g. the compaction_end was processed while the lease was
    * still settling and flushed the empty queue), queueing would orphan the
    * message — dispatch directly instead.
+   *
+   * `front` (审查建议 2): the lease-expired TRIGGER message goes to the HEAD
+   * of the pending queue — later arrivals (B/C) were queued FIFO before the
+   * timeout, and the success-path order (trigger first, then pending FIFO)
+   * requires A ahead of them. New arrivals during the stuck compaction keep
+   * the default FIFO position.
    */
   function queueDuringStuckCompaction(
     memberName: string,
     msg: TeamMessage,
-    cfg?: ResolvedAutoCompact
+    cfg?: ResolvedAutoCompact,
+    front = false
   ): void {
-    if (autoCompact.queueDuringCompaction(memberName, msg)) {
+    if (autoCompact.queueDuringCompaction(memberName, msg, front)) {
       startFallbackWatcher(memberName, cfg);
       return;
     }
@@ -940,18 +947,28 @@ export function createSendToMember(
       if (autoCompact.shouldCompact(statsResult.stats, cfg)) {
         phase = "compact";
         const compactResult = await autoCompact.compactNow(memberName, handle, cfg);
-        if (!compactResult.ok && compactResult.timedOut) {
+        if (!compactResult.ok && compactResult.timedOut && !compactResult.settledByHeartbeat) {
           // Phase 2: lease expired, member-side compaction may still run —
           // keep compacting, queue the message, let the heartbeat flush it.
           // (The runtime recorded the timeout mark for the close notification;
           // a near-miss heartbeat during the lease suppresses it.)
+          // 审查建议 3: settledByHeartbeat (near-miss) falls through to the
+          // settled path below — the heartbeat already proved the compaction
+          // finished, so dispatch immediately (no queue, no watcher round).
           notify(
             `[自动压缩] 成员 "${memberName}" 压缩超过 ${cfg.timeoutMinutes} 分钟未完成，任务已排队，将在压缩结束后自动派发。`
           );
-          queueDuringStuckCompaction(memberName, msg, cfg);
+          // front=true: the trigger message goes to the HEAD of the pending
+          // queue (审查建议 2 — later arrivals B/C were queued FIFO first;
+          // the success-path order is trigger A, then pending FIFO).
+          queueDuringStuckCompaction(memberName, msg, cfg, true);
           return; // no endCompaction, no dispatch — the waiting flow owns it
         }
-        if (!compactResult.ok) {
+        if (!compactResult.ok && !compactResult.settledByHeartbeat) {
+          // Non-timeout failure (member-side compaction settled) → fail-open
+          // with an honest notification. settledByHeartbeat (near-miss) is
+          // NOT a failure — the heartbeat proved the compaction finished, so
+          // it falls through to the silent settled path.
           throw new Error(compactResult.error);
         }
         // Success is silent — the TL does not need to perceive the process.
