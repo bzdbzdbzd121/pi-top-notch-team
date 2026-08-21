@@ -9,6 +9,9 @@ import type { TeamMessage } from "./types";
 /** Timeout for the pre-dispatch stats query (same as the status widget). Also used for the get_state compaction-state query (Phase 1). */
 const STATS_QUERY_TIMEOUT_MS = 3000;
 
+/** Poll interval for the waitCompactionIdle fallback (Phase 2, 三出口之②). */
+const WAIT_COMPACTION_POLL_MS = 30_000;
+
 // ── Types ──────────────────────────────────────────────────
 
 /** Context usage snapshot of a member (from get_session_stats). */
@@ -24,6 +27,21 @@ export type QueryStatsResult =
 
 /** Result of a compact RPC: success, or the failure reason (fail-open). */
 export type CompactResult =
+  | { ok: true }
+  | {
+      ok: false;
+      error: string;
+      /**
+       * Phase 2: true when the LOCAL lease expired (sendCommandAndWait
+       * timeout) — the member-side compaction may STILL be running, so the
+       * caller must NOT dispatch into it (queue instead). false = the RPC
+       * settled on the member side (safe to dispatch).
+       */
+      timedOut: boolean;
+    };
+
+/** Result of the waitCompactionIdle fallback poll (Phase 2). */
+export type WaitCompactionIdleResult =
   | { ok: true }
   | { ok: false; error: string };
 
@@ -80,12 +98,34 @@ export interface AutoCompactRuntime {
    */
   hasInFlightCompaction(name: string): boolean;
   /**
-   * Record that a compaction_end heartbeat arrived while the member's compact
-   * lease was in flight. A subsequent near-miss lease timeout (the heartbeat
-   * arrived but the response was delayed past the lease) must NOT record a
-   * stale timeout mark — the compaction actually finished.
+   * Record that a compaction_end heartbeat was processed by the event branch
+   * (both the in-flight-deferred path and the close path). Powers two
+   * Phase-2 mechanisms:
+   *   (a) the near-miss stale-mark suppression inside compactNow (a heartbeat
+   *       during THIS lease ⇒ the compaction finished, the response is merely
+   *       delayed — no timeout mark);
+   *   (b) the batch barrier's attempted 语义 (a member whose compaction
+   *       SETTLED via the event during the barrier is marked, so its messages
+   *       skip the redundant inline check).
    */
-  markCompactionEndDuringLease(name: string): void;
+  markCompactionEnd(name: string): void;
+  /** Per-member count of processed compaction_end heartbeats (barrier baselines). */
+  getCompactionEndCount(name: string): number;
+  /**
+   * Phase 2 fallback wait (三出口之②): poll until the member's compaction is
+   * no longer running, or the budget is exhausted. The compaction_end event
+   * is the primary exit; this covers event loss (pipe/network) and process
+   * auto-restart (events not replayed). Every 30s, release when
+   *   (a) the operational state left `compacting` (process exit — the 2.3
+   *       branch owns pending cleanup), or
+   *   (b) get_state.isCompacting === false, or the query FAILED (fail-open
+   *       treats "unknown" as "ended" — the rejection correction restores
+   *       the honest state if the dispatch then gets refused).
+   * Budget exhausted → `{ ok: false }` (the caller abandons the pending
+   * messages + resolves corrIds + notifies the TL for manual intervention).
+   * The poll timer is unref'd (an abandoned wait never holds the process).
+   */
+  waitCompactionIdle(name: string, handle: MemberProcessHandle, budgetMs: number): Promise<WaitCompactionIdleResult>;
   /**
    * Exit compacting (compacting → idle). Called in `finally` so the state is
    * reset on success, failure AND interruption. Does NOT flush — flushing is
@@ -131,6 +171,29 @@ export interface AutoCompactRuntime {
 // ── createAutoCompactRuntime ───────────────────────────────
 
 /**
+ * Query the member's compaction state via get_state (isCompacting). 3s
+ * timeout, fail-open → null on any failure/timeout. Shared by the
+ * queryCompactionState primitive (rejection correction) and the
+ * waitCompactionIdle fallback poll.
+ */
+async function queryCompactionStateRpc(handle: MemberProcessHandle): Promise<boolean | null> {
+  try {
+    const resp = await handle.sendCommandAndWait(
+      { type: "get_state" },
+      (event: any) => event.type === "response" && event.command === "get_state",
+      STATS_QUERY_TIMEOUT_MS
+    );
+    if (!resp || resp.success === false) return null;
+    const isCompacting = resp?.data?.isCompacting;
+    return typeof isCompacting === "boolean" ? isCompacting : null;
+  } catch {
+    // Timeout / RPC failure — fail-open (null = "could not determine").
+    // The caller picks the conservative branch.
+    return null;
+  }
+}
+
+/**
  * Create the shared auto-compaction runtime bound to the given operational
  * state map. The map is held by reference, so the runtime stays in sync with
  * whatever the caller writes (e.g. the state machine transitions from the
@@ -155,12 +218,11 @@ export function createAutoCompactRuntime(
    */
   const inFlightCompactions = new Set<string>();
   /**
-   * Per-member timestamp of a compaction_end heartbeat observed while the
-   * lease was in flight (near-miss detection, review fix 建议 1). Scoped to
-   * the current lease: set by the branch, read in compactNow's timeout
-   * catch, cleared on lease settle.
+   * Per-member compaction_end heartbeat count (Phase 2). Incremented by the
+   * event branch; the near-miss suppression reads the delta across a lease,
+   * the batch barrier uses it for the attempted 语义 (settled via event).
    */
-  const compactionEndDuringLease = new Map<string, number>();
+  const compactionEndCounts = new Map<string, number>();
 
   return {
     async queryStats(
@@ -207,7 +269,7 @@ export function createAutoCompactRuntime(
       // before the compact response, so a healthy in-lease compaction always
       // hits the branch while the lease is held.
       inFlightCompactions.add(name);
-      const leaseStart = Date.now();
+      const endCountAtLeaseStart = compactionEndCounts.get(name) ?? 0;
       try {
         const compactResp = await handle.sendCommandAndWait(
           { type: "compact" },
@@ -216,15 +278,17 @@ export function createAutoCompactRuntime(
         );
         if (!compactResp || compactResp.success === false) {
           // Fail-open, but keep the RPC's own error text when available
-          // (matches the pre-refactor inline behavior).
-          return { ok: false, error: compactResp?.error ?? "压缩命令未成功" };
+          // (matches the pre-refactor inline behavior). The member-side
+          // compaction already settled — safe to dispatch.
+          return { ok: false, error: compactResp?.error ?? "压缩命令未成功", timedOut: false };
         }
         return { ok: true };
       } catch (err) {
         // Timeout / RPC failure — fail-open, but keep the real reason for
         // honest notifications (matches the pre-refactor inline behavior).
+        const reason = err instanceof Error ? err.message : String(err);
         // A TIMEOUT records the lease-expired mark ONLY when no compaction_end
-        // heartbeat was observed during this lease (租约 vs 心跳 — the lease
+        // heartbeat was processed during this lease (租约 vs 心跳 — the lease
         // expiry says nothing about the member-side state). If the heartbeat
         // DID arrive, the compaction actually finished and the response is
         // merely delayed — recording a mark would linger and mis-fire on the
@@ -232,18 +296,14 @@ export function createAutoCompactRuntime(
         // fix 建议 1: near-miss race). Non-timeout failures mean the
         // compaction RPC already settled on the member side — no mark.
         const heartbeatSeen =
-          (compactionEndDuringLease.get(name) ?? 0) >= leaseStart;
-        if (
-          err instanceof Error &&
-          err.message.includes("timed out") &&
-          !heartbeatSeen
-        ) {
+          (compactionEndCounts.get(name) ?? 0) > endCountAtLeaseStart;
+        const timedOut = reason.includes("timed out");
+        if (timedOut && !heartbeatSeen) {
           compactionTimeouts.set(name, Date.now());
         }
-        return { ok: false, error: err instanceof Error ? err.message : String(err) };
+        return { ok: false, error: reason, timedOut };
       } finally {
         inFlightCompactions.delete(name);
-        compactionEndDuringLease.delete(name);
       }
     },
 
@@ -251,28 +311,57 @@ export function createAutoCompactRuntime(
       return inFlightCompactions.has(name);
     },
 
-    markCompactionEndDuringLease(name: string): void {
-      compactionEndDuringLease.set(name, Date.now());
+    markCompactionEnd(name: string): void {
+      compactionEndCounts.set(name, (compactionEndCounts.get(name) ?? 0) + 1);
+    },
+
+    getCompactionEndCount(name: string): number {
+      return compactionEndCounts.get(name) ?? 0;
+    },
+
+    async waitCompactionIdle(
+      name: string,
+      handle: MemberProcessHandle,
+      budgetMs: number
+    ): Promise<WaitCompactionIdleResult> {
+      const deadline = Date.now() + budgetMs;
+      return new Promise<WaitCompactionIdleResult>((resolve) => {
+        let settled = false;
+        const pollOnce = async (): Promise<void> => {
+          if (settled) return;
+          // Operational state first: a process exit / intentional stop has
+          // already drained the pending queue (2.3) — release without an RPC.
+          if (memberOpsStates.get(name) !== "compacting") {
+            settled = true;
+            resolve({ ok: true });
+            return;
+          }
+          // Ask the member (fail-open): false OR a failed query counts as
+          // "ended" — the caller closes the lifecycle and flushes.
+          const isCompacting = await queryCompactionStateRpc(handle);
+          if (settled) return;
+          if (isCompacting === false || isCompacting === null) {
+            settled = true;
+            resolve({ ok: true });
+            return;
+          }
+          if (Date.now() >= deadline) {
+            settled = true;
+            resolve({ ok: false, error: "压缩超时上限" });
+            return;
+          }
+          timer = setTimeout(pollOnce, WAIT_COMPACTION_POLL_MS);
+        };
+        let timer: NodeJS.Timeout = setTimeout(pollOnce, WAIT_COMPACTION_POLL_MS);
+        if (typeof timer.unref === "function") timer.unref();
+      });
     },
 
     async queryCompactionState(
       name: string,
       handle: MemberProcessHandle
     ): Promise<boolean | null> {
-      try {
-        const resp = await handle.sendCommandAndWait(
-          { type: "get_state" },
-          (event: any) => event.type === "response" && event.command === "get_state",
-          STATS_QUERY_TIMEOUT_MS
-        );
-        if (!resp || resp.success === false) return null;
-        const isCompacting = resp?.data?.isCompacting;
-        return typeof isCompacting === "boolean" ? isCompacting : null;
-      } catch {
-        // Timeout / RPC failure — fail-open (null = "could not determine").
-        // The caller picks the conservative branch.
-        return null;
-      }
+      return queryCompactionStateRpc(handle);
     },
 
     markCompactionTimeout(name: string): void {

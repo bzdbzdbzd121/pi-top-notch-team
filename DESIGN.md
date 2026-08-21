@@ -1600,7 +1600,7 @@ tracker 生命周期随 widget install/uninstall（onSessionStart / onSessionEnd
   - 仅「无在飞租约」（超时后心跳，finally 已结束）才执行 endCompaction+flush+通知。超时路径语义不受影响。
 - **near-miss 陈旧 mark 抑制（审查建议 1）**：compaction_end 在租约在飞期间到达（压缩实际已完成、响应因大结果延迟晚于租约）→ 超时 catch 检查 `compactionEndDuringLease`（按租约起始时间戳）→ 不记录 mark。否则 mark 残留到下一次正常压缩的 compaction_end，误报「压缩已于 N 分钟后结束」（分钟数还基于旧时间戳）。记录与读取均按租约作用域（settle 清除 + leaseStart 双保险）。
 - **超时痕迹桥接**：runtime 新原语 `markCompactionTimeout(name)` / `takeCompactionTimeout(name)`（per-member Map）。`compactNow` 在本地租约超时（sendCommandAndWait reject 消息含 `timed out`）时记录时间戳；非超时失败（RPC 错误响应/其他 reject——成员端压缩已结算）不记录。`compaction_end` 分支消费一次即清 → 超时场景通知 TL「压缩已于 N 分钟后结束，积压消息已自动补发」；正常路径保持静默（成功静默原则）。
-- **时序收敛性**（单管道 FIFO 保证）：拒收→get_state 查询与 compaction_end 到达顺序无论先后均收敛——get_state 先到：compaction_confirmed→compacting→compaction_end→idle ✓；compaction_end 先到：endCompaction（working 不动）→get_state false→task_completed→idle ✓。陈旧 true 响应晚于 compaction_end 到达在 FIFO 管道上不可能（响应在成员端先于 compaction_end 写出）。
+- **时序收敛性**（单管道 FIFO）：拒收→get_state 查询与 compaction_end 到达顺序无论先后均收敛——get_state 先到：compaction_confirmed→compacting→compaction_end→idle ✓；compaction_end 先到：endCompaction（working 不动）→get_state false→task_completed→idle ✓。**true 恒先于事件**（查询时仍在压缩 → 响应在成员端先于 compaction_end 写出），陈旧 true 晚于事件在管道上不可能；**false 可后至**（查询时已结束）——后至 false 是正常闭合路径（working→idle）。
 
 ### 1.2 拒收分支状态纠正（get_state 判定，beta 形态）
 
@@ -1609,7 +1609,7 @@ tracker 生命周期随 widget install/uninstall（onSessionStart / onSessionEnd
   - `isCompacting === false` → 置 `idle`（`task_completed` 事件，保持纯函数纪律；重派安全）。
   - 查询失败 → `idle` + 通知（保守选择）。
   - handle/runtime 未接线 → no-op（legacy 最小配置行为不变）。
-- **陈旧答案不覆盖新状态（审查建议 2）**：查询窗口（≤3s）内若真实回合开始（agent_start/agent_end）或进程退出（process_exit/process_error），handler 内 per-member `stateGeneration` 递增；纠正应用前校验「状态仍为拒收快照 + 代际未变」，否则整体跳过（含保守通知）。否则陈旧 `isCompacting=false` 会把 running turn 覆盖为假 idle（wait 工具提前释放），陈旧 true 会把新 prompt 覆盖为假 compacting（无出口）。`compaction_end` 刻意不计入代际：FIFO 保证查询答案先于事件写出（true 不可能晚于事件到达），且计入会让已结算租约的心跳流程困死在 working（endCompaction 对 working 是 no-op，只有查询答案能闭合）。
+- **陈旧答案不覆盖新状态（审查建议 2）**：查询窗口（≤3s）内若真实回合开始（agent_start/agent_end）或进程退出（process_exit/process_error），handler 内 per-member `stateGeneration` 递增；纠正应用前校验「状态仍为拒收快照 + 代际未变」，否则整体跳过（含保守通知）。否则陈旧 `isCompacting=false` 会把 running turn 覆盖为假 idle（wait 工具提前释放），陈旧 true 会把新 prompt 覆盖为假 compacting（无出口）。`compaction_end` 刻意不计入代际：单管道 FIFO 下 **true 答案恒先于事件到达**（成员查询时仍在压缩 → 响应先写出；陈旧 true 晚于事件在管道上不可能），**false 答案可能后至**（查询时压缩已结束）——后至 false 恰好是正常闭合路径（working→idle），计入代际会误杀它；且计入会让已结算租约的心跳流程困死在 working（endCompaction 对 working 是 no-op，只有查询答案能闭合）。
 - 通知文案诚实化：「消息未送达（已丢失，请稍后重试）…已查询成员实际状态并按实际恢复」。
 
 ### 1.3 waitForAllIdle deadline + 诊断（beta C，防御纵深）
@@ -1624,3 +1624,46 @@ tracker 生命周期随 widget install/uninstall（onSessionStart / onSessionEnd
 - DI：`EventHandlerDeps` 新增 `autoCompact?`（共享 runtime）与 `memberHandles?`（get_state 查询 + flush 派发）；`MemberLifecycleDeps` 同步新增并转发；`index.ts` 注入。
 - 共享派发提取为模块级 `dispatchPromptToMember`（`PromptDispatchDeps`：pi/memberOpsStates/memberHandles/lastPendingCorrId/responseWaiter）——内联路径与 compaction_end flush 路径同一套发送语义（working 标记 + followUp + sendCommand 异常 fail-open）。
 - 测试（37 个新用例，含审查修订 7 个）：拒收状态恢复四态（compacting/idle/查询失败+通知/无接线 no-op）、诚实文案断言、compaction_end 分支（正常静默+flush/超时通知+单次消费/无 runtime no-op/working 不动）、双重压缩防护（compacting 成员新消息→入 pending→compaction_end→自动派发，期间零 RPC）、状态机 `compaction_confirmed` 转换表（working/idle→compacting、compacting 幂等、crashed/stopped 不动）、runtime 新原语（超时标记/非超时不标记/单次消费）、wait deadline（诊断内容/0=不限/unref 存在性/工具级回归）、team_send_and_wait deadline 诊断；**审查修订用例**：在飞租约守卫集成用例（compaction_end 先于 compact 响应到达→不提前复位/不提前补发→响应 settle 后 A→B→C 顺序锁定 + 窗口内新派发零二次压缩）、在飞租约生命周期（true/false）、near-miss 陈旧 mark 抑制、陈旧答案不覆盖（agent_start 窗口内 skip / 保守回退 skip）。
+
+## 22. 自动压缩超时根治（Phase 2：事件驱动派发，三出口闭合）
+
+> 依赖 Phase 1（§21：compaction_end 消费分支 + 拒收 get_state 判定 + wait deadline）。Phase 1 止血：拒收后状态纠正 + wait 兜底；Phase 2 根治：**超时后不派发**，由成员端心跳权威驱动补发，消息零丢失。核心抽象延续「租约 vs 心跳」——TL 本地计时器只是租约，`compaction_end` 才是心跳。
+
+### 2.1 内联路径超时语义重定义（runAutoCompactAndDispatch）
+
+- `compactNow` 结果增加 `timedOut` 判别（`CompactResult`）：本地租约超时 = 压缩可能仍在成员端运行 → **不再 fail-open 派发**（Phase 1 证明：派发必被拒收 → 消息丢失 + working 黑洞）；保持 `compacting`，消息经 `queueDuringStuckCompaction` 入 pending，由心跳 flush。
+- 非超时失败（RPC error 响应）＝成员端已结算 → endCompaction → 直接派发（安全）。
+- 成功路径不变：endCompaction → 派发当前消息 → FIFO 补发 pending（锁定顺序，正常时序零回归）。
+- 超时通知：`压缩超过 N 分钟未完成，任务已排队，将在压缩结束后自动派发`。
+- **入队竞态闭合**（alpha）：入队前检查状态——已非 compacting（close 已先跑并 flush 空队列）→ 直接派发，杜绝孤儿。
+
+### 2.2 二次超时兜底 + 轮询兜底（三出口之②）
+
+- runtime 新原语 `waitCompactionIdle(name, handle, budgetMs)`：每 30s 轮询 `get_state.isCompacting`（3s 单次超时，fail-open 按已结束），释放条件 = 操作状态离开 compacting（进程退出，2.3 已接管 pending）或查询 false/失败；预算耗尽 → `{ok:false}`。定时器 unref。
+- 兜底 watcher（`startFallbackWatcher`，per-channel dedupe）：仅在**无在飞租约**的 compacting（＝租约已超时的卡住压缩）启动——入口：内联超时分支 + sendToMember compacting 分支（覆盖批屏障消息/Inspector 直发/成员互发）。释放 → `closeCompactionAndFlush`（消费 mark + endCompaction + flush + 超时场景通知）；预算耗尽 → `abandonPendingMessages`（清空 pending + resolve 各 corrId [已放弃] + 通知「请 stop_member 或 /team stop 后 /team resume」）。
+- **新租约守卫**：watcher 结算时若 `hasInFlightCompaction`（成员已回 idle 并开始了新压缩周期）→ 不 close 不 abandon——新周期的持有流程接管。
+- 预算 = `timeoutMinutes` 一个租约周期（与批屏障 batchMaxWaitMinutes 语义统一）。
+- 四场景闭合：正常结束（心跳）✓ / 事件丢失（轮询）✓ / 进程退出（2.3 + 状态释放）✓ / 永不结束（预算放弃）✓。
+
+### 2.3 process_exit/process_error 清 pending（三出口之③）
+
+- 退出/崩溃/主动停止分支统一 `drainPendingOnProcessExit`：清空 pending + resolve 各 corrId（[消息未送达]）+ 静默消费超时 mark（新进程的心跳不误报）+ 通知 TL 消息概要（重启后重派）。
+
+### 2.4 批屏障接线 + attempted 语义修正（alpha P2）
+
+- 屏障 compact 超时：**保持 compacting、不 endCompaction、不计 attempt**——批消息在 commit 阶段经 sendToMember 的 compacting 分支入 pending（自动触发兜底 watcher），心跳/轮询 flush。等待计入 batchMaxWaitMinutes 预算（compact 已从预算中消耗自身 timeout）。
+- **attempted 语义修正**：`skipAutoCompact` 仅绑定「压缩已结清」——compact 响应（成功/非超时失败）**或** compaction_end 事件（runtime 心跳计数 `markCompactionEnd`/`getCompactionEndCount`，屏障按 toWait 等待期/compact 循环期计数增量判定）→ 打标；超时未结清 → 不打标（由等待流程接管，消息不再跳过压缩检查）。
+- 事件结清打标同时闭合 E12 竞态：超时成员的 compaction_end 在屏障期间到达（在飞守卫延迟处理）→ 成员被打标 → commit 时消息带 marker 直接派发，杜绝第二个压缩。
+- 正常成功路径时序零回归（压缩 2 分钟成功 → compaction_end 在飞守卫记录 → 响应 settle → endCompaction → A→B FIFO）。
+
+### 2.5 测试与不变式核对
+
+- 新增 17 用例：超时→保持 compacting→compaction_end→flush→派发成功不被拒（F11 补齐，全程仅 1 个 compact RPC = E12）；事件丢失→30s 轮询兜底补发；二次超时→放弃+corrId resolve+人工干预通知；进程崩溃/主动停止/process_error→pending 清空+resolve+mark 静默消费；批屏障超时（不打标+状态保持+E1 enqueue 顺序）、屏障期事件结清（打标）、toWait 事件结清（打标）；waitCompactionIdle 全形态（状态释放零 RPC/查询 false/30s 节奏/失败 fail-open/预算耗尽）；心跳计数。
+- **E1**：屏障整体仍在 corrId 注册与 enqueue 之前（含超时变体，enqueue 恒在 compact settle 后）；corrId 注册先于 enqueue（commit 阶段既有顺序）；压缩期 pending FIFO；成功路径时序不回归（A→B 顺序锁定测试保持绿色）。
+- **E12**：at most one compaction per dispatch——超时链全程 1 个 compact RPC；事件结清打标杜绝 commit 后第二次压缩检查。
+- **E15**：gap race 重检保留（stats 与 compact 间成员离开 idle → 跳过不打标，inline 自然接管）。
+- 既有「超时→fail-open→继续派发」用例按新语义更新（不再派发）。
+
+### 验收对照
+
+压缩超时后成员状态恒为 compacting（诚实）✓；wait 类工具 deadline 诊断 + 压缩结束自动恢复 ✓（Phase 1）；四场景（成功/失败/事件丢失/进程重启）积压消息零丢失补发 ✓；压缩永不结束 → 放弃+通知+无永久孤儿+无工具无限卡 ✓；批路径与内联一致（同一 queue/watcher 机制）✓；E1/E12/E15 核对通过 ✓；全量测试绿色 ✓。

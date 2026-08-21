@@ -244,7 +244,7 @@ describe("auto-compact runtime compactNow", () => {
     await expect(rt.compactNow("worker", handle, enabledCfg)).resolves.toEqual({ ok: true });
   });
 
-  it("resolves { ok: false, error } with the RPC's own error when the member reports failure — fail-open", async () => {
+  it("resolves { ok: false, error, timedOut: false } with the RPC's own error when the member reports failure — fail-open", async () => {
     const rt = makeRuntime();
     const handle = makeHandle(undefined, { type: "response", command: "compact", success: false, error: "boom" });
 
@@ -252,10 +252,12 @@ describe("auto-compact runtime compactNow", () => {
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.error).toBe("boom");
+      // Member-side compaction already settled — safe to dispatch.
+      expect(result.timedOut).toBe(false);
     }
   });
 
-  it("resolves { ok: false, error } with the real reason when the compact RPC rejects (timeout) — fail-open", async () => {
+  it("resolves { ok: false, error, timedOut: true } when the compact RPC rejects (lease timeout) — fail-open", async () => {
     const rt = makeRuntime();
     const handle = makeHandle() as unknown as MemberProcessHandle;
     handle.sendCommandAndWait = vi.fn().mockRejectedValue(new Error("Command to \"worker\" timed out after 600000ms"));
@@ -264,16 +266,20 @@ describe("auto-compact runtime compactNow", () => {
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.error).toBe("Command to \"worker\" timed out after 600000ms");
+      // Phase 2: the timeout is a lease expiry — the member-side compaction
+      // may STILL be running (the caller must NOT dispatch into it).
+      expect(result.timedOut).toBe(true);
     }
   });
 
-  it("resolves { ok: false } with a generic reason when no response arrives — fail-open", async () => {
+  it("resolves { ok: false, timedOut: false } with a generic reason when no response arrives — fail-open", async () => {
     const rt = makeRuntime();
     const handle = makeHandle(undefined, undefined);
 
     await expect(rt.compactNow("worker", handle, enabledCfg)).resolves.toEqual({
       ok: false,
       error: "压缩命令未成功",
+      timedOut: false,
     });
   });
 
@@ -548,11 +554,147 @@ describe("auto-compact runtime in-flight lease tracking", () => {
     );
 
     const p = rt.compactNow("worker", handle, enabledCfg);
-    rt.markCompactionEndDuringLease("worker"); // heartbeat while the lease is in flight
+    rt.markCompactionEnd("worker"); // heartbeat processed by the branch while the lease is in flight
     rejectCompact!(new Error('Command to "worker" timed out after 600000ms'));
 
     const result = await p;
     expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.timedOut).toBe(true);
     expect(rt.takeCompactionTimeout("worker")).toBeUndefined();
+  });
+});
+
+// ── compaction_end heartbeat count (Phase 2: barrier attempted 语义) ──
+// The barrier marks a member attempted only when its compaction SETTLED via
+// a compact response OR a compaction_end event. The count distinguishes
+// "event processed during the barrier" from "still running".
+
+describe("auto-compact runtime compaction_end heartbeat count", () => {
+  it("markCompactionEnd increments the per-member count", async () => {
+    const rt = makeRuntime();
+    expect(rt.getCompactionEndCount("worker")).toBe(0);
+    rt.markCompactionEnd("worker");
+    rt.markCompactionEnd("worker");
+    expect(rt.getCompactionEndCount("worker")).toBe(2);
+  });
+
+  it("counts are per-member", async () => {
+    const rt = makeRuntime();
+    rt.markCompactionEnd("a");
+    expect(rt.getCompactionEndCount("a")).toBe(1);
+    expect(rt.getCompactionEndCount("b")).toBe(0);
+  });
+});
+
+// ── waitCompactionIdle (Phase 2: 三出口之② 轮询兜底) ──────
+// The compaction_end event is the PRIMARY exit for a lease-expired
+// compaction; waitCompactionIdle is the fallback for event loss (pipe /
+// network) and auto-restart (events not replayed): every 30s poll
+// get_state.isCompacting (fail-open → treat as ended), bounded by the
+// secondary budget. On release the caller closes the lifecycle and flushes;
+// on budget exhaustion the caller abandons + resolves + notifies.
+
+describe("auto-compact runtime waitCompactionIdle", () => {
+  const POLL = 30_000;
+
+  function getStateResponse(isCompacting: boolean): any {
+    return { type: "response", command: "get_state", success: true, data: { isCompacting } };
+  }
+
+  it("releases when the member's operational state leaves compacting (process exit) — zero RPC", async () => {
+    const states = new Map<string, MemberOperationalState>([["worker", "compacting"]]);
+    const rt = makeRuntime(states);
+    const handle = makeHandle() as unknown as MemberProcessHandle;
+    handle.sendCommandAndWait = vi.fn();
+
+    vi.useFakeTimers();
+    try {
+      const p = rt.waitCompactionIdle("worker", handle, 60_000);
+      states.set("worker", "crashed"); // process_exit already handled pending (2.3)
+      await vi.advanceTimersByTimeAsync(POLL);
+      await expect(p).resolves.toEqual({ ok: true });
+      expect(handle.sendCommandAndWait).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("releases when get_state reports isCompacting=false (event lost → poll fallback)", async () => {
+    const states = new Map<string, MemberOperationalState>([["worker", "compacting"]]);
+    const rt = makeRuntime(states);
+    const handle = makeHandle() as unknown as MemberProcessHandle;
+    handle.sendCommandAndWait = vi.fn().mockResolvedValue(getStateResponse(false));
+
+    vi.useFakeTimers();
+    try {
+      const p = rt.waitCompactionIdle("worker", handle, 60_000);
+      await vi.advanceTimersByTimeAsync(POLL);
+      await expect(p).resolves.toEqual({ ok: true });
+      expect(handle.sendCommandAndWait).toHaveBeenCalledWith(
+        { type: "get_state" },
+        expect.any(Function),
+        3000
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps polling every 30s while the compaction is still running", async () => {
+    const states = new Map<string, MemberOperationalState>([["worker", "compacting"]]);
+    const rt = makeRuntime(states);
+    const handle = makeHandle() as unknown as MemberProcessHandle;
+    let calls = 0;
+    handle.sendCommandAndWait = vi.fn().mockImplementation(() => {
+      calls++;
+      return Promise.resolve(getStateResponse(true));
+    });
+
+    vi.useFakeTimers();
+    try {
+      const p = rt.waitCompactionIdle("worker", handle, 90_000);
+      await vi.advanceTimersByTimeAsync(POLL * 2);
+      // 30s and 60s polls: two get_state queries, still running
+      expect(calls).toBe(2);
+      // release at 90s (third poll sees false)
+      handle.sendCommandAndWait = vi.fn().mockResolvedValue(getStateResponse(false));
+      await vi.advanceTimersByTimeAsync(POLL);
+      await expect(p).resolves.toEqual({ ok: true });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("releases on query failure (fail-open: treat as ended)", async () => {
+    const states = new Map<string, MemberOperationalState>([["worker", "compacting"]]);
+    const rt = makeRuntime(states);
+    const handle = makeHandle() as unknown as MemberProcessHandle;
+    handle.sendCommandAndWait = vi.fn().mockRejectedValue(new Error("timeout"));
+
+    vi.useFakeTimers();
+    try {
+      const p = rt.waitCompactionIdle("worker", handle, 60_000);
+      await vi.advanceTimersByTimeAsync(POLL);
+      await expect(p).resolves.toEqual({ ok: true });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("resolves { ok: false } when the budget expires with the compaction still running (secondary timeout)", async () => {
+    const states = new Map<string, MemberOperationalState>([["worker", "compacting"]]);
+    const rt = makeRuntime(states);
+    const handle = makeHandle() as unknown as MemberProcessHandle;
+    handle.sendCommandAndWait = vi.fn().mockResolvedValue(getStateResponse(true));
+
+    vi.useFakeTimers();
+    try {
+      const p = rt.waitCompactionIdle("worker", handle, 90_000);
+      // 30s + 60s polls say still running; the 90s poll checks the deadline
+      await vi.advanceTimersByTimeAsync(POLL * 3 + 1);
+      await expect(p).resolves.toEqual({ ok: false, error: expect.stringContaining("上限") });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

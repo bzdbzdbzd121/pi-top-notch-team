@@ -1110,6 +1110,98 @@ describe("createMemberEventHandler compaction_end branch (Phase 1)", () => {
   });
 });
 
+// ── process_exit / process_error pending cleanup (Phase 2: 三出口之③) ──
+// A member whose process dies while messages sit in its pending queue would
+// orphan them forever (no compaction_end will ever flush). The exit branches
+// drain the queue, resolve the pending corrIds, consume the timeout mark
+// (no future heartbeat to notify) and notify the TL with a summary.
+
+describe("createMemberEventHandler process-exit pending cleanup (Phase 2)", () => {
+  function makePendingMsg(id: string, corrId?: string) {
+    return { id, from: "tl", to: "worker", content: `Pending task ${id}`, correlationId: corrId, timestamp: Date.now() };
+  }
+
+  it("process_exit drains the pending queue, resolves corrIds and notifies with a summary (crash)", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const { createAutoCompactRuntime } = await import("./auto-compact");
+    const deps = createMockDeps();
+    const runtime = createAutoCompactRuntime(deps.memberOpsStates);
+    deps.autoCompact = runtime;
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    deps.memberOpsStates.set("worker", "compacting");
+    runtime.queueDuringCompaction("worker", makePendingMsg("p1", "corr-p1"));
+    runtime.queueDuringCompaction("worker", makePendingMsg("p2")); // member inter-send, no corrId
+    runtime.markCompactionTimeout("worker"); // mark must be consumed silently (no future heartbeat)
+    deps.lastPendingCorrId.set("worker", "corr-p1");
+    deps.responseWaiter.resolveIfWaiting.mockReturnValue(true);
+
+    handler({ type: "process_exit", memberName: "worker", exitCode: 1, wasRunning: true });
+
+    expect(runtime.flushPending("worker")).toEqual([]);
+    expect(deps.responseWaiter.resolveIfWaiting).toHaveBeenCalledWith(
+      "corr-p1", "worker", expect.stringContaining("消息未送达")
+    );
+    expect(deps.lastPendingCorrId.has("worker")).toBe(false);
+    // Timeout mark consumed — a later compaction_end (from a NEW process) must not mis-fire.
+    expect(runtime.takeCompactionTimeout("worker")).toBeUndefined();
+    // Summary notice mentions the dropped content.
+    expect(deps.pi.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ content: expect.stringContaining("Pending task p1") })
+    );
+  });
+
+  it("process_exit drains pending even on an INTENTIONAL stop (wasRunning=false)", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const { createAutoCompactRuntime } = await import("./auto-compact");
+    const deps = createMockDeps();
+    const runtime = createAutoCompactRuntime(deps.memberOpsStates);
+    deps.autoCompact = runtime;
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    deps.memberOpsStates.set("worker", "compacting");
+    runtime.queueDuringCompaction("worker", makePendingMsg("p1", "corr-p1"));
+
+    handler({ type: "process_exit", memberName: "worker", exitCode: 0, wasRunning: false });
+
+    expect(runtime.flushPending("worker")).toEqual([]);
+    expect(deps.responseWaiter.resolveIfWaiting).toHaveBeenCalledWith(
+      "corr-p1", "worker", expect.stringContaining("消息未送达")
+    );
+  });
+
+  it("process_error drains the pending queue too", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const { createAutoCompactRuntime } = await import("./auto-compact");
+    const deps = createMockDeps();
+    const runtime = createAutoCompactRuntime(deps.memberOpsStates);
+    deps.autoCompact = runtime;
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    deps.memberOpsStates.set("worker", "compacting");
+    runtime.queueDuringCompaction("worker", makePendingMsg("p1", "corr-p1"));
+
+    handler({ type: "process_error", memberName: "worker" });
+
+    expect(runtime.flushPending("worker")).toEqual([]);
+    expect(deps.responseWaiter.resolveIfWaiting).toHaveBeenCalledWith(
+      "corr-p1", "worker", expect.stringContaining("消息未送达")
+    );
+  });
+
+  it("is a no-op when no pending messages exist", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const { createAutoCompactRuntime } = await import("./auto-compact");
+    const deps = createMockDeps();
+    deps.autoCompact = createAutoCompactRuntime(deps.memberOpsStates);
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    handler({ type: "process_exit", memberName: "worker", exitCode: 1, wasRunning: true });
+
+    expect(deps.pi.sendMessage).toHaveBeenCalledTimes(1); // crash notice only
+  });
+});
+
 describe("createSendToMember", () => {
   it("should return a function", async () => {
     const { createSendToMember } = await loadModule();
@@ -1352,26 +1444,184 @@ describe("createSendToMember auto-compaction", () => {
     expect(deps.memberOpsStates.get("worker")).toBe("working");
   });
 
-  it("fails open and notifies TL when compaction times out", async () => {
+  it("Phase 2: on compact lease timeout the message is QUEUED (not dispatched), state stays compacting, honest notice", async () => {
+    // Phase 1 dispatched anyway → the member-side compaction (still running)
+    // rejected the prompt → message lost + working black hole. Phase 2: the
+    // lease expiry says nothing about the member-side state — keep compacting,
+    // queue the message, let the compaction_end heartbeat flush it.
     const { createSendToMember } = await loadModule();
+    const { createAutoCompactRuntime } = await import("./auto-compact");
     const deps = createMockDeps({ getAutoCompact: () => ({ ...enabledCfg, timeoutMinutes: 1 }) }) as any;
+    const runtime = createAutoCompactRuntime(deps.memberOpsStates);
+    deps.autoCompact = runtime;
     const handle = {
       sendCommand: vi.fn(),
       sendCommandAndWait: vi.fn().mockImplementation((cmd: any) => {
         if (cmd.type === "get_session_stats") return Promise.resolve(usageResponse(92, 184000));
-        return new Promise((_, reject) => setTimeout(() => reject(new Error("timed out")), 10));
+        return new Promise((_, reject) => setTimeout(() => reject(new Error("Command to \"worker\" timed out after 60000ms")), 10));
       }),
     };
     deps.memberHandles.set("worker", handle as any);
     deps.memberOpsStates.set("worker", "idle");
 
     createSendToMember(deps)("worker", makeMsg());
-    await vi.waitFor(() => expect(handle.sendCommand).toHaveBeenCalled());
+    await vi.waitFor(() => expect(deps.pi.sendMessage).toHaveBeenCalled());
 
+    // No prompt dispatched into the still-running compaction; state honest.
+    expect(handle.sendCommand).not.toHaveBeenCalled();
+    expect(deps.memberOpsStates.get("worker")).toBe("compacting");
+    // The message is queued in the shared pending (compaction_end will flush).
+    expect(runtime.flushPending("worker").map((m: any) => m.id)).toEqual(["msg-ac-1"]);
     expect(deps.pi.sendMessage).toHaveBeenCalledWith(
-      expect.objectContaining({ customType: "team-message", content: expect.stringContaining("自动压缩") })
+      expect.objectContaining({ customType: "team-message", content: expect.stringContaining("任务已排队") })
+    );
+  });
+
+  it("Phase 2 F11: timeout → compaction_end → flush → dispatched, never rejected (full chain, one compact RPC)", async () => {
+    const { createMemberEventHandler, createSendToMember } = await loadModule();
+    const { createAutoCompactRuntime } = await import("./auto-compact");
+    const deps = createMockDeps({ getAutoCompact: () => ({ ...enabledCfg, timeoutMinutes: 1 }) }) as any;
+    const runtime = createAutoCompactRuntime(deps.memberOpsStates);
+    deps.autoCompact = runtime;
+    let rejectCompact!: (e: Error) => void;
+    const handle = {
+      sendCommand: vi.fn(),
+      sendCommandAndWait: vi.fn().mockImplementation((cmd: any) => {
+        if (cmd.type === "get_session_stats") return Promise.resolve(usageResponse(92, 184000));
+        return new Promise((_, rej) => { rejectCompact = rej; });
+      }),
+    };
+    deps.memberHandles.set("worker", handle as any);
+    deps.memberOpsStates.set("worker", "idle");
+
+    const send = createSendToMember(deps);
+    const handler = createMemberEventHandler("worker", deps as any);
+    send("worker", { ...makeMsg(), content: "Timeout task" });
+    await vi.waitFor(() => expect(runtime.hasInFlightCompaction("worker")).toBe(true));
+
+    // Lease expires (member-side compaction may still run) → queued, not sent.
+    rejectCompact!(new Error('Command to "worker" timed out after 60000ms'));
+    await vi.waitFor(() => expect(deps.pi.sendMessage).toHaveBeenCalled());
+    expect(handle.sendCommand).not.toHaveBeenCalled();
+    expect(deps.memberOpsStates.get("worker")).toBe("compacting");
+
+    // The member-side compaction finishes → compaction_end heartbeat flushes.
+    handler({ type: "compaction_end" });
+    expect(handle.sendCommand).toHaveBeenCalledTimes(1);
+    expect(handle.sendCommand).toHaveBeenCalledWith(
+      expect.objectContaining({ message: expect.stringContaining("Timeout task") })
     );
     expect(deps.memberOpsStates.get("worker")).toBe("working");
+    // E12: exactly one compact RPC for this dispatch — no re-compaction.
+    const commands = handle.sendCommandAndWait.mock.calls.map((c: any[]) => c[0].type);
+    expect(commands.filter((t: string) => t === "compact")).toHaveLength(1);
+    expect(runtime.flushPending("worker")).toEqual([]);
+  });
+
+  it("Phase 2: event lost → the 30s poll fallback flushes the queued message (waitCompactionIdle)", async () => {
+    const { createMemberEventHandler, createSendToMember } = await loadModule();
+    const { createAutoCompactRuntime } = await import("./auto-compact");
+    const deps = createMockDeps({ getAutoCompact: () => ({ ...enabledCfg, timeoutMinutes: 1 }) }) as any;
+    const runtime = createAutoCompactRuntime(deps.memberOpsStates);
+    deps.autoCompact = runtime;
+    let rejectCompact!: (e: Error) => void;
+    let getStateCalls = 0;
+    const handle = {
+      sendCommand: vi.fn(),
+      sendCommandAndWait: vi.fn().mockImplementation((cmd: any) => {
+        if (cmd.type === "get_session_stats") return Promise.resolve(usageResponse(92, 184000));
+        if (cmd.type === "get_state") {
+          getStateCalls++;
+          return Promise.resolve({ type: "response", command: "get_state", success: true, data: { isCompacting: false } });
+        }
+        return new Promise((_, rej) => { rejectCompact = rej; });
+      }),
+    };
+    deps.memberHandles.set("worker", handle as any);
+    deps.memberOpsStates.set("worker", "idle");
+
+    const send = createSendToMember(deps);
+    const handler = createMemberEventHandler("worker", deps as any);
+    vi.useFakeTimers();
+    try {
+      send("worker", { ...makeMsg(), content: "Lost-event task" });
+      await vi.advanceTimersByTimeAsync(0); // flush microtasks → stats + compact in flight
+      expect(runtime.hasInFlightCompaction("worker")).toBe(true);
+      rejectCompact!(new Error('Command to "worker" timed out after 60000ms'));
+      await vi.advanceTimersByTimeAsync(0); // timeout branch: notify + queue + watcher
+      expect(deps.pi.sendMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ content: expect.stringContaining("任务已排队") })
+      );
+      expect(handle.sendCommand).not.toHaveBeenCalled();
+      expect(deps.memberOpsStates.get("worker")).toBe("compacting");
+
+      // NO compaction_end ever arrives (pipe loss) — the poll fallback
+      // releases at the first 30s tick and flushes the queued message.
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(getStateCalls).toBeGreaterThanOrEqual(1);
+      expect(handle.sendCommand).toHaveBeenCalledTimes(1);
+      expect(handle.sendCommand).toHaveBeenCalledWith(
+        expect.objectContaining({ message: expect.stringContaining("Lost-event task") })
+      );
+      expect(deps.memberOpsStates.get("worker")).toBe("working");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("Phase 2: secondary budget exhausted → message abandoned + corrId resolved + manual-intervention notice", async () => {
+    const { createSendToMember } = await loadModule();
+    const { createAutoCompactRuntime } = await import("./auto-compact");
+    const deps = createMockDeps({ getAutoCompact: () => ({ ...enabledCfg, timeoutMinutes: 1 }) }) as any;
+    const runtime = createAutoCompactRuntime(deps.memberOpsStates);
+    deps.autoCompact = runtime;
+    let rejectCompact!: (e: Error) => void;
+    const handle = {
+      sendCommand: vi.fn(),
+      sendCommandAndWait: vi.fn().mockImplementation((cmd: any) => {
+        if (cmd.type === "get_session_stats") return Promise.resolve(usageResponse(92, 184000));
+        if (cmd.type === "get_state") {
+          return Promise.resolve({ type: "response", command: "get_state", success: true, data: { isCompacting: true } });
+        }
+        return new Promise((_, rej) => { rejectCompact = rej; });
+      }),
+    };
+    deps.memberHandles.set("worker", handle as any);
+    deps.memberOpsStates.set("worker", "idle");
+    deps.lastPendingCorrId.set("worker", "corr-abandon-1");
+    deps.responseWaiter.resolveIfWaiting.mockReturnValue(true);
+
+    vi.useFakeTimers();
+    try {
+      createSendToMember(deps)("worker", { ...makeMsg(), content: "Doomed task", correlationId: "corr-abandon-1" });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(runtime.hasInFlightCompaction("worker")).toBe(true);
+      rejectCompact!(new Error('Command to "worker" timed out after 60000ms'));
+      await vi.advanceTimersByTimeAsync(0); // timeout branch: notify + queue + watcher
+      expect(deps.pi.sendMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ content: expect.stringContaining("任务已排队") })
+      );
+
+      // The compaction NEVER ends (isCompacting stays true) → budget (1 min)
+      // exhausted → abandon: resolve the corrId, drop the message, notify.
+      await vi.advanceTimersByTimeAsync(61_000);
+      expect(deps.responseWaiter.resolveIfWaiting).toHaveBeenCalledWith(
+        "corr-abandon-1",
+        "worker",
+        expect.stringContaining("已放弃")
+      );
+      expect(deps.lastPendingCorrId.has("worker")).toBe(false);
+      expect(handle.sendCommand).not.toHaveBeenCalled();
+      expect(runtime.flushPending("worker")).toEqual([]);
+      expect(deps.pi.sendMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ content: expect.stringContaining("已放弃") })
+      );
+      expect(deps.pi.sendMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ content: expect.stringContaining("stop_member") })
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("queues messages arriving during compaction and flushes them after", async () => {

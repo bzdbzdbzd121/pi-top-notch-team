@@ -7,6 +7,7 @@ import type { ResponseWaiter } from "../channel/response-waiter";
 import type { TeamMessage } from "../channel/types";
 import type { ProcessManager } from "../process/manager";
 import type { ResolvedAutoCompact } from "../settings/resolve-auto-compact";
+import { DEFAULT_TIMEOUT_MINUTES } from "../settings/resolve-auto-compact";
 import { createAutoCompactRuntime, type AutoCompactRuntime } from "./auto-compact";
 
 // ── Constants ──────────────────────────────────────────────
@@ -303,46 +304,27 @@ export function createMemberEventHandler(
     if (event.type === "compaction_end") {
       const runtime = deps.autoCompact;
       if (!runtime) return; // no shared runtime → nothing to reset/flush
+      // Heartbeat accounting (Phase 2): the batch barrier marks a member
+      // attempted when its compaction settled via the event; compactNow
+      // suppresses the near-miss stale mark when a heartbeat arrived during
+      // the lease. Counted in BOTH paths below (in-flight record + close).
+      runtime.markCompactionEnd(memberName);
       // In-flight lease: the member emits compaction_end BEFORE the compact
       // response (agent-session.js emits, rpc-mode.js writes the response
       // afterwards), so during a healthy in-lease compaction this branch runs
       // while compactNow still awaits the response. The lease-owning flow
-      // (inline finally / batch barrier) owns the exit (endCompaction) and
-      // the ORDERED flush (current message first, then pending FIFO) —
-      // acting here would (a) invert the dispatch order (pending B before
-      // the triggering A) and (b) reset compacting early, opening a
-      // double-compaction window before the response settles (review fix,
-      // 重要). Defer: record the heartbeat (a near-miss lease timeout must
-      // not record a stale mark) and return. Only lease-expired heartbeats
-      // (timeout already settled the lease) fall through to the exit+flush.
+      // (inline post-compact path / batch barrier) owns the exit
+      // (endCompaction) and the ORDERED flush (current message first, then
+      // pending FIFO) — acting here would (a) invert the dispatch order
+      // (pending B before the triggering A) and (b) reset compacting early,
+      // opening a double-compaction window before the response settles
+      // (Phase-1 review fix, 重要). Defer and return. Only lease-expired
+      // heartbeats (timeout already settled the lease) fall through to the
+      // exit+flush below.
       if (runtime.hasInFlightCompaction(memberName)) {
-        runtime.markCompactionEndDuringLease(memberName);
         return;
       }
-      // Timeout scenario: a compactNow lease expired earlier for this
-      // member; the member-side compaction has now ACTUALLY finished.
-      // The mark is consumed exactly once — the TL is notified (the normal
-      // path stays silent per the success-is-silent principle).
-      const timedOutAt = runtime.takeCompactionTimeout(memberName);
-      runtime.endCompaction(memberName);
-      const flushed = runtime.flushPending(memberName);
-      const dispatch = toPromptDispatchDeps(deps);
-      if (dispatch) {
-        for (const pendingMsg of flushed) {
-          dispatchPromptToMember(dispatch, memberName, pendingMsg);
-        }
-      }
-      if (timedOutAt !== undefined) {
-        const minutes = Math.max(1, Math.round((Date.now() - timedOutAt) / 60_000));
-        deps.pi.sendMessage({
-          customType: "team-message",
-          content:
-            flushed.length > 0
-              ? `⚠️ 成员 "${memberName}" 的压缩已于 ${minutes} 分钟后结束，积压消息已自动补发。`
-              : `⚠️ 成员 "${memberName}" 的压缩已于 ${minutes} 分钟后结束。`,
-          display: true,
-        });
-      }
+      closeCompactionAndFlush(deps, memberName);
       return;
     }
 
@@ -479,6 +461,13 @@ export function createMemberEventHandler(
         type: "process_exit",
         isCrashLoop: !isNormalExit,
       }));
+      // Phase 2 (三出口之③): the process is gone — messages sitting in the
+      // pending queue would be orphaned forever (no compaction_end will ever
+      // flush them). Drain the queue, resolve the pending corrIds (消息未送
+      // 达), consume the timeout mark silently (no future heartbeat to
+      // notify) and notify the TL with a summary. Runs on intentional stops
+      // too (wasRunning=false) — a stopped member orphans pending as well.
+      drainPendingOnProcessExit(exitMemberName, deps);
       if (!event.wasRunning) return;
 
       if (!isNormalExit) {
@@ -521,6 +510,8 @@ export function createMemberEventHandler(
 
       const currentState = states.get(errMemberName) ?? "idle";
       states.set(errMemberName, transitionState(currentState, { type: "process_exit", isCrashLoop: true }));
+      // Phase 2 (三出口之③): same pending drain as process_exit.
+      drainPendingOnProcessExit(errMemberName, deps);
       const pendingCorrId = lpc.get(errMemberName);
       if (pendingCorrId) {
         rw.resolveIfWaiting(
@@ -564,10 +555,14 @@ export function createMemberEventHandler(
  * a false idle over a running turn, releasing the wait tools early; or a
  * stale compacting over a new prompt). Apply only when the state is
  * unchanged since the rejection AND no state-affecting event arrived.
- * Note: compaction_end is deliberately NOT counted — FIFO guarantees the
- * query answer was written before it, and counting it would strand the
- * settled-lease heartbeat flow in `working` (the branch's endCompaction is
- * a no-op on working; only the query answer can close it).
+ * Note: compaction_end is deliberately NOT counted — on the single pipe, a
+ * TRUE answer is always written before the compaction_end event (the member
+ * was still compacting when it answered), while a FALSE answer may arrive
+ * after it (the member answered once the compaction ended) — and that
+ * late-false is exactly the closing path (working → idle). Counting the
+ * event would kill that path and strand the settled-lease heartbeat flow in
+ * `working` (the branch's endCompaction is a no-op on working; only the
+ * query answer can close it).
  */
 async function correctStateAfterPromptRejection(
   memberName: string,
@@ -602,6 +597,45 @@ async function correctStateAfterPromptRejection(
       display: true,
     });
   }
+}
+
+/**
+ * Phase 2 (三出口之③): drain a member's pending queue after its process
+ * exits/errors. Messages queued during a compaction would be orphaned
+ * forever — no compaction_end will ever flush them (the process is gone).
+ * Resolves each queued message's corrId with the 消息未送达 semantics,
+ * consumes the timeout mark silently (no future heartbeat to notify), and
+ * notifies the TL with a content summary so the work can be re-dispatched
+ * after a restart. No-op when nothing is queued. Runs on intentional stops
+ * too (a stopped member orphans pending just the same).
+ */
+function drainPendingOnProcessExit(memberName: string, deps: EventHandlerDeps): void {
+  const runtime = deps.autoCompact;
+  if (!runtime) return;
+  const pending = runtime.flushPending(memberName);
+  // Consume silently — a later compaction_end (from a NEW process) must not
+  // mis-fire the timeout notification.
+  runtime.takeCompactionTimeout(memberName);
+  if (pending.length === 0) return;
+  for (const msg of pending) {
+    if (msg.correlationId) {
+      deps.responseWaiter.resolveIfWaiting(
+        msg.correlationId,
+        memberName,
+        `[消息未送达] 成员 "${memberName}" 进程已退出，其待派发消息已移除`
+      );
+    }
+  }
+  const lpcCorr = deps.lastPendingCorrId.get(memberName);
+  if (lpcCorr && pending.some((m) => m.correlationId === lpcCorr)) {
+    deps.lastPendingCorrId.delete(memberName);
+  }
+  const summary = pending.map((m) => m.content.slice(0, 60)).join(" | ");
+  deps.pi.sendMessage({
+    customType: "team-message",
+    content: `⚠️ 成员 "${memberName}" 进程已退出，其待派发队列中的 ${pending.length} 条消息已移除（概要：${summary}）。进程重启后请重新派发。`,
+    display: true,
+  });
 }
 
 // ── createSendToMember ─────────────────────────────────────
@@ -665,8 +699,8 @@ export function dispatchPromptToMember(
   }
 }
 
-/** Adapt EventHandlerDeps to PromptDispatchDeps; null when memberHandles is absent. */
-function toPromptDispatchDeps(deps: EventHandlerDeps): PromptDispatchDeps | null {
+/** Adapt close-deps (or EventHandlerDeps) to PromptDispatchDeps; null when memberHandles is absent. */
+function toPromptDispatchDeps(deps: CompactionCloseDeps): PromptDispatchDeps | null {
   if (!deps.memberHandles) return null;
   return {
     pi: deps.pi,
@@ -675,6 +709,53 @@ function toPromptDispatchDeps(deps: EventHandlerDeps): PromptDispatchDeps | null
     lastPendingCorrId: deps.lastPendingCorrId,
     responseWaiter: deps.responseWaiter,
   };
+}
+
+/** Dependencies of the shared compaction-lifecycle close (Phase 2). */
+interface CompactionCloseDeps {
+  pi: ExtensionAPI;
+  memberOpsStates: Map<string, MemberOperationalState>;
+  memberHandles?: Map<string, MemberProcessHandle>;
+  lastPendingCorrId: Map<string, string>;
+  responseWaiter: ResponseWaiter;
+  autoCompact?: AutoCompactRuntime;
+}
+
+/**
+ * Close a compaction lifecycle: consume the timeout mark (once), exit
+ * compacting (compacting → idle) and flush pending messages in FIFO order
+ * (dispatched via the shared prompt path). When the lease had previously
+ * expired (mark present), notify the TL — the normal path stays silent.
+ *
+ * Shared by the compaction_end event branch (primary exit) and the
+ * waitCompactionIdle fallback (event loss / auto-restart). Idempotent: the
+ * mark is consumed exactly once and the pending queue is drained once, so a
+ * second close (e.g. the event arriving after the poll already released) is
+ * a no-op.
+ */
+export function closeCompactionAndFlush(deps: CompactionCloseDeps, memberName: string): void {
+  const runtime = deps.autoCompact;
+  if (!runtime) return;
+  const timedOutAt = runtime.takeCompactionTimeout(memberName);
+  runtime.endCompaction(memberName);
+  const flushed = runtime.flushPending(memberName);
+  const dispatch = toPromptDispatchDeps(deps);
+  if (dispatch) {
+    for (const pendingMsg of flushed) {
+      dispatchPromptToMember(dispatch, memberName, pendingMsg);
+    }
+  }
+  if (timedOutAt !== undefined) {
+    const minutes = Math.max(1, Math.round((Date.now() - timedOutAt) / 60_000));
+    deps.pi.sendMessage({
+      customType: "team-message",
+      content:
+        flushed.length > 0
+          ? `⚠️ 成员 "${memberName}" 的压缩已于 ${minutes} 分钟后结束，积压消息已自动补发。`
+          : `⚠️ 成员 "${memberName}" 的压缩已于 ${minutes} 分钟后结束。`,
+      display: true,
+    });
+  }
 }
 
 export interface SendToMemberDeps {
@@ -720,18 +801,125 @@ export function createSendToMember(
     responseWaiter: deps.responseWaiter,
   };
 
+  // Compaction-lifecycle close deps — shared by the compaction_end branch
+  // (via the handler) and the Phase-2 fallback watcher below.
+  const closeDeps: CompactionCloseDeps = {
+    pi,
+    memberOpsStates,
+    memberHandles,
+    lastPendingCorrId: deps.lastPendingCorrId,
+    responseWaiter: deps.responseWaiter,
+    autoCompact,
+  };
+
   /** Auto-compaction notices go to the TL session as team messages. */
   function notify(content: string): void {
     pi.sendMessage({ customType: "team-message", content, display: true });
   }
 
+  // ── Phase 2: stuck-compaction fallback (三出口之②) ──
+  // After a compactNow lease TIMEOUT the message is queued (never dispatched
+  // into the still-running compaction) and the compaction_end event is the
+  // PRIMARY exit. This watcher covers the fallback exits: the event LOST
+  // (pipe/network) or the member auto-restarted (events not replayed) →
+  // waitCompactionIdle polls get_state and closes+flushes when the
+  // compaction actually ends; the compaction NEVER ends → the secondary
+  // budget expires → the pending messages are abandoned (corrIds resolved,
+  // TL notified for manual intervention). One watcher per member (deduped).
+  const activeFallbackWatchers = new Set<string>();
+
+  /**
+   * Queue a message into a compaction that has NO in-flight lease (its lease
+   * already timed out — the stuck case). Starts the fallback watcher. The
+   * 入队竞态闭合 (alpha): when the member is no longer compacting (a close
+   * already ran — e.g. the compaction_end was processed while the lease was
+   * still settling and flushed the empty queue), queueing would orphan the
+   * message — dispatch directly instead.
+   */
+  function queueDuringStuckCompaction(
+    memberName: string,
+    msg: TeamMessage,
+    cfg?: ResolvedAutoCompact
+  ): void {
+    if (autoCompact.queueDuringCompaction(memberName, msg)) {
+      startFallbackWatcher(memberName, cfg);
+      return;
+    }
+    // 竞态闭合: not compacting anymore — dispatch straight through.
+    dispatchPromptToMember(promptDeps, memberName, msg);
+  }
+
+  /** Start (once per member) the waitCompactionIdle fallback watcher. */
+  function startFallbackWatcher(memberName: string, cfg?: ResolvedAutoCompact): void {
+    if (activeFallbackWatchers.has(memberName)) return;
+    const handle = memberHandles.get(memberName);
+    if (!handle) return;
+    activeFallbackWatchers.add(memberName);
+    // Secondary budget = one lease period (与批屏障 batchMaxWaitMinutes 语义
+    // 统一：等待计入预算；0/缺省用默认超时）。
+    const budgetMs = (cfg?.timeoutMinutes ?? DEFAULT_TIMEOUT_MINUTES) * 60_000;
+    void (async () => {
+      try {
+        const result = await autoCompact.waitCompactionIdle(memberName, handle, budgetMs);
+        // If a NEW compaction cycle started while we polled, its lease-owning
+        // flow (or its own branch deferral) owns the lifecycle — never close
+        // or abandon under someone else's lease.
+        if (autoCompact.hasInFlightCompaction(memberName)) return;
+        if (result.ok) {
+          // Compaction ended (event lost / auto-restart) — close + flush.
+          closeCompactionAndFlush(closeDeps, memberName);
+        } else {
+          // Budget exhausted — the compaction never ended: abandon.
+          abandonPendingMessages(memberName, result.error);
+        }
+      } finally {
+        activeFallbackWatchers.delete(memberName);
+      }
+    })();
+  }
+
+  /**
+   * Abandon a member's pending messages after the secondary budget expired:
+   * drain the queue, resolve each corrId (the team_send_and_wait waiter is
+   * unblocked with the [已放弃] semantics), and notify the TL with the
+   * manual-intervention advice (stop_member / /team stop + resume).
+   */
+  function abandonPendingMessages(memberName: string, reason: string): void {
+    const pending = autoCompact.flushPending(memberName);
+    if (pending.length === 0) return;
+    for (const msg of pending) {
+      if (msg.correlationId) {
+        deps.responseWaiter.resolveIfWaiting(
+          msg.correlationId,
+          memberName,
+          `[任务已放弃] 成员 "${memberName}" 压缩超时上限（${reason}），消息已放弃，请重新派发`
+        );
+      }
+    }
+    const lpcCorr = deps.lastPendingCorrId.get(memberName);
+    if (lpcCorr && pending.some((m) => m.correlationId === lpcCorr)) {
+      deps.lastPendingCorrId.delete(memberName);
+    }
+    const summary = pending.map((m) => m.content.slice(0, 60)).join(" | ");
+    pi.sendMessage({
+      customType: "team-message",
+      content: `⚠️ 成员 "${memberName}" 压缩超时上限，${pending.length} 条已排队任务已放弃（概要：${summary}）。请 stop_member 或 /team stop 后 /team resume 恢复。`,
+      display: true,
+    });
+  }
+
   /**
    * Auto-Compaction flow — composed from AutoCompactRuntime primitives.
-   * Behavior identical to the pre-refactor inline implementation:
-   * check usage → compact if over threshold → dispatch. Fail-open everywhere:
-   * any failure ends with the prompt dispatched anyway plus a TL notification.
-   * Success is silent. At most one compaction per dispatch — no re-check loop
-   * afterwards (E12 guard arrives with the skipAutoCompact marker in phase 2).
+   * Success is silent; failures fail open with honest notifications.
+   *
+   * Phase 2 timeout semantics: a compactNow TIMEOUT is a lease expiry, not
+   * a compaction end — the member-side compaction may still be running and
+   * would synchronously reject any dispatched prompt (message lost + state
+   * black hole, the Phase-1 root cause). The message is therefore QUEUED
+   * (state stays compacting) and the compaction_end event flushes it; the
+   * fallback watcher covers event loss / auto-restart / never-ending
+   * compactions (三出口). Non-timeout failures mean the member-side
+   * compaction already settled — dispatch is safe (fail-open as before).
    */
   async function runAutoCompactAndDispatch(
     memberName: string,
@@ -752,6 +940,17 @@ export function createSendToMember(
       if (autoCompact.shouldCompact(statsResult.stats, cfg)) {
         phase = "compact";
         const compactResult = await autoCompact.compactNow(memberName, handle, cfg);
+        if (!compactResult.ok && compactResult.timedOut) {
+          // Phase 2: lease expired, member-side compaction may still run —
+          // keep compacting, queue the message, let the heartbeat flush it.
+          // (The runtime recorded the timeout mark for the close notification;
+          // a near-miss heartbeat during the lease suppresses it.)
+          notify(
+            `[自动压缩] 成员 "${memberName}" 压缩超过 ${cfg.timeoutMinutes} 分钟未完成，任务已排队，将在压缩结束后自动派发。`
+          );
+          queueDuringStuckCompaction(memberName, msg, cfg);
+          return; // no endCompaction, no dispatch — the waiting flow owns it
+        }
         if (!compactResult.ok) {
           throw new Error(compactResult.error);
         }
@@ -764,15 +963,15 @@ export function createSendToMember(
       } else {
         notify(`[自动压缩] 成员 "${memberName}" 自动压缩未完成（${reason}），已直接派发任务。`);
       }
-    } finally {
-      // Exit compacting and dispatch — fail-open regardless of outcome above.
-      // Order is locked by tests: reset state → dispatch current message →
-      // flush messages queued during compaction (FIFO via the runtime).
-      autoCompact.endCompaction(memberName);
-      dispatchPromptToMember(promptDeps, memberName, msg);
-      for (const pendingMsg of autoCompact.flushPending(memberName)) {
-        dispatchPromptToMember(promptDeps, memberName, pendingMsg);
-      }
+    }
+    // Settled path (success / non-timeout failure): exit compacting and
+    // dispatch — fail-open regardless of outcome above. Order is locked by
+    // tests: reset state → dispatch current message → flush messages queued
+    // during compaction (FIFO via the runtime).
+    autoCompact.endCompaction(memberName);
+    dispatchPromptToMember(promptDeps, memberName, msg);
+    for (const pendingMsg of autoCompact.flushPending(memberName)) {
+      dispatchPromptToMember(promptDeps, memberName, pendingMsg);
     }
   }
 
@@ -801,9 +1000,15 @@ export function createSendToMember(
 
     // A compaction is already in progress for this member — queue the message
     // in the shared runtime and let the in-flight flow flush it after
-    // compaction completes.
+    // compaction completes. Phase 2: when the compaction has NO in-flight
+    // lease (its lease already timed out — the stuck case), also start the
+    // fallback watcher (event-loss poll + secondary timeout).
     if (state === "compacting") {
-      autoCompact.queueDuringCompaction(memberName, msg);
+      if (autoCompact.hasInFlightCompaction(memberName)) {
+        autoCompact.queueDuringCompaction(memberName, msg);
+      } else {
+        queueDuringStuckCompaction(memberName, msg, deps.getAutoCompact?.());
+      }
       return;
     }
 

@@ -753,14 +753,33 @@ async function runBatchCompactionBarrier(
     cfg.batchMaxWaitMinutes > 0 ? cfg.batchMaxWaitMinutes * 60_000 : Infinity;
   const deadline = Date.now() + budgetMs;
 
+  // Phase 2 attempted 语义 (alpha P2): a member is attempted ONLY when its
+  // compaction SETTLED — via the compact response (ok / non-timeout failure)
+  // OR via a compaction_end event processed during the barrier. A lease
+  // TIMEOUT leaves the member-side compaction unsettled: no endCompaction,
+  // no marker — the waiting flow (compaction_end / poll fallback) takes
+  // over and no longer skips the compaction check.
+  const attempted = new Set<string>();
+
   // 1. WAIT: members already compacting (E3 — never re-compact). Silent —
   //    the barrier is internal; the TL only experiences a longer wait.
   //    Releases as soon as a member is out of compacting (crashed/stopped
   //    included — no hang).
   if (plan.toWait.length > 0) {
+    const waitBaseline = new Map(
+      plan.toWait.map((n) => [n, runtime.getCompactionEndCount(n)] as const)
+    );
     await waitForMembersIdle(plan.toWait, ctx.memberOpsStates, deadline);
     if (Date.now() >= deadline) {
       return new Set<string>();
+    }
+    // 「或 compaction_end」: a toWait member whose compaction ENDED via the
+    // event during the wait has settled — mark it so its batch messages skip
+    // the redundant inline check (the compaction just ran).
+    for (const n of plan.toWait) {
+      if (runtime.getCompactionEndCount(n) > (waitBaseline.get(n) ?? 0)) {
+        attempted.add(n);
+      }
     }
   }
 
@@ -779,8 +798,18 @@ async function runBatchCompactionBarrier(
   // 3. COMPACT: strictly serial (at most one compact RPC at a time). A
   //    compaction already in flight when the budget runs out is left to run
   //    to its own timeout — "stop remaining" means stop NOT-YET-STARTED
-  //    compactions only.
-  const attempted = new Set<string>();
+  //    compactions only. `attempted` is declared before the WAIT phase (the
+  //    toWait settlement marking writes it too).
+  // Phase 2 attempted 语义 (alpha P2): a member is attempted ONLY when its
+  // compaction SETTLED — via the compact response (ok / non-timeout failure)
+  // OR via a compaction_end event processed during the barrier. A lease
+  // TIMEOUT leaves the member-side compaction unsettled: no endCompaction,
+  // no marker — the batch messages queue into the stuck compaction at the
+  // commit phase and are flushed by the waiting flow (compaction_end / poll
+  // fallback), which no longer skips the compaction check.
+  const compactionEndBaseline = new Map(
+    toCompact.map((n) => [n, runtime.getCompactionEndCount(n)] as const)
+  );
   for (const name of toCompact) {
     if (Date.now() >= deadline) {
       // Budget exhausted — stop the not-yet-started compactions (D1:
@@ -795,14 +824,30 @@ async function runBatchCompactionBarrier(
     if (!handle) continue;
 
     // Synchronous state set before any await (race-free, F2 pattern);
-    // finally-reset on every path (F3 / E8: Esc-safe). Success and failure
-    // are both silent — the batch dispatches as-is either way (fail-open).
+    // endCompaction on every SETTLED path (F3 / E8: Esc-safe). Success and
+    // non-timeout failure are both silent — the batch dispatches as-is
+    // either way (fail-open).
     runtime.beginCompaction(name);
-    await runtime.compactNow(name, handle, cfg);
-    runtime.endCompaction(name);
-
-    // Success or failure both count as an attempt (at most one per dispatch).
-    attempted.add(name);
+    const compactResult = await runtime.compactNow(name, handle, cfg);
+    if (compactResult.ok || !compactResult.timedOut) {
+      // Settled via the compact response (success or member-side failure).
+      runtime.endCompaction(name);
+      attempted.add(name);
+    }
+    // Timeout: keep compacting (no endCompaction), no attempt — the waiting
+    // flow takes over. The wait counts against the batchMaxWaitMinutes
+    // budget (the compact consumed its own timeout from it); the eventual
+    // flush is bounded by the compaction_end event + the poll fallback.
+  }
+  // Phase 2 (「或 compaction_end」): a timed-out compaction whose heartbeat
+  // was processed during the barrier has actually SETTLED (the event arrived
+  // while the lease was in flight — deferred, not closed). Mark it: its
+  // messages then skip the inline check at the commit phase — no second
+  // compaction (E12).
+  for (const name of toCompact) {
+    if (runtime.getCompactionEndCount(name) > (compactionEndBaseline.get(name) ?? 0)) {
+      attempted.add(name);
+    }
   }
 
   return attempted;

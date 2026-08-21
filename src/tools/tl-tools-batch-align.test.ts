@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { registerTlTools, planBatchCompaction } from "./tl-tools";
 import type { BatchCompactionPlan } from "./tl-tools";
 import { createAutoCompactRuntime } from "../channel/auto-compact";
+import type { AutoCompactRuntime } from "../channel/auto-compact";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { ProcessManager } from "../process/manager";
 import type { MemberProcessHandle } from "../process/member-process";
@@ -206,6 +207,7 @@ describe("team_send_and_wait batch barrier (phase 3)", () => {
   let messageQueue: MessageQueue;
   let lastPendingCorrId: Map<string, string>;
   let executeFn: Function;
+  let autoCompact: AutoCompactRuntime;
   let setup: ReturnType<typeof setupBarrier>;
 
   beforeEach(() => {
@@ -421,6 +423,127 @@ describe("team_send_and_wait batch barrier (phase 3)", () => {
       expect(order).toEqual(["stats:b", "compact:b", "enqueue:a", "enqueue:b"]);
       expect(enqueuedFor(messageQueue, "a")[0].skipAutoCompact).toBeUndefined();
       expect(enqueuedFor(messageQueue, "b")[0].skipAutoCompact).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("Phase 2: toWait member whose compaction_end arrives during the wait IS attempted (settled via event)", async () => {
+    // attempted 语义修正（alpha P2）：skipAutoCompact 仅在实际收到压缩结束
+    // 信号（compact 响应或 compaction_end）的成员上打标。toWait 成员的压缩
+    // 经事件结清 → 打标——其消息直接派发，不再触发冗余的第二次压缩检查。
+    vi.useFakeTimers();
+    try {
+      setup = setupBarrier({
+        states: { a: "compacting", b: "idle" },
+        handles: { b: { stats: () => usageResponse(10, 1000) } }, // below threshold
+      });
+      ({ executeFn, order, memberOpsStates, messageQueue, autoCompact } = setup);
+
+      const execPromise = executeFn("call-1", {
+        tasks: [
+          { to: "a", content: "task-a" },
+          { to: "b", content: "task-b" },
+        ],
+        nextSteps: "next",
+      });
+      await vi.advanceTimersByTimeAsync(0);
+
+      // a's compaction ends via the event (branch: markCompactionEnd + close → idle)
+      autoCompact.markCompactionEnd("a");
+      memberOpsStates.set("a", "idle");
+      await vi.advanceTimersByTimeAsync(1000);
+      await execPromise;
+
+      expect(enqueuedFor(messageQueue, "a")[0].skipAutoCompact).toBe(true);
+      expect(enqueuedFor(messageQueue, "b")[0].skipAutoCompact).toBeUndefined();
+      expect(memberOpsStates.get("a")).toBe("idle");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("Phase 2: compact lease timeout keeps the member compacting and NOT attempted (unsettled → no marker)", async () => {
+    // 超时未结清：不计 attempt、不打标（由等待流程接管——批消息在 commit
+    // 阶段经 sendToMember 的 compacting 分支入 pending，compaction_end 或
+    // 轮询兜底 flush；不再跳过压缩检查）。E1：enqueue 仍在屏障之后。
+    vi.useFakeTimers();
+    try {
+      let rejectCompact!: (e: Error) => void;
+      const compactGate = new Promise((_, rej) => { rejectCompact = rej; });
+      setup = setupBarrier({
+        states: { a: "idle", b: "idle" },
+        handles: {
+          a: { stats: () => usageResponse(95, 190000), compact: () => compactGate },
+          b: { stats: () => usageResponse(10, 1000) }, // below threshold
+        },
+      });
+      ({ executeFn, order, memberOpsStates, messageQueue } = setup);
+
+      const execPromise = executeFn("call-1", {
+        tasks: [
+          { to: "a", content: "task-a" },
+          { to: "b", content: "task-b" },
+        ],
+        nextSteps: "next",
+      });
+      await vi.advanceTimersByTimeAsync(0);
+
+      // a's compact lease times out (member-side compaction may still run)
+      rejectCompact!(new Error('Command to "a" timed out after 600000ms'));
+      await vi.advanceTimersByTimeAsync(0);
+      await execPromise;
+
+      // a stays compacting (NOT reset — the flush is the waiting flow's job),
+      // not attempted → its message carries NO skipAutoCompact.
+      expect(memberOpsStates.get("a")).toBe("compacting");
+      expect(enqueuedFor(messageQueue, "a")[0].skipAutoCompact).toBeUndefined();
+      expect(enqueuedFor(messageQueue, "b")[0].skipAutoCompact).toBeUndefined();
+      // E1: the batch still commits only after the barrier's compacts settled
+      // (stats run in parallel, then the serial compact).
+      expect(order).toEqual(["stats:a", "stats:b", "compact:a", "enqueue:a", "enqueue:b"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("Phase 2: timeout settled by compaction_end during the barrier → member IS attempted (no second compact)", async () => {
+    // 事件在屏障期间到达（在飞守卫记录心跳、分支不复位）；租约随后超时。
+    // 屏障按心跳计数将 a 判为已结清 → 打标：a 的批消息带 skipAutoCompact
+    // （直接派发路径），杜绝第二个压缩。
+    vi.useFakeTimers();
+    try {
+      let rejectCompact!: (e: Error) => void;
+      const compactGate = new Promise((_, rej) => { rejectCompact = rej; });
+      setup = setupBarrier({
+        states: { a: "idle", b: "idle" },
+        handles: {
+          a: { stats: () => usageResponse(95, 190000), compact: () => compactGate },
+        },
+      });
+      ({ executeFn, order, memberOpsStates, messageQueue, autoCompact } = setup);
+
+      const execPromise = executeFn("call-1", {
+        tasks: [
+          { to: "a", content: "task-a" },
+          { to: "b", content: "task-b" },
+        ],
+        nextSteps: "next",
+      });
+      await vi.advanceTimersByTimeAsync(0);
+
+      // The member-side compaction finished; the branch processed the event
+      // while the lease was in flight (heartbeat recorded, state unchanged).
+      autoCompact.markCompactionEnd("a");
+      rejectCompact!(new Error('Command to "a" timed out after 600000ms')); // response delayed past lease
+      await vi.advanceTimersByTimeAsync(0);
+      await execPromise;
+
+      // Settled via compaction_end → attempted → a's message IS marked.
+      expect(enqueuedFor(messageQueue, "a")[0].skipAutoCompact).toBe(true);
+      // The state stays compacting (the branch deferred; the watcher closes
+      // it once the queue holds the messages).
+      expect(memberOpsStates.get("a")).toBe("compacting");
     } finally {
       vi.useRealTimers();
     }
