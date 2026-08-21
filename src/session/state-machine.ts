@@ -11,6 +11,13 @@ export type MemberEvent =
   | { type: "compaction_started" }
   /** Emitted when Auto-Compaction ends (success, failure, or timeout) — the pending prompt is dispatched right after. */
   | { type: "compaction_completed" }
+  /**
+   * Emitted when get_state authoritatively confirms a compaction is running
+   * (post-rejection correction — the rejection branch asks the member instead
+   * of guessing). Corrects the `working` state left behind by the failed
+   * dispatch; the exit is the compaction_end event branch (Phase 1).
+   */
+  | { type: "compaction_confirmed" }
   /** Emitted after a member process has been spawned and its RPC is ready (ready promise resolved). */
   | { type: "started" }
   | { type: "stopped" };
@@ -46,6 +53,15 @@ export function transitionState(
       // Compaction finished — member is back to idle; the pending prompt
       // dispatch immediately follows with task_started → working.
       return current === "compacting" ? "idle" : current;
+
+    case "compaction_confirmed":
+      // Authoritative confirmation (get_state.isCompacting) that the
+      // member-side compaction is running — corrects the `working` state
+      // left behind by a rejected dispatch (the compaction-timeout black
+      // hole). crashed/stopped members have no running compaction to wait
+      // for (process_exit wins). Exit: the compaction_end event branch.
+      if (current === "crashed" || current === "stopped") return current;
+      return "compacting";
 
     case "process_exit":
       // process_exit only applies to non-crashed/stopped members

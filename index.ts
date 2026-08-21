@@ -234,6 +234,11 @@ export default function (pi: ExtensionAPI) {
     lastAssistantTexts,
     perTurnReplied,
     pendingAutoReplies,
+    // Phase 1 wiring: the event handler now consumes compaction_end events
+    // (shared runtime) and queries get_state after prompt rejections (handle
+    // map) — both fix the compaction-timeout permanent-working black hole.
+    memberHandles,
+    autoCompact,
     onMemberActivity: (memberName: string, event: any) => {
       // Multi-cast to all activity consumers with PER-CONSUMER isolation (N4):
       // a throwing observer must never break the other observers — and the

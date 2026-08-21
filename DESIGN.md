@@ -396,7 +396,7 @@ The TL follows the **Orchestration Playbook** (`src/prompts/orchestration-playbo
 - `session.json` manifest: roster (the only durable copy for dynamic teams), origin, dynamicPhase, sharedContextWritten, Goal, startedMembers, memberPids, status (`active` = interrupted / `stopped` = clean stop)
 
 **Flow:**
-1. Scan `sessions/*/*/session.json` (incl. `_dynamic_*`), sort by `lastActiveAt` desc; **filter to the current working directory by default** (manifest records the creating TL's cwd — mirrors `pi --resume` project scoping; `--all` lists every directory with cwd shown in labels); arg filters by team name or sessionId prefix; multiple matches → `ctx.ui.select` picker
+1. Scan `sessions/*/*/session.json` (incl. `_dynamic_*`), sort by `lastActiveAt` desc; **filter to the current working directory by default** (manifest records the creating TL's cwd — mirrors `pi --resume` project scoping; `--all` lists every directory with cwd shown in labels); arg filters by team name or sessionId prefix; multiple matches → `scrollSelect` picker (label = `teamName (sessionId)`, description = 类型/状态/成员数/时间[/cwd]) — the scrollable+filterable component with a `maxVisible` window, since the built-in `ctx.ui.select` renders ALL options without scrolling and overflows the screen when many sessions are resumable
 2. Orphan cleanup: for each `memberPids` entry, verify via `/proc/<pid>/environ` (TEAM_NAME + session path) and SIGTERM survivors (Linux-only, best-effort)
 3. Rehydrate: `startSession(teamFromManifest, {sessionId, origin})` — manifest roster is authoritative (YAML supplies description/workflow only); restore `sharedContextWritten`, Goal, `isDynamicSession`/`dynamicPhase`/`agentInitiatedTask`
 4. `onSessionStart`（widget + 会话工具注册 + 重注册 team-mode 编辑器工厂——`onSessionEnd` 曾用 `setEditorComponent(undefined)` 将其清除，不重新注册则输入框边框不变色）+ 激活工具（动态团队 + `add_dynamic_member`，agent 来源 + `stop_team_session`）
@@ -443,7 +443,7 @@ The TL follows the **Orchestration Playbook** (`src/prompts/orchestration-playbo
 - Persisted to `<rootDir>/settings.yaml` (`src/settings/settings.ts`), e.g. `memberModel: { mode: fixed, model: "anthropic/claude-sonnet-4-5" }`. Missing/corrupt file falls back to `{ mode: follow }`; `fixed` without a model auto-falls back to `follow`.
 - **Model resolution precedence** (`src/settings/resolve-model.ts`, pure function): member YAML `model` > team YAML `defaults.model` > global fixed > global follow (TL current model) > no override (member pi uses its own default).
 - The resolved model is passed to the member process as the `--model provider/id` CLI flag at spawn (`MemberProcessConfig.model` in `member-process.ts`). This also wires up the previously inert team-YAML `defaults.model` / `member.model` fields. Already-running members keep the model they were spawned with.
-- The model picker uses `src/ui/scroll-select.ts` — a reusable `ctx.ui.custom` component with a `maxVisible` scroll window (default 10, same as pi's `/model` selector), `(n/total)` scroll indicator, PgUp/PgDn support, and a fuzzy-search input (`fuzzyFilter` from pi-tui). pi's built-in `ctx.ui.select` renders ALL options without scrolling, which is unusable for 100+ available models. Small menus (top-level, mode picker) still use `ctx.ui.select`.
+- The model picker uses `src/ui/scroll-select.ts` — a reusable `ctx.ui.custom` component with a `maxVisible` scroll window (default 10, same as pi's `/model` selector), `(n/total)` scroll indicator, PgUp/PgDn support, and a fuzzy-search input (`fuzzyFilter` from pi-tui). pi's built-in `ctx.ui.select` renders ALL options without scrolling, which is unusable for 100+ available models. Small menus (top-level, mode picker) still use `ctx.ui.select`. The `/team resume` session picker also uses `scrollSelect` for the same reason (many resumable sessions would overflow the screen).
 
 ## 6. TL Process Management Tools
 
@@ -1260,7 +1260,7 @@ inspector 输入框曾有两个独立的按键故障根因，修复互补、全�
 
 #### CSI-u 解码纪律（防再犯硬性约定）
 
-**任何字符插入路径必须经 `decodePrintableKey`（或等价解码）**——inspector 与 pi 主输入框（editor.js）的不一致是本轮 bug 温床：主输入框解码了、inspector 没有。实现注记：`decodePrintableKey` 从 `@earendil-works/pi-tui/dist/keys.js` 深导入（主 index 仅 re-export `decodeKittyPrintable`；上游 editor.js 同样深导入 keys.js）。安全性（实测）：仅纯字符/Shift 字符的 CSI-u 被解码；ctrl/alt 修饰序列与 legacy 原字符返回 undefined → 走原兜底路径；解码分支位于 ctrl+enter/enter 键匹配分支之后（顺序双保险）。
+**任何字符插入路径必须经 `decodePrintableKey`（或等价解码）**——inspector 与 pi 主输入框（editor.js）的不一致是本轮 bug 温床：主输入框解码了、inspector 没有。实现注记：**本地实现 `src/ui/pi-key-decode.ts`**——`decodeKittyPrintable` 从主入口 `@earendil-works/pi-tui` 导入（loader 可别名/虚拟模块映射的裸包名），`decodeModifyOtherKeysPrintable` 回退按上游 `dist/keys.js` 原样复刻（0.83.0 与 0.84.2 逐字节一致，diff 验证）。⚠️ 不能深导入 `@earendil-works/pi-tui/dist/keys.js`：pi 扩展加载器（`dist/core/extensions/loader.js`）用 jiti alias 前缀替换解析依赖（`@earendil-works/pi-tui` → 包 main `dist/index.js`），子路径导入被拼接到 main 后 → `<...>/pi-tui/dist/index.js/dist/keys.js` → Cannot find module → 整个扩展 Failed to load extension（2025-08 实测复现：Node 模式 `pi --mode json -e ./index.ts` 报错，本地实现后零错误）。安全性（实测）：仅纯字符/Shift 字符的 CSI-u 被解码；ctrl/alt 修饰序列与 legacy 原字符返回 undefined → 走原兜底路径；解码分支位于 ctrl+enter/enter 键匹配分支之后（顺序双保险）。
 
 #### 键位协议约束表
 
@@ -1579,3 +1579,42 @@ tracker 生命周期随 widget install/uninstall（onSessionStart / onSessionEnd
 | 崩溃成员永久显示 executing | P3 tracker.delete + S1 进程死亡强制调度渲染（≤120ms 显示 💥/⏹️） |
 | 单行超宽（成员 >8–10）导致 TUI 换行/布局成本 | 已知 UX 边界（非性能问题），toolName 截断缓解；O4 需用户反馈 |
 | doRender 单帧成本量化缺口（三方均未实测） | N6 中 performance.now() 实测组件侧留档（7.3μs/帧，v2 简化后）；N1 收益论证不依赖精确帧成本 |
+
+## 21. 自动压缩超时事件驱动出口（Phase 1 止血）
+
+> 背景：member 触发自动压缩后压缩超时 → TL 端 fail-open 立即派发 → 成员端同步拒收（`"Cannot submit a prompt while compaction is in progress"`，压缩检查位于 followUp 排队逻辑之前）→ 拒收分支只 resolve corrId 不纠正状态 → `working` 成为无清算事件的黑洞状态 → `wait_and_get_member_status` 无限卡死。根因：**TL 用本地倒计时（租约）判断压缩结束，但真实状态只有成员端知道（心跳）**。Phase 1 为止血 + 防御纵深（独立可交付）；Phase 2 根治（超时后不派发、事件驱动补发、批路径接线）按方案另行实施。
+
+### 设计原则
+
+1. **权威信号回归**：压缩生命周期由成员端 `compaction_end` 事件（心跳）权威驱动；TL 端 `timeoutMinutes` 仅作「停止主动等待」的租约，到期 ≠ 压缩失败。
+2. **状态诚实**：压缩真实进行中 → 状态恒为 `compacting`，绝不预置虚假 `working`；拒收后按 `get_state` 实际结果恢复（compacting/idle 二选一）。
+3. **防御纵深**：wait 工具 deadline 兜底——无论根因修不修，用户永不无限卡。
+4. **诚实通信**：通知与实际结果一致（删除「已直接派发任务」假陈述）；不依赖 LLM 听从引导性文案。
+
+### 1.1 compaction_end 消费分支（F7 盲区修复，事件驱动支点）
+
+- 收到 `compaction_end` → `autoCompact.endCompaction(name)`（compacting→idle）→ `flushPending(name)` 派发积压消息（→working→agent_end→idle 全链路）。working 成员不受影响（提示词正在处理，绝不可被事件重置）。
+- **超时痕迹桥接**：runtime 新原语 `markCompactionTimeout(name)` / `takeCompactionTimeout(name)`（per-member Map）。`compactNow` 在本地租约超时（sendCommandAndWait reject 消息含 `timed out`）时记录时间戳；非超时失败（RPC 错误响应/其他 reject——成员端压缩已结算）不记录。`compaction_end` 分支消费一次即清 → 超时场景通知 TL「压缩已于 N 分钟后结束，积压消息已自动补发」；正常路径保持静默（成功静默原则）。
+- **时序收敛性**（单管道 FIFO 保证）：拒收→get_state 查询与 compaction_end 到达顺序无论先后均收敛——get_state 先到：compaction_confirmed→compacting→compaction_end→idle ✓；compaction_end 先到：endCompaction（working 不动）→get_state false→task_completed→idle ✓。陈旧 true 响应晚于 compaction_end 到达在 FIFO 管道上不可能（响应在成员端先于 compaction_end 写出）。
+
+### 1.2 拒收分支状态纠正（get_state 判定，beta 形态）
+
+- prompt 拒收分支（`success===false && id===undefined`）在 resolve + 通知后追加 `get_state` 查询（3s 超时 fail-open，runtime 新原语 `queryCompactionState`，复用 queryStats 模式）：
+  - `isCompacting === true` → 置 `compacting`（状态机新事件 `compaction_confirmed`：working→compacting 纠正黑洞；crashed/stopped 不动）。出口由 1.1 提供；后续新消息经 sendToMember 的 compacting 分支自动入 pending → **双重压缩循环从结构上消灭**（拒收时压缩大概率仍在跑，拉回 idle 会让 TL 重派触发第二个并行 compact）。
+  - `isCompacting === false` → 置 `idle`（`task_completed` 事件，保持纯函数纪律；重派安全）。
+  - 查询失败 → `idle` + 通知（保守选择）。
+  - handle/runtime 未接线 → no-op（legacy 最小配置行为不变）。
+- 通知文案诚实化：「消息未送达（已丢失，请稍后重试）…已查询成员实际状态并按实际恢复」。
+
+### 1.3 waitForAllIdle deadline + 诊断（beta C，防御纵深）
+
+- `waitForAllIdle(memberOpsStates, deadlineMs?)` 返回 `{ timedOut, stuckMembers }`；deadline 默认 15 分钟（`WAIT_IDLE_DEFAULT_DEADLINE_MINUTES`），`resolveWaitIdleDeadlineMs(getAutoCompact?)` 复用 `batchMaxWaitMinutes` 语义（0 = 不限保持现状），无配置时用默认（deadline 是防御纵深，与 auto-compact 开关正交）。
+- 到期返回诊断：疑似卡死成员（working/compacting）+ 建议操作（`stop_member` / `/team stop` 后 `/team resume`）。`wait_and_get_member_status` 与 `team_send_and_wait` 的 all-idle 竞速路径同时受益（后者 partial 结果追加诊断块）。
+- `setInterval` 加 `unref`（与批屏障 `waitForMembersIdle` 一致——Esc 中断后无轮询泄漏）。
+- wait 结束后**重读状态**输出（不再用 pre-wait 快照——成员可能在等待期间完成转换，状态栏必须反映 post-wait 现实）。
+
+### 接线与测试
+
+- DI：`EventHandlerDeps` 新增 `autoCompact?`（共享 runtime）与 `memberHandles?`（get_state 查询 + flush 派发）；`MemberLifecycleDeps` 同步新增并转发；`index.ts` 注入。
+- 共享派发提取为模块级 `dispatchPromptToMember`（`PromptDispatchDeps`：pi/memberOpsStates/memberHandles/lastPendingCorrId/responseWaiter）——内联路径与 compaction_end flush 路径同一套发送语义（working 标记 + followUp + sendCommand 异常 fail-open）。
+- 测试（30 个新用例）：拒收状态恢复四态（compacting/idle/查询失败+通知/无接线 no-op）、诚实文案断言、compaction_end 分支（正常静默+flush/超时通知+单次消费/无 runtime no-op/working 不动）、双重压缩防护（compacting 成员新消息→入 pending→compaction_end→自动派发，期间零 RPC）、状态机 `compaction_confirmed` 转换表（working/idle→compacting、compacting 幂等、crashed/stopped 不动）、runtime 新原语（超时标记/非超时不标记/单次消费）、wait deadline（诊断内容/0=不限/unref 存在性/工具级回归）、team_send_and_wait deadline 诊断。

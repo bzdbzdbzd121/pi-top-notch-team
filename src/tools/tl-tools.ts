@@ -461,12 +461,24 @@ export function registerTlTools(deps: TlToolsDeps): void {
       // Quick check: if no member is actively working, skip waiting.
       // "stopped" and "crashed" members won't transition to "idle" on their own.
       const anyActive = entries.some(([, s]) => s === "working" || s === "compacting");
+      let waitDiag: WaitForAllIdleResult | null = null;
       if (anyActive) {
-        // Wait until all members are idle (same mechanism as team_send_and_wait)
-        await waitForAllIdle(memberOpsStates);
+        // Wait until all members are idle (same mechanism as team_send_and_wait).
+        // Phase 1: bounded by the deadline (default 15 min / batch budget) —
+        // the user's final exit when a member is stuck (e.g. the compaction-
+        // timeout black hole). 0 = unlimited (status quo).
+        waitDiag = await waitForAllIdle(
+          memberOpsStates,
+          resolveWaitIdleDeadlineMs(deps.getAutoCompact)
+        );
       }
 
-      const lines = entries.map(([name, state]) => {
+      // Re-read the CURRENT state after the wait — the status output must
+      // reflect post-wait reality (members may have transitioned while we
+      // waited; a pre-wait snapshot would show stale states, e.g. a member
+      // that just finished compacting).
+      const finalEntries = Array.from(memberOpsStates.entries());
+      const lines = finalEntries.map(([name, state]) => {
         // working 在 list_members 文本输出用 💦（D5 裁决，独立于状态栏——
         // v2.2 起状态栏 working 兜底为 💭，浮窗同步；此处保持 💦 不改）。
         const icon = state === "working" ? "💦"
@@ -476,9 +488,18 @@ export function registerTlTools(deps: TlToolsDeps): void {
                    : "⏹️";
         return `  ${icon} ${name}: ${state}`;
       });
+      let text = `团队成员操作状态：\n${lines.join("\n")}`;
+      if (waitDiag?.timedOut) {
+        // Deadline expiry diagnostic — the user gets actionable advice
+        // instead of an infinite hang.
+        text +=
+          `\n\n⚠️ 等待超时（默认 15 分钟，可在 /team setting 的批等待预算调整）：` +
+          `以下成员在超时后仍处于活跃状态：${waitDiag.stuckMembers.join("、")}\n` +
+          `建议：对该成员执行 stop_member，或 /team stop 后 /team resume 恢复会话。`;
+      }
       return {
         details: {},
-        content: [{ type: "text" as const, text: `团队成员操作状态：\n${lines.join("\n")}` }],
+        content: [{ type: "text" as const, text }],
       };
     },
   });
@@ -491,6 +512,38 @@ export function registerTlTools(deps: TlToolsDeps): void {
  export const WAIT_IDLE_CHECK_INTERVAL_MS = 3000;
 
 /**
+ * Default deadline for waitForAllIdle, in minutes (Phase 1 defense in
+ * depth): even if member state never reaches idle, wait tools return with a
+ * diagnostic instead of hanging forever. Mirrors the batch barrier's
+ * DEFAULT_BATCH_MAX_WAIT_MINUTES semantics.
+ */
+export const WAIT_IDLE_DEFAULT_DEADLINE_MINUTES = 15;
+
+/** Result of the all-idle wait — diagnostic on deadline expiry. */
+export interface WaitForAllIdleResult {
+  /** True when the deadline expired with members still active. */
+  timedOut: boolean;
+  /** Members still working/compacting at the deadline (diagnostic). */
+  stuckMembers: string[];
+}
+
+/**
+ * Resolve the wait-idle deadline (ms) from the effective auto-compaction
+ * config — reuses the batch barrier's `batchMaxWaitMinutes` budget
+ * semantics (0 = unlimited). No config → the 15-minute default: the
+ * deadline is defense in depth and must exist even when auto-compaction
+ * is disabled (the stuck state it guards against is caused by the
+ * compaction lifecycle itself).
+ */
+export function resolveWaitIdleDeadlineMs(
+  getAutoCompact?: () => ResolvedAutoCompact
+): number {
+  const cfg = getAutoCompact?.();
+  if (!cfg) return WAIT_IDLE_DEFAULT_DEADLINE_MINUTES * 60_000;
+  return cfg.batchMaxWaitMinutes > 0 ? cfg.batchMaxWaitMinutes * 60_000 : Infinity;
+}
+
+/**
  * Wait until all members are no longer actively working.
  * "Active" means "working" or "compacting" — these states indicate
  * a member is processing a task. Members in "idle", "stopped", or
@@ -500,11 +553,21 @@ export function registerTlTools(deps: TlToolsDeps): void {
  * NOTE: Does NOT do a quick-start check — always polls for at least
  * WAIT_IDLE_REQUIRED_CONSECUTIVE checks. Callers that want a fast path
  * (e.g. wait_and_get_member_status) should do their own pre-check before calling.
+ *
+ * Phase 1: bounded by `deadlineMs` (default 15 min, 0 = unlimited). On
+ * expiry the promise resolves with a DIAGNOSTIC (timedOut + stuck members)
+ * instead of hanging forever — the user's final exit when the compaction-
+ * timeout black hole (working state with no clearing event) slips through
+ * every other fix. The poll timer is unref'd so an abandoned wait (e.g. Esc
+ * interrupt) never keeps the process alive.
  */
-async function waitForAllIdle(
-  memberOpsStates: Map<string, MemberOperationalState>
-): Promise<void> {
-  return new Promise<void>((resolve) => {
+export async function waitForAllIdle(
+  memberOpsStates: Map<string, MemberOperationalState>,
+  deadlineMs: number = WAIT_IDLE_DEFAULT_DEADLINE_MINUTES * 60_000
+): Promise<WaitForAllIdleResult> {
+  return new Promise<WaitForAllIdleResult>((resolve) => {
+    const effectiveDeadlineMs = deadlineMs <= 0 ? Infinity : deadlineMs;
+    const deadline = Date.now() + effectiveDeadlineMs;
     let consecutiveIdleCount = 0;
     const pollTimer = setInterval(() => {
       const currentEntries = Array.from(memberOpsStates.entries());
@@ -519,12 +582,28 @@ async function waitForAllIdle(
         consecutiveIdleCount++;
         if (consecutiveIdleCount >= WAIT_IDLE_REQUIRED_CONSECUTIVE) {
           clearInterval(pollTimer);
-          resolve();
+          resolve({ timedOut: false, stuckMembers: [] });
         }
+      } else if (Date.now() >= deadline) {
+        // Deadline expired with members still active — return a diagnostic
+        // (stuck members + caller renders advice) instead of hanging forever.
+        clearInterval(pollTimer);
+        resolve({
+          timedOut: true,
+          stuckMembers: currentEntries
+            .filter(([, s]) => s === "working" || s === "compacting")
+            .map(([n]) => n),
+        });
       } else {
         consecutiveIdleCount = 0;
       }
     }, WAIT_IDLE_CHECK_INTERVAL_MS);
+    // Do not keep the process alive for the poll if the tool call is
+    // abandoned (e.g. session teardown / Esc while the wait runs) — matches
+    // the batch barrier's waitForMembersIdle (fixes the polling leak).
+    if (typeof (pollTimer as NodeJS.Timeout).unref === "function") {
+      (pollTimer as NodeJS.Timeout).unref();
+    }
   });
 }
 
@@ -769,7 +848,14 @@ async function waitWithAllIdleCheck(
   });
 
   const allDonePromise = Promise.all(waitPromises);
-  const allIdlePromise = waitForAllIdle(memberOpsStates);
+  // Phase 1: the all-idle race is bounded by the same deadline (default
+  // 15 min / batch budget) — a member stuck in `working` (the compaction-
+  // timeout black hole) must not block team_send_and_wait forever. On
+  // expiry the all-idle branch returns partial results + a diagnostic.
+  const allIdlePromise = waitForAllIdle(
+    memberOpsStates,
+    resolveWaitIdleDeadlineMs(ctx.getAutoCompact)
+  );
 
   // Race: all tasks done vs all members idle
   const raceResult = await Promise.race([
@@ -816,9 +902,21 @@ async function waitWithAllIdleCheck(
     }
   }
 
+  let text = preambleBlock + parts.join("\n\n---\n") + nextStepsFooter;
+  // Phase 1: deadline-expiry diagnostic — the all-idle branch won the race
+  // because the deadline fired with members still active (stuck, not busy).
+  // The TL gets the suspect list + actionable advice instead of a bare
+  // partial result.
+  const idleResult = await allIdlePromise; // already resolved (race winner)
+  if (idleResult.timedOut) {
+    text +=
+      `\n\n⚠️ 等待超时：以下成员在超时后仍处于活跃状态：${idleResult.stuckMembers.join("、")}。\n` +
+      `建议：对该成员执行 stop_member，或 /team stop 后 /team resume 恢复会话。`;
+  }
+
   return {
     details: { allIdle: true, partial: true, nextSteps },
-    content: [{ type: "text" as const, text: preambleBlock + parts.join("\n\n---\n") + nextStepsFooter }],
+    content: [{ type: "text" as const, text }],
   };
 }
 

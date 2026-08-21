@@ -13,6 +13,9 @@ function createMockDeps(overrides?: Record<string, any>) {
     lastPendingCorrId: new Map<string, string>(),
     recentlyProcessedMessages: new Map<string, number>(),
     memberHandles: new Map<string, MemberProcessHandle>(),
+    // Phase 1 deps: the shared auto-compaction runtime (compaction_end
+    // branch + get_state correction). Absent = branches inert.
+    autoCompact: undefined as any,
     processManager: { handleExit: vi.fn() },
     ...overrides,
   };
@@ -698,6 +701,277 @@ describe("createMemberEventHandler prompt rejection surfacing", () => {
   });
 });
 
+// ── Prompt rejection state correction (Phase 1: get_state 判定) ──
+// The most common rejection cause is a compaction still running on the
+// member side (the TL-side timeout lease expired while the member-side
+// compaction continued). The rejection branch must restore the operational
+// state to what the member actually reports — never leave a fabricated
+// `working` behind (that was the permanent-hang black hole).
+
+describe("createMemberEventHandler prompt rejection state correction (Phase 1)", () => {
+  const rejection = (error: string) => ({
+    type: "response",
+    command: "prompt",
+    success: false,
+    error,
+  });
+
+  function getStateResponse(isCompacting: boolean): any {
+    return {
+      type: "response",
+      command: "get_state",
+      success: true,
+      data: { isCompacting },
+    };
+  }
+
+  function makeHandle(getStateResult?: any) {
+    return {
+      sendCommand: vi.fn(),
+      sendCommandAndWait: vi.fn().mockResolvedValue(getStateResult),
+    };
+  }
+
+  it("sets compacting when get_state reports isCompacting=true (exit = the compaction_end branch)", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const { createAutoCompactRuntime } = await import("./auto-compact");
+    const deps = createMockDeps();
+    const handle = makeHandle(getStateResponse(true));
+    deps.memberHandles.set("worker", handle as any);
+    deps.autoCompact = createAutoCompactRuntime(deps.memberOpsStates);
+    deps.memberOpsStates.set("worker", "working"); // state left behind by the failed dispatch
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    handler(rejection("Cannot submit a prompt while compaction is in progress"));
+
+    await vi.waitFor(() => expect(deps.memberOpsStates.get("worker")).toBe("compacting"));
+    expect(handle.sendCommandAndWait).toHaveBeenCalledWith(
+      { type: "get_state" },
+      expect.any(Function),
+      3000
+    );
+  });
+
+  it("sets idle when get_state reports isCompacting=false (re-dispatch is safe — no double compaction)", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const { createAutoCompactRuntime } = await import("./auto-compact");
+    const deps = createMockDeps();
+    const handle = makeHandle(getStateResponse(false));
+    deps.memberHandles.set("worker", handle as any);
+    deps.autoCompact = createAutoCompactRuntime(deps.memberOpsStates);
+    deps.memberOpsStates.set("worker", "working");
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    handler(rejection("Agent is already processing"));
+
+    await vi.waitFor(() => expect(deps.memberOpsStates.get("worker")).toBe("idle"));
+    // Successful query → only the rejection notice (no extra notification).
+    expect(deps.pi.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("sets idle + notifies when the get_state query fails (conservative fail-open)", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const { createAutoCompactRuntime } = await import("./auto-compact");
+    const deps = createMockDeps();
+    const handle = {
+      sendCommand: vi.fn(),
+      sendCommandAndWait: vi.fn().mockRejectedValue(new Error("timeout")),
+    };
+    deps.memberHandles.set("worker", handle as any);
+    deps.autoCompact = createAutoCompactRuntime(deps.memberOpsStates);
+    deps.memberOpsStates.set("worker", "working");
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    handler(rejection("boom"));
+
+    await vi.waitFor(() => expect(deps.memberOpsStates.get("worker")).toBe("idle"));
+    // Two notices: the rejection notice + the conservative-idle notice.
+    expect(deps.pi.sendMessage).toHaveBeenCalledTimes(2);
+    expect(deps.pi.sendMessage.mock.calls[1][0].content).toContain("恢复为 idle");
+  });
+
+  it("leaves the state untouched when no handle/runtime is wired (legacy minimal setups)", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const deps = createMockDeps(); // no memberHandles / autoCompact
+    deps.memberOpsStates.set("worker", "working");
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    handler(rejection("boom"));
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(deps.memberOpsStates.get("worker")).toBe("working");
+    expect(deps.pi.sendMessage).toHaveBeenCalledTimes(1); // only the rejection notice
+  });
+
+  it("honest notification: the notice no longer claims the task was dispatched (it was LOST)", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const deps = createMockDeps();
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    handler(rejection("boom"));
+
+    const content = deps.pi.sendMessage.mock.calls[0][0].content as string;
+    expect(content).toContain("消息未送达");
+    expect(content).toContain("已丢失");
+    expect(content).not.toContain("已直接派发");
+  });
+});
+
+// ── compaction_end consumer branch (Phase 1: 事件驱动出口) ──
+// compaction_end is the authoritative heartbeat: it fires on the member side
+// whenever a compaction actually finishes (success or failure). The TL-side
+// timeout lease says nothing about the member-side state — this branch is the
+// event-driven counterpart of the lease: exit compacting + flush messages
+// queued during the compaction.
+
+describe("createMemberEventHandler compaction_end branch (Phase 1)", () => {
+  function makeMsg(id = "p1") {
+    return { id, from: "tl", to: "worker", content: `Queued task ${id}`, timestamp: Date.now() };
+  }
+
+  it("exits compacting and flushes queued messages on compaction_end — normal path stays silent", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const { createAutoCompactRuntime } = await import("./auto-compact");
+    const deps = createMockDeps();
+    const runtime = createAutoCompactRuntime(deps.memberOpsStates);
+    deps.autoCompact = runtime;
+    const handle = { sendCommand: vi.fn() };
+    deps.memberHandles.set("worker", handle as any);
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    deps.memberOpsStates.set("worker", "compacting");
+    runtime.queueDuringCompaction("worker", makeMsg("p1"));
+    runtime.queueDuringCompaction("worker", makeMsg("p2"));
+
+    handler({ type: "compaction_end" });
+
+    // Flushed messages were dispatched → the member is back to working
+    // (task_started), full chain: compacting → idle → working.
+    expect(deps.memberOpsStates.get("worker")).toBe("working");
+    const prompts = handle.sendCommand.mock.calls.map((c: any[]) => c[0].message as string);
+    expect(prompts[0]).toContain("Queued task p1");
+    expect(prompts[1]).toContain("Queued task p2");
+    expect(prompts[0]).toContain("[消息通道 - 来自 tl]");
+    // Normal path (no prior timeout) is silent — no notification.
+    expect(deps.pi.sendMessage).not.toHaveBeenCalled();
+    expect(runtime.flushPending("worker")).toEqual([]);
+  });
+
+  it("exits compacting to idle when nothing was queued", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const { createAutoCompactRuntime } = await import("./auto-compact");
+    const deps = createMockDeps();
+    deps.autoCompact = createAutoCompactRuntime(deps.memberOpsStates);
+    const handle = { sendCommand: vi.fn() };
+    deps.memberHandles.set("worker", handle as any);
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    deps.memberOpsStates.set("worker", "compacting");
+    handler({ type: "compaction_end" });
+
+    expect(deps.memberOpsStates.get("worker")).toBe("idle");
+    expect(handle.sendCommand).not.toHaveBeenCalled();
+  });
+
+  it("notifies the TL when the compaction had previously timed out (lease expired → heartbeat arrived)", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const { createAutoCompactRuntime } = await import("./auto-compact");
+    const deps = createMockDeps();
+    const runtime = createAutoCompactRuntime(deps.memberOpsStates);
+    deps.autoCompact = runtime;
+    const handle = { sendCommand: vi.fn() };
+    deps.memberHandles.set("worker", handle as any);
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    deps.memberOpsStates.set("worker", "compacting");
+    runtime.queueDuringCompaction("worker", makeMsg("p1"));
+    runtime.markCompactionTimeout("worker");
+
+    handler({ type: "compaction_end" });
+
+    expect(deps.pi.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customType: "team-message",
+        display: true,
+        content: expect.stringContaining("压缩已于"),
+      })
+    );
+    const content = deps.pi.sendMessage.mock.calls[0][0].content as string;
+    expect(content).toContain("结束");
+    expect(content).toContain("积压消息已自动补发");
+    // The mark is consumed exactly once.
+    expect(runtime.takeCompactionTimeout("worker")).toBeUndefined();
+    expect(deps.memberOpsStates.get("worker")).toBe("working"); // flushed → dispatched
+  });
+
+  it("is a no-op when no shared runtime is wired (legacy minimal setups)", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const deps = createMockDeps();
+    deps.memberOpsStates.set("worker", "compacting");
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    handler({ type: "compaction_end" });
+
+    expect(deps.memberOpsStates.get("worker")).toBe("compacting"); // untouched
+    expect(deps.pi.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("leaves a working member untouched on compaction_end (inline path already exited; the prompt is being processed)", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const { createAutoCompactRuntime } = await import("./auto-compact");
+    const deps = createMockDeps();
+    deps.autoCompact = createAutoCompactRuntime(deps.memberOpsStates);
+    const handle = { sendCommand: vi.fn() };
+    deps.memberHandles.set("worker", handle as any);
+    const handler = createMemberEventHandler("worker", deps as any);
+    deps.memberOpsStates.set("worker", "working");
+
+    handler({ type: "compaction_end" });
+
+    expect(deps.memberOpsStates.get("worker")).toBe("working");
+    expect(handle.sendCommand).not.toHaveBeenCalled();
+    expect(deps.pi.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("double-compaction protection: a compacting member's new message queues; compaction_end flushes it — NO second compact RPC", async () => {
+    // Regression for the user scenario: compaction timeout → prompt rejected
+    // → get_state corrected the state to compacting. A retry now must NOT
+    // trigger a fresh stats/compact cycle (double compaction) — it queues and
+    // is flushed by the compaction_end heartbeat.
+    const enabledCfg = {
+      enabled: true,
+      thresholdPercent: 80,
+      thresholdTokens: undefined,
+      timeoutMinutes: 10,
+      percentIsDefaultFallback: false,
+    };
+    const { createMemberEventHandler, createSendToMember } = await loadModule();
+    const { createAutoCompactRuntime } = await import("./auto-compact");
+    const deps = createMockDeps({ getAutoCompact: () => enabledCfg });
+    const runtime = createAutoCompactRuntime(deps.memberOpsStates);
+    deps.autoCompact = runtime;
+    const handle = { sendCommand: vi.fn(), sendCommandAndWait: vi.fn() };
+    deps.memberHandles.set("worker", handle as any);
+    deps.memberOpsStates.set("worker", "compacting"); // corrected after the rejection
+
+    const send = createSendToMember(deps as any);
+    send("worker", { ...makeMsg(), content: "Retry task" });
+    // Queued — zero RPC, zero prompt.
+    expect(handle.sendCommandAndWait).not.toHaveBeenCalled();
+    expect(handle.sendCommand).not.toHaveBeenCalled();
+
+    const handler = createMemberEventHandler("worker", deps as any);
+    handler({ type: "compaction_end" });
+
+    expect(handle.sendCommand).toHaveBeenCalledTimes(1);
+    expect(handle.sendCommand).toHaveBeenCalledWith(
+      expect.objectContaining({ message: expect.stringContaining("Retry task") })
+    );
+    expect(handle.sendCommandAndWait).not.toHaveBeenCalled();
+    expect(deps.memberOpsStates.get("worker")).toBe("working");
+  });
+});
+
 describe("createSendToMember", () => {
   it("should return a function", async () => {
     const { createSendToMember } = await loadModule();
@@ -842,7 +1116,7 @@ describe("createSendToMember auto-compaction", () => {
     const { createSendToMember } = await loadModule();
     const deps = createMockDeps() as any;
     const handle = makeHandle(usageResponse(95, 190000), { success: true });
-    deps.memberHandles.set("worker", handle);
+    deps.memberHandles.set("worker", handle as any);
     deps.memberOpsStates.set("worker", "idle");
 
     createSendToMember(deps)("worker", makeMsg());
@@ -857,7 +1131,7 @@ describe("createSendToMember auto-compaction", () => {
     const { createSendToMember } = await loadModule();
     const deps = createMockDeps({ getAutoCompact: () => enabledCfg }) as any;
     const handle = makeHandle(usageResponse(50, 100000), { success: true });
-    deps.memberHandles.set("worker", handle);
+    deps.memberHandles.set("worker", handle as any);
     deps.memberOpsStates.set("worker", "idle");
 
     createSendToMember(deps)("worker", makeMsg());
@@ -872,7 +1146,7 @@ describe("createSendToMember auto-compaction", () => {
     const { createSendToMember } = await loadModule();
     const deps = createMockDeps({ getAutoCompact: () => enabledCfg }) as any;
     const handle = makeHandle(usageResponse(92, 184000), { type: "response", command: "compact", success: true, data: {} });
-    deps.memberHandles.set("worker", handle);
+    deps.memberHandles.set("worker", handle as any);
     deps.memberOpsStates.set("worker", "idle");
 
     createSendToMember(deps)("worker", makeMsg());
@@ -893,7 +1167,7 @@ describe("createSendToMember auto-compaction", () => {
     const { createSendToMember } = await loadModule();
     const deps = createMockDeps({ getAutoCompact: () => enabledCfg }) as any;
     const handle = makeHandle(usageResponse(95, 190000), { success: true });
-    deps.memberHandles.set("worker", handle);
+    deps.memberHandles.set("worker", handle as any);
     deps.memberOpsStates.set("worker", "working");
 
     createSendToMember(deps)("worker", makeMsg());
@@ -910,7 +1184,7 @@ describe("createSendToMember auto-compaction", () => {
       sendCommand: vi.fn(),
       sendCommandAndWait: vi.fn().mockRejectedValue(new Error("timeout")),
     };
-    deps.memberHandles.set("worker", handle);
+    deps.memberHandles.set("worker", handle as any);
     deps.memberOpsStates.set("worker", "idle");
 
     createSendToMember(deps)("worker", makeMsg());
@@ -927,7 +1201,7 @@ describe("createSendToMember auto-compaction", () => {
     const { createSendToMember } = await loadModule();
     const deps = createMockDeps({ getAutoCompact: () => enabledCfg }) as any;
     const handle = makeHandle(usageResponse(92, 184000), { type: "response", command: "compact", success: false, error: "boom" });
-    deps.memberHandles.set("worker", handle);
+    deps.memberHandles.set("worker", handle as any);
     deps.memberOpsStates.set("worker", "idle");
 
     createSendToMember(deps)("worker", makeMsg());
@@ -950,7 +1224,7 @@ describe("createSendToMember auto-compaction", () => {
         return new Promise((_, reject) => setTimeout(() => reject(new Error("timed out")), 10));
       }),
     };
-    deps.memberHandles.set("worker", handle);
+    deps.memberHandles.set("worker", handle as any);
     deps.memberOpsStates.set("worker", "idle");
 
     createSendToMember(deps)("worker", makeMsg());
@@ -974,7 +1248,7 @@ describe("createSendToMember auto-compaction", () => {
         return compactPromise;
       }),
     };
-    deps.memberHandles.set("worker", handle);
+    deps.memberHandles.set("worker", handle as any);
     deps.memberOpsStates.set("worker", "idle");
 
     const send = createSendToMember(deps);
@@ -999,7 +1273,7 @@ describe("createSendToMember auto-compaction", () => {
     const { createSendToMember } = await loadModule();
     const deps = createMockDeps({ getAutoCompact: () => enabledCfg }) as any;
     const handle = makeHandle(usageResponse(92, 184000), { success: true });
-    deps.memberHandles.set("worker", handle);
+    deps.memberHandles.set("worker", handle as any);
     deps.memberOpsStates.set("worker", "idle");
 
     createSendToMember(deps)("worker", makeMsg());
@@ -1027,7 +1301,7 @@ describe("createSendToMember auto-compaction", () => {
         return compactPromise;
       }),
     };
-    deps.memberHandles.set("worker", handle);
+    deps.memberHandles.set("worker", handle as any);
     deps.memberOpsStates.set("worker", "idle");
 
     const send = createSendToMember(deps);
@@ -1069,7 +1343,7 @@ describe("createSendToMember auto-compaction", () => {
         return compactPromise;
       }),
     };
-    deps.memberHandles.set("worker", handle);
+    deps.memberHandles.set("worker", handle as any);
     deps.memberOpsStates.set("worker", "idle");
 
     const send = createSendToMember(deps);
@@ -1099,7 +1373,7 @@ describe("createSendToMember auto-compaction", () => {
     const { createSendToMember } = await loadModule();
     const deps = createMockDeps({ getAutoCompact: () => enabledCfg }) as any;
     const handle = makeHandle(usageResponse(95, 190000), { success: true });
-    deps.memberHandles.set("worker", handle);
+    deps.memberHandles.set("worker", handle as any);
     deps.memberOpsStates.set("worker", "idle");
 
     createSendToMember(deps)("worker", { ...makeMsg(), skipAutoCompact: true });
@@ -1127,7 +1401,7 @@ describe("createSendToMember auto-compaction", () => {
         return compactPromise;
       }),
     };
-    deps.memberHandles.set("worker", handle);
+    deps.memberHandles.set("worker", handle as any);
     deps.memberOpsStates.set("worker", "idle");
 
     const send = createSendToMember(deps);
@@ -1150,7 +1424,7 @@ describe("createSendToMember auto-compaction", () => {
     const { createSendToMember } = await loadModule();
     const deps = createMockDeps({ getAutoCompact: () => enabledCfg }) as any;
     const handle = makeHandle(usageResponse(50, 100000), { success: true });
-    deps.memberHandles.set("worker", handle);
+    deps.memberHandles.set("worker", handle as any);
     deps.memberOpsStates.set("worker", "idle");
 
     createSendToMember(deps)("worker", { ...makeMsg(), skipAutoCompact: false });
@@ -1165,7 +1439,7 @@ describe("createSendToMember auto-compaction", () => {
     const { createSendToMember } = await loadModule();
     const deps = createMockDeps({ getAutoCompact: () => enabledCfg }) as any;
     const handle = makeHandle(usageResponse(95, 190000), { success: true });
-    deps.memberHandles.set("worker", handle);
+    deps.memberHandles.set("worker", handle as any);
     deps.memberOpsStates.set("worker", "idle");
 
     createSendToMember(deps)("worker", makeMsg());
@@ -1189,7 +1463,7 @@ describe("createSendToMember auto-compaction", () => {
     const runtime = createAutoCompactRuntime(deps.memberOpsStates);
     deps.autoCompact = runtime;
     const handle = { sendCommand: vi.fn(), sendCommandAndWait: vi.fn() };
-    deps.memberHandles.set("worker", handle);
+    deps.memberHandles.set("worker", handle as any);
     deps.memberOpsStates.set("worker", "idle");
 
     const send = createSendToMember(deps);
@@ -1216,7 +1490,7 @@ describe("createSendToMember auto-compaction", () => {
     const { createSendToMember } = await loadModule();
     const deps = createMockDeps({ getAutoCompact: () => enabledCfg }) as any;
     const handle = makeHandle(usageResponse(50, 100000), { success: true });
-    deps.memberHandles.set("worker", handle);
+    deps.memberHandles.set("worker", handle as any);
     deps.memberOpsStates.set("worker", "idle");
 
     createSendToMember(deps)("worker", { ...makeMsg(), skipAutoCompact: true });

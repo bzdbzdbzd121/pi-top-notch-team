@@ -766,6 +766,42 @@ describe("registerTlTools", () => {
       expect(result.content[0].text).toContain("⚠️");
     });
 
+    it("team_send_and_wait all-idle race: deadline expiry returns partial + stuck-member diagnostic (Phase 1)", {"timeout": 5000}, async () => {
+      // The user scenario: a member is stuck in `working` (the compaction
+      // timeout black hole). team_send_and_wait's all-idle path must not
+      // wait forever — the deadline returns partial results with a
+      // diagnostic so the TL can act (stop_member / resume).
+      vi.useFakeTimers();
+      try {
+        memberOpsStates.set("worker", "working"); // stuck forever
+
+        responseWaiter.waitForResponse = vi.fn(() => new Promise<WaitResult>(() => {}));
+
+        let executeFn: Function = () => {};
+        pi.registerTool = vi.fn((def: any) => {
+          if (def.name === "team_send_and_wait") {
+            executeFn = def.execute;
+          }
+        });
+
+        callRegisterTlTools();
+
+        const resultPromise = executeFn("call-dl", {
+          tasks: [{ to: "worker", content: "Do work" }],
+          nextSteps: "check",
+        });
+        await vi.advanceTimersByTimeAsync(15 * 60_000 + WAIT_IDLE_CHECK_INTERVAL_MS);
+        const result = await resultPromise;
+
+        expect(result.details).toHaveProperty("allIdle");
+        expect(result.content[0].text).toContain("等待超时");
+        expect(result.content[0].text).toContain("worker");
+        expect(result.content[0].text).toContain("stop_member");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it("team_send_and_wait returns error for empty tasks array", async () => {
       let executeFn: Function = () => {};
       pi.registerTool = vi.fn((def: any) => {
@@ -1122,6 +1158,126 @@ describe("registerTlTools", () => {
       const result = await executeFn("call-3");
       expect(result.content[0].text).toContain("analyzer");
       expect(result.content[0].text).toContain("crashed");
+    });
+
+    // ── Phase 1: wait deadline + diagnostic (defense in depth) ──
+    // The user's main symptom: wait_and_get_member_status hangs FOREVER after
+    // a compaction timeout left a member in the `working` black hole. The
+    // deadline is the final exit — the user gets their tools back with a
+    // diagnostic instead of an infinite hang.
+
+    it("returns a diagnostic instead of hanging forever when a member stays active past the deadline", { timeout: 5000 }, async () => {
+      vi.useFakeTimers();
+      // The black hole: a member stuck in working with no event that will
+      // ever clear it (the Phase-1 bug scenario).
+      memberOpsStates.set("worker", "working");
+
+      let executeFn: Function = () => {};
+      pi.registerTool = vi.fn((def: any) => {
+        if (def.name === "wait_and_get_member_status") {
+          executeFn = def.execute;
+        }
+      });
+
+      callRegisterTlTools();
+
+      const resultPromise = executeFn("call-dl");
+      // Default deadline: 15 min (no config in this harness) + one poll tick.
+      await vi.advanceTimersByTimeAsync(15 * 60_000 + WAIT_IDLE_CHECK_INTERVAL_MS);
+      const result = await resultPromise;
+
+      expect(result.content[0].text).toContain("worker");
+      expect(result.content[0].text).toContain("等待超时");
+      expect(result.content[0].text).toContain("stop_member");
+    });
+
+    it("regression (Phase 1): after the rejection correction restores the member, wait returns normally — no deadlock", { timeout: 5000 }, async () => {
+      vi.useFakeTimers();
+      // Simulates the bug chain: compaction timeout → prompt rejected →
+      // get_state correction restored compacting → compaction_end → idle.
+      // The tool must return promptly once the member is out of the black
+      // hole — the old code would have hung here.
+      memberOpsStates.set("worker", "compacting"); // correction in progress
+
+      let executeFn: Function = () => {};
+      pi.registerTool = vi.fn((def: any) => {
+        if (def.name === "wait_and_get_member_status") {
+          executeFn = def.execute;
+        }
+      });
+
+      callRegisterTlTools();
+
+      const resultPromise = executeFn("call-rej");
+      await vi.advanceTimersByTimeAsync(WAIT_IDLE_CHECK_INTERVAL_MS * 2);
+
+      memberOpsStates.set("worker", "idle"); // compaction_end arrived → idle
+      await vi.advanceTimersByTimeAsync(
+        WAIT_IDLE_CHECK_INTERVAL_MS * (WAIT_IDLE_REQUIRED_CONSECUTIVE + 1)
+      );
+
+      const result = await resultPromise;
+      expect(result.content[0].text).toContain("worker");
+      expect(result.content[0].text).toContain("idle");
+      expect(result.content[0].text).not.toContain("等待超时");
+    });
+
+    it("waitForAllIdle resolves with the stuck members when the deadline expires", { timeout: 5000 }, async () => {
+      vi.useFakeTimers();
+      const { waitForAllIdle } = await import("./tl-tools");
+      const states = new Map<string, MemberOperationalState>([
+        ["worker", "working"],
+        ["analyzer", "idle"],
+      ]);
+
+      const promise = waitForAllIdle(states, 2 * WAIT_IDLE_CHECK_INTERVAL_MS);
+      await vi.advanceTimersByTimeAsync(3 * WAIT_IDLE_CHECK_INTERVAL_MS);
+
+      await expect(promise).resolves.toEqual({ timedOut: true, stuckMembers: ["worker"] });
+    });
+
+    it("waitForAllIdle with deadline 0 is unlimited (status quo)", { timeout: 5000 }, async () => {
+      vi.useFakeTimers();
+      const { waitForAllIdle } = await import("./tl-tools");
+      const states = new Map<string, MemberOperationalState>([["worker", "working"]]);
+
+      const promise = waitForAllIdle(states, 0);
+      // Way past the default deadline — the poll must still be alive.
+      await vi.advanceTimersByTimeAsync(2 * 15 * 60_000);
+
+      // Member becomes idle → resolves normally, no timeout.
+      states.set("worker", "idle");
+      await vi.advanceTimersByTimeAsync(
+        WAIT_IDLE_CHECK_INTERVAL_MS * (WAIT_IDLE_REQUIRED_CONSECUTIVE + 1)
+      );
+      await expect(promise).resolves.toEqual({ timedOut: false, stuckMembers: [] });
+    });
+
+    it("waitForAllIdle unrefs its poll timer (no polling leak after Esc interrupt)", async () => {
+      const unref = vi.fn();
+      let capturedCallback: (() => void) | undefined;
+      const setIntervalSpy = vi
+        .spyOn(globalThis, "setInterval")
+        .mockImplementation(((cb: () => void) => {
+          capturedCallback = cb;
+          return { unref, ref: vi.fn() } as any;
+        }) as any);
+      try {
+        const { waitForAllIdle } = await import("./tl-tools");
+        const states = new Map<string, MemberOperationalState>([["worker", "idle"]]);
+
+        const promise = waitForAllIdle(states);
+        expect(unref).toHaveBeenCalled();
+
+        // Drive 4 consecutive idle checks so the poll resolves (no dangling timer).
+        capturedCallback!();
+        capturedCallback!();
+        capturedCallback!();
+        capturedCallback!();
+        await expect(promise).resolves.toEqual({ timedOut: false, stuckMembers: [] });
+      } finally {
+        setIntervalSpy.mockRestore();
+      }
     });
   });
 });

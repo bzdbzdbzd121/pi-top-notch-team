@@ -13,6 +13,7 @@ import { getRootDir } from "../config";
 import { loadSettings } from "../settings/settings";
 import { resolveMemberModel } from "../settings/resolve-model";
 import { createMemberEventHandler } from "../channel/event-handler";
+import type { AutoCompactRuntime } from "../channel/auto-compact";
 import { mkdirSync } from "node:fs";
 import { transitionState } from "../session/state-machine";
 import { ensureSharedContextFile } from "../session/shared-context";
@@ -35,6 +36,17 @@ export interface MemberLifecycleDeps {
   pendingAutoReplies?: Map<string, NodeJS.Timeout>;
   /** Activity hook forwarded to the event handler (Member Inspector). Receives the full member RPC event. */
   onMemberActivity?: (memberName: string, event: any) => void;
+  /**
+   * Member process handles by name — forwarded to the event handler (Phase 1:
+   * the get_state query after prompt rejections + the compaction_end flush
+   * dispatch). Absent = those branches are inert.
+   */
+  memberHandles?: Map<string, MemberProcessHandle>;
+  /**
+   * Shared auto-compaction runtime (from createMessageChannel) — forwarded to
+   * the event handler (Phase 1: the compaction_end consumption branch).
+   */
+  autoCompact?: AutoCompactRuntime;
 }
 
 // ── createAndRegisterMember ────────────────────────────────

@@ -6,7 +6,7 @@ import type { TeamMessage } from "./types";
 
 // ── Constants ──────────────────────────────────────────────
 
-/** Timeout for the pre-dispatch stats query (same as the status widget). */
+/** Timeout for the pre-dispatch stats query (same as the status widget). Also used for the get_state compaction-state query (Phase 1). */
 const STATS_QUERY_TIMEOUT_MS = 3000;
 
 // ── Types ──────────────────────────────────────────────────
@@ -84,6 +84,23 @@ export interface AutoCompactRuntime {
    */
   queueDuringCompaction(name: string, msg: TeamMessage): boolean;
   /**
+   * Query the member's compaction state via get_state (isCompacting).
+   * 3s timeout, fail-open → null on any failure/timeout. Used by the
+   * prompt-rejection branch to restore the honest operational state
+   * ("ask instead of guess" — never fabricate working/idle).
+   */
+  queryCompactionState(name: string, handle: MemberProcessHandle): Promise<boolean | null>;
+  /**
+   * Record that the compact RPC lease expired (local timeout) while the
+   * member-side compaction may still be running ("租约 vs 心跳": the lease
+   * expiry says nothing about the member). Consumed by the compaction_end
+   * event branch to notify the TL when the member-side compaction actually
+   * finishes.
+   */
+  markCompactionTimeout(name: string): void;
+  /** Return and clear the recorded compaction-timeout timestamp for a member, if any. */
+  takeCompactionTimeout(name: string): number | undefined;
+  /**
    * Return and clear the messages queued during compaction (FIFO — backlog
    * before later arrivals). The caller is responsible for dispatching them.
    * No-op (returns []) when nothing is queued.
@@ -104,6 +121,12 @@ export function createAutoCompactRuntime(
 ): AutoCompactRuntime {
   /** Messages that arrive while a member is compacting, held until compaction ends. */
   const pendingDuringCompaction = new Map<string, TeamMessage[]>();
+  /**
+   * Per-member timestamp of the last compactNow lease timeout (Phase 1). The
+   * member-side compaction may still be running — the compaction_end event
+   * branch consumes the mark to notify the TL.
+   */
+  const compactionTimeouts = new Map<string, number>();
 
   return {
     async queryStats(
@@ -157,9 +180,50 @@ export function createAutoCompactRuntime(
         }
         return { ok: true };
       } catch (err) {
-        // Timeout / RPC failure — fail-open with the real reason.
+        // Timeout / RPC failure — fail-open, but keep the real reason for
+        // honest notifications (matches the pre-refactor inline behavior).
+        // A TIMEOUT additionally records the lease-expired mark: the
+        // member-side compaction may still be running, and the
+        // compaction_end event branch uses the mark to notify the TL when
+        // it actually finishes (租约 vs 心跳 — the lease expiry says
+        // nothing about the member-side state). Non-timeout failures mean
+        // the compaction RPC already settled on the member side — no mark.
+        if (err instanceof Error && err.message.includes("timed out")) {
+          compactionTimeouts.set(name, Date.now());
+        }
         return { ok: false, error: err instanceof Error ? err.message : String(err) };
       }
+    },
+
+    async queryCompactionState(
+      name: string,
+      handle: MemberProcessHandle
+    ): Promise<boolean | null> {
+      try {
+        const resp = await handle.sendCommandAndWait(
+          { type: "get_state" },
+          (event: any) => event.type === "response" && event.command === "get_state",
+          STATS_QUERY_TIMEOUT_MS
+        );
+        if (!resp || resp.success === false) return null;
+        const isCompacting = resp?.data?.isCompacting;
+        return typeof isCompacting === "boolean" ? isCompacting : null;
+      } catch {
+        // Timeout / RPC failure — fail-open (null = "could not determine").
+        // The caller picks the conservative branch.
+        return null;
+      }
+    },
+
+    markCompactionTimeout(name: string): void {
+      compactionTimeouts.set(name, Date.now());
+    },
+
+    takeCompactionTimeout(name: string): number | undefined {
+      const ts = compactionTimeouts.get(name);
+      if (ts === undefined) return undefined;
+      compactionTimeouts.delete(name);
+      return ts;
     },
 
     endCompaction(name: string): void {

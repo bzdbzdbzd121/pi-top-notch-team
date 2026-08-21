@@ -64,6 +64,27 @@ describe("transitionState", () => {
     expect(transitionState("crashed", { type: "compaction_completed" })).toBe("crashed");
   });
 
+  // ── compaction_confirmed (Phase 1: get_state-verified compaction) ──
+  // After a prompt rejection, the rejection branch queries get_state. When it
+  // reports isCompacting=true, the working state left behind by the failed
+  // dispatch must be corrected to compacting — the working black hole.
+  it("transitions working to compacting on compaction_confirmed (post-rejection correction)", () => {
+    expect(transitionState("working", { type: "compaction_confirmed" })).toBe("compacting");
+  });
+
+  it("transitions idle to compacting on compaction_confirmed", () => {
+    expect(transitionState("idle", { type: "compaction_confirmed" })).toBe("compacting");
+  });
+
+  it("stays compacting on compaction_confirmed (idempotent)", () => {
+    expect(transitionState("compacting", { type: "compaction_confirmed" })).toBe("compacting");
+  });
+
+  it("preserves crashed/stopped on compaction_confirmed (no running compaction to wait for)", () => {
+    expect(transitionState("crashed", { type: "compaction_confirmed" })).toBe("crashed");
+    expect(transitionState("stopped", { type: "compaction_confirmed" })).toBe("stopped");
+  });
+
   // ── task_completed → idle ──
   it("transitions working → idle on task_completed", () => {
     expect(transitionState("working", { type: "task_completed" })).toBe("idle");

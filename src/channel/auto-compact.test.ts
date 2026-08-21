@@ -369,3 +369,128 @@ describe("auto-compact runtime queueDuringCompaction + flushPending", () => {
     expect(rt.flushPending("worker")).toEqual([msg]);
   });
 });
+
+// ── queryCompactionState (Phase 1) ────────────────────────
+// The prompt-rejection branch asks the member (get_state.isCompacting)
+// instead of guessing — this query powers that correction.
+
+describe("auto-compact runtime queryCompactionState", () => {
+  function getStateResponse(isCompacting: boolean): any {
+    return {
+      type: "response",
+      command: "get_state",
+      success: true,
+      data: { isCompacting },
+    };
+  }
+
+  it("resolves true when get_state reports isCompacting=true", async () => {
+    const rt = makeRuntime();
+    const handle = makeHandle() as unknown as MemberProcessHandle;
+    handle.sendCommandAndWait = vi.fn().mockResolvedValue(getStateResponse(true));
+
+    await expect(rt.queryCompactionState("worker", handle)).resolves.toBe(true);
+
+    // Same 3s timeout pattern as the stats query (fail-open).
+    expect(handle.sendCommandAndWait).toHaveBeenCalledWith(
+      { type: "get_state" },
+      expect.any(Function),
+      3000
+    );
+  });
+
+  it("resolves false when get_state reports isCompacting=false", async () => {
+    const rt = makeRuntime();
+    const handle = makeHandle() as unknown as MemberProcessHandle;
+    handle.sendCommandAndWait = vi.fn().mockResolvedValue(getStateResponse(false));
+
+    await expect(rt.queryCompactionState("worker", handle)).resolves.toBe(false);
+  });
+
+  it("resolves null on RPC failure (fail-open — caller picks the conservative branch)", async () => {
+    const rt = makeRuntime();
+    const handle = makeHandle() as unknown as MemberProcessHandle;
+    handle.sendCommandAndWait = vi.fn().mockRejectedValue(new Error("Command to \"worker\" timed out after 3000ms"));
+
+    await expect(rt.queryCompactionState("worker", handle)).resolves.toBeNull();
+  });
+
+  it("resolves null when the member reports a failed get_state", async () => {
+    const rt = makeRuntime();
+    const handle = makeHandle() as unknown as MemberProcessHandle;
+    handle.sendCommandAndWait = vi.fn().mockResolvedValue({
+      type: "response",
+      command: "get_state",
+      success: false,
+      error: "boom",
+    });
+
+    await expect(rt.queryCompactionState("worker", handle)).resolves.toBeNull();
+  });
+
+  it("resolves null when isCompacting is not a boolean", async () => {
+    const rt = makeRuntime();
+    const handle = makeHandle() as unknown as MemberProcessHandle;
+    handle.sendCommandAndWait = vi.fn().mockResolvedValue({
+      type: "response",
+      command: "get_state",
+      success: true,
+      data: { isCompacting: "yes" },
+    });
+
+    await expect(rt.queryCompactionState("worker", handle)).resolves.toBeNull();
+  });
+});
+
+// ── compaction timeout marks (Phase 1) ────────────────────
+// "租约 vs 心跳": a compactNow timeout (local lease) says NOTHING about the
+// member-side compaction — it may still be running. The mark bridges the
+// gap: compaction_end (the heartbeat) checks it to notify the TL that the
+// member-side compaction actually finished.
+
+describe("auto-compact runtime compaction timeout marks", () => {
+  it("compactNow timeout records a mark (lease expired — member-side compaction may still run)", async () => {
+    const rt = makeRuntime();
+    const handle = makeHandle() as unknown as MemberProcessHandle;
+    handle.sendCommandAndWait = vi.fn().mockRejectedValue(
+      new Error('Command to "worker" timed out after 600000ms')
+    );
+
+    const result = await rt.compactNow("worker", handle, enabledCfg);
+    expect(result.ok).toBe(false);
+
+    // The mark was recorded with a timestamp …
+    expect(rt.takeCompactionTimeout("worker")).toEqual(expect.any(Number));
+    // … and consumed exactly once (no re-notification on a later event).
+    expect(rt.takeCompactionTimeout("worker")).toBeUndefined();
+  });
+
+  it("compactNow non-timeout RPC failure records NO mark", async () => {
+    const rt = makeRuntime();
+    const handle = makeHandle() as unknown as MemberProcessHandle;
+    handle.sendCommandAndWait = vi.fn().mockRejectedValue(new Error("RPC connection lost"));
+
+    await rt.compactNow("worker", handle, enabledCfg);
+
+    expect(rt.takeCompactionTimeout("worker")).toBeUndefined();
+  });
+
+  it("compactNow RPC failure response (member-side compaction already ended) records NO mark", async () => {
+    const rt = makeRuntime();
+    const handle = makeHandle(undefined, {
+      type: "response",
+      command: "compact",
+      success: false,
+      error: "compaction failed",
+    });
+
+    await rt.compactNow("worker", handle, enabledCfg);
+
+    expect(rt.takeCompactionTimeout("worker")).toBeUndefined();
+  });
+
+  it("takeCompactionTimeout returns undefined when nothing was recorded", async () => {
+    const rt = makeRuntime();
+    expect(rt.takeCompactionTimeout("worker")).toBeUndefined();
+  });
+});
