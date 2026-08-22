@@ -12,6 +12,7 @@ import { readTeam } from "../../team/store";
 import { getRootDir } from "../../config";
 import { ensureAddDynamicMemberTool } from "../../setup/dynamic-session-bootstrap";
 import { STOP_TEAM_SESSION_TOOL_NAME } from "../../tools/agent-session-tool-names";
+import { scrollSelect } from "../../ui/scroll-select";
 import type { TeamDefinition } from "../../team/definition";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -69,14 +70,17 @@ export function cleanupOrphanMembers(manifest: TeamSessionManifest): string[] {
   return killed;
 }
 
-// ── Picker label ───────────────────────────────────────────
+// ── Picker item ────────────────────────────────────────────
 
-function formatEntry(m: TeamSessionManifest, showCwd: boolean): string {
+function formatEntry(m: TeamSessionManifest, showCwd: boolean): { label: string; description: string } {
   const when = new Date(m.lastActiveAt).toLocaleString();
   const status = m.status === "active" ? "中断" : "已停止";
   const kind = m.isDynamic ? "动态" : "预定义";
   const cwd = showCwd ? ` — ${m.cwd ?? "未知目录"}` : "";
-  return `${m.teamName} (${m.sessionId}) — ${kind}/${status}/${m.members.length} 成员 — ${when}${cwd}`;
+  return {
+    label: `${m.teamName} (${m.sessionId})`,
+    description: `${kind}/${status}/${m.members.length} 成员 — ${when}${cwd}`,
+  };
 }
 
 // ── Handler ────────────────────────────────────────────────
@@ -134,11 +138,22 @@ export async function handleResume(
 
   let selected = candidates[0];
   if (candidates.length > 1) {
-    const options = candidates.map((e) => formatEntry(e.manifest, showAll));
-    const choice = await ctx.ui.select("选择要恢复的团队会话（按最后活跃时间排序）", options);
-    if (!choice) return; // cancelled
-    const idx = options.indexOf(choice);
-    if (idx < 0) return;
+    // Scrollable + filterable picker: the built-in ctx.ui.select renders ALL
+    // options without scrolling, which overflows the screen when many
+    // resumable sessions exist (same rationale as the /team setting model
+    // picker). Value is the candidate index — robust against identical
+    // teamName/sessionId prefixes across teams.
+    const choice = await scrollSelect(ctx, {
+      title: "选择要恢复的团队会话（按最后活跃时间排序，输入可筛选）",
+      items: candidates.map((e, i) => {
+        const { label, description } = formatEntry(e.manifest, showAll);
+        return { value: String(i), label, description };
+      }),
+      maxVisible: 10,
+    });
+    if (choice === undefined) return; // cancelled
+    const idx = Number(choice);
+    if (!Number.isInteger(idx) || !candidates[idx]) return;
     selected = candidates[idx];
   }
 

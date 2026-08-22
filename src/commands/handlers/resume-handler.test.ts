@@ -4,6 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { handleResume, type ResumeHandlerDeps } from "./resume-handler";
 import { createMockExtensionAPI, createMockContext } from "../../test/fixtures/mock-extension-api";
+import { scrollSelect } from "../../ui/scroll-select";
+
+// The resume picker uses the scrollable scrollSelect component (ctx.ui.select
+// renders all options without scrolling) — mock it at the module boundary.
+vi.mock("../../ui/scroll-select", () => ({
+  scrollSelect: vi.fn(),
+}));
+const mockScrollSelect = scrollSelect as unknown as ReturnType<typeof vi.fn>;
 import type { TeamContext } from "../../session/context";
 import { getSessionState, endSession, startSession } from "../../session/state";
 import { getGoalState, resetGoal } from "../../tools/goal-tools";
@@ -61,6 +69,7 @@ let rootDir: string;
 beforeEach(() => {
   rootDir = mkdtempSync(join(tmpdir(), "resume-handler-"));
   process.env.TOP_NOTCH_TEAM_ROOT = rootDir;
+  mockScrollSelect.mockReset();
 });
 
 afterEach(() => {
@@ -136,12 +145,14 @@ describe("/team resume", () => {
     writeManifest(rootDir, { teamName: "b-team", sessionId: "s-2", startedMembers: [], lastActiveAt: 2000 });
     const pi = createMockExtensionAPI();
     const ctx = createMockContext();
-    // Sorted by lastActiveAt desc → opts[0] is b-team (most recent)
-    (ctx.ui.select as any).mockImplementation(async (_t: string, opts: string[]) => opts[0]);
+    // Sorted by lastActiveAt desc → items[0] is b-team (most recent)
+    mockScrollSelect.mockImplementation(async (_ctx: unknown, opts: { items: { value: string }[] }) => opts.items[0]?.value);
 
     await handleResume(pi as any, makeTeamCtx(), ctx as any, "", { startResumedMember: vi.fn() });
 
-    expect(ctx.ui.select).toHaveBeenCalled();
+    expect(mockScrollSelect).toHaveBeenCalled();
+    // Scrollable window bounded so long session lists never overflow the screen
+    expect(mockScrollSelect.mock.calls[0][1].maxVisible).toBeLessThanOrEqual(10);
     expect(getSessionState().teamDefinition?.name).toBe("b-team");
   });
 
@@ -179,7 +190,7 @@ describe("/team resume", () => {
 
     // Only one candidate in this cwd → resumed directly without a picker
     await handleResume(pi as any, makeTeamCtx(), ctx as any, "", { startResumedMember: vi.fn() });
-    expect(ctx.ui.select).not.toHaveBeenCalled();
+    expect(mockScrollSelect).not.toHaveBeenCalled();
     expect(getSessionState().teamDefinition?.name).toBe("this-dir");
   });
 
@@ -188,14 +199,14 @@ describe("/team resume", () => {
     writeManifest(rootDir, { teamName: "other-dir", sessionId: "s-else", startedMembers: [], cwd: "/other/project" });
     const pi = createMockExtensionAPI();
     const ctx = createMockContext();
-    (ctx.ui.select as any).mockImplementation(async (_t: string, opts: string[]) => opts[0]);
+    mockScrollSelect.mockImplementation(async (_ctx: unknown, opts: { items: { value: string }[] }) => opts.items[0]?.value);
 
     await handleResume(pi as any, makeTeamCtx(), ctx as any, "--all", { startResumedMember: vi.fn() });
-    expect(ctx.ui.select).toHaveBeenCalled();
-    // Picker shows 2 candidates and labels include the working directory
-    const options = (ctx.ui.select as any).mock.calls[0][1] as string[];
-    expect(options).toHaveLength(2);
-    expect(options.some((o) => o.includes("/other/project"))).toBe(true);
+    expect(mockScrollSelect).toHaveBeenCalled();
+    // Picker shows 2 candidates and the working directory appears in --all mode
+    const items = mockScrollSelect.mock.calls[0][1].items as { label: string; description?: string }[];
+    expect(items).toHaveLength(2);
+    expect(items.some((o) => (o.label + (o.description ?? "")).includes("/other/project"))).toBe(true);
   });
 
   it("reports the --all escape hatch when the current directory has no sessions", async () => {

@@ -1,9 +1,11 @@
 import { matchesKey, Key, visibleWidth } from "@earendil-works/pi-tui";
 // CSI-u 解码纪律：任何字符插入路径必须经 decodePrintableKey（与 pi 主输入框
-// editor.js 一致——它同样深导入 keys.js）。主 index 只 re-export 了
-// decodeKittyPrintable；deep import 覆盖 kitty CSI-u + modifyOtherKeys 两种
-// 协议，且与上游 editor 行为完全对齐（一致性即正确性）。
-import { decodePrintableKey } from "@earendil-works/pi-tui/dist/keys.js";
+// editor.js 一致）。本地实现见 pi-key-decode.ts——不能深导入
+// `@earendil-works/pi-tui/dist/keys.js`：扩展加载器（loader.js）的 jiti alias
+// 前缀替换会把子路径拼到包 main 后（→ dist/index.js/dist/keys.js），导致扩展
+// 加载失败（Cannot find module）。主 index 只 re-export decodeKittyPrintable，
+// 故 modifyOtherKeys 回退在本地按上游 keys.js 原样复刻（0.83.0/0.84.2 一致）。
+import { decodePrintableKey } from "./pi-key-decode";
 import type { MemberProcessHandle } from "../process/member-process";
 import type { MemberOperationalState } from "../session/context";
 import {
