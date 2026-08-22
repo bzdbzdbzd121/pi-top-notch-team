@@ -993,6 +993,112 @@ export function messageFingerprint(m: unknown): string {
   return fnv1a64(s ?? "");
 }
 
+// ── P4: get_entries {since} 增量拉取（spike: docs/spike-get-entries-incremental.md）──
+
+/**
+ * 磁盘 entry（get_entries 响应项）。type: "message" | "compaction" |
+ * "model_change" | "thinking_level_change" | ...；message entry 的
+ * `message` 字段与 get_messages 返回对象同源（同 shape，可直接渲染）。
+ */
+export interface SessionEntry {
+  type: string;
+  id: string;
+  parentId: string | null;
+  timestamp?: string;
+  message?: unknown;
+}
+
+/**
+ * 全量拉取后建立「已见 parentId 映射」（游标语义的一部分）：增量响应只含
+ * since 之后的 entries，回溯祖先链可能需要分叉点之前的节点——此映射提供。
+ */
+export function buildSeenParents(entries: SessionEntry[]): Map<string, string | null> {
+  const seen = new Map<string, string | null>();
+  for (const e of entries) seen.set(e.id, e.parentId);
+  return seen;
+}
+
+/**
+ * 祖先链过滤（纯函数）：返回 entries 中落在「leafId 沿 parentId 回溯到根」
+ * 链上的条目，保持 append order。首条 message 的 parentId 指向被 getEntries
+ * 排除的 session header（不在映射中）——该节点仍视为链上（链末端语义：
+ * parentId 不在映射时停止回溯但保留当前节点）。extraParents 供增量场景
+ * （分叉点 ≤ since 的已见映射，见 buildSeenParents）。
+ */
+export function mainChainEntries(
+  entries: SessionEntry[],
+  leafId: string | null,
+  extraParents?: ReadonlyMap<string, string | null>
+): SessionEntry[] {
+  if (!leafId) return [];
+  const parent = new Map<string, string | null>(extraParents ?? []);
+  for (const e of entries) parent.set(e.id, e.parentId);
+  // 回溯收集链上 id（有界：entries 长度 + 已见映射大小上限，防异常环）
+  const chain = new Set<string>();
+  let node: string | null = leafId;
+  let guard = 0;
+  while (node && guard++ < 1_000_000) {
+    chain.add(node);
+    const p = parent.get(node);
+    if (p === undefined || p === null) break; // 末端（session 头 / 根）
+    node = p;
+  }
+  return entries.filter((e) => e.type === "message" && chain.has(e.id));
+}
+
+/**
+ * 分支移动判定（纯函数）：增量响应带回新 leafId；若 since 条目仍在新祖先
+ * 链上（直接延续，或 steer/retry fork 分叉点 ≤ since）→ true（增量安全）；
+ * 否则（主分支重写 / 断链 / 空 leaf）→ false（调用方全量回退）。保守：
+ * 任何不确定都返回 false——fail-open 以全量兜底，显示不丢不串。
+ */
+export function isSinceOnMainChain(
+  seen: ReadonlyMap<string, string | null>,
+  newEntries: SessionEntry[],
+  since: string,
+  leafId: string | null
+): boolean {
+  if (!leafId || !since) return false;
+  const parent = new Map<string, string | null>(seen);
+  for (const e of newEntries) parent.set(e.id, e.parentId);
+  let node: string | null = leafId;
+  let guard = 0;
+  while (node && guard++ < 1_000_000) {
+    if (node === since) return true;
+    const p = parent.get(node);
+    if (p === undefined) return false; // 断链：parentId 从未见过 → 保守回退
+    if (p === null) return false; // 回溯到根仍未遇 since → 主分支重写
+    node = p;
+  }
+  return false;
+}
+
+// ── P4 R5: reconcilePending 内容哈希化（O(p×m) stringify → O(p+m)）──
+
+/**
+ * 消息内容键：role + content 序列化。与 sameMessageContent 的判定语义
+ * 完全一致（role 相等 + content 严格相等），仅把比较预计算成可索引的键。
+ */
+export function messageContentKey(m: unknown): string {
+  const mm = m as any;
+  return (mm?.role ?? "") + "\u0000" + JSON.stringify(mm?.content ?? null);
+}
+
+/**
+ * 预计算消息数组的内容键索引：key → 升序下标列表（同内容消息合并）。
+ * R5：reconcilePending 从 O(p×m) 次 stringify 降到 O(p+m) 次。
+ */
+export function precomputeContentKeys(messages: unknown[]): Map<string, number[]> {
+  const keys = new Map<string, number[]>();
+  for (let i = 0; i < messages.length; i++) {
+    const k = messageContentKey(messages[i]);
+    const arr = keys.get(k);
+    if (arr) arr.push(i);
+    else keys.set(k, [i]);
+  }
+  return keys;
+}
+
 /** Per-tab incremental build cache (see P1-③ design above). */
 export interface BodyBuildCache {
   /** Messages covered by the raw prefix (streaming tail excluded). */
@@ -1555,22 +1661,31 @@ export class MemberInspectorState {
    * decreasing position bound — history is append-only, so a later completion
    * sits at a higher index; interleaved toolResult/user messages between
    * completions are tolerated). Unconfirmed entries are kept.
+   *
+   * P4-R5: 预计算消息内容键索引（Map<key, 升序下标>），单次 stringify 即可
+   * 定位全部候选——O(p×m) → O(p+m)。语义与逐对 sameMessageContent 完全
+   * 等价（键 = role + content 序列化）；“取 < scanBound 的最大下标”与旧
+   * 向后扫描首个匹配一致。
    */
   reconcilePending(name: string, messages: any[]): void {
     const tab = this.tabs.find((t) => t.name === name);
     const pending = tab?.pendingCompletions;
     if (!tab || !pending || pending.length === 0) return;
+    const keys = precomputeContentKeys(messages);
     const confirmed = new Set<number>();
     let scanBound = messages.length; // strictly decreasing scan ceiling
     for (let p = pending.length - 1; p >= 0; p--) {
+      const arr = keys.get(messageContentKey(pending[p]));
+      if (!arr) continue; // unconfirmed — earlier entries may still match
+      // arr 升序：从尾部找 < scanBound 的最大下标（与旧向后扫描首个匹配一致）
       let found = -1;
-      for (let i = scanBound - 1; i >= 0; i--) {
-        if (sameMessageContent(messages[i], pending[p])) {
-          found = i;
+      for (let k = arr.length - 1; k >= 0; k--) {
+        if (arr[k] < scanBound) {
+          found = arr[k];
           break;
         }
       }
-      if (found < 0) continue; // unconfirmed — earlier entries may still match
+      if (found < 0) continue;
       confirmed.add(p);
       scanBound = found;
     }

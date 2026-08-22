@@ -9,10 +9,13 @@ import type { MemberOperationalState } from "../session/context";
 import {
   MemberInspectorState,
   buildBodyLinesIncremental,
+  buildSeenParents,
   canIncrementCache,
   createBodyBuildCache,
   fitLinesIncremental,
   clearAppendWrapCache,
+  isSinceOnMainChain,
+  mainChainEntries,
   buildHeaderLine,
   buildFooterStatusLine,
   truncateLine,
@@ -25,6 +28,7 @@ import {
   type BuildBodyOptions,
   type InspectorTab,
   type InspectorTheme,
+  type SessionEntry,
 } from "./member-inspector-state";
 
 // ── Member Inspector (TUI glue) ────────────────────────────
@@ -217,6 +221,22 @@ export class MemberInspectorComponent {
    */
   private lastMessages = new Map<string, any[]>();
   /**
+   * P4: per-tab get_entries 游标（since = 最后已见 entry id；seen = 已见
+   * parentId 映射供祖先链回溯；leafId = 上次响应主分支尾）。磁盘 entry id
+   * 跨成员进程重启稳定——TL 存活期间游标一直有效；TL 重启后自然全量重建。
+   */
+  private entryCursors = new Map<
+    string,
+    { since: string | null; leafId: string | null; seen: Map<string, string | null> }
+  >();
+  /**
+   * P4 fail-open: get_entries 连续失败（老版本 pi 无此命令）→ 该 tab 永久回退
+   * get_messages 全量路径，避免无限重试循环。
+   */
+  private legacyFetch = new Set<string>();
+  /** P4: get_entries 连续失败计数（≥2 → legacyFetch 回退）。 */
+  private failedFetches = new Map<string, number>();
+  /**
    * P2-③: per-tab cached `buildMessages` array (history + pending + live).
    * Rebuilt only when the pieces actually change (refetch replaces history,
    * message_end/agent_end change pending/live) — the streaming flush reuses
@@ -281,6 +301,9 @@ export class MemberInspectorComponent {
     this.streamTimer = null;
     this.bodyCaches.clear();
     this.lastMessages.clear();
+    this.entryCursors.clear();
+    this.legacyFetch.clear();
+    this.failedFetches.clear();
     this.done(null);
   }
 
@@ -444,6 +467,15 @@ export class MemberInspectorComponent {
     for (const k of this.buildMessagesCache.keys()) {
       if (!live.has(k)) this.buildMessagesCache.delete(k);
     }
+    for (const k of this.entryCursors.keys()) {
+      if (!live.has(k)) this.entryCursors.delete(k);
+    }
+    for (const k of this.legacyFetch.keys()) {
+      if (!live.has(k)) this.legacyFetch.delete(k);
+    }
+    for (const k of this.failedFetches.keys()) {
+      if (!live.has(k)) this.failedFetches.delete(k);
+    }
 
     const bh = bodyHeight();
     // P3-③: 只急切刷活跃 tab。非活跃 tab 仅置 dirty（switchTab 时补刷），
@@ -474,18 +506,80 @@ export class MemberInspectorComponent {
       // (e/t toggle, member activity in the chunked-build yield gaps)
       // re-set it, and .then can tell "pending" apart from "stale".
       tab.dirty = false;
+      // P4: get_entries 游标增量拉取（spike: docs/spike-get-entries-incremental.md）。
+      // 有游标 → 只拉 since 之后的新 entries（稳态载荷 O(history)→O(new)）；
+      // 无游标（首次 / 游标失效后）→ 全量。fail-open：连续失败（老版本 pi
+      // 无 get_entries 命令）→ 永久回退 get_messages 全量路径。
+      const cursor = this.entryCursors.get(tab.name);
+      const cmd = this.legacyFetch.has(tab.name)
+        ? { type: "get_messages" }
+        : cursor?.since != null
+          ? { type: "get_entries", since: cursor.since }
+          : { type: "get_entries" };
       handle
         .sendCommandAndWait(
-          { type: "get_messages" },
+          cmd,
           (event: any) =>
-            event.type === "response" && event.command === "get_messages",
+            event.type === "response" &&
+            (event.command === "get_entries" ||
+              event.command === "get_messages"),
           RPC_TIMEOUT_MS
         )
         .then(async (response: any) => {
           // P1-④/S3: the overlay may have been closed while the fetch was
           // in flight — do not commit or render into a dead component.
           if (this.disposed) return;
-          const messages = response?.data?.messages ?? [];
+          const data = response?.data;
+          const entries: SessionEntry[] | null = Array.isArray(data?.entries)
+            ? data.entries
+            : null;
+          const leafId: string | null = data?.leafId ?? null;
+          let messages: any[];
+          if (entries) {
+            this.failedFetches.delete(tab.name);
+            if (cursor?.since != null) {
+              // 增量：分支移动 / 断链 → 全量回退（删游标 + 重刷）
+              if (!isSinceOnMainChain(cursor.seen, entries, cursor.since, leafId)) {
+                this.entryCursors.delete(tab.name);
+                tab.dirty = true;
+                this.scheduleFlush();
+                return;
+              }
+              // 增量安全：祖先链过滤（旁支剔除）→ 追加尾部
+              const fresh = mainChainEntries(entries, leafId, cursor.seen);
+              const prev = this.lastMessages.get(tab.name) ?? [];
+              messages = [...prev, ...fresh.map((e) => e.message)];
+              // 游标推进：合并新 parentId、since = 最后一条 entry id、leafId 更新
+              for (const e of entries) cursor.seen.set(e.id, e.parentId);
+              const last = entries[entries.length - 1];
+              cursor.since = last?.id ?? cursor.since;
+              cursor.leafId = leafId;
+            } else {
+              // 首次全量（或游标失效后的全量回退）：祖先链 message 全量替换
+              const chain = mainChainEntries(entries, leafId);
+              messages = chain.map((e) => e.message);
+              this.entryCursors.set(tab.name, {
+                since: entries.length ? entries[entries.length - 1].id : null,
+                leafId,
+                seen: buildSeenParents(entries),
+              });
+            }
+          } else if (response?.success === false) {
+            // since 不匹配 / 命令不可用（success:false）：删游标重试全量（无
+            // since）。连续两次失败 → 该 tab 永久回退 get_messages 全量路径
+            // （老版本 pi 无 get_entries 命令时的 fail-open，防无限重试）。
+            this.entryCursors.delete(tab.name);
+            this.failedFetches.set(tab.name, (this.failedFetches.get(tab.name) ?? 0) + 1);
+            if ((this.failedFetches.get(tab.name) ?? 0) >= 2) {
+              this.legacyFetch.add(tab.name);
+            }
+            tab.dirty = true;
+            this.scheduleFlush();
+            return;
+          } else {
+            // fail-open 兜底：老版本响应（data.messages 形态 / 已标记 legacy）
+            messages = data?.messages ?? [];
+          }
           // Keep the fetched history as the streaming base (live tail renders
           // from it without waiting for the next refetch).
           this.lastMessages.set(tab.name, messages);
