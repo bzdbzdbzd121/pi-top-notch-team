@@ -1713,3 +1713,43 @@ tracker 生命周期随 widget install/uninstall（onSessionStart / onSessionEnd
 ### 验收对照
 
 超时触发消息在积压队列中的位置与成功路径一致（A 先、FIFO 后）✓；near-miss 场景取消 30s watcher 延迟（内联与批路径均即时结算）✓；非近失超时行为零回归（F11 全链/事件丢失轮询/二次超时放弃测试保持绿色）✓；轮询定时器全链 unref（Esc 中断零泄漏）✓；ADR-0006 交付（上游事实带行号证据）✓；全量测试绿色（1114 通过）✓。
+
+## 24. 压缩后 get_session_stats percent:null 语义分流（问题二 Phase 1）
+
+### 24.1 根因（上游契约 vs 本地误判）
+
+pi 上游 `getContextUsage()`（0.83.x/0.84.x dist 实读，agent-session.js ~2542）：模型/contextWindow 缺失 → `undefined`；存在最新压缩条目且其后无有效 assistant usage（stopReason 非 aborted/error 且 `calculateContextTokens(usage) > 0`）→ **刻意返回 `{ tokens: null, contextWindow, percent: null }`**（注释原文："context token count is unknown until the next LLM response"——压缩前 usage 反映压缩前大上下文、不可信）；否则 → 估算数值。压缩失败不写 compaction 条目（appendCompaction 仅在成功路径，~1432 行），故 **null ⟺ 最近压缩成功且无后续有效回复**，绝非异常。
+
+本地误判：`queryStats` 的 `typeof usage.percent !== "number"` 把合法「未知」与真失败（RPC 超时/断连、undefined）混为一谈 → 误导性「无法查询成员上下文用量」fail-open 通知。功能零损失（fail-open 下消息照常派发；压缩后上下文必然低），伤害 100% 在感知层。
+
+### 24.2 修复（语义三分，仅感知层）
+
+```
+usage.percent === null        → { ok: true, stats: { percent: 0, tokens: 0 } }  // 合法未知 → 已知低，静默跳过
+!usage || typeof percent !== number → { ok: false, error: "成员未返回上下文用量数据" }  // 真异常，保留通知
+正常                            → { ok: true, stats: { percent, tokens: usage.tokens ?? 0 } }
+```
+
+- percent:0 是语义化猜测而非事实——防御性注释写明上游契约、版本、字段粒度边界（当前 percent/tokens 同时 null；混合形态需字段级判别，勿锁死假设）。
+- `shouldCompact` 与调用点零改动（0 < 任何阈值 → false）；批屏障共享 runtime 自动受益（预检 ok:true → needs=false → 消息不带 skipAutoCompact → 内联再查一次 → 仍静默；双查询为两次本地管道 RPC，无害保留）。
+- 通知文案诚实化：stats 失败分支改为「（原因：<RPC 原因或"成员未返回上下文用量数据">）」。
+- 恢复窗口 = 压缩完成到首个有效 assistant 回复之间，窗口内每笔查询命中 null；主来源 = pi 自动压缩（agent_end 后 _checkCompaction）/ resume（--continue 最新条目为压缩边界）/ abort / 无 usage 提供商。
+
+### 24.3 测试矩阵（7 条，TDD）
+
+| # | 场景 | 断言 |
+|---|------|------|
+| 1 | `{tokens:null, contextWindow:200000, percent:null}` | `{ok:true, stats:{percent:0, tokens:0}}` + shouldCompact false |
+| 2 | `contextUsage: undefined`（无模型/无 contextWindow） | 仍 `{ok:false}`（真异常保留） |
+| 3 | percent 其他非 number 形态（undefined/字符串） | 仍 `{ok:false}`（锁定不放宽） |
+| 4 | 端到端：压缩后窗口下一笔任务 | 零通知 + 正常派发 + 仅一次 stats 查询 + 无 compact RPC |
+| 5 | 窗口闭合回归：成员处理任务后 percent 正常 92% | 超阈值仍触发压缩（compact RPC 恰 1 次） |
+| 6 | resume 场景：--continue 恢复（压缩边界）首笔任务 | 零通知 + 正常派发 + 零 compact RPC |
+| 7 | 既有「percent 非 number → 失败」用例 | 保持绿色（锁定） |
+
+全量测试通过（本阶段新增 6 用例 + 1 更新）；压缩决策行为与修复前完全一致（fail-open 语义、批屏障路径、跳过语义均不变）。
+
+### 未采纳（记录，属 Phase 2 或永久否决）
+
+- 冷却标记跳过查询 / 重试 / tokens 历史累计兜底 / 批屏障双查询优化——见方案「未采纳说明」。
+- 显示层 percent null 显示"?"（widget/inspector `Math.round(null)===0`）与 ADR-0007（上游 reason 字段为主、估算值为备选）属 **Phase 2**，本阶段未实施。

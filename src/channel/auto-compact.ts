@@ -251,6 +251,21 @@ export function createAutoCompactRuntime(
           STATS_QUERY_TIMEOUT_MS
         );
         const usage = statsResp?.data?.contextUsage;
+        // pi 上游 getContextUsage()（0.83.x/0.84.x dist 实测，agent-session.js
+        // ~2542 行）在「最新压缩条目之后无有效 assistant 回复（stopReason 非
+        // aborted/error 且 calculateContextTokens(usage) > 0）」时刻意返回
+        // { tokens: null, contextWindow, percent: null }——压缩前的 usage 反映
+        // 压缩前的大上下文、不可信，宁缺毋滥（上游注释原文："context token count
+        // is unknown until the next LLM response"）。压缩刚完成，上下文 = summary
+        // + 保留窗口 + 待派发任务，必然远低于压缩阈值——null 语义化为「已知低」
+        // （percent 0），静默跳过本次压缩检查（与现状「跳过+通知」的压缩行为完全
+        // 一致，仅去掉误导性「无法查询」通知；批屏障共享 runtime 自动受益）。
+        // 注意：percent:0 是语义化猜测而非事实；当前上游 percent/tokens 同时为
+        // null，若未来出现混合形态（如 tokens null 而 percent 为 number），需
+        // 字段级判别，勿锁死「同时 null」假设。
+        if (usage && usage.percent === null) {
+          return { ok: true, stats: { percent: 0, tokens: 0 } };
+        }
         if (!usage || typeof usage.percent !== "number") {
           return { ok: false, error: "成员未返回上下文用量数据" };
         }

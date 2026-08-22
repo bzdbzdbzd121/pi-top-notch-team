@@ -116,6 +116,57 @@ describe("auto-compact runtime queryStats", () => {
     });
   });
 
+  it("treats percent:null as a LEGAL post-compaction 'unknown' — ok:true with percent 0 (silent skip)", async () => {
+    // pi 上游 getContextUsage() 在「最新压缩条目之后无有效 assistant 回复」时
+    // 刻意返回 { tokens: null, contextWindow, percent: null }（合法确定性状态，
+    // 非 RPC 失败）——语义化为「已知低」静默跳过，不得进失败分支触发误导性通知。
+    const rt = makeRuntime();
+    const handle = makeHandle({
+      type: "response",
+      command: "get_session_stats",
+      success: true,
+      data: { contextUsage: { tokens: null, contextWindow: 200000, percent: null } },
+    });
+
+    await expect(rt.queryStats("worker", handle)).resolves.toEqual({
+      ok: true,
+      stats: { percent: 0, tokens: 0 },
+    });
+    // percent 0 < 任何阈值 → 压缩决策与现状一致（跳过），仅去通知噪音。
+    expect(rt.shouldCompact({ percent: 0, tokens: 0 }, enabledCfg)).toBe(false);
+  });
+
+  it("resolves { ok: false } when contextUsage is undefined (no model / no contextWindow) — genuine anomaly, notify path unchanged", async () => {
+    const rt = makeRuntime();
+    const handle = makeHandle({
+      type: "response",
+      command: "get_session_stats",
+      success: true,
+      data: { contextUsage: undefined },
+    });
+
+    await expect(rt.queryStats("worker", handle)).resolves.toEqual({
+      ok: false,
+      error: "成员未返回上下文用量数据",
+    });
+  });
+
+  it("resolves { ok: false } when percent is undefined — only null is the legal unknown (lock: no widening)", async () => {
+    // 1.1 仅放宽 `=== null`：undefined / 其他非 number 形态仍是真异常（锁定回归）。
+    const rt = makeRuntime();
+    const handle = makeHandle({
+      type: "response",
+      command: "get_session_stats",
+      success: true,
+      data: { contextUsage: { percent: undefined, tokens: 1000 } },
+    });
+
+    await expect(rt.queryStats("worker", handle)).resolves.toEqual({
+      ok: false,
+      error: "成员未返回上下文用量数据",
+    });
+  });
+
   it("treats missing tokens as 0", async () => {
     const rt = makeRuntime();
     const handle = makeHandle(usageResponse(92));

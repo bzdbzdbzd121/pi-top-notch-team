@@ -976,7 +976,10 @@ export function createSendToMember(
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       if (phase === "stats") {
-        notify(`[自动压缩] 无法查询成员 "${memberName}" 的上下文用量（${reason}），已跳过压缩检查并直接派发任务。`);
+        // 通知诚实化（问题二 1.2）：如实带真实原因——RPC 失败原因或「成员未返回
+        // 上下文用量数据」。percent:null 的合法「未知」已在 queryStats 内分流为
+        // 静默跳过，不会进入本分支。
+        notify(`[自动压缩] 无法查询成员 "${memberName}" 的上下文用量（原因：${reason}），已跳过压缩检查并直接派发任务。`);
       } else {
         notify(`[自动压缩] 成员 "${memberName}" 自动压缩未完成（${reason}），已直接派发任务。`);
       }

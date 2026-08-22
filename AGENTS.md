@@ -253,6 +253,12 @@ src/
     - **建议 3（near-miss ~30s 有界延迟）**：`CompactResult` 增加 `settledByHeartbeat?: boolean`（仅 timedOut 分支、仅近失时置位）——租约内心跳已到 + 超时 settle = 压缩**已结清**（响应只是延迟）：内联路径落入静默 settled 路径（不 notify、不入队、不启 watcher）直接 endCompaction+派发；批屏障 in-loop 同步闭合（`ok || !timedOut || settledByHeartbeat` → endCompaction+打标，commit 时成员已 idle 直接派发，零 watcher 轮询）。取消「近失需等首轮轮询才 close+flush」的 ~30s 延迟。
 
     - **测试（6 新用例 + 2 更新，全量 1114 通过）**：settledByHeartbeat 置位（near-miss 用例更新断言）/缺位（新）、queue front/false 两向（新）、重排 unref 计数（新）、内联近失全链——零 notify/零 pending/直接派发（新）、stuck 顺序全链 A/B/C（新）；批屏障近失用例更新（状态 compacting→idle）。
+32. **压缩后 get_session_stats 的 percent:null 语义分流（问题二 Phase 1）** — 「压缩完成后查不到上下文用量」不是故障：pi 上游 `getContextUsage()`（0.83.x/0.84.x dist 实测，agent-session.js ~2542 行）在「最新压缩条目之后无有效 assistant 回复」时刻意返回 `{tokens:null, contextWindow, percent:null}`（上游注释："context token count is unknown until the next LLM response"）——压缩前 usage 不可信、宁缺毋滥。扩展层 `queryStats` 曾用 `typeof percent !== "number"` 把合法「未知」与真失败混为一谈 → 误导性「无法查询成员上下文用量」通知。修复 = 语义三分：\n
+    - **null（合法未知）→ `{ok:true, stats:{percent:0, tokens:0}}`**：语义化为「已知低」静默跳过压缩检查（压缩刚完成上下文 = summary+保留窗口+待派发任务，必远低于阈值；与现状「跳过+通知」的压缩行为完全一致，仅去噪音）；批屏障共享 runtime 自动受益（预检 ok:true → needs=false → 内联再查一次 → 仍静默，双查询保留但零噪音）。percent:0 是语义化猜测而非事实——防御性注释写明上游契约/版本/字段粒度（勿锁死「同时 null」假设，混合形态需字段级判别）。\n
+    - **undefined（模型无 contextWindow/配置缺失）与 RPC 失败 → 保留 fail-open 通知**：仅放宽 `=== null`，其他形态测试锁定不放宽。\n
+    - **通知文案诚实化**：stats 失败分支改为「（原因：<RPC 原因或成员未返回上下文用量数据>）」如实带原因。\n
+    - **测试矩阵 7 条**：null→ok:true/percent:0+shouldCompact false；contextUsage undefined→仍 ok:false；percent 其他异常形态→仍 ok:false（锁定）；端到端压缩后窗口零通知+正常派发（仅一次 stats 查询、无 compact RPC）；窗口闭合回归（成员处理任务后 percent 正常→超阈值仍触发压缩）；resume 场景（--continue 恢复会话最新条目为压缩边界→首笔任务零通知）；既有 percent 非 number 用例锁定。\n
+    - 不做（未采纳）：冷却标记跳过查询（省本地管道 RPC，复杂度/收益倒挂）、重试（数据源恒 null）、tokens 历史累计（含压缩前严重高估）、批屏障双查询优化（零噪音后无意义）。显示层 0% 修复与 ADR-0007 属 Phase 2，不在本阶段。
 
 ## Dependency Injection Pattern
 

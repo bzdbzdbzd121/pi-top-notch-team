@@ -1393,6 +1393,105 @@ describe("createSendToMember auto-compaction", () => {
     expect(deps.pi.sendMessage).not.toHaveBeenCalled();
   });
 
+  it("Phase 1 (问题二): post-compaction window — percent:null → silent skip, message dispatched, ZERO notifications", async () => {
+    // 压缩完成后、成员产生下一个有效 assistant 回复前，getContextUsage() 刻意
+    // 返回 percent:null（合法「未知」）。null 语义化为「已知低」：静默跳过压缩
+    // 检查并直接派发——不得出现误导性「无法查询」通知（与现状跳过+通知的压缩
+    // 行为完全一致，仅去噪音）。
+    const { createSendToMember } = await loadModule();
+    const deps = createMockDeps({ getAutoCompact: () => enabledCfg }) as any;
+    const handle = {
+      sendCommand: vi.fn(),
+      sendCommandAndWait: vi.fn().mockResolvedValue({
+        type: "response",
+        command: "get_session_stats",
+        success: true,
+        data: { contextUsage: { tokens: null, contextWindow: 200000, percent: null } },
+      }),
+    };
+    deps.memberHandles.set("worker", handle as any);
+    deps.memberOpsStates.set("worker", "idle");
+
+    createSendToMember(deps)("worker", makeMsg());
+    await vi.waitFor(() => expect(handle.sendCommand).toHaveBeenCalled());
+
+    expect(handle.sendCommand).toHaveBeenCalledWith(expect.objectContaining({ type: "prompt" }));
+    // 零通知（与压缩成功静默哲学一致）
+    expect(deps.pi.sendMessage).not.toHaveBeenCalled();
+    // 仅一次 stats 查询，无 compact RPC
+    expect(handle.sendCommandAndWait).toHaveBeenCalledTimes(1);
+    expect(handle.sendCommandAndWait.mock.calls[0][0].type).toBe("get_session_stats");
+    expect(deps.memberOpsStates.get("worker")).toBe("working");
+  });
+
+  it("Phase 1 (问题二): window-closed regression — post-compaction usage exists → percent normal → compaction STILL triggers", async () => {
+    // 窗口闭合：压缩后成员处理过任务（有 usage）→ getContextUsage 返回真实数值，
+    // 超阈值仍必须触发压缩（行为与修复前一致）。第一笔任务（窗口内）零通知。
+    const { createSendToMember } = await loadModule();
+    const deps = createMockDeps({ getAutoCompact: () => enabledCfg }) as any;
+    let statsCalls = 0;
+    const handle = {
+      sendCommand: vi.fn(),
+      sendCommandAndWait: vi.fn().mockImplementation((cmd: any) => {
+        if (cmd.type === "get_session_stats") {
+          statsCalls++;
+          return Promise.resolve(
+            statsCalls === 1
+              ? { type: "response", command: "get_session_stats", success: true, data: { contextUsage: { tokens: null, contextWindow: 200000, percent: null } } }
+              : usageResponse(92, 184000)
+          );
+        }
+        if (cmd.type === "compact") return Promise.resolve({ type: "response", command: "compact", success: true });
+        return Promise.reject(new Error("unexpected command"));
+      }),
+    };
+    deps.memberHandles.set("worker", handle as any);
+    deps.memberOpsStates.set("worker", "idle");
+    const send = createSendToMember(deps);
+
+    // Task 1: post-compaction window (null) → silent skip, dispatched.
+    send("worker", makeMsg());
+    await vi.waitFor(() => expect(handle.sendCommand).toHaveBeenCalledTimes(1));
+    expect(deps.pi.sendMessage).not.toHaveBeenCalled();
+
+    // The member finished task 1 (agent_end → idle): the window is now closed.
+    deps.memberOpsStates.set("worker", "idle");
+    // Task 2: real usage 92% over threshold → compaction MUST still trigger.
+    send("worker", makeMsg());
+    await vi.waitFor(() => expect(handle.sendCommand).toHaveBeenCalledTimes(2));
+    const commands = handle.sendCommandAndWait.mock.calls.map((c: any[]) => c[0].type);
+    expect(commands.filter((t: string) => t === "compact")).toHaveLength(1);
+    expect(deps.memberOpsStates.get("worker")).toBe("working");
+  });
+
+  it("Phase 1 (问题二): resume scenario — continued session (compaction boundary as latest entry) → first task zero notification", async () => {
+    // /team resume 以 --continue 重启成员：恢复的会话最新条目为压缩边界，恢复后
+    // 第一笔任务 getContextUsage() 同样返回 percent:null——与压缩后窗口同一合法
+    // 形态，必须静默、正常派发、零 compact RPC。
+    const { createSendToMember } = await loadModule();
+    const deps = createMockDeps({ getAutoCompact: () => enabledCfg }) as any;
+    const handle = {
+      sendCommand: vi.fn(),
+      sendCommandAndWait: vi.fn().mockResolvedValue({
+        type: "response",
+        command: "get_session_stats",
+        success: true,
+        data: { contextUsage: { tokens: null, contextWindow: 200000, percent: null } },
+      }),
+    };
+    deps.memberHandles.set("worker", handle as any);
+    deps.memberOpsStates.set("worker", "idle");
+
+    createSendToMember(deps)("worker", makeMsg());
+    await vi.waitFor(() => expect(handle.sendCommand).toHaveBeenCalled());
+
+    expect(deps.pi.sendMessage).not.toHaveBeenCalled();
+    expect(handle.sendCommand).toHaveBeenCalledWith(expect.objectContaining({ type: "prompt" }));
+    const commands = handle.sendCommandAndWait.mock.calls.map((c: any[]) => c[0].type);
+    expect(commands).toEqual(["get_session_stats"]); // 无 compact RPC
+    expect(deps.memberOpsStates.get("worker")).toBe("working");
+  });
+
   it("skips compaction entirely when member is not idle", async () => {
     const { createSendToMember } = await loadModule();
     const deps = createMockDeps({ getAutoCompact: () => enabledCfg }) as any;
@@ -1421,8 +1520,17 @@ describe("createSendToMember auto-compaction", () => {
     await vi.waitFor(() => expect(handle.sendCommand).toHaveBeenCalled());
 
     expect(handle.sendCommand).toHaveBeenCalledWith(expect.objectContaining({ type: "prompt" }));
+    // 通知诚实化（问题二 1.2）：如实带真实原因（RPC 原因或「成员未返回上下文用量数据」）。
     expect(deps.pi.sendMessage).toHaveBeenCalledWith(
-      expect.objectContaining({ customType: "team-message", content: expect.stringContaining("无法查询") })
+      expect.objectContaining({
+        customType: "team-message",
+        content: expect.stringContaining("无法查询"),
+      })
+    );
+    expect(deps.pi.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        content: expect.stringContaining("原因：timeout"),
+      })
     );
     expect(deps.memberOpsStates.get("worker")).toBe("working");
   });
