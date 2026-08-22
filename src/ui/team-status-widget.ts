@@ -7,8 +7,11 @@ import { nextStreamFlushDelay } from "./member-inspector-state";
 // ── Types ─────────────────────────────────────────────────
 
 export interface MemberContextInfo {
-  percent: number;
-  tokens: number;
+  // percent can be null: pi 上游 getContextUsage() 在压缩完成后返回 percent:null
+  // （合法「未知」，见 auto-compact.ts queryStats 注释）——显示层渲染 "?"，
+  // 不得 Math.round(null)===0 显示误导性 "0%"。
+  percent: number | null;
+  tokens: number | null;
   contextWindow: number;
 }
 
@@ -199,9 +202,11 @@ export function createTeamStatusWidget(options: {
       }
 
       // Context percentage: shown in every running state (idle included);
-      // stopped/crashed keep the " —" placeholder instead.
+      // stopped/crashed keep the " —" placeholder instead. percent:null is a
+      // LEGAL post-compaction "unknown" (上游 getContextUsage 契约)——渲染
+      // "?"，不得 Math.round(null)===0 显示误导性 "0%"（问题二 Phase 2）。
       if (info != null && logicalState !== "stopped" && logicalState !== "crashed") {
-        extraRaw += ` ${Math.round(info.percent)}%`;
+        extraRaw += info.percent === null ? " ?" : ` ${Math.round(info.percent)}%`;
       }
 
       const raw = ` ${icon} ${label}${extraRaw}`;

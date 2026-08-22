@@ -342,8 +342,11 @@ export const IDENTITY_THEME: InspectorTheme = {
 // ── Types ──────────────────────────────────────────────────
 
 export interface MemberContextInfo {
-  percent: number;
-  tokens: number;
+  // percent can be null: pi 上游 getContextUsage() 在压缩完成后返回 percent:null
+  // （合法「未知」，见 auto-compact.ts queryStats 注释）——footer 渲染 "?"，
+  // 不得 Math.round(null)===0 显示误导性 "0%"。
+  percent: number | null;
+  tokens: number | null;
   contextWindow: number;
 }
 
@@ -1479,7 +1482,9 @@ export function buildFooterStatusLine(
       seg += "（压缩中）";
     }
     if (t.contextInfo != null && state !== "stopped" && state !== "crashed") {
-      seg += ` ${Math.round(t.contextInfo.percent)}%`;
+      // percent:null = 压缩后合法「未知」→ "?"（Math.round(null)===0 的
+      // "0%" 误导，问题二 Phase 2）。
+      seg += t.contextInfo.percent === null ? " ?" : ` ${Math.round(t.contextInfo.percent)}%`;
     } else if (state === "stopped" || state === "crashed") {
       seg += " —";
     }

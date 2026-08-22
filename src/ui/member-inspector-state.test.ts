@@ -414,6 +414,17 @@ describe("buildFooterStatusLine", () => {
     expect(line).toContain("💭 分析员 42%");
     expect(line).toContain("💥 编码员 —");
   });
+
+  it("renders '?' for a null context percent (post-compaction unknown — no misleading 0%)", () => {
+    // 压缩完成后 get_session_stats 返回 percent:null（合法「未知」）——
+    // Math.round(null)===0 的 "0%" 是误导（问题二 Phase 2，gamma 发现）。
+    const state = new MemberInspectorState([{ name: "a", label: "分析员" }]);
+    state.tabs[0].contextInfo = { percent: null, tokens: null, contextWindow: 100000 };
+    const ops = new Map([["a", "working" as const]]);
+    const line = buildFooterStatusLine(state.tabs, ops, 120);
+    expect(line).toContain("💭 分析员 ?");
+    expect(line).not.toContain("0%");
+  });
 });
 
 // ── MemberInspectorState ───────────────────────────────────

@@ -1753,3 +1753,31 @@ usage.percent === null        → { ok: true, stats: { percent: 0, tokens: 0 } }
 
 - 冷却标记跳过查询 / 重试 / tokens 历史累计兜底 / 批屏障双查询优化——见方案「未采纳说明」。
 - 显示层 percent null 显示"?"（widget/inspector `Math.round(null)===0`）与 ADR-0007（上游 reason 字段为主、估算值为备选）属 **Phase 2**，本阶段未实施。
+
+## 25. 显示层 percent null 判空 + ADR-0007（问题二 Phase 2）
+
+### 25.1 显示层同根症状（gamma 发现）
+
+`Math.round(null) === 0`：widget 与 inspector footer 对 `contextUsage.percent === null`（压缩后合法「未知」，§24）未判空 → 状态栏/浮窗持久显示误导性 "0%"。修复（两处渲染点 + 两处类型定义）：
+
+```ts
+// team-status-widget.ts ~204（widget 成员行）
+extraRaw += info.percent === null ? " ?" : ` ${Math.round(info.percent)}%`;
+// member-inspector-state.ts ~1482（inspector footer）
+seg += t.contextInfo.percent === null ? " ?" : ` ${Math.round(t.contextInfo.percent)}%`;
+```
+
+- `MemberContextInfo.percent` 类型 `number` → `number | null`（两处定义同步；tokens 同放宽——上游同时 null）。
+- 测试：widget 集成用例（get_session_stats 返回 percent:null → 行含 "?" 且不含 "0%"）；inspector-state 纯函数用例（footer 行 "💭 分析员 ?" 且不含 "0%"）；既有数值渲染用例（42% / 45%→47% 轮询）保持绿色锁定。
+
+### 25.2 ADR-0007（上游提案，非阻塞）
+
+`docs/adr/0007-pi-upstream-context-usage-reason.md` — 上游 `getContextUsage()` 的 null 形态（压缩后未知，合法）与 undefined 形态（模型/contextWindow 缺失，配置异常）在 RPC 层无类型标注，消费者只能 `typeof percent !== "number"` 一刀切 → 误报或依赖对上游实现细节的推测。提案：
+
+- **主推 reason 字段**：null 分支返回 `{ tokens: null, contextWindow, percent: null, reason: "post-compaction" }`——一行成本、RPC 层零改动、显式语义、全体消费者通用；null 字段保持保守（不提供可能不准确的估算值）。
+- **备选估算值**：null 分支改用 `estimateContextTokens(this.messages)`（compaction.js:131，无 usage 时退化逐条 chars/4 估算）——下游零判别，但与上游「only trust usage」保守原则冲突（需论证估算用于阈值决策的误差可接受）。
+- 两者非互斥，并列提交上游裁决；本仓库 Phase 1/2 已正确工作，ADR 仅作文档提案。
+
+### 验收对照
+
+显示层 percent null 显示 "?"（无 0% 误导）✓（widget + inspector 两处）；数值仍原样百分比 ✓（既有用例锁定）；ADR-0007 记录完成（含实现位置与成本说明）✓；未引入其他本地功能变更 ✓（严格 Phase 2 范围）；全量测试绿色 ✓。

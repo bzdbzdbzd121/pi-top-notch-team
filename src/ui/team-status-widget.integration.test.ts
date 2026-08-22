@@ -210,6 +210,31 @@ describe("team-status-widget integration (tracker → widget live path)", () => 
     expect(h.middle()).not.toContain("<accent>"); // working: plain 💭
   });
 
+  it("P1 (问题二 Phase 2): percent null → renders '?' instead of the misleading '0%' (Math.round(null)===0)", async () => {
+    // 压缩完成后 get_session_stats 返回 percent:null（合法「未知」）——
+    // Math.round(null)===0 会把未知渲染成 "0%" 误导；应显示 "?"。
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    const statsHandle = {
+      sendCommandAndWait: vi.fn().mockResolvedValue({
+        data: { contextUsage: { percent: null, tokens: null, contextWindow: 100 } },
+      }),
+    };
+    const teamCtx = { ...createMockTeamCtx(), getHandle: () => statsHandle };
+    const h = createHarness({
+      members: [createTeamMember("coder", "编码员")],
+      opsStates: { coder: "working" },
+      teamCtx,
+    });
+    const widget = await h.getWidget();
+    widget.install(h.ui, h.theme);
+    await vi.advanceTimersByTimeAsync(0); // install-time initial query settles (null)
+
+    h.emit("coder", { type: "agent_start" });
+    await vi.advanceTimersByTimeAsync(300);
+    expect(h.middle()).toContain("?");
+    expect(h.middle()).not.toContain("0%");
+  });
+
   it("N3: parallel stats polling — one poll bounded by max timeout, not 3N", async () => {
     vi.useRealTimers();
     const members = Array.from({ length: 8 }, (_, i) => createTeamMember(`m${i + 1}`, `成员${i + 1}`));

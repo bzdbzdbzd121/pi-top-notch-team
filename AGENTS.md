@@ -259,6 +259,10 @@ src/
     - **通知文案诚实化**：stats 失败分支改为「（原因：<RPC 原因或成员未返回上下文用量数据>）」如实带原因。\n
     - **测试矩阵 7 条**：null→ok:true/percent:0+shouldCompact false；contextUsage undefined→仍 ok:false；percent 其他异常形态→仍 ok:false（锁定）；端到端压缩后窗口零通知+正常派发（仅一次 stats 查询、无 compact RPC）；窗口闭合回归（成员处理任务后 percent 正常→超阈值仍触发压缩）；resume 场景（--continue 恢复会话最新条目为压缩边界→首笔任务零通知）；既有 percent 非 number 用例锁定。\n
     - 不做（未采纳）：冷却标记跳过查询（省本地管道 RPC，复杂度/收益倒挂）、重试（数据源恒 null）、tokens 历史累计（含压缩前严重高估）、批屏障双查询优化（零噪音后无意义）。显示层 0% 修复与 ADR-0007 属 Phase 2，不在本阶段。
+33. **显示层 percent null 判空 + ADR-0007（问题二 Phase 2）** — 与 Phase 1 同根的第二用户可见症状（gamma 发现）+ 上游提案：\n
+    - **显示层判空**：`Math.round(null) === 0` 把压缩后合法「未知」渲染成误导性 "0%"——widget（team-status-widget.ts）与 inspector footer（member-inspector-state.ts buildFooterStatusLine）两处渲染点改为 `percent === null ? "?" : Math.round(percent)%`；`MemberContextInfo.percent` 类型放宽为 `number | null`（两处定义同步，注释写明上游契约）。测试：widget 集成（percent null → "?" + 无 "0%"）、inspector-state 纯函数（footer 行 "💭 分析员 ?" + 无 "0%"）；既有数值渲染用例锁定。\n
+    - **ADR-0007**（`docs/adr/0007-pi-upstream-context-usage-reason.md`）：上游 `getContextUsage()` null 分支返回结构化 `reason: "post-compaction"`（主推，一行成本，全体消费者通用，不依赖下游对实现细节的推测）；备选：null 分支改用 `estimateContextTokens` 估算值（可行性已验证——无 usage 时退化逐条估算，compaction.js:131；但与上游「only trust usage」保守注释原则冲突）。两者非互斥、均非阻塞。\n
+    - 上游合入后的演进空间：queryStats 改判 reason 字段（不再依赖 `percent === null` 隐含知识）或恢复单分支（估算值形态）——均为可选适配，非本阶段范围。
 
 ## Dependency Injection Pattern
 
@@ -581,6 +585,7 @@ TL: 监控进展、协调异常、write_shared_context 更新共享上下文（�
 - `docs/adr/0004-team-session-resume.md` — Team session resume: member session persistence + manifest + /team resume
 - `docs/adr/0005-pi-upstream-truncation-marking.md` — Upstream framework truncation marking proposal (finalize-time detection + length-protection extension + oneOf error de-noising; non-blocking, for pi upstream issue)
 - `docs/adr/0006-pi-upstream-abort-compaction-rpc.md` — Upstream `abort_compaction` RPC proposal (`agent-session.abortCompaction()` exists but is not reachable over RPC; ~3-line wiring in rpc-mode.js; non-blocking, for pi upstream issue)
+- `docs/adr/0007-pi-upstream-context-usage-reason.md` — Upstream `getContextUsage()` structured-reason proposal (`percent:null` after compaction is a legal state, indistinguishable from config-missing `undefined` by consumers; reason field primary / estimate alternative; non-blocking, for pi upstream issue)
 
 ## Design Document
 
