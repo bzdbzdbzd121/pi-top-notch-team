@@ -56,8 +56,8 @@ describe("P4 entries: main-chain filtering", () => {
     const { entries, leafId } = makeChain();
     const chain = mainChainEntries(entries, leafId);
     expect(chain.map((e: any) => e.id)).toEqual(["a1", "a2", "a3"]);
-    // message 内容原样保留
-    expect(chain[0].message.content).toBe("p1");
+    // message 内容原样保留（SessionEntry.message 为 unknown——断言处收窄）
+    expect((chain[0].message as { content: string }).content).toBe("p1");
   });
 
   it("全量：leafId 为 null（空会话）→ 空链", () => {

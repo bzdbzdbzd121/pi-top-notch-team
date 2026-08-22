@@ -12,9 +12,10 @@ import { MemberInspectorState } from "./member-inspector-state";
 let entrySeq = 1000;
 
 /** 把消息数组包成磁盘 entry 链（模拟 get_entries 响应）。 */
+// leafId 可为 null（空会话/显式 parentId null——与 get_entries 响应契约一致）。
 function entriesFrom(msgs: any[], opts?: { parentId?: string | null; leafId?: string; append?: boolean }): {
   entries: any[];
-  leafId: string;
+  leafId: string | null;
 } {
   const parent = opts?.parentId === undefined ? "session-id" : opts.parentId;
   let last = parent;
