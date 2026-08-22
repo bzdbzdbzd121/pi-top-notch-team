@@ -1214,19 +1214,37 @@ it — a message never vanishes between `message_end` and the refetch, and
 interleaved toolResult messages between completions). `agent_end` clears the
 live tail.
 
-**2. Refetch path (completed content — P3-③ 只急切刷活跃 tab):**
+**2. Refetch path (completed content — P3-③ 只急切刷活跃 tab + P4 游标增量拉取):**
 
 ```
 Member RPC event (tool_execution_end / message_end / ...)
   → event-handler.ts onMemberActivity hook
   → inspectorHandle.onMemberEvent(memberName, event)   (non-stream events)
-  → tab.dirty → throttled flush (500ms): RPC get_messages
+  → tab.dirty → throttled flush (500ms): RPC get_entries {since?}  ← P4
+  → 首次全量：祖先链 message 过滤 → lastMessages + 建立游标
+  → 增量：since 之后 entries 祖先链过滤 → 追加 lastMessages 尾部
   → buildBodyLines([...messages, ...pendingCompletions, live?], opts)  (pure)
   → setTabLines (tail-follow or scroll-preserve + "↓ 有更新")
   → tui.requestRender()
 
 Context usage (footer %): separate 5s poll via RPC get_session_stats.
 ```
+
+**P4 游标增量拉取（阶段 4，spike: docs/spike-get-entries-incremental.md）**：
+- **稳态 refetch 载荷 O(history) → O(new)**：每 tab 持久化 since 游标
+  （= 最后已见 entry id）+ seen parentId 映射；`get_entries {since}` 只拉
+  新 entries → 祖先链过滤（leafId 沿 parentId 回溯，旁支/compaction/
+  model_change 剔除）→ 追加 `[...prev, ...fresh]`。磁盘 entry id 跨成员
+  进程重启稳定（TL 存活期间游标一直有效）；TL 重启后自然全量重建。
+- **显示语义变化**：数据源从 agent 运行时上下文（get_messages，压缩后为
+  摘要链）切到磁盘原文（get_entries）——压缩前历史仍可见（更完整）；
+  compaction 是额外 entry（磁盘 append-only），**游标不受压缩影响**。
+- **失效回退链（fail-open）**：since 不匹配 / 分支重写（since 不在新祖先
+  链）/ 断链 → 删游标 + 全量重拉；get_entries 连续两次失败（老版本 pi
+  无此命令）→ 该 tab 永久回退 get_messages 全量路径（legacyFetch）。
+- **R5: reconcilePending 哈希化**——内容键（role + content 序列化）预计算
+  Map<key, 升序下标>，O(p×m) 次 stringify → O(p+m)；语义与逐对比较完全
+  等价（取 < scanBound 的最大下标 = 旧向后扫描首个匹配）。
 
 **P3 刷新调度收敛（阶段 3）**：
 - **e/t 全局切换 = 全 tab 本地重建（零 RPC）**（P3-①）：running 成员同样适用——

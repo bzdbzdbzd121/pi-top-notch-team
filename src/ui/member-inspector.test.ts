@@ -567,7 +567,8 @@ describe("MemberInspectorComponent — navigation & refresh", () => {
     await vi.advanceTimersByTimeAsync(600);
     expect(handleA.sendCommandAndWait).toHaveBeenCalled();
     const cmd = handleA.sendCommandAndWait.mock.calls[0][0];
-    expect(cmd.type).toBe("get_messages");
+    expect(cmd.type).toBe("get_entries");
+    expect(cmd.since).toBeUndefined(); // 首次全量无游标（P4）
     // Lines built from fetched messages
     expect(state.tabs[0].lines.join("\n")).toContain("任务内容");
     expect(state.tabs[0].dirty).toBe(false);
