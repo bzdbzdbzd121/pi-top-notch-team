@@ -707,7 +707,7 @@ dispatch to idle member
 - **`compacting` operational state** (`idle`/`working`/`compacting`/`crashed`/`stopped`): the compaction turn's own RPC `agent_start`/`agent_end` events are shielded in the state machine (`task_started`/`task_completed` on `compacting` are no-ops), so the all-idle wait logic treats compacting as busy with no changes to the wait code. Shown as 🗜️ in the team status widget and Member Inspector (with a `（压缩中）` footer hint); the widget polls context usage at the active interval while any member is compacting.
 - **Queueing**: messages routed to a member while it is compacting are held in a per-member pending list and flushed (in order, via the normal prompt path) after compaction completes. Member Inspector direct input during compaction is sent as `follow_up`/`steer` (busy semantics).
 - **Scope**: only the message-channel dispatch path is covered — Member Inspector direct `prompt` messages bypass Auto-Compaction (the user can compact manually via the inspector's compact control).
-- **Configuration** (global `/team setting`, no team-YAML override): `autoCompact: { enabled (default true), thresholdPercent? (1–100), thresholdTokens? (positive int), timeoutMinutes (default 10, ≥1), batchMaxWaitMinutes? (default 15, 0 = unlimited) }` in `<rootDir>/settings.yaml`. Enabled-but-no-thresholds falls back to 80% (flagged `percentIsDefaultFallback` so the settings menu shows `80%（默认）`). Resolution + threshold check are pure functions in `src/settings/resolve-auto-compact.ts` (`resolveAutoCompact` / `shouldCompact` / `describeAutoCompactSetting`); the config is re-read from disk on every dispatch so mid-session changes take effect immediately.
+- **Configuration** (global `/team setting`, no team-YAML override): `autoCompact: { enabled (default true), thresholdPercent? (1–100), thresholdTokens? (positive int), timeoutMinutes (default 10, ≥1) }`；顶层通用等待预算 `waitTimeoutMinutes?`（default 15, 0 = unlimited，独立于自动压缩——wait 工具 all-idle deadline 与批屏障共享，见 §1.3） in `<rootDir>/settings.yaml`. Enabled-but-no-thresholds falls back to 80% (flagged `percentIsDefaultFallback` so the settings menu shows `80%（默认）`). Resolution + threshold check are pure functions in `src/settings/resolve-auto-compact.ts` (`resolveAutoCompact` / `shouldCompact` / `describeAutoCompactSetting`); the config is re-read from disk on every dispatch so mid-session changes take effect immediately.
 
 ### Shared runtime + skipAutoCompact + batch barrier (阶段 1–3)
 
@@ -741,7 +741,7 @@ sendAndWaitExecute(tasks)  [tasks.length > 1 && autoCompact enabled && DI wired]
 - **Serial compactions**: at most one compact RPC at a time — without PD separation, concurrent compactions are concurrent prefill bursts, the exact problem this feature solves.
 - **Compacting members** (inline-path compaction already in flight, or a previous batch left running after Esc): counted into the wait set, polled out of compacting (idle/crashed/stopped all release — a dead compaction cannot be aligned), never re-compacted (D3 — replaces any lock-based approach).
 - **Silent by design**: the barrier is FULLY silent to the TL — no `[批屏障]` notices are sent (wait start, compaction start, per-member failure, and budget overrun are all invisible; the TL only experiences a longer wait inside `team_send_and_wait`, and the batch dispatches as-is in every case). Fail-open behavior is unchanged; the inline dispatch path keeps its own existing failure notification.
-- **maxWait budget** (`batchMaxWaitMinutes`, default 15 min, 0 = unlimited): total budget shared by the WAIT phase and all compactions. On exhaustion: the not-yet-started compactions are skipped, the batch is dispatched as-is (silent). Members not yet attempted carry no marker.
+- **maxWait budget** (顶层 `waitTimeoutMinutes`, default 15 min, 0 = unlimited — 通用等待预算，与 wait 工具 all-idle deadline 共享): total budget shared by the WAIT phase and all compactions. On exhaustion: the not-yet-started compactions are skipped, the batch is dispatched as-is (silent). Members not yet attempted carry no marker.
 - **Scope**: barrier covers only the tasks[] explicit targets; `to:"all"` is rejected by the existing unknown-target validation (broadcasts are not batch semantics); member inter-sends and Inspector direct messages never participate (manual intervention wins). Single-task batches and disabled auto-compaction take the legacy path with zero pre-check.
 
 ### Detecting Member-to-Member Messages
@@ -1632,7 +1632,7 @@ tracker 生命周期随 widget install/uninstall（onSessionStart / onSessionEnd
 
 ### 1.3 waitForAllIdle deadline + 诊断（beta C，防御纵深）
 
-- `waitForAllIdle(memberOpsStates, deadlineMs?)` 返回 `{ timedOut, stuckMembers }`；deadline 默认 15 分钟（`WAIT_IDLE_DEFAULT_DEADLINE_MINUTES`），`resolveWaitIdleDeadlineMs(getAutoCompact?)` 复用 `batchMaxWaitMinutes` 语义（0 = 不限保持现状），无配置时用默认（deadline 是防御纵深，与 auto-compact 开关正交）。
+- `waitForAllIdle(memberOpsStates, deadlineMs?)` 返回 `{ timedOut, stuckMembers }`；deadline 默认 15 分钟（`DEFAULT_WAIT_TIMEOUT_MINUTES`，`src/settings/resolve-wait-timeout.ts`），`resolveWaitIdleDeadlineMs(getSettings?)` 解析顶层 `waitTimeoutMinutes`（0 = 不限保持现状），无配置时用默认（deadline 是防御纵深，与 auto-compact 开关正交）。
 - 到期返回诊断：疑似卡死成员（working/compacting）+ 建议操作（`stop_member` / `/team stop` 后 `/team resume`）。`wait_and_get_member_status` 与 `team_send_and_wait` 的 all-idle 竞速路径同时受益（后者 partial 结果追加诊断块）。
 - `setInterval` 加 `unref`（与批屏障 `waitForMembersIdle` 一致——Esc 中断后无轮询泄漏）。
 - wait 结束后**重读状态**输出（不再用 pre-wait 快照——成员可能在等待期间完成转换，状态栏必须反映 post-wait 现实）。
@@ -1660,7 +1660,7 @@ tracker 生命周期随 widget install/uninstall（onSessionStart / onSessionEnd
 - runtime 新原语 `waitCompactionIdle(name, handle, budgetMs)`：每 30s 轮询 `get_state.isCompacting`（3s 单次超时，fail-open 按已结束），释放条件 = 操作状态离开 compacting（进程退出，2.3 已接管 pending）或查询 false/失败；预算耗尽 → `{ok:false}`。定时器 unref。
 - 兜底 watcher（`startFallbackWatcher`，per-channel dedupe）：仅在**无在飞租约**的 compacting（＝租约已超时的卡住压缩）启动——入口：内联超时分支 + sendToMember compacting 分支（覆盖批屏障消息/Inspector 直发/成员互发）。释放 → `closeCompactionAndFlush`（消费 mark + endCompaction + flush + 超时场景通知）；预算耗尽 → `abandonPendingMessages`（清空 pending + resolve 各 corrId [已放弃] + 通知「请 stop_member 或 /team stop 后 /team resume」）。
 - **新租约守卫**：watcher 结算时若 `hasInFlightCompaction`（成员已回 idle 并开始了新压缩周期）→ 不 close 不 abandon——新周期的持有流程接管。
-- 预算 = `timeoutMinutes` 一个租约周期（与批屏障 batchMaxWaitMinutes 语义统一）。
+- 预算 = `timeoutMinutes` 一个租约周期（与批屏障等待预算 waitTimeoutMinutes 语义统一）。
 - 四场景闭合：正常结束（心跳）✓ / 事件丢失（轮询）✓ / 进程退出（2.3 + 状态释放）✓ / 永不结束（预算放弃）✓。
 
 ### 2.3 process_exit/process_error 清 pending（三出口之③）
@@ -1669,7 +1669,7 @@ tracker 生命周期随 widget install/uninstall（onSessionStart / onSessionEnd
 
 ### 2.4 批屏障接线 + attempted 语义修正（alpha P2）
 
-- 屏障 compact 超时：**保持 compacting、不 endCompaction、不计 attempt**——批消息在 commit 阶段经 sendToMember 的 compacting 分支入 pending（自动触发兜底 watcher），心跳/轮询 flush。等待计入 batchMaxWaitMinutes 预算（compact 已从预算中消耗自身 timeout）。
+- 屏障 compact 超时：**保持 compacting、不 endCompaction、不计 attempt**——批消息在 commit 阶段经 sendToMember 的 compacting 分支入 pending（自动触发兜底 watcher），心跳/轮询 flush。等待计入 `waitTimeoutMinutes` 预算（compact 已从预算中消耗自身 timeout）。
 - **attempted 语义修正**：`skipAutoCompact` 仅绑定「压缩已结清」——compact 响应（成功/非超时失败）**或** compaction_end 事件（runtime 心跳计数 `markCompactionEnd`/`getCompactionEndCount`，屏障按 toWait 等待期/compact 循环期计数增量判定）→ 打标；超时未结清 → 不打标（由等待流程接管，消息不再跳过压缩检查）。
 - 事件结清打标同时闭合 E12 竞态：超时成员的 compaction_end 在屏障期间到达（在飞守卫延迟处理）→ 成员被打标 → commit 时消息带 marker 直接派发，杜绝第二个压缩。
 - 正常成功路径时序零回归（压缩 2 分钟成功 → compaction_end 在飞守卫记录 → 响应 settle → endCompaction → A→B FIFO）。

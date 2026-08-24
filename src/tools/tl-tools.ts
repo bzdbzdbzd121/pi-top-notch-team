@@ -6,6 +6,11 @@ import type { MessageQueue } from "../channel/message-queue";
 import type { TeamMessage } from "../channel/types";
 import type { AutoCompactRuntime } from "../channel/auto-compact";
 import type { ResolvedAutoCompact } from "../settings/resolve-auto-compact";
+import type { TeamSettings } from "../settings/settings";
+import {
+  DEFAULT_WAIT_TIMEOUT_MINUTES,
+  resolveWaitTimeoutMinutes,
+} from "../settings/resolve-wait-timeout";
 import type { MemberOperationalState } from "../session/context";
 import { getSessionState } from "../session/state";
 import { syncActiveManifest } from "../session/manifest";
@@ -36,6 +41,12 @@ export interface TlToolsDeps {
    * changes take effect immediately). Absent = feature disabled.
    */
   getAutoCompact?: () => ResolvedAutoCompact;
+  /**
+   * Resolve global team settings (per call, so /team setting changes take
+   * effect immediately). Powers the unified wait budget (`waitTimeoutMinutes`)
+   * shared by the all-idle deadline and the batch barrier. Absent = default.
+   */
+  getSettings?: () => TeamSettings;
   /** Resolve a member's process handle by name (batch barrier compact RPC). */
   getHandle?: (name: string) => MemberProcessHandle | undefined;
   /**
@@ -429,6 +440,7 @@ export function registerTlTools(deps: TlToolsDeps): void {
         messageQueue,
         autoCompact: deps.autoCompact,
         getAutoCompact: deps.getAutoCompact,
+        getSettings: deps.getSettings,
         getHandle: deps.getHandle,
       });
     },
@@ -469,7 +481,7 @@ export function registerTlTools(deps: TlToolsDeps): void {
         // timeout black hole). 0 = unlimited (status quo).
         waitDiag = await waitForAllIdle(
           memberOpsStates,
-          resolveWaitIdleDeadlineMs(deps.getAutoCompact)
+          resolveWaitIdleDeadlineMs(deps.getSettings)
         );
       }
 
@@ -511,14 +523,6 @@ export function registerTlTools(deps: TlToolsDeps): void {
  export const WAIT_IDLE_REQUIRED_CONSECUTIVE = 4;
  export const WAIT_IDLE_CHECK_INTERVAL_MS = 3000;
 
-/**
- * Default deadline for waitForAllIdle, in minutes (Phase 1 defense in
- * depth): even if member state never reaches idle, wait tools return with a
- * diagnostic instead of hanging forever. Mirrors the batch barrier's
- * DEFAULT_BATCH_MAX_WAIT_MINUTES semantics.
- */
-export const WAIT_IDLE_DEFAULT_DEADLINE_MINUTES = 15;
-
 /** Result of the all-idle wait — diagnostic on deadline expiry. */
 export interface WaitForAllIdleResult {
   /** True when the deadline expired with members still active. */
@@ -528,19 +532,19 @@ export interface WaitForAllIdleResult {
 }
 
 /**
- * Resolve the wait-idle deadline (ms) from the effective auto-compaction
- * config — reuses the batch barrier's `batchMaxWaitMinutes` budget
- * semantics (0 = unlimited). No config → the 15-minute default: the
- * deadline is defense in depth and must exist even when auto-compaction
- * is disabled (the stuck state it guards against is caused by the
+ * Resolve the wait-idle deadline (ms) from the global settings' unified
+ * wait budget (`waitTimeoutMinutes` — top-level, independent of
+ * auto-compaction; 0 = unlimited): shared by the all-idle deadline and
+ * the batch barrier. No settings → the 15-minute default: the deadline
+ * is defense in depth and must exist even when auto-compaction is
+ * disabled (the stuck state it guards against is caused by the
  * compaction lifecycle itself).
  */
 export function resolveWaitIdleDeadlineMs(
-  getAutoCompact?: () => ResolvedAutoCompact
+  getSettings?: () => TeamSettings
 ): number {
-  const cfg = getAutoCompact?.();
-  if (!cfg) return WAIT_IDLE_DEFAULT_DEADLINE_MINUTES * 60_000;
-  return cfg.batchMaxWaitMinutes > 0 ? cfg.batchMaxWaitMinutes * 60_000 : Infinity;
+  const minutes = resolveWaitTimeoutMinutes(getSettings?.());
+  return minutes > 0 ? minutes * 60_000 : Infinity;
 }
 
 /**
@@ -563,7 +567,7 @@ export function resolveWaitIdleDeadlineMs(
  */
 export async function waitForAllIdle(
   memberOpsStates: Map<string, MemberOperationalState>,
-  deadlineMs: number = WAIT_IDLE_DEFAULT_DEADLINE_MINUTES * 60_000
+  deadlineMs: number = DEFAULT_WAIT_TIMEOUT_MINUTES * 60_000
 ): Promise<WaitForAllIdleResult> {
   return new Promise<WaitForAllIdleResult>((resolve) => {
     const effectiveDeadlineMs = deadlineMs <= 0 ? Infinity : deadlineMs;
@@ -616,6 +620,12 @@ interface SendAndWaitCtx {
   autoCompact?: AutoCompactRuntime;
   /** Resolve the effective auto-compaction config. Absent = feature disabled. */
   getAutoCompact?: () => ResolvedAutoCompact;
+  /**
+   * Resolve global team settings (per call). Powers the unified wait budget
+   * (`waitTimeoutMinutes`) for the all-idle deadline and the batch barrier.
+   * Absent = the 15-minute default.
+   */
+  getSettings?: () => TeamSettings;
   /** Resolve a member's process handle (batch barrier compact RPC). */
   getHandle?: (name: string) => MemberProcessHandle | undefined;
 }
@@ -749,8 +759,11 @@ async function runBatchCompactionBarrier(
   );
 
   // Total batch budget: WAIT phase + all compactions share it (D1 maxWait).
-  const budgetMs =
-    cfg.batchMaxWaitMinutes > 0 ? cfg.batchMaxWaitMinutes * 60_000 : Infinity;
+  // Comes from the top-level unified wait budget (`waitTimeoutMinutes`) —
+  // independent of auto-compaction, shared with the all-idle deadline.
+  // 0 = unlimited (never time out).
+  const budgetMinutes = resolveWaitTimeoutMinutes(ctx.getSettings?.());
+  const budgetMs = budgetMinutes > 0 ? budgetMinutes * 60_000 : Infinity;
   const deadline = Date.now() + budgetMs;
 
   // Phase 2 attempted 语义 (alpha P2): a member is attempted ONLY when its
@@ -839,7 +852,7 @@ async function runBatchCompactionBarrier(
       attempted.add(name);
     }
     // Timeout: keep compacting (no endCompaction), no attempt — the waiting
-    // flow takes over. The wait counts against the batchMaxWaitMinutes
+    // flow takes over. The wait counts against the waitTimeoutMinutes
     // budget (the compact consumed its own timeout from it); the eventual
     // flush is bounded by the compaction_end event + the poll fallback.
   }
@@ -898,12 +911,12 @@ async function waitWithAllIdleCheck(
 
   const allDonePromise = Promise.all(waitPromises);
   // Phase 1: the all-idle race is bounded by the same deadline (default
-  // 15 min / batch budget) — a member stuck in `working` (the compaction-
+  // 15 min / wait budget) — a member stuck in `working` (the compaction-
   // timeout black hole) must not block team_send_and_wait forever. On
   // expiry the all-idle branch returns partial results + a diagnostic.
   const allIdlePromise = waitForAllIdle(
     memberOpsStates,
-    resolveWaitIdleDeadlineMs(ctx.getAutoCompact)
+    resolveWaitIdleDeadlineMs(ctx.getSettings)
   );
 
   // Race: all tasks done vs all members idle

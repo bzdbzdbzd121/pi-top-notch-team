@@ -8,14 +8,19 @@ import {
 } from "../../settings/settings";
 import {
   DEFAULT_THRESHOLD_PERCENT,
-  DEFAULT_BATCH_MAX_WAIT_MINUTES,
   describeAutoCompactSetting,
 } from "../../settings/resolve-auto-compact";
+import {
+  DEFAULT_WAIT_TIMEOUT_MINUTES,
+  describeWaitTimeoutSetting,
+  resolveWaitTimeoutMinutes,
+} from "../../settings/resolve-wait-timeout";
 import { scrollSelect } from "../../ui/scroll-select";
 
 /** Menu option identifiers (suffix after the emoji prefix is matched loosely). */
 const OPT_MEMBER_MODEL = "成员默认模型";
 const OPT_AUTO_COMPACT = "自动压缩";
+const OPT_WAIT_TIMEOUT = "等待上限";
 const OPT_FOLLOW = "跟随当前配置";
 const OPT_FIXED = "指定模型";
 
@@ -26,7 +31,6 @@ const AC_SET_TOKENS = "设置 token 阈值";
 const AC_CLEAR_PERCENT = "清除百分比阈值";
 const AC_CLEAR_TOKENS = "清除 token 阈值";
 const AC_SET_TIMEOUT = "设置超时（分钟）";
-const AC_SET_BATCH_WAIT = "设置批等待上限（分钟）";
 
 function formatModel(m: { provider: string; id: string; name?: string }): string {
   return `${m.provider}/${m.id}`;
@@ -58,6 +62,7 @@ export async function handleSetting(
     [
       `${OPT_MEMBER_MODEL}（当前：${describeMemberModelSetting(settings, currentModelRef(ctx))}）`,
       `${OPT_AUTO_COMPACT}（当前：${describeAutoCompactSetting(settings)}）`,
+      `${OPT_WAIT_TIMEOUT}（当前：${describeWaitTimeoutSetting(settings)}）`,
     ]
   );
   if (topChoice === undefined) return; // Esc
@@ -66,6 +71,8 @@ export async function handleSetting(
     await configureMemberModel(ctx, settings, rootDir);
   } else if (topChoice.startsWith(OPT_AUTO_COMPACT)) {
     await configureAutoCompact(ctx, settings, rootDir);
+  } else if (topChoice.startsWith(OPT_WAIT_TIMEOUT)) {
+    await configureWaitTimeout(ctx, settings, rootDir);
   }
 }
 
@@ -116,10 +123,6 @@ async function configureAutoCompact(
 
   for (;;) {
     const ac = settings.autoCompact;
-    const batchWaitText =
-      ac.batchMaxWaitMinutes === 0
-        ? "不限"
-        : `${ac.batchMaxWaitMinutes ?? DEFAULT_BATCH_MAX_WAIT_MINUTES} 分钟`;
     const items = [
       `${AC_TOGGLE}（当前：${ac.enabled ? "开启" : "关闭"}）`,
       `${AC_SET_PERCENT}（当前：${ac.thresholdPercent !== undefined ? `${ac.thresholdPercent}%` : "未配置"}）`,
@@ -127,7 +130,6 @@ async function configureAutoCompact(
       `${AC_CLEAR_PERCENT}`,
       `${AC_CLEAR_TOKENS}`,
       `${AC_SET_TIMEOUT}（当前：${ac.timeoutMinutes} 分钟）`,
-      `${AC_SET_BATCH_WAIT}（当前：${batchWaitText}）`,
     ];
     const choice = await ctx.ui.select(
       `自动压缩 — 生效中：${describeAutoCompactSetting(settings)}（Esc 返回）`,
@@ -174,21 +176,40 @@ async function configureAutoCompact(
       }
       ac.timeoutMinutes = n;
       saveAndMaybeNotifyFallback();
-    } else if (choice.startsWith(AC_SET_BATCH_WAIT)) {
-      const text = await ctx.ui.input(
-        "批等待上限（分钟，0 = 不限）",
-        String(ac.batchMaxWaitMinutes ?? DEFAULT_BATCH_MAX_WAIT_MINUTES)
-      );
-      if (text === undefined) continue;
-      const n = parseNonNegativeInt(text);
-      if (n === undefined) {
-        ctx.ui.notify("无效输入：请输入 ≥0 的整数分钟数（0 = 不限）。", "warning");
-        continue;
-      }
-      ac.batchMaxWaitMinutes = n;
-      saveAndMaybeNotifyFallback();
     }
   }
+}
+
+/**
+ * Wait budget (top-level, independent of auto-compaction): unified budget
+ * for team wait operations — the all-idle deadline of
+ * wait_and_get_member_status / team_send_and_wait and the batch barrier
+ * (maxWait). 0 = never time out (the original wait-tool semantics).
+ */
+async function configureWaitTimeout(
+  ctx: ExtensionCommandContext,
+  settings: TeamSettings,
+  rootDir: string,
+): Promise<void> {
+  const current = resolveWaitTimeoutMinutes(settings);
+  const text = await ctx.ui.input(
+    "等待上限（分钟，0 = 永不超时）",
+    String(current)
+  );
+  if (text === undefined) return; // Esc — no change
+  const n = parseNonNegativeInt(text);
+  if (n === undefined) {
+    ctx.ui.notify("无效输入：请输入 ≥0 的整数分钟数（0 = 永不超时）。", "warning");
+    return;
+  }
+  settings.waitTimeoutMinutes = n;
+  saveSettings(settings, rootDir);
+  ctx.ui.notify(
+    n === 0
+      ? "等待上限已设为「不限」：wait 工具与批屏障永不超时（恢复原始语义）。"
+      : `等待上限已设为 ${n} 分钟：wait 工具在超时后返回诊断，批屏障在超预算后直接派发。`,
+    "info"
+  );
 }
 
 async function configureMemberModel(

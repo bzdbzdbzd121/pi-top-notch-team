@@ -65,7 +65,7 @@ src/
 │   │   ├── show-handler.ts
 │   │   ├── delete-handler.ts
 │   │   ├── status-handler.ts
-│   │   ├── setting-handler.ts   ← /team setting 交互式设置菜单（成员默认模型 + 自动压缩）
+│   │   ├── setting-handler.ts   ← /team setting 交互式设置菜单（成员默认模型 + 自动压缩 + 等待上限）
 │   │   ├── done-handler.ts
 │   │   └── help-handler.ts
 │   ├── shared/        ← Shared schemas, tool helpers, and extracted pure functions
@@ -124,7 +124,8 @@ src/
 ├── settings/         ← Global settings (/team setting)
 │   ├── settings.ts        ← TeamSettings type + <rootDir>/settings.yaml read/write
 │   ├── resolve-model.ts   ← Pure function: member model precedence resolution
-│   └── resolve-auto-compact.ts ← Pure functions: auto-compaction resolution + threshold check + menu label
+│   ├── resolve-auto-compact.ts ← Pure functions: auto-compaction resolution + threshold check + menu label
+│   └── resolve-wait-timeout.ts ← Pure functions: 顶层通用等待预算 waitTimeoutMinutes（wait 工具 all-idle deadline + 批屏障共享，独立于自动压缩）
 ├── ui/               ← TUI components for team mode
 │   ├── team-status-widget.ts  ← Bordered widget: live member status + context %；阶段 2 实时化 + v2 简化：细粒度阶段渲染（💭×2/🔧×2/✏️/✅——working 与 thinking 同 💭 靠颜色区分（默认 vs accent），无耗时无工具名）+ N1 双层渲染去重（调度侧签名 logical|phase + 渲染侧 styled 行比较闸门）+ N2 轮询完成保留 refresh + N3 轮询并行化 + 合并节流（120ms + nextStreamFlushDelay 自适应退避，上限 1s）
 │   ├── team-status-widget.test.ts ← widget 单测：徽标/截断/overlay 优先级/时长格式/N1 双闸门（颜色盲区 B1）/S1 进程死亡强制调度/定时器清理
@@ -202,7 +203,7 @@ src/
    - Member Inspector direct messages bypass auto-compaction (user can compact manually via `ctrl+o`).
    - **共享压缩运行时（阶段 1）**: `src/channel/auto-compact.ts` 的 `AutoCompactRuntime` 拥有全部压缩原语（queryStats/shouldCompact/beginCompaction/compactNow/endCompaction/queueDuringCompaction/flushPending）与 per-member pending 队列。内联派发路径（`createSendToMember`）与批屏障（tl-tools）共享**同一实例**（`createMessageChannel` 创建并注入），压缩期间到达的消息（Inspector 直发等）统一进 pending、`flushPending` FIFO 释放——预检路径与内联路径共享同一 pending/flush，孤儿消息结构性不可能（D2）。接口为 discriminated union `{ ok: true, stats? } | { ok: false, error }`，错误携带真实 RPC 原因供通知。
    - **skipAutoCompact 标记（阶段 2）**: `TeamMessage.skipAutoCompact?: boolean`——"本批压缩决策已由预检做出"的唯一信号（正确性机制非优化）。带标记消息在 `createSendToMember` 中跳过内联检查直接派发（防 E12：压缩后 usage 仍超阈值时的二次压缩；同时保证 at most one per dispatch）。非屏障路径（单任务/成员互发/Inspector 直发）永不产生带标记消息。
-   - **批屏障（阶段 3）**: `sendAndWaitExecute` 在 enqueue 之前运行批预检（tasks.length > 1 且 autoCompact 启用才启用）。【不变式 E1】整个屏障（WAIT + stats + 串行压缩）在 corrId 注册与 enqueue **之前**完成——屏障期不存在任何 wait 检测，all-idle 误释放不可能（顺序硬编码 + 测试锁定：压缩完成前 messageQueue 长度为 0）。流程：`planBatchCompaction`（纯函数：idle→查 stats / compacting→待等集合，不重复发 compact / 其他→跳过）→ 并行 stats（本地 RPC）→ 需压缩集合 **串行** compact（同一时刻至多一个 compact RPC，无 PD 分离下并发压缩=并发 prefill）→ per-member fail-open（失败者带 skip 随批派发、其余继续）→ maxWait 批预算（`batchMaxWaitMinutes`，默认 15 分钟，0=不限）超预算停止**未开始的**压缩整批派发（在飞 compact RPC 跑满自身 timeout 后才停，属预期） → COMMIT 注册全部 corrId 并 enqueue，`skipAutoCompact: true` **仅加给实际执行过压缩尝试的成员**（成功或失败均算）。可见性：屏障对 TL **完全静默**（[批屏障] 通知已移除）——TL 只感知更长的等待时间，不感知屏障内部过程（压缩等待/开始/失败/超预算均不通知；失败与超预算由内联路径的既有通知兜底）。单任务/关闭路径完全原路径零预检（E9）。待等集合的释放条件为"非 compacting"（idle/crashed/stopped 均放行——toWait 成员崩溃或 /team stop 后压缩已无意义，不得挂起到超时）。
+   - **批屏障（阶段 3）**: `sendAndWaitExecute` 在 enqueue 之前运行批预检（tasks.length > 1 且 autoCompact 启用才启用）。【不变式 E1】整个屏障（WAIT + stats + 串行压缩）在 corrId 注册与 enqueue **之前**完成——屏障期不存在任何 wait 检测，all-idle 误释放不可能（顺序硬编码 + 测试锁定：压缩完成前 messageQueue 长度为 0）。流程：`planBatchCompaction`（纯函数：idle→查 stats / compacting→待等集合，不重复发 compact / 其他→跳过）→ 并行 stats（本地 RPC）→ 需压缩集合 **串行** compact（同一时刻至多一个 compact RPC，无 PD 分离下并发压缩=并发 prefill）→ per-member fail-open（失败者带 skip 随批派发、其余继续）→ maxWait 批预算（顶层 `waitTimeoutMinutes`，默认 15 分钟，0=不限，与 wait 工具兜底 deadline 共享）超预算停止**未开始的**压缩整批派发（在飞 compact RPC 跑满自身 timeout 后才停，属预期） → COMMIT 注册全部 corrId 并 enqueue，`skipAutoCompact: true` **仅加给实际执行过压缩尝试的成员**（成功或失败均算）。可见性：屏障对 TL **完全静默**（[批屏障] 通知已移除）——TL 只感知更长的等待时间，不感知屏障内部过程（压缩等待/开始/失败/超预算均不通知；失败与超预算由内联路径的既有通知兜底）。单任务/关闭路径完全原路径零预检（E9）。待等集合的释放条件为"非 compacting"（idle/crashed/stopped 均放行——toWait 成员崩溃或 /team stop 后压缩已无意义，不得挂起到超时）。
 
 17. **First-action protocol + TL read guard（双防亲自分析）** — TL 收到任务型诉求后亲自埋头分析（而不派发）是最常见的角色偏离。纯提示词约束不可靠（基座 coding-assistant 提示词驱动模型自己动手，且提示词中"能用代码验证的不要去问用户"曾与之矛盾、给了模型合规借口）。修复分两层：
    - **提示词层**：`src/prompts/tl-first-action.ts` 的「第一动作协议」（共享片段，防漂移）注入两种模式 TL 提示词的**顶部**——收到任务型诉求时第一个工具调用必须是 `start_member`/`team_send_and_wait`，派发前禁止 read/bash 代码文件；同时将旧规则限定为"需求对齐阶段允许读取 1-2 个文件查证"以消除矛盾。
@@ -233,14 +234,14 @@ src/
 29. **自动压缩超时事件驱动出口（Phase 1 止血）** — 修复「压缩超时→成员永久 working→wait 工具卡死」根因链的止血层（根治见 Phase 2 方案，未实施）：
     - **1.1 compaction_end 消费分支**（`src/channel/event-handler.ts`）：成员端 `compaction_end` 事件（无论成败必发，F7 盲区）是压缩生命周期的**权威心跳**——TL 端 `timeoutMinutes` 只是「停止主动等待」的租约，到期 ≠ 压缩失败。收到事件 → `autoCompact.endCompaction`（compacting→idle）→ `flushPending` 派发积压消息（→working→agent_end→idle 全链路）；此前发生过 compactNow 超时的场景通知 TL「压缩已于 N 分钟后结束，积压消息已自动补发」（正常路径静默）。超时痕迹由 runtime 新原语 `markCompactionTimeout`/`takeCompactionTimeout`（per-member Map，`compactNow` 在本地租约超时错误（`timed out`）时记录，非超时失败不记录——成员端已结算）承接，消费一次即清。**审查修订（重要）——在飞租约守卫**：成员端先 emit `compaction_end`、后写 compact 响应（agent-session.js → rpc-mode.js），故每次租约内成功的压缩，事件都会在 compactNow 响应前到达。runtime 新增在飞租约跟踪（`hasInFlightCompaction`/`markCompactionEndDuringLease`，compactNow 登记、settle 后清除），分支开头 `if (hasInFlightCompaction) return`——在飞期间由持有流程（内联 finally / 批屏障）负责退出与**按序**补发（当前消息 A 先、pending FIFO 后），杜绝顺序反转（B 先于 A）与双重压缩窗口（提前复位 idle 后亚毫秒窗口重派发→第二个 compact）。仅「无在飞租约」（超时后心跳）才执行 endCompaction+flush+通知。**near-miss 陈旧 mark 抑制（建议 1）**：心跳在租约在飞期间到达（压缩实际已完成、响应延迟过租约）→ 超时 catch 不记录 mark（`compactionEndDuringLease` 按租约起始时间戳校验），防止残留 mark 误报下一次压缩的「压缩已于 N 分钟后结束」。
     - **1.2 拒收分支状态纠正（get_state 判定，beta 形态）**：prompt 拒收分支（`success===false && id===undefined`）在 resolve+通知后追加 `get_state` 查询（3s 超时 fail-open，runtime 新原语 `queryCompactionState`，复用 queryStats 模式）——`isCompacting===true` → 置 `compacting`（状态机新事件 `compaction_confirmed`：working→compacting 纠正黑洞状态；出口由 1.1 提供；新消息经 sendToMember 的 compacting 分支自动入 pending → **双重压缩循环结构上消灭**）；`false` → 置 `idle`（`task_completed` 事件，纯函数纪律）；查询失败 → `idle`+通知（保守）。通知文案诚实化：删除「已直接派发任务」假陈述，改为「消息未送达（已丢失，请稍后重试）…已按实际状态恢复」。**审查修订（建议 2）——陈旧答案不覆盖新状态**：查询窗口（≤3s）内若真实回合开始（agent_start/agent_end）或进程退出（process_exit/process_error），handler 内 per-member `stateGeneration` 递增；纠正应用前校验「状态仍为拒收快照 + 代际未变」，否则跳过（陈旧 isCompacting=false 覆盖 running turn 为假 idle、或陈旧 true 覆盖新 prompt 为假 compacting 均被杜绝；查询失败路径同守）。`compaction_end` 刻意不计入代际：单管道 FIFO 下 **true 答案恒先于事件到达**（成员查询时仍在压缩 → 响应先于 compaction_end 写出），而 false 答案可能后至（查询时压缩已结束）——计入代际会误杀后至 false 的正常闭合路径，且会让已结算租约的心跳流程（endCompaction 对 working 是 no-op）困死在 working。
-    - **1.3 waitForAllIdle deadline（防御纵深最后一道）**：`waitForAllIdle` 增加 deadline（默认 15 分钟复用 `batchMaxWaitMinutes` 语义，0=不限保持现状；`resolveWaitIdleDeadlineMs` 解析）；到期返回**诊断结果**（`timedOut` + 疑似卡死成员清单 + 建议 stop_member / `/team stop` 后 `/team resume`）而非无限挂起——`wait_and_get_member_status` 与 `team_send_and_wait` 的 all-idle 竞速路径同时受益（后者 partial 结果追加诊断）；`setInterval` 加 `unref`（与批屏障 `waitForMembersIdle` 一致，Esc 中断后无轮询泄漏）；wait 结束后状态重读（输出反映 post-wait 现实，不再用 pre-wait 快照）。
+    - **1.3 waitForAllIdle deadline（防御纵深最后一道）**：`waitForAllIdle` 增加 deadline（默认 15 分钟，复用顶层 `waitTimeoutMinutes` 预算语义，0=不限保持现状；`resolveWaitIdleDeadlineMs` 解析）；到期返回**诊断结果**（`timedOut` + 疑似卡死成员清单 + 建议 stop_member / `/team stop` 后 `/team resume`）而非无限挂起——`wait_and_get_member_status` 与 `team_send_and_wait` 的 all-idle 竞速路径同时受益（后者 partial 结果追加诊断）；`setInterval` 加 `unref`（与批屏障 `waitForMembersIdle` 一致，Esc 中断后无轮询泄漏）；wait 结束后状态重读（输出反映 post-wait 现实，不再用 pre-wait 快照）。
     - **DI/接线**：`EventHandlerDeps` 新增 `autoCompact?`（共享 runtime）与 `memberHandles?`（get_state 查询 + flush 派发）；`MemberLifecycleDeps` 同步新增并转发；`index.ts` 注入。共享派发提取为模块级 `dispatchPromptToMember`（PromptDispatchDeps），内联路径与 compaction_end flush 路径同一套发送语义（working 标记 + followUp）。
     - **测试（37 个新用例，含审查修订 7 个）**：拒收分支状态恢复断言（compacting/idle/查询失败/无接线四态）、诚实文案、compaction_end 分支（正常静默/超时通知/无 runtime no-op/working 不动）、双重压缩防护（compacting 成员新消息入 pending→compaction_end flush，期间零 RPC）、状态机 `compaction_confirmed` 转换表、runtime 新原语、wait deadline 诊断/0=不限/unref 存在性、压缩超时→拒收→纠正→wait 正常返回回归；审查修订：在飞租约守卫集成用例（compaction_end 先于 compact 响应→A→B→C 顺序 + 窗口零二次压缩）、租约生命周期、near-miss 陈旧 mark 抑制、陈旧答案不覆盖（agent_start 窗口 skip×2）。
 30. **自动压缩超时根治（Phase 2：事件驱动派发，三出口闭合）** — 依赖 Phase 1（#29）；根治「超时后仍派发必被拒收 → 消息丢失」：
     - **2.1 内联超时语义重定义**（`runAutoCompactAndDispatch`）：`CompactResult` 增加 `timedOut` 判别——租约超时 → **不再派发**，保持 `compacting`，消息经 `queueDuringStuckCompaction` 入 pending（心跳 flush）；非超时失败（成员端已结算）→ endCompaction+直接派发；成功路径时序不变。入队竞态闭合（alpha）：入队前状态已非 compacting → 直接派发。通知：`压缩超过 N 分钟未完成，任务已排队，将在压缩结束后自动派发`。
     - **2.2 轮询兜底 + 二次超时（三出口之②）**：runtime 原语 `waitCompactionIdle(name, handle, budgetMs)`（30s 轮询 get_state.isCompacting，3s 单次超时 fail-open 按已结束，预算 = timeoutMinutes 一租约周期，unref）；兜底 watcher（`startFallbackWatcher`，per-channel dedupe）仅对**无在飞租约**的 compacting 启动（内联超时分支 + sendToMember compacting 分支）——释放 → `closeCompactionAndFlush`（共享于心跳分支与兜底：消费 mark+endCompaction+flush+超时通知，幂等）；预算耗尽 → `abandonPendingMessages`（清空 pending+resolve 各 corrId [已放弃]+通知人工干预）；新租约守卫（结算时在飞 → 不 close/abandon，新周期持有流程接管）。四场景闭合：心跳/事件丢失/进程退出/永不结束。
     - **2.3 进程退出清 pending（三出口之③）**：process_exit/process_error/主动停止统一 `drainPendingOnProcessExit`——清 pending+resolve corrId（[消息未送达]）+静默消费超时 mark+通知概要（重启后重派）。
-    - **2.4 批屏障接线 + attempted 语义修正（alpha P2）**：屏障超时 → 保持 compacting、不 endCompaction、**不计 attempt**（批消息 commit 后经 compacting 分支入 pending + 自动启动 watcher，等待计入 batchMaxWaitMinutes 预算）；`skipAutoCompact` 仅绑定「压缩已结清」——compact 响应（成功/非超时失败）或 compaction_end（runtime 心跳计数 `markCompactionEnd`/`getCompactionEndCount`，屏障按等待期/循环期增量判定，toWait 成员同规则）→ 打标；超时未结清 → 不打标（等待流程接管，不再跳过压缩检查）。事件结清打标同时闭合 E12 竞态（屏障期间事件到达的成员被打标，杜绝 commit 后第二个压缩）。
+    - **2.4 批屏障接线 + attempted 语义修正（alpha P2）**：屏障超时 → 保持 compacting、不 endCompaction、**不计 attempt**（批消息 commit 后经 compacting 分支入 pending + 自动启动 watcher，等待计入 `waitTimeoutMinutes` 预算）；`skipAutoCompact` 仅绑定「压缩已结清」——compact 响应（成功/非超时失败）或 compaction_end（runtime 心跳计数 `markCompactionEnd`/`getCompactionEndCount`，屏障按等待期/循环期增量判定，toWait 成员同规则）→ 打标；超时未结清 → 不打标（等待流程接管，不再跳过压缩检查）。事件结清打标同时闭合 E12 竞态（屏障期间事件到达的成员被打标，杜绝 commit 后第二个压缩）。
     - **测试（17 新用例，全量 1108 通过）**：F11 全链（超时→心跳→flush→派发不被拒，全程 1 个 compact RPC=E12）、事件丢失→轮询补发、二次超时→放弃+resolve+通知、进程退出×3（崩溃/主动停止/process_error）清 pending、批屏障超时（不打标+状态保持+E1 顺序）/屏障期事件结清（打标）/toWait 事件结清（打标）、waitCompactionIdle 全形态、心跳计数。E1/E12/E15 核对（§22 清单）；既有「超时→fail-open→派发」用例按新语义更新。
     - **文档精度修正（审查遗留）**：「FIFO 保证查询答案先于事件写出」措辞精确化——true 恒先于事件（查询时仍在压缩 → 响应先写出）、false 可后至（查询时已结束，后至 false 恰为正常闭合路径）；`compaction_end` 不计入代际的理由以此为准。
 31. **Phase 3（ADR-0006）+ 审查建议三修** — 上游 `abort_compaction` RPC 提案以 ADR 交付（无本地代码），顺带落地审查员 3 个建议级修复（含 TDD 测试）：\n
@@ -263,6 +264,12 @@ src/
     - **显示层判空**：`Math.round(null) === 0` 把压缩后合法「未知」渲染成误导性 "0%"——widget（team-status-widget.ts）与 inspector footer（member-inspector-state.ts buildFooterStatusLine）两处渲染点改为 `percent === null ? "?" : Math.round(percent)%`；`MemberContextInfo.percent` 类型放宽为 `number | null`（两处定义同步，注释写明上游契约）。测试：widget 集成（percent null → "?" + 无 "0%"）、inspector-state 纯函数（footer 行 "💭 分析员 ?" + 无 "0%"）；既有数值渲染用例锁定。\n
     - **ADR-0007**（`docs/adr/0007-pi-upstream-context-usage-reason.md`）：上游 `getContextUsage()` null 分支返回结构化 `reason: "post-compaction"`（主推，一行成本，全体消费者通用，不依赖下游对实现细节的推测）；备选：null 分支改用 `estimateContextTokens` 估算值（可行性已验证——无 usage 时退化逐条估算，compaction.js:131；但与上游「only trust usage」保守注释原则冲突）。两者非互斥、均非阻塞。\n
     - 上游合入后的演进空间：queryStats 改判 reason 字段（不再依赖 `percent === null` 隐含知识）或恢复单分支（估算值形态）——均为可选适配，非本阶段范围。
+34. **等待预算提升为顶层通用设置（waitTimeoutMinutes）** — 用户裁决：批等待上限本与自动压缩无关（wait 工具永不超时的原始设计被 1.3 的防御性 deadline 修正后，该 deadline 只是**借用**了自动压缩设置组的 `batchMaxWaitMinutes` 槽位），故提升为 `TeamSettings` 顶层字段 `waitTimeoutMinutes?`（默认 15 分钟，0=不限）并改名：
+    - **新位置/新名字**：`src/settings/resolve-wait-timeout.ts`（`DEFAULT_WAIT_TIMEOUT_MINUTES`/`resolveWaitTimeoutMinutes`/`describeWaitTimeoutSetting`）；旧 `resolve-auto-compact.ts` 的 `DEFAULT_BATCH_MAX_WAIT_MINUTES` 与 `ResolvedAutoCompact.batchMaxWaitMinutes` 删除，`describeAutoCompactSetting` 不再含「批等待」。
+    - **消费点**：`resolveWaitIdleDeadlineMs(getSettings?)`（wait 工具 all-idle 兜底 deadline）与批屏障 maxWait 预算（`runBatchCompactionBarrier`，0→Infinity 转换在调用点保留）共用同一预算；`TlToolsDeps`/`SendAndWaitCtx` 新增 `getSettings?`（index.ts 两处接线注入 `() => loadSettings(getRootDir())`），inline 派发路径（message-channel）不需要，不注入。
+    - **迁移**：`loadSettings` 读旧 `autoCompact.batchMaxWaitMinutes` 一次性搬移到顶层（守卫用**原始 YAML 值**判断新键缺省——settings 克隆恒带默认 15，用克隆值判断会永不迁移）；已保存文件下次写入即为新形态。
+    - **UI**：`/team setting` 顶层菜单新增「等待上限（当前：15 分钟/不限）」，自动压缩子菜单移除「设置批等待上限」；菜单标签 `等待上限`，提示语明示「0 = 永不超时（恢复原始语义）」。
+    - **测试**：settings 解析/往返/迁移（3 例）、新 resolver 单测（5 例）、tl-tools deadline 配置化与 0=不限（1 例）、批屏障 budgetMinutes 接线（2 例改），全量 1155 通过。
 
 ## Dependency Injection Pattern
 
@@ -270,7 +277,7 @@ The codebase uses an explicit Dependency Injection (DI) pattern to decouple modu
 
 | DI Interface | Module | Dependencies |
 |-------------|--------|-------------|
-| `TlToolsDeps` | `tools/tl-tools.ts` | `pi`, `manager`, `responseWaiter`, `memberOpsStates`, `lastPendingCorrId`, `messageQueue`, `createMember?`, `buildMemberConfig?`, `getMemberLog?`, `isDynamicSession?`, `addMemberToSession?`, `onDynamicMemberAdded?`, `onDynamicPhaseTransition?`, `getAutoCompact?`, `getHandle?`, `autoCompact?` |
+| `TlToolsDeps` | `tools/tl-tools.ts` | `pi`, `manager`, `responseWaiter`, `memberOpsStates`, `lastPendingCorrId`, `messageQueue`, `createMember?`, `buildMemberConfig?`, `getMemberLog?`, `isDynamicSession?`, `addMemberToSession?`, `onDynamicMemberAdded?`, `onDynamicPhaseTransition?`, `getAutoCompact?`, `getSettings?`, `getHandle?`, `autoCompact?` |
 | `MemberLifecycleDeps` | `setup/member-lifecycle.ts` | `pi`, `memberOpsStates`, `messageQueue`, `responseWaiter`, `lastPendingCorrId`, `recentlyProcessedMessages`, `processManager?` |
 | `MessageChannelDeps` | `setup/message-channel.ts` | `pi`, `memberOpsStates`, `lastPendingCorrId`, `memberHandles`, `onRouteNotification?`, `getAutoCompact?` |
 | `EventHandlerDeps` | `channel/event-handler.ts` | `pi`, `memberOpsStates`, `messageQueue`, `responseWaiter`, `lastPendingCorrId`, `recentlyProcessedMessages`, `processManager?`, `onMemberActivity?` |
@@ -413,7 +420,7 @@ npm run test:watch  # Watch mode
 | `/team cancel`           | Alias for `/team done` (backward compatibility) |
 | `/team delete <name>` | Delete a team definition (with confirmation) |
 | `/team status` | Show active session + member process statuses |
-| `/team setting` | Interactive settings menu — member default model (follow TL current model / fixed available model) + auto-compaction (toggle / percent & token thresholds / timeout). Also allowed during a session |
+| `/team setting` | Interactive settings menu — member default model (follow TL current model / fixed available model) + auto-compaction (toggle / percent & token thresholds / timeout) + wait budget (等待上限, 0=永不超时 — wait 工具 all-idle deadline 与批屏障共享的顶层通用预算). Also allowed during a session |
 | `/team help` | Display usage help for all subcommands |
 
 ## TL Tools (registered + active only during team session)

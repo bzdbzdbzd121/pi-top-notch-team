@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { Compile } from "typebox/compile";
 import { registerTlTools, WAIT_IDLE_CHECK_INTERVAL_MS, WAIT_IDLE_REQUIRED_CONSECUTIVE, prepareTeamSendAndWaitArgs } from "./tl-tools";
 import { startSession, endSession, markSharedContextWritten } from "../session/state";
+import { DEFAULT_SETTINGS } from "../settings/settings";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { ProcessManager } from "../process/manager";
 import type { ResponseWaiter, WaitResult } from "../channel/response-waiter";
@@ -101,6 +102,7 @@ describe("registerTlTools", () => {
     createMember?: any;
     buildMemberConfig?: any;
     getMemberLog?: any;
+    getSettings?: any;
   }) {
     registerTlTools({
       pi,
@@ -112,6 +114,7 @@ describe("registerTlTools", () => {
       createMember: overrides?.createMember,
       buildMemberConfig: overrides?.buildMemberConfig,
       getMemberLog: overrides?.getMemberLog,
+      getSettings: overrides?.getSettings,
     });
   }
 
@@ -1189,6 +1192,55 @@ describe("registerTlTools", () => {
       expect(result.content[0].text).toContain("worker");
       expect(result.content[0].text).toContain("等待超时");
       expect(result.content[0].text).toContain("stop_member");
+    });
+
+    it("honors the configured waitTimeoutMinutes budget (top-level, independent of auto-compaction)", { timeout: 5000 }, async () => {
+      vi.useFakeTimers();
+      try {
+        memberOpsStates.set("worker", "working"); // stuck black hole
+
+        let executeFn: Function = () => {};
+        pi.registerTool = vi.fn((def: any) => {
+          if (def.name === "wait_and_get_member_status") {
+            executeFn = def.execute;
+          }
+        });
+
+        // getSettings is provided (production wiring): a 1-minute waitTimeoutMinutes
+        // must bound the wait — the diagnostic fires way before the 15-min default.
+        callRegisterTlTools({
+          getSettings: () => ({ ...structuredClone(DEFAULT_SETTINGS), waitTimeoutMinutes: 1 }),
+        });
+
+        const resultPromise = executeFn("call-dl");
+        await vi.advanceTimersByTimeAsync(60_000 + WAIT_IDLE_CHECK_INTERVAL_MS);
+        const result = await resultPromise;
+
+        expect(result.content[0].text).toContain("等待超时");
+        expect(result.content[0].text).toContain("worker");
+
+        // 0 = unlimited (original never-timeout semantics): the wait must still
+        // be pending well past the default 15 minutes would have fired.
+        memberOpsStates.clear();
+        memberOpsStates.set("worker", "working");
+        callRegisterTlTools({
+          getSettings: () => ({ ...structuredClone(DEFAULT_SETTINGS), waitTimeoutMinutes: 0 }),
+        });
+        const unlimitedPromise = executeFn("call-unlimited");
+        let resolved = false;
+        void unlimitedPromise.then(() => { resolved = true; });
+        await vi.advanceTimersByTimeAsync(16 * 60_000 + WAIT_IDLE_CHECK_INTERVAL_MS);
+        await vi.advanceTimersByTimeAsync(0); // flush microtasks, no poll due
+        expect(resolved).toBe(false);
+
+        // Release the member — the wait resolves normally, with no diagnostic.
+        memberOpsStates.set("worker", "idle");
+        await vi.advanceTimersByTimeAsync(WAIT_IDLE_CHECK_INTERVAL_MS * (WAIT_IDLE_REQUIRED_CONSECUTIVE + 1));
+        const unlimitedResult = await unlimitedPromise;
+        expect(unlimitedResult.content[0].text).not.toContain("等待超时");
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it("regression (Phase 1): after the rejection correction restores the member, wait returns normally — no deadlock", { timeout: 5000 }, async () => {

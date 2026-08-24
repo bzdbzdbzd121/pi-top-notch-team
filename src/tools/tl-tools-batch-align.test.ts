@@ -11,6 +11,8 @@ import type { MessageQueue } from "../channel/message-queue";
 import type { TeamMessage } from "../channel/types";
 import type { MemberOperationalState } from "../session/context";
 import type { ResolvedAutoCompact } from "../settings/resolve-auto-compact";
+import { DEFAULT_SETTINGS } from "../settings/settings";
+import { DEFAULT_WAIT_TIMEOUT_MINUTES } from "../settings/resolve-wait-timeout";
 
 // ── Test helpers ────────────────────────────────────────────
 
@@ -19,7 +21,6 @@ const defaultCfg: ResolvedAutoCompact = {
   thresholdPercent: 80,
   thresholdTokens: undefined,
   timeoutMinutes: 10,
-  batchMaxWaitMinutes: 15,
   percentIsDefaultFallback: false,
 };
 
@@ -106,6 +107,8 @@ interface SetupOptions {
   states?: Record<string, MemberOperationalState>;
   /** Map member name → handle behavior. Members absent here get NO handle (getHandle → undefined). */
   handles?: Record<string, HandleBehavior>;
+  /** Total wait budget in minutes (top-level waitTimeoutMinutes). 0 = unlimited. Absent = default. */
+  budgetMinutes?: number;
   /** Extra deps to inject. */
   deps?: Record<string, any>;
 }
@@ -137,6 +140,10 @@ function setupBarrier(opts: SetupOptions = {}) {
     lastPendingCorrId,
     messageQueue,
     getAutoCompact: () => opts.cfg ?? defaultCfg,
+    getSettings: () => ({
+      ...structuredClone(DEFAULT_SETTINGS),
+      waitTimeoutMinutes: opts.budgetMinutes ?? DEFAULT_WAIT_TIMEOUT_MINUTES,
+    }),
     getHandle: (name: string) => handles.get(name),
     autoCompact,
     ...opts.deps,
@@ -352,7 +359,7 @@ describe("team_send_and_wait batch barrier (phase 3)", () => {
       let resolveCompactA: (v: any) => void;
       const compactAPromise = new Promise((r) => { resolveCompactA = r; });
       setup = setupBarrier({
-        cfg: { ...defaultCfg, batchMaxWaitMinutes: 1 }, // 1-minute total budget
+        budgetMinutes: 1, // 1-minute total budget
         states: { a: "idle", b: "idle" },
         handles: {
           a: { stats: () => usageResponse(95, 190000), compact: () => compactAPromise },
@@ -554,7 +561,7 @@ describe("team_send_and_wait batch barrier (phase 3)", () => {
     vi.useFakeTimers();
     try {
       setup = setupBarrier({
-        cfg: { ...defaultCfg, batchMaxWaitMinutes: 0 }, // unlimited — must NOT hang forever
+        budgetMinutes: 0, // unlimited — must NOT hang forever
         states: { a: "compacting", b: "idle" },
         handles: { b: { stats: () => usageResponse(95, 190000) } },
       });

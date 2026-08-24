@@ -25,23 +25,30 @@ export interface AutoCompactSetting {
   thresholdTokens?: number;
   /** How long to wait for the compaction RPC before failing open (minutes, >=1). Default: 10. */
   timeoutMinutes: number;
-  /**
-   * Total budget for the batch alignment barrier (phase 3), in minutes.
-   * 0 = unlimited. Default: 15. When the budget runs out, remaining
-   * compactions are skipped and the batch is dispatched as-is.
-   */
-  batchMaxWaitMinutes?: number;
 }
 
 /** Global top-notch-team settings (apply to all team sessions). */
 export interface TeamSettings {
   memberModel: MemberModelSetting;
   autoCompact: AutoCompactSetting;
+  /**
+   * Unified wait budget for team wait operations, in minutes.
+   * 0 = unlimited (never time out). Default: 15.
+   *
+   * Shared by (and fully independent of auto-compaction):
+   *  - the all-idle deadline of wait_and_get_member_status /
+   *    team_send_and_wait (defense in depth: a member stuck in
+   *    working/compacting must not block the wait tools forever), and
+   *  - the batch alignment barrier budget (maxWait: when exhausted,
+   *    not-yet-started compactions are skipped and the batch dispatches).
+   */
+  waitTimeoutMinutes?: number;
 }
 
 export const DEFAULT_SETTINGS: TeamSettings = {
   memberModel: { mode: "follow" },
-  autoCompact: { enabled: true, thresholdPercent: 80, timeoutMinutes: 10, batchMaxWaitMinutes: 15 },
+  autoCompact: { enabled: true, thresholdPercent: 80, timeoutMinutes: 10 },
+  waitTimeoutMinutes: 15,
 };
 
 const SETTINGS_FILE = "settings.yaml";
@@ -122,15 +129,32 @@ export function loadSettings(rootDir: string): TeamSettings {
       ) {
         settings.autoCompact.timeoutMinutes = acObj.timeoutMinutes;
       }
-      // Batch budget: 0 = unlimited is meaningful; negative / non-integer
-      // values are dropped (default applies).
-      if (
-        typeof acObj.batchMaxWaitMinutes === "number" &&
-        Number.isInteger(acObj.batchMaxWaitMinutes) &&
-        acObj.batchMaxWaitMinutes >= 0
-      ) {
-        settings.autoCompact.batchMaxWaitMinutes = acObj.batchMaxWaitMinutes;
-      }
+    }
+
+    // waitTimeoutMinutes (top-level, generic wait budget): 0 = unlimited is
+    // meaningful; negative / non-integer values are dropped (default applies).
+    const rawData = data as Record<string, unknown>;
+    const wt = rawData.waitTimeoutMinutes;
+    if (typeof wt === "number" && Number.isInteger(wt) && wt >= 0) {
+      settings.waitTimeoutMinutes = wt;
+    }
+
+    // Migration (legacy key): batchMaxWaitMinutes used to live inside
+    // autoCompact but is actually independent of auto-compaction. Carry the
+    // old value over to the top-level waitTimeoutMinutes once when the file
+    // has no top-level key (the settings clone always carries the default,
+    // so the guard must check the raw file value, not the resolved object).
+    const legacyAc = rawData.autoCompact;
+    const legacyBatch = (legacyAc as Record<string, unknown> | null)
+      ? ((legacyAc as Record<string, unknown>).batchMaxWaitMinutes as unknown)
+      : undefined;
+    if (
+      wt === undefined &&
+      typeof legacyBatch === "number" &&
+      Number.isInteger(legacyBatch) &&
+      legacyBatch >= 0
+    ) {
+      settings.waitTimeoutMinutes = legacyBatch;
     }
     return settings;
   } catch (err) {

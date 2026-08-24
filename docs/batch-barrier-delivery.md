@@ -31,7 +31,7 @@
 | stats 预检 | 并行 `get_session_stats`（3s 超时，per-member fail-open=不压缩）；同成员多任务去重（只查一次） |
 | 压缩执行 | 需压缩集合 S **串行**：`beginCompaction`（同步置位）→ `compactNow`（RPC，timeoutMinutes 超时）→ `endCompaction`（finally 复位） |
 | 压缩失败 | per-member fail-open：失败者**带 skip** 随批统一派发（静默，不通知 TL）；**其余成员继续串行压缩** |
-| 批预算 | `batchMaxWaitMinutes`（默认 15 分钟，0=不限，`/team setting` 可调）：WAIT 与全部压缩共享总预算；超预算**停止未开始的压缩**（在飞 compact RPC 跑满自身 timeout 后停，属预期）→ 整批 enqueue 派发（静默） |
+| 批预算 | 顶层 `waitTimeoutMinutes`（默认 15 分钟，0=不限，`/team setting` 可调；与 wait 工具 all-idle deadline 共享的通用等待预算，独立于自动压缩）：WAIT 与全部压缩共享总预算；超预算**停止未开始的压缩**（在飞 compact RPC 跑满自身 timeout 后停，属预期）→ 整批 enqueue 派发（静默） |
 | 待等集合 | 轮询条件为**非 compacting**（idle/crashed/stopped 均放行——成员崩溃或 /team stop 后压缩已无意义，不得挂起到超时）；1s 轮询；等待静默进行 |
 | skip 规则 | `skipAutoCompact: true` **仅加给屏障中实际执行过压缩尝试的成员**（成功或失败均算，at most one per dispatch）；maxWait 中断未轮到者、非 S 成员不带（内联路径自然获得第二次机会）；非屏障路径（单任务/成员互发/Inspector 直发/backup 解析）永不产生带标记消息 |
 | 孤儿消息防护 | 屏障压缩期间到达的消息进共享 pending（`queueDuringCompaction`）；屏障 `endCompaction` 只复位不 flush，由后续第一条到达该成员的消息（内联直发分支，含带标记消息）**先 drain pending（FIFO）再发自己**；内联路径 finally 保持 [当前消息 → 积压] 顺序 |
@@ -68,7 +68,7 @@
 | `waiting` 新状态 | 屏障期成员状态显示 ⏳（现复用 compacting） | 未来改走"enqueue 后屏障"（通道层聚合）时才需要 |
 | 增量同步（`syncParallelBatch`） | 当前预检开销 = 一次并行本地 stats RPC（无模型调用），无需逃生门 | 出现 stats 查询成为瓶颈的证据 |
 
-## 6. 配置参考（`/team setting` → 自动压缩）
+## 6. 配置参考（`/team setting` → 自动压缩 / 等待上限）
 
 ```
 autoCompact:
@@ -76,7 +76,7 @@ autoCompact:
   thresholdPercent: 80     # 百分比阈值（默认 80，未配置时回退 80 并显示"默认"）
   thresholdTokens: null    # token 阈值（可选）
   timeoutMinutes: 10       # 单次 compact RPC 超时（≥1，默认 10）
-  batchMaxWaitMinutes: 15  # 批屏障总预算（≥0 整数，0=不限，默认 15）
+waitTimeoutMinutes: 15    # 顶层通用等待预算（wait 工具兜底 deadline + 批屏障总预算；≥0 整数，0=不限，默认 15）
 ```
 
 ## 7. 验证摘要

@@ -862,8 +862,8 @@ export function createSendToMember(
     const handle = memberHandles.get(memberName);
     if (!handle) return;
     activeFallbackWatchers.add(memberName);
-    // Secondary budget = one lease period (与批屏障 batchMaxWaitMinutes 语义
-    // 统一：等待计入预算；0/缺省用默认超时）。
+    // Secondary budget = one lease period (与批屏障等待预算语义统一：等待计入
+    // waitTimeoutMinutes 预算；0/缺省用默认超时）。
     const budgetMs = (cfg?.timeoutMinutes ?? DEFAULT_TIMEOUT_MINUTES) * 60_000;
     void (async () => {
       try {

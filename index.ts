@@ -334,6 +334,7 @@ export default function (pi: ExtensionAPI) {
     // aligns batch prompts behind member compactions.
     autoCompact,
     getAutoCompact: () => resolveAutoCompact(loadSettings(getRootDir())),
+    getSettings: () => loadSettings(getRootDir()),
     getHandle: (name: string) => teamCtx.getHandle(name),
   };
 
