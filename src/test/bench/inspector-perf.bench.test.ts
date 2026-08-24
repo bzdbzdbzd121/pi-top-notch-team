@@ -258,7 +258,7 @@ describe.runIf(BENCH)("P1 R3-A rope micro-bench (BENCH=1)", () => {
     console.log(`C 数组 push+join(对照组):       ${fmt(timeC)}`);
     const thirdScale = timeA.third3 / Math.max(0.001, timeA.third1);
     console.log(`\n第三段/第一段耗时比: ${thirdScale.toFixed(2)}x`);
-    if (thirdScale < 3 && timeA.total < timeB.total * 4) {
+    if (thirdScale < 3 && timeA.total < timeB * 4) {
       console.log("结论: 每步访问未随长度显著变慢 → V8 对 ConsString flatten 已有效处理 → rope 项【永久关闭】");
     } else {
       console.log("结论: 每步访问随长度显著变慢（O(T²) 特征）→ rope 项【追加专项】（阶段 2 后基准驱动）");
