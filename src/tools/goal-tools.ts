@@ -21,6 +21,32 @@ let activeGoal: GoalState | null = null;
 const REMINDER_COOLDOWN_MS = 10_000;
 let lastReminderSeq = 0;
 
+/**
+ * A low-level agent loop can end more than once before the outer AgentSession
+ * run is fully settled (for example while retrying, compacting, or draining a
+ * queued continuation). Keep that lifecycle separate from the reminder
+ * candidate so agent_end only prepares state and agent_settled is the sole
+ * trigger for delivery.
+ */
+interface GoalReminderCandidate {
+  runId: number;
+  text: string;
+  criteria: string;
+}
+
+interface GoalReminderRunState {
+  runId: number;
+  sawAgentEnd: boolean;
+  aborted: boolean;
+  settled: boolean;
+  candidate: GoalReminderCandidate | null;
+}
+
+let nextRunId = 0;
+let currentRun: GoalReminderRunState | null = null;
+let pendingReminder: GoalReminderCandidate | null = null;
+let reminderTimer: ReturnType<typeof setTimeout> | null = null;
+
 // ── Public helpers (for tests and index.ts integration) ────
 
 /** Get current goal state snapshot (for testing or display). */
@@ -166,28 +192,79 @@ export function registerGoalTools(pi: ExtensionAPI): void {
 
 }
 
-// ── agent_end reminder handler (safe to register at module init) ─
+// ── Agent lifecycle reminder handler (safe to register at module init) ─
 
 export function registerGoalAgentHandler(pi: ExtensionAPI): void {
+  // agent_start begins (or resumes) an outer AgentSession run. Retry,
+  // compaction, and queued continuation starts occur before agent_settled and
+  // therefore reuse this state instead of opening a new reminder window.
+  pi.on("agent_start", (_event, ctx) => {
+    if (!currentRun || currentRun.settled) {
+      currentRun = {
+        runId: ++nextRunId,
+        sawAgentEnd: false,
+        aborted: false,
+        settled: false,
+        candidate: null,
+      };
+    }
+    if (ctx?.signal?.aborted) {
+      currentRun.aborted = true;
+    }
+  });
+
+  // agent_end only records the outcome and a candidate. It is deliberately
+  // not a delivery boundary: pi may still retry, compact, or process queued
+  // messages after this event and before agent_settled.
   pi.on("agent_end", async (event, ctx) => {
-    // Guard: only fire if a goal exists and is NOT completed
+    if (!currentRun || currentRun.settled) {
+      // Be tolerant of lightweight callers/tests that emit agent_end without
+      // first emitting agent_start. Real AgentSession runs always emit both.
+      currentRun = {
+        runId: ++nextRunId,
+        sawAgentEnd: false,
+        aborted: false,
+        settled: false,
+        candidate: null,
+      };
+    }
+    const run = currentRun;
+    run.sawAgentEnd = true;
+
+    // Preserve the existing abort guard at the low-level boundary. The
+    // end→settled abort window is part of the follow-up cancellation phase.
+    if (ctx?.signal?.aborted) {
+      run.aborted = true;
+    }
+
+    // Check the structured assistant outcome when it is available. This is
+    // intentionally limited to recording the run outcome; agent_settled still
+    // owns the decision to schedule delivery.
+    const messages = (event as any).messages ?? [];
+    const assistantMsg = messages.findLast?.((m: any) => m?.role === "assistant");
+    if (assistantMsg?.stopReason === "aborted") {
+      run.aborted = true;
+    }
+
+    // Guard: only prepare a candidate when a goal exists and is NOT completed.
     if (!activeGoal || activeGoal.completed) return;
 
-    // Guard: only fire during an active team session (avoid side effects outside sessions)
+    // Guard: only prepare reminders during an active team session.
     if (!getSessionState().active) return;
 
-    // Guard: if user pressed Esc or typed a new message to abort/redirect,
-    // skip the reminder — the signal from the aborted turn is marked as aborted.
-    if (ctx.signal?.aborted) return;
+    // Guard: an aborted low-level end cannot become a reminder candidate.
+    if (run.aborted) return;
 
-    // Guard: cooldown — prevent infinite re-trigger loops
+    // Guard: cooldown — prevent infinite re-trigger loops. The cooldown is
+    // intentionally retained at this lifecycle stage; dispatch-time
+    // re-accounting belongs to the subsequent race/guard phase.
     const now = Date.now();
     if (now - lastReminderSeq < REMINDER_COOLDOWN_MS) return;
     lastReminderSeq = now;
 
-    // Check if TL *already* called finish_goal in this turn (race-safe guard)
-    const messages = (event as any).messages ?? [];
-    const assistantMsg = messages.findLast?.((m: any) => m?.role === "assistant");
+    // Check if TL *already* called finish_goal in this turn (race-safe guard).
+    // The authoritative goal-completion check is retained for the subsequent
+    // goal-generation phase; this protects existing behavior in this phase.
     const content = typeof assistantMsg?.content === "string"
       ? assistantMsg.content
       : Array.isArray(assistantMsg?.content)
@@ -195,27 +272,41 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
         : "";
     if (content.includes("finish_goal")) return;
 
-    // Defer sending to next tick — agent_end fires while agent is still in a
-    // processing lifecycle state (pi's isStreaming stays true through the
-    // post-agent_end settlement window: listener drain, auto-retry,
-    // auto-compaction). deliverAs: "followUp" makes the reminder queue instead
-    // of throwing "Agent is already processing..." if the TL agent is still
-    // streaming (or already streaming again) when the timer fires; it is
-    // ignored when the agent is idle, so the reminder triggers a turn normally.
-    // Capture the goal in a local: TS narrowing does not survive the closure.
-    const goal = activeGoal;
-    if (!goal) return;
-    setTimeout(() => {
+    run.candidate = {
+      runId: run.runId,
+      text: activeGoal.text,
+      criteria: activeGoal.criteria,
+    };
+  });
+
+  // agent_settled is the only reminder delivery boundary. The one-shot timer
+  // merely avoids re-entering pi from inside the settled listener; it does
+  // not attempt to infer lifecycle state from a timer tick.
+  pi.on("agent_settled", async () => {
+    const run = currentRun;
+    if (!run || run.settled) return;
+    run.settled = true;
+
+    if (!run.sawAgentEnd || run.aborted || !run.candidate) return;
+
+    pendingReminder = run.candidate;
+    if (reminderTimer) return;
+
+    reminderTimer = setTimeout(() => {
+      reminderTimer = null;
+      const candidate = pendingReminder;
+      pendingReminder = null;
+      if (!candidate) return;
+
       pi.sendUserMessage(
         `## ⚡ 目标提醒\n\n` +
-        `当前目标 **"${goal.text}"** 尚未完成。\n\n` +
-        `**完成条件：**\n${goal.criteria}\n\n` +
+        `当前目标 **"${candidate.text}"** 尚未完成。\n\n` +
+        `**完成条件：**\n${candidate.criteria}\n\n` +
         `---\n` +
         `请检查当前进度：\n\n` +
         `1. **如果目标尚未完成** — 继续调度成员执行下一轮任务，直到所有条件满足\n` +
         `2. **如果目标已完成** — 调用 \`finish_goal\` 工具清理此目标\n` +
         `3. **如果遇到不可解决的阻塞问题** — 也调用 \`finish_goal\` 并告知用户情况`,
-        { deliverAs: "followUp" }
       );
     }, 0);
   });

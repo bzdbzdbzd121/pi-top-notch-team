@@ -279,11 +279,11 @@ export default function (pi: ExtensionAPI) {
   // the TL's current model to members spawned in "follow" mode.
   let tlCurrentModel: string | undefined;
 
-  // Only register the agent_end reminder handler at module init (safe, guards itself).
-  // The session tools themselves are NOT registered here — they are registered
-  // on-demand at session start via ensureSessionToolsRegistered() (see below),
-  // so outside a session the tool registry contains none of them.
-  registerGoalAgentHandler(pi);
+  // The goal lifecycle handlers are registered below, after the shared
+  // agent_settled status handler. The session tools themselves are NOT
+  // registered here — they are registered on-demand at session start via
+  // ensureSessionToolsRegistered() (see below), so outside a session the tool
+  // registry contains none of them.
 
   // start_team_session is the SINGLE deliberate exception to session-scoped
   // registration (ADR-0003): it must be visible at all times so the agent can
@@ -571,6 +571,12 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.setStatus("team-members-running", undefined);
     }
   });
+
+  // Register the goal lifecycle handlers after the shared settled handler so
+  // callers that inspect the first agent_settled listener continue to receive
+  // the team-member status behavior above. The goal handler itself is safe to
+  // register at module initialization and guards on active session state.
+  registerGoalAgentHandler(pi);
 
   // ── session_shutdown: clean up team state on /new, /resume, /fork ──
   // The session DIRECTORY IS PRESERVED (member contexts stay resumable via
