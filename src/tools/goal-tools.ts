@@ -49,6 +49,8 @@ interface GoalReminderRunState {
   suppressReminderCandidate: boolean;
   /** A rollover marker was seen, but the corresponding user message is not classified yet. */
   stalePromptPending: boolean;
+  /** Only the first user prompt can associate a rollover marker with this run. */
+  sawUserPrompt: boolean;
   /** Every low-level prompt/continue signal seen in this outer run. */
   signals: Set<unknown>;
   /** Session identity captured when this outer run started. */
@@ -374,6 +376,7 @@ function createRun(ctx: unknown): GoalReminderRunState {
     settled: false,
     suppressReminderCandidate: false,
     stalePromptPending: false,
+    sawUserPrompt: false,
     signals,
     sessionId: session?.sessionId ?? null,
     sessionEpoch,
@@ -1061,13 +1064,16 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
     const run = currentRun;
     if (!run) return;
     const message = (event as { message?: unknown } | null | undefined)?.message;
-    if (!message) return;
+    if (!message || (message as { role?: unknown }).role !== "user") return;
+    if (run.sawUserPrompt) return;
+    run.sawUserPrompt = true;
     const marker = extractReminderMarker(messageText(message));
     const markerId = marker ? reminderMarkerId(marker) : null;
-    const isStaleMarker = markerId !== null && staleRolloverMarkers.has(markerId);
+    const staleMarker = markerId === null ? undefined : staleRolloverMarkers.get(markerId);
+    const isStaleMarker = markerId !== null && Boolean(staleMarker?.markerSeen);
     if (isStaleMarker) {
-      // Also inspect the message itself: an old prompt can be delayed until
-      // after a fresh run consumed the provisional slot at agent_start.
+      // Also inspect the first user prompt itself: an old prompt can be delayed
+      // until after a fresh run consumed the provisional slot at agent_start.
       run.stalePromptPending = false;
       run.suppressReminderCandidate = true;
       consumeStaleMarker(markerId);

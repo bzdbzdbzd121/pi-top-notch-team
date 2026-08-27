@@ -366,6 +366,65 @@ describe("registerGoalAgentHandler reminder", () => {
     expect(pi.sendUserMessage.mock.calls[2][0]).toContain("replacement goal");
   });
 
+  it("ignores stale marker text in assistant and tool message_start events", async () => {
+    vi.useFakeTimers();
+    setupActiveGoal();
+    const { pi, handlers } = createMockPi();
+    registerGoalAgentHandler(pi as any);
+    pi.sendUserMessage.mockImplementation(() => undefined as any);
+
+    await finishLowLevelRun(handlers);
+    await settleRun(handlers);
+    await flushReminderTimer();
+    const staleReminderPrompt = pi.sendUserMessage.mock.calls[0][0];
+    resetGoal();
+    setGoalForTesting({ text: "replacement goal", criteria: "- replacement", completed: false });
+    await handlers["before_agent_start"]({ prompt: staleReminderPrompt }, activeContext());
+
+    const freshContext = {
+      signal: { aborted: false },
+      isIdle: () => true,
+      abort: vi.fn(),
+    };
+    await handlers["agent_start"]({}, freshContext);
+    await handlers["message_start"](
+      {
+        message: {
+          role: "user",
+          content: [{ type: "text", text: "fresh user prompt" }],
+        },
+      },
+      freshContext,
+    );
+    // The marker is only historical text here; neither response-side event
+    // may turn it into a stale prompt or abort the fresh run.
+    await handlers["message_start"](
+      {
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: `echo ${staleReminderPrompt}` }],
+        },
+      },
+      freshContext,
+    );
+    await handlers["message_start"](
+      {
+        message: {
+          role: "toolResult",
+          content: [{ type: "text", text: `tool output ${staleReminderPrompt}` }],
+        },
+      },
+      freshContext,
+    );
+    await handlers["agent_end"]({ messages: [] }, freshContext);
+    await settleRun(handlers, freshContext);
+    await flushReminderTimer();
+
+    expect(freshContext.abort).not.toHaveBeenCalled();
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
+    expect(pi.sendUserMessage.mock.calls[1][0]).toContain("replacement goal");
+  });
+
   it("does not let a stale marker without agent_start swallow the next fresh run", async () => {
     vi.useFakeTimers();
     setupActiveGoal();
