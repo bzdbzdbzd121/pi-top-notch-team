@@ -149,7 +149,7 @@ Since TL and Member are declared as two separate extensions, but both are loaded
 | Member RPC process | `"rpc"` | **Member** — registers `team_send_message` tool, injects team system prompt via env vars |
 
 **Detection logic:**
-- `index.ts` (TL side): registers the /team command at load; registers team tools **only on session start** (`onSessionStart` → `ensureSessionToolsRegistered`) and enforces registration+activation at every `before_agent_start` turn boundary (`enforceSessionToolVisibility`). Outside a session the tool registry contains none of them. No mode check needed.
+- `index.ts` (TL side): registers the /team command at load; registers team tools **only on session start** (`onSessionStart` → `ensureSessionToolsRegistered`) and enforces registration+activation at every `before_agent_start` turn boundary (`enforceSessionToolVisibility`). Because pi has no unregister API, tools remain registered after the first session; outside a session they are removed from `activeTools` and therefore not visible or callable. No mode check needed.
 - `member.ts` (Member side): checks `process.env.TEAM_ROLE` at startup. If not set, exits early (no tools registered).
 
 **Detection logic in `member.ts`:**
