@@ -27,7 +27,7 @@ The per-session behavior and constraints that the TL communicates to a Member du
 _Avoid_: Baking session tasks into YAML definition
 
 **Process Management Tools**:
-A set of tools that exist in the tool registry **only during an active Team Session** (registered on-demand at session start, never at extension load): 9 session-scoped tools — `start_member`, `stop_member`, `list_members`, `get_member_log`, `wait_and_get_member_status`, `team_send_and_wait`, `write_shared_context`, `set_goal`, `finish_goal` — plus `add_dynamic_member` (dynamic mode only). These tools manage the lifecycle of Member `pi --mode rpc` processes, enable TL-to-Member communication, gate the shared-context write, and provide a goal-tracking system to keep the TL on task. Not registered and not available outside a Team Session.
+A set of tools that become active only during an active Team Session. The 9 session-scoped tools — `start_member`, `stop_member`, `list_members`, `get_member_log`, `wait_and_get_member_status`, `team_send_and_wait`, `write_shared_context`, `set_goal`, `finish_goal` — are registered on demand at the first session start, plus `add_dynamic_member` (dynamic mode only). Because pi provides no unregister API, registered tools remain in the registry after teardown; outside a Team Session they are removed from `activeTools`, so they are not visible or callable. These tools manage the lifecycle of Member `pi --mode rpc` processes, enable TL-to-Member communication, gate the shared-context write, and provide a goal-tracking system to keep the TL on task.
 
 **Real-time Message Channel**:
 The communication medium through which agents (Team Lead and Members) exchange information during a Team Session. Implementation is separate from the team orchestration logic.

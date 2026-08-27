@@ -174,7 +174,7 @@ members:
 交互式设置菜单（会话内外均可使用），持久化到 `~/.pi/top-notch-team/settings.yaml`：
 
 - **成员默认模型**——`跟随 TL 当前模型` 或 `固定为某个已登录模型`；优先级：成员 YAML > 团队 YAML 默认 > 全局固定 > 全局跟随。只影响之后启动的成员
-- **自动压缩**——成员空闲且即将收到新任务时，若上下文占用超过阈值（百分比和/或绝对 token 数），先自动压缩再派发。可配置开关、阈值、压缩超时（默认 10 分钟）与批预算（默认 15 分钟）
+- **自动压缩**——成员空闲且即将收到新任务时，若上下文占用超过阈值（百分比和/或绝对 token 数），先自动压缩再派发。可配置开关、阈值与压缩超时（默认 10 分钟）。另有独立的顶层**等待上限**（默认 15 分钟；批屏障与 all-idle wait 共用，`0` 表示不限）。
 
 
 
@@ -193,7 +193,7 @@ members:
 | `/team done` / `/team cancel` | 结束并退出当前创建/编辑模式 |
 | `/team delete <name>` | 删除团队定义（带确认） |
 | `/team status` | 查看会话与成员状态 |
-| `/team setting` | 全局设置（成员默认模型、自动压缩） |
+| `/team setting` | 全局设置（成员默认模型、自动压缩、等待上限） |
 | `/team help` | 显示使用帮助 |
 
 `/team start`、`/team show`、`/team delete`、`/team edit` 支持团队名 Tab 补全。
@@ -217,7 +217,7 @@ members:
 
 1. **定义团队** — 用 `/team create` 描述你想要的团队，TL 收集细节后把 YAML 定义保存到 `~/.pi/top-notch-team/teams/`；或用 `/team dynamic` 跳过预定义，让 TL 在运行时现场设计团队。
 
-2. **启动会话** — `/team start <name>` 或 `/team dynamic` 会注册并激活会话工具（`start_member`、`stop_member`、`list_members`、`get_member_log`、`wait_and_get_member_status`、`team_send_and_wait`、`write_shared_context`、`set_goal`、`finish_goal`，动态模式另有 `add_dynamic_member`），并向 TL 的系统提示词注入团队认知。会话之外，这些工具不存在于工具注册表中。
+2. **启动会话** — `/team start <name>` 或 `/team dynamic` 会按需注册并激活会话工具（`start_member`、`stop_member`、`list_members`、`get_member_log`、`wait_and_get_member_status`、`team_send_and_wait`、`write_shared_context`、`set_goal`、`finish_goal`，动态模式另有 `add_dynamic_member`），并向 TL 的系统提示词注入团队认知。pi 不提供 unregister API，因此首次注册后工具会保留在 registry；会话之外仅从 active tools 移除，不可见且不可调用。
 
 3. **TL 与你协作** — TL 澄清需求、撰写共享上下文文档，并通过 `start_member` 拉起 Member。
 

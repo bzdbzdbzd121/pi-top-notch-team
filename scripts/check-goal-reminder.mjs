@@ -37,8 +37,11 @@ if (statusHandlerIndex < 0 || goalRegistrationIndex < statusHandlerIndex) {
   failures.push("index.ts: goal lifecycle handler must register after the shared agent_settled status handler");
 }
 
-// Active documentation must not reintroduce the old agent_end/stop wording.
+// Active documentation must not reintroduce old lifecycle wording.
 forbidMatch("legacy stop wording", lifecycleDocs, /在你停止时提醒|目标达成前停下时系统会自动重新触发/);
+forbidMatch("auto-compact-owned batch budget", lifecycleDocs, /自动压缩[^\n]*可配置[^\n]*批预算/);
+forbidMatch("registry disappearance wording", lifecycleDocs, /会话之外，这些工具不存在于工具注册表中/);
+forbidMatch("registry disappearance wording", lifecycleDocs, /Not registered and not available outside a Team Session/);
 requireMatch("fully-settled wording", source, /一次运行完全结算/);
 requireMatch("fully-settled wording in design", read("DESIGN.md"), /Goal Reminder Lifecycle/i);
 
