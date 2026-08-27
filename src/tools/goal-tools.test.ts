@@ -355,6 +355,67 @@ describe("registerGoalAgentHandler reminder", () => {
     expect(pi.sendUserMessage.mock.calls[2][0]).toContain("S3 goal");
   });
 
+  it("cleans unresolved markers when the host session shuts down", async () => {
+    vi.useFakeTimers();
+    setupActiveGoal();
+    const { pi, handlers } = createMockPi();
+    registerGoalAgentHandler(pi as any);
+    pi.sendUserMessage.mockImplementation(() => undefined as any);
+
+    // Leave M1 and M2 unacknowledged across two rollovers. The host session
+    // shutdown is the explicit terminal boundary: no old before_agent_start
+    // can arrive after the AgentSession has been destroyed.
+    await finishLowLevelRun(handlers);
+    await settleRun(handlers);
+    await flushReminderTimer();
+    const markerM1 = pi.sendUserMessage.mock.calls[0][0];
+
+    endSession();
+    resetGoal();
+    startSession({ name: "test-team-s2", description: "", members: [] } as any, {
+      sessionId: "goal-tools-cleanup-s2",
+    });
+    setGoalForTesting({ text: "S2 goal", criteria: "- S2", completed: false });
+    await finishLowLevelRun(handlers);
+    await settleRun(handlers);
+    await flushReminderTimer();
+    const markerM2 = pi.sendUserMessage.mock.calls[1][0];
+
+    endSession();
+    resetGoal();
+    startSession({ name: "test-team-s3", description: "", members: [] } as any, {
+      sessionId: "goal-tools-cleanup-s3",
+    });
+    setGoalForTesting({ text: "S3 goal", criteria: "- S3", completed: false });
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
+
+    const abort = vi.fn();
+    await handlers["session_shutdown"]({}, { abort, signal: { aborted: false } });
+    // Shutdown cleanup releases the quarantine because the old host prompt is
+    // no longer capable of delivering a lifecycle event.
+    const postShutdownContext = {
+      signal: { aborted: false },
+      isIdle: () => true,
+      abort,
+    };
+    await handlers["before_agent_start"]({ prompt: markerM1 }, postShutdownContext);
+    await handlers["before_agent_start"]({ prompt: markerM2 }, postShutdownContext);
+    expect(abort).not.toHaveBeenCalled();
+
+    // A new session remains fully usable after cleanup.
+    endSession();
+    resetGoal();
+    startSession({ name: "test-team-s4", description: "", members: [] } as any, {
+      sessionId: "goal-tools-cleanup-s4",
+    });
+    setGoalForTesting({ text: "S4 goal", criteria: "- S4", completed: false });
+    await finishLowLevelRun(handlers);
+    await settleRun(handlers);
+    await flushReminderTimer();
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(3);
+    expect(pi.sendUserMessage.mock.calls[2][0]).toContain("S4 goal");
+  });
+
   it("does not let a reset run's late agent_end create a reminder in a new session", async () => {
     vi.useFakeTimers();
     setupActiveGoal();

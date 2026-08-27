@@ -83,11 +83,6 @@ interface ReminderAcknowledgement {
   marker: string;
 }
 
-interface StaleRolloverSubmission extends ReminderAcknowledgement {
-  /** The marker has reached before_agent_start and its next run is stale. */
-  markerSeen: boolean;
-}
-
 interface UncertainSubmission {
   candidate: GoalReminderCandidate;
 }
@@ -112,12 +107,17 @@ let resetBarrier: ResetBarrier | null = null;
 let pendingSubmission: ReminderSubmission | null = null;
 let acknowledgedSubmission: ReminderAcknowledgement | null = null;
 /**
- * Accepted reminders can cross more than one session/goal transition before
- * their host prompt reaches before_agent_start. Keep each marker independently
- * until its corresponding stale run starts; a single slot would let a newer
- * rollover erase an older marker.
+ * Marker IDs are process-wide monotonic and are generated only by this
+ * module. A high-water tombstone represents all markers captured by identity
+ * rollovers without retaining each full candidate (text/criteria): treating an
+ * earlier marker as stale is conservative, while every later fresh marker has
+ * a larger ID. This keeps quarantine memory constant while still matching
+ * delayed old markers; it is cleared only at the terminal host shutdown.
  */
-const staleRolloverSubmissions = new Map<string, StaleRolloverSubmission>();
+let staleRolloverMarkerWatermark: number | null = null;
+let staleRolloverMarkerRunCount = 0;
+let staleRolloverSourceGoalGeneration = -1;
+let staleRolloverSourceSessionEpoch = -1;
 /**
  * Timed-out void submissions remain matchable by their complete marker until
  * acknowledgement or goal/session reset. The dispatch gate below permits only
@@ -143,40 +143,63 @@ function clearPendingSubmission(): void {
   }
 }
 
-/** Retain a marker until the host has delivered its corresponding stale run. */
-function retainStaleSubmission(candidate: GoalReminderCandidate, marker: string): void {
-  if (!staleRolloverSubmissions.has(marker)) {
-    staleRolloverSubmissions.set(marker, { candidate, marker, markerSeen: false });
+/** Parse the numeric ID from a validated complete reminder marker. */
+function reminderMarkerId(marker: string): number | null {
+  const idText = marker.slice(
+    REMINDER_MARKER_PREFIX.length,
+    marker.length - REMINDER_MARKER_SUFFIX.length,
+  );
+  const id = Number(idText);
+  return Number.isSafeInteger(id) && id > 0 ? id : null;
+}
+
+/** Retain a marker as a constant-memory rollover tombstone. */
+function retainStaleMarker(candidate: GoalReminderCandidate, marker: string): void {
+  const markerId = reminderMarkerId(marker);
+  if (markerId === null) return;
+  if (
+    staleRolloverMarkerWatermark === null ||
+    markerId > staleRolloverMarkerWatermark
+  ) {
+    staleRolloverMarkerWatermark = markerId;
   }
+  staleRolloverSourceGoalGeneration = Math.max(
+    staleRolloverSourceGoalGeneration,
+    candidate.goalGeneration,
+  );
+  staleRolloverSourceSessionEpoch = Math.max(
+    staleRolloverSourceSessionEpoch,
+    candidate.sessionEpoch,
+  );
 }
 
 /** Move every currently live submission into the rollover quarantine. */
 function captureLiveSubmissionsAsStale(): void {
   if (pendingSubmission) {
-    retainStaleSubmission(pendingSubmission.candidate, pendingSubmission.marker);
+    retainStaleMarker(pendingSubmission.candidate, pendingSubmission.marker);
   }
   for (const [marker, submission] of uncertainSubmissions) {
-    retainStaleSubmission(submission.candidate, marker);
+    retainStaleMarker(submission.candidate, marker);
   }
   if (acknowledgedSubmission) {
-    retainStaleSubmission(acknowledgedSubmission.candidate, acknowledgedSubmission.marker);
+    retainStaleMarker(acknowledgedSubmission.candidate, acknowledgedSubmission.marker);
   }
 }
 
-function firstSeenStaleSubmission(): StaleRolloverSubmission | null {
-  for (const submission of staleRolloverSubmissions.values()) {
-    if (submission.markerSeen) return submission;
-  }
-  return null;
+function clearRolloverTombstones(): void {
+  staleRolloverMarkerWatermark = null;
+  staleRolloverMarkerRunCount = 0;
+  staleRolloverSourceGoalGeneration = -1;
+  staleRolloverSourceSessionEpoch = -1;
 }
 
-/** Clear an in-flight submission; rollover handling may retain stale markers. */
-function clearSubmissionState(preserveStaleRollover = false): void {
+/** Clear an in-flight submission; rollover handling may retain tombstones. */
+function clearSubmissionState(preserveRolloverTombstones = false): void {
   clearPendingSubmission();
   uncertainSubmissions.clear();
   acknowledgedSubmission = null;
-  if (!preserveStaleRollover) {
-    staleRolloverSubmissions.clear();
+  if (!preserveRolloverTombstones) {
+    clearRolloverTombstones();
   }
 }
 
@@ -192,7 +215,7 @@ function invalidateReminderState(resetRun = false): void {
   // A session/goal rollover may have captured accepted old markers just before
   // a replacement/reset. Preserve those stale markers until their host runs
   // are rejected; ordinary changes with no stale marker have nothing to keep.
-  clearSubmissionState(staleRolloverSubmissions.size > 0);
+  clearSubmissionState(staleRolloverMarkerWatermark !== null);
   pendingReminder = null;
   if (currentRun) {
     currentRun.candidate = null;
@@ -606,11 +629,15 @@ function acknowledgeReminderPrompt(prompt: unknown): boolean {
   const marker = extractReminderMarker(prompt);
   if (!marker) return false;
 
-  const staleSubmission = staleRolloverSubmissions.get(marker);
-  if (staleSubmission) {
+  const markerId = reminderMarkerId(marker);
+  if (
+    markerId !== null &&
+    staleRolloverMarkerWatermark !== null &&
+    markerId <= staleRolloverMarkerWatermark
+  ) {
     // This is an accepted prompt from a previous session/goal generation. It
     // must not ACK any new submission; its next run is cancelled/suppressed.
-    staleSubmission.markerSeen = true;
+    staleRolloverMarkerRunCount += 1;
     return true;
   }
 
@@ -920,6 +947,15 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
     }, 0);
   };
 
+  // Once the host AgentSession is destroyed, no delayed marker can legally
+  // arrive. This terminal lifecycle boundary releases all quarantine state and
+  // prevents repeated rollovers in a long-lived process from retaining it.
+  pi.on("session_shutdown", () => {
+    clearReminderTimer();
+    pendingReminder = null;
+    clearSubmissionState();
+  });
+
   // before_agent_start is the first lifecycle event carrying the prompt. It
   // is the only event that can associate a fire-and-forget request with the
   // run it eventually starts; agent_start has no payload in pi 0.83.0.
@@ -960,13 +996,15 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
       acknowledgedSubmission = null;
     }
 
-    const staleSubmission = firstSeenStaleSubmission();
-    if (staleSubmission && run.runId !== staleSubmission.candidate.runId) {
-      if (
-        staleSubmission.candidate.sessionId !== run.sessionId ||
-        staleSubmission.candidate.sessionEpoch !== run.sessionEpoch ||
-        staleSubmission.candidate.goalGeneration !== goalGeneration
-      ) {
+    if (staleRolloverMarkerRunCount > 0) {
+      // A complete stale marker was observed immediately before this run. The
+      // source identity must precede the current one in at least one dimension;
+      // goalGeneration is checked explicitly for same-session replacement.
+      const staleIdentity =
+        staleRolloverSourceGoalGeneration < goalGeneration ||
+        staleRolloverSourceSessionEpoch < run.sessionEpoch;
+      staleRolloverMarkerRunCount -= 1;
+      if (staleIdentity) {
         run.suppressReminderCandidate = true;
         try {
           ctx.abort();
@@ -975,9 +1013,6 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
           // remains the correctness guard if the host cannot abort here.
         }
       }
-      // The marker has now reached its corresponding host run. Remove only
-      // this entry; later stale markers remain quarantined independently.
-      staleRolloverSubmissions.delete(staleSubmission.marker);
     }
 
     if (runWasAborted(run)) {
