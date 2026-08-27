@@ -111,7 +111,13 @@ let freshRunRequiresSignal = false;
 let resetBarrier: ResetBarrier | null = null;
 let pendingSubmission: ReminderSubmission | null = null;
 let acknowledgedSubmission: ReminderAcknowledgement | null = null;
-let staleRolloverSubmission: StaleRolloverSubmission | null = null;
+/**
+ * Accepted reminders can cross more than one session/goal transition before
+ * their host prompt reaches before_agent_start. Keep each marker independently
+ * until its corresponding stale run starts; a single slot would let a newer
+ * rollover erase an older marker.
+ */
+const staleRolloverSubmissions = new Map<string, StaleRolloverSubmission>();
 /**
  * Timed-out void submissions remain matchable by their complete marker until
  * acknowledgement or goal/session reset. The dispatch gate below permits only
@@ -137,13 +143,40 @@ function clearPendingSubmission(): void {
   }
 }
 
-/** Clear an in-flight submission; rollover handling may retain its stale marker. */
+/** Retain a marker until the host has delivered its corresponding stale run. */
+function retainStaleSubmission(candidate: GoalReminderCandidate, marker: string): void {
+  if (!staleRolloverSubmissions.has(marker)) {
+    staleRolloverSubmissions.set(marker, { candidate, marker, markerSeen: false });
+  }
+}
+
+/** Move every currently live submission into the rollover quarantine. */
+function captureLiveSubmissionsAsStale(): void {
+  if (pendingSubmission) {
+    retainStaleSubmission(pendingSubmission.candidate, pendingSubmission.marker);
+  }
+  for (const [marker, submission] of uncertainSubmissions) {
+    retainStaleSubmission(submission.candidate, marker);
+  }
+  if (acknowledgedSubmission) {
+    retainStaleSubmission(acknowledgedSubmission.candidate, acknowledgedSubmission.marker);
+  }
+}
+
+function firstSeenStaleSubmission(): StaleRolloverSubmission | null {
+  for (const submission of staleRolloverSubmissions.values()) {
+    if (submission.markerSeen) return submission;
+  }
+  return null;
+}
+
+/** Clear an in-flight submission; rollover handling may retain stale markers. */
 function clearSubmissionState(preserveStaleRollover = false): void {
   clearPendingSubmission();
   uncertainSubmissions.clear();
   acknowledgedSubmission = null;
   if (!preserveStaleRollover) {
-    staleRolloverSubmission = null;
+    staleRolloverSubmissions.clear();
   }
 }
 
@@ -156,10 +189,10 @@ function clearPendingSubmissionForMarker(marker: string): void {
 /** Invalidate all reminder state without changing the active goal itself. */
 function invalidateReminderState(resetRun = false): void {
   clearReminderTimer();
-  // A session rollover may have captured an accepted old marker just before a
-  // goal replacement/reset. Preserve that stale marker until its host run is
-  // rejected; ordinary same-session goal changes have no marker to preserve.
-  clearSubmissionState(staleRolloverSubmission !== null);
+  // A session/goal rollover may have captured accepted old markers just before
+  // a replacement/reset. Preserve those stale markers until their host runs
+  // are rejected; ordinary changes with no stale marker have nothing to keep.
+  clearSubmissionState(staleRolloverSubmissions.size > 0);
   pendingReminder = null;
   if (currentRun) {
     currentRun.candidate = null;
@@ -185,6 +218,9 @@ function advanceGoalGeneration(resetRun = false): void {
   // state; otherwise an accepted old prompt could be reinterpreted under the
   // new goal when startSession/endSession happen between lifecycle callbacks.
   currentSessionIdentity();
+  // Goal replacement is a separate identity rollover even when the session key
+  // is unchanged. Quarantine accepted markers before incrementing generation.
+  captureLiveSubmissionsAsStale();
   goalGeneration += 1;
   lastReminder = null;
   invalidateReminderState(resetRun);
@@ -225,29 +261,12 @@ function currentSessionIdentity(): { active: boolean; sessionId: string | null }
       sessionEpoch += 1;
       // A session switch invalidates any fire-and-forget acknowledgement from
       // the previous session; never let its marker acknowledge new work. Keep
-      // the marker separately until before_agent_start/agent_start so an
-      // already accepted old reminder cannot become a candidate for the new
-      // session. If no marker arrives, a genuinely new run is unaffected.
-      const staleSubmission = pendingSubmission
-        ? { candidate: pendingSubmission.candidate, marker: pendingSubmission.marker }
-        : uncertainSubmissions.size > 0
-          ? (() => {
-              const first = uncertainSubmissions.entries().next().value as
-                | [string, UncertainSubmission]
-                | undefined;
-              return first ? { candidate: first[1].candidate, marker: first[0] } : null;
-            })()
-          : acknowledgedSubmission
-            ? { candidate: acknowledgedSubmission.candidate, marker: acknowledgedSubmission.marker }
-            : null;
+      // every live marker separately until before_agent_start/agent_start so
+      // an already accepted old reminder cannot become a candidate for the
+      // replacement session. Existing quarantine entries are preserved when a
+      // teardown is observed twice (active → inactive → active).
+      captureLiveSubmissionsAsStale();
       clearSubmissionState(true);
-      if (staleSubmission) {
-        // A teardown transition can be observed twice (active → inactive,
-        // then inactive → replacement). The second transition has no live
-        // submission to capture, so retain the marker captured on the first
-        // transition until the old prompt reaches its lifecycle events.
-        staleRolloverSubmission = { ...staleSubmission, markerSeen: false };
-      }
     }
     return { active: session.active, sessionId: session.sessionId };
   } catch {
@@ -587,10 +606,11 @@ function acknowledgeReminderPrompt(prompt: unknown): boolean {
   const marker = extractReminderMarker(prompt);
   if (!marker) return false;
 
-  if (staleRolloverSubmission?.marker === marker) {
-    // This is an accepted prompt from the previous session. It must not ACK
-    // any new submission; its next run is cancelled/suppressed instead.
-    staleRolloverSubmission.markerSeen = true;
+  const staleSubmission = staleRolloverSubmissions.get(marker);
+  if (staleSubmission) {
+    // This is an accepted prompt from a previous session/goal generation. It
+    // must not ACK any new submission; its next run is cancelled/suppressed.
+    staleSubmission.markerSeen = true;
     return true;
   }
 
@@ -940,11 +960,12 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
       acknowledgedSubmission = null;
     }
 
-    const staleSubmission = staleRolloverSubmission;
-    if (staleSubmission?.markerSeen && run.runId !== staleSubmission.candidate.runId) {
+    const staleSubmission = firstSeenStaleSubmission();
+    if (staleSubmission && run.runId !== staleSubmission.candidate.runId) {
       if (
         staleSubmission.candidate.sessionId !== run.sessionId ||
-        staleSubmission.candidate.sessionEpoch !== run.sessionEpoch
+        staleSubmission.candidate.sessionEpoch !== run.sessionEpoch ||
+        staleSubmission.candidate.goalGeneration !== goalGeneration
       ) {
         run.suppressReminderCandidate = true;
         try {
@@ -954,7 +975,9 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
           // remains the correctness guard if the host cannot abort here.
         }
       }
-      staleRolloverSubmission = null;
+      // The marker has now reached its corresponding host run. Remove only
+      // this entry; later stale markers remain quarantined independently.
+      staleRolloverSubmissions.delete(staleSubmission.marker);
     }
 
     if (runWasAborted(run)) {

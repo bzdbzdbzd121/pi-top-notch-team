@@ -631,6 +631,55 @@ describe("goal reminder with the installed pi 0.83.0 AgentSession", () => {
     }
   });
 
+  it("invalidates an accepted marker across same-session goal replacement", async () => {
+    vi.useFakeTimers();
+    beginGoal();
+    const harness = await createHarness([
+      { kind: "stop", text: "old goal response" },
+      { kind: "stop", text: "old reminder response" },
+      { kind: "stop", text: "new goal response" },
+      { kind: "stop", text: "new reminder response" },
+    ]);
+    const oldAckGate = deferred<void>();
+
+    try {
+      await harness.session.prompt("old goal prompt");
+      harness.state.holdNextReminderAck = oldAckGate;
+      await vi.advanceTimersByTimeAsync(0);
+      expect(harness.state.apiCalls).toHaveLength(1);
+      const oldMarkerPrompt = harness.state.markerPrompts[0];
+      expect(oldMarkerPrompt).toContain("top-notch-team:goal-reminder:");
+
+      // No session key changes here. resetGoal/setGoalForTesting still form a
+      // goal-generation rollover while the old accepted prompt is in native
+      // before_agent_start preflight.
+      resetGoal();
+      setGoalForTesting({
+        text: "同会话替换目标",
+        criteria: "- 替换目标完成",
+        completed: false,
+      });
+      oldAckGate.resolve(undefined);
+      await flushMicrotasks();
+      expect(harness.session.isIdle).toBe(true);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(harness.state.apiCalls).toHaveLength(1);
+
+      await harness.session.prompt("new goal prompt");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(harness.state.apiCalls).toHaveLength(2);
+      expect(harness.state.apiCalls[1].content).toContain("同会话替换目标");
+      expect(harness.state.apiCalls[1].content).not.toContain("高保真生命周期验证");
+      expect(harness.state.markerPrompts).toHaveLength(2);
+      expect(harness.state.markerPrompts[0]).toBe(oldMarkerPrompt);
+      expect(harness.state.markerPrompts[1]).not.toBe(oldMarkerPrompt);
+      await flushMicrotasks();
+      expect(harness.session.isIdle).toBe(true);
+    } finally {
+      harness.dispose();
+    }
+  });
+
   it("does not create a stale reminder across a real abort and then accepts a fresh run", async () => {
     beginGoal();
     const harness = await createHarness([

@@ -264,6 +264,97 @@ describe("registerGoalAgentHandler reminder", () => {
     expect(pi.sendUserMessage).not.toHaveBeenCalled();
   });
 
+  it("isolates accepted markers from same-session goal replacement", async () => {
+    vi.useFakeTimers();
+    setupActiveGoal();
+    const { pi, handlers } = createMockPi();
+    registerGoalAgentHandler(pi as any);
+    pi.sendUserMessage.mockImplementation(() => undefined as any);
+    const oldAckSignal = { aborted: false };
+
+    await finishLowLevelRun(handlers, { messages: [] }, activeContext(oldAckSignal));
+    await settleRun(handlers, activeContext(oldAckSignal));
+    await flushReminderTimer();
+    const oldReminderPrompt = pi.sendUserMessage.mock.calls[0][0];
+
+    // Keep the accepted marker unresolved while only the goal generation
+    // changes. The next agent_start must not be evaluated against the new goal.
+    resetGoal();
+    setGoalForTesting({ text: "replacement goal", criteria: "- replacement", completed: false });
+    await handlers["before_agent_start"]({ prompt: oldReminderPrompt }, activeContext());
+    await finishLowLevelRun(handlers);
+    await settleRun(handlers);
+    await flushReminderTimer();
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+
+    await finishLowLevelRun(handlers);
+    await settleRun(handlers);
+    await flushReminderTimer();
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
+    expect(pi.sendUserMessage.mock.calls[1][0]).toContain("replacement goal");
+  });
+
+  it("retains multiple stale markers across two session rollovers", async () => {
+    vi.useFakeTimers();
+    setupActiveGoal();
+    const { pi, handlers } = createMockPi();
+    registerGoalAgentHandler(pi as any);
+    pi.sendUserMessage.mockImplementation(() => undefined as any);
+
+    // S1 submits M1. Its before_agent_start is intentionally delayed.
+    await finishLowLevelRun(handlers);
+    await settleRun(handlers);
+    await flushReminderTimer();
+    const markerM1 = pi.sendUserMessage.mock.calls[0][0];
+
+    endSession();
+    resetGoal();
+    startSession({ name: "test-team-s2", description: "", members: [] } as any, {
+      sessionId: "goal-tools-s2",
+    });
+    setGoalForTesting({ text: "S2 goal", criteria: "- S2", completed: false });
+
+    // A synthetic S2 lifecycle run uses the real handler state machine to
+    // submit M2 while M1 is still unresolved. This is the race that a single
+    // stale slot cannot represent.
+    await finishLowLevelRun(handlers);
+    await settleRun(handlers);
+    await flushReminderTimer();
+    const markerM2 = pi.sendUserMessage.mock.calls[1][0];
+
+    endSession();
+    resetGoal();
+    startSession({ name: "test-team-s3", description: "", members: [] } as any, {
+      sessionId: "goal-tools-s3",
+    });
+    setGoalForTesting({ text: "S3 goal", criteria: "- S3", completed: false });
+    await vi.advanceTimersByTimeAsync(10_001);
+
+    // Deliver M1 after M2 was captured by the second rollover. Both old runs
+    // must be suppressed; neither may create a candidate for S3.
+    await handlers["before_agent_start"]({ prompt: markerM1 }, activeContext());
+    await finishLowLevelRun(handlers);
+    await settleRun(handlers);
+    await flushReminderTimer();
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
+
+    await handlers["before_agent_start"]({ prompt: markerM2 }, activeContext());
+    await finishLowLevelRun(handlers);
+    await settleRun(handlers);
+    await flushReminderTimer();
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
+
+    // Once both delayed markers/runs are consumed, a genuinely fresh S3 run
+    // remains eligible and uses the new goal text.
+    await vi.advanceTimersByTimeAsync(10_001);
+    await finishLowLevelRun(handlers);
+    await settleRun(handlers);
+    await flushReminderTimer();
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(3);
+    expect(pi.sendUserMessage.mock.calls[2][0]).toContain("S3 goal");
+  });
+
   it("does not let a reset run's late agent_end create a reminder in a new session", async () => {
     vi.useFakeTimers();
     setupActiveGoal();
