@@ -93,7 +93,6 @@ const REMINDER_MARKER_PREFIX = "<!-- top-notch-team:goal-reminder:";
 const REMINDER_MARKER_SUFFIX = " -->";
 const MIN_UNCERTAIN_SUBMISSION_TTL_MS = 60_000;
 const DEFAULT_UNCERTAIN_SUBMISSION_TTL_MS = DEFAULT_SETTINGS.autoCompact.timeoutMinutes * 60_000;
-const MAX_UNCERTAIN_SUBMISSIONS = 32;
 
 let nextRunId = 0;
 let goalGeneration = 0;
@@ -108,7 +107,11 @@ let awaitingFreshRun = false;
 let freshRunRequiresSignal = false;
 let resetBarrier: ResetBarrier | null = null;
 let pendingSubmission: ReminderSubmission | null = null;
-/** Timed-out void submissions remain matchable by their complete marker. */
+/**
+ * Timed-out void submissions remain matchable by their complete marker. The
+ * TTL and reminder cooldown naturally bound this map; capacity eviction is
+ * deliberately avoided because an unexpired marker may still be valid.
+ */
 const uncertainSubmissions = new Map<string, UncertainSubmission>();
 let nextSubmissionId = 0;
 /** Signal identities from invalidated runs; objects are weakly held to avoid unbounded growth. */
@@ -216,11 +219,6 @@ function pruneUncertainSubmissions(now = Date.now()): void {
     if (submission.expiresAt <= now) {
       uncertainSubmissions.delete(marker);
     }
-  }
-  while (uncertainSubmissions.size > MAX_UNCERTAIN_SUBMISSIONS) {
-    const oldest = uncertainSubmissions.keys().next().value;
-    if (typeof oldest !== "string") break;
-    uncertainSubmissions.delete(oldest);
   }
 }
 
