@@ -865,7 +865,7 @@ Strict 模式的注入结构相同，但标题为「严格模式 ⚡ — 必须�
   - **fail-open**：`.md` 读取不计数（文档工作是 TL 本职）；管理工具（start/stop/list_members、team_send_and_wait、write/edit 等）永不拦截（解锁通道永远畅通）；派发后不再拦截（派发后的 read 视为协调/审阅）；设计阶段不启用本守卫（无 Member 可派发），取而代之的是**设计阶段 read 软限制**（`createDesignReadGuard`，见上）：非 `.md` read 每 4 次拦截一次提醒，确需读取时再次调用即放行。
   - 提示词层（`src/prompts/tl-first-action.ts` 的"第一动作协议"，注入预定义团队与动态模式执行阶段提示词顶部）与运行时层（本守卫）配对，模型能预知规则被强制执行。
 
-The handler stays registered for the entire pi session but checks `session.active` to decide whether to inject TL instructions. When `/team stop` ends the session, `session.active` becomes `false` and no extra prompt is injected.
+The handler stays registered for the entire pi session but checks `session.active` to decide whether to inject regular TL instructions. When `/team stop` ends the session, `session.active` becomes `false` and no regular TL instructions are injected; a one-shot session-ended banner may be injected on the next turn and is then consumed.
 
 ## 11. Team Session State
 
