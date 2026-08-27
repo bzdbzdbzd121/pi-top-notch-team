@@ -17,7 +17,7 @@ function createMockPi() {
     }),
     // Most tests use an injected observable sender. A dedicated test below
     // models pi 0.83.0's real fire-and-forget wrapper, which returns void.
-    sendUserMessage: vi.fn(() => Promise.resolve()),
+    sendUserMessage: vi.fn((_content: string) => Promise.resolve()),
     sendMessage: vi.fn(),
     registerTool: vi.fn(),
   };
@@ -431,20 +431,49 @@ describe("registerGoalAgentHandler reminder", () => {
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
     expect(pi.sendMessage).not.toHaveBeenCalled();
 
-    // No following agent_start means the void API cannot be confirmed. The
-    // bounded fallback makes that uncertainty visible and retains the one
-    // candidate for a later settled retry.
+    // No matching before_agent_start means the void API cannot be confirmed.
+    // The bounded fallback makes that uncertainty visible without restoring
+    // the candidate (which could duplicate an accepted-but-delayed request).
     await vi.advanceTimersByTimeAsync(1_000);
     expect(pi.sendMessage).toHaveBeenCalledWith(
       expect.objectContaining({
         customType: "team-message",
-        content: expect.stringContaining("目标提醒提交失败"),
+        content: expect.stringContaining("目标提醒未确认"),
         display: true,
       }),
     );
   });
 
-  it("acknowledges an unobservable send when it starts a subsequent agent run", async () => {
+  it("does not treat an unrelated agent_start as a fire-and-forget acknowledgement", async () => {
+    vi.useFakeTimers();
+    setupActiveGoal();
+    const { pi, handlers } = createMockPi();
+    registerGoalAgentHandler(pi as any);
+    pi.sendUserMessage.mockImplementation(() => undefined as any);
+
+    await finishLowLevelRun(handlers);
+    await settleRun(handlers);
+    await vi.advanceTimersByTimeAsync(0);
+    const reminderPrompt = pi.sendUserMessage.mock.calls[0][0];
+
+    // A normal run can start while pi's internal async preflight is still in
+    // flight. Its agent_start has no prompt and must not cancel this attempt.
+    const unrelatedSignal = { aborted: false };
+    await handlers["agent_start"]({}, activeContext(unrelatedSignal));
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(pi.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        content: expect.stringContaining("目标提醒未确认"),
+      }),
+    );
+    expect(reminderPrompt).toContain("top-notch-team:goal-reminder:");
+    unrelatedSignal.aborted = true;
+    await handlers["agent_end"]({ messages: [] }, activeContext(unrelatedSignal));
+    await settleRun(handlers, activeContext(unrelatedSignal));
+  });
+
+  it("correlates a delayed fire-and-forget acknowledgement by before_agent_start prompt", async () => {
     vi.useFakeTimers();
     setupActiveGoal();
     const { pi, handlers } = createMockPi();
@@ -455,14 +484,56 @@ describe("registerGoalAgentHandler reminder", () => {
     await finishLowLevelRun(handlers);
     await settleRun(handlers);
     await vi.advanceTimersByTimeAsync(0);
+    const reminderPrompt = pi.sendUserMessage.mock.calls[0][0];
+
+    // A slow but accepted reminder may cross the old 1s watchdog. It must not
+    // cause a second reminder once its own prompt is finally observable.
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+    await handlers["before_agent_start"]({ prompt: reminderPrompt }, activeContext(signal));
     await handlers["agent_start"]({}, activeContext(signal));
-    signal.aborted = true;
     await handlers["agent_end"]({ messages: [] }, activeContext(signal));
     await settleRun(handlers, activeContext(signal));
-    await vi.advanceTimersByTimeAsync(1_000);
+    await flushReminderTimer();
 
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
-    expect(pi.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("does not let a late observable result clear a newer void submission watchdog", async () => {
+    vi.useFakeTimers();
+    setupActiveGoal();
+    const { pi, handlers } = createMockPi();
+    registerGoalAgentHandler(pi as any);
+    let resolveFirst!: () => void;
+    const firstResult = new Promise<void>((resolve) => {
+      resolveFirst = resolve;
+    });
+    pi.sendUserMessage
+      .mockImplementationOnce(() => firstResult)
+      .mockImplementationOnce(() => undefined as any);
+
+    await finishLowLevelRun(handlers);
+    await settleRun(handlers);
+    await flushReminderTimer();
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+
+    // Let the first observable request remain unresolved until a later
+    // reminder attempt has armed its own fire-and-forget watchdog.
+    vi.advanceTimersByTime(10_001);
+    await finishLowLevelRun(handlers);
+    await settleRun(handlers);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
+
+    resolveFirst();
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(pi.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        content: expect.stringContaining("目标提醒未确认"),
+      }),
+    );
   });
 
   it("swallows synchronous and asynchronous sendUserMessage failures", async () => {

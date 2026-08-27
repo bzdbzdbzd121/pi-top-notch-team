@@ -71,11 +71,14 @@ interface ResetBarrier {
 
 interface ReminderSubmission {
   candidate: GoalReminderCandidate;
+  /** Prompt marker carried through before_agent_start for correlation. */
+  marker: string;
   watchdog: ReturnType<typeof setTimeout>;
 }
 
 /** pi 0.83.0's sendUserMessage wrapper returns void; bound the no-ack fallback. */
 const REMINDER_SUBMISSION_ACK_TIMEOUT_MS = 1_000;
+const REMINDER_MARKER_PREFIX = "<!-- top-notch-team:goal-reminder:";
 
 let nextRunId = 0;
 let goalGeneration = 0;
@@ -90,6 +93,9 @@ let awaitingFreshRun = false;
 let freshRunRequiresSignal = false;
 let resetBarrier: ResetBarrier | null = null;
 let pendingSubmission: ReminderSubmission | null = null;
+/** Timed-out void submissions remain matchable if their delayed prompt arrives later. */
+const uncertainSubmissionMarkers = new Set<string>();
+let nextSubmissionId = 0;
 /** Signal identities from invalidated runs; objects are weakly held to avoid unbounded growth. */
 const invalidatedSignalObjects = new WeakSet<object>();
 
@@ -107,10 +113,21 @@ function clearPendingSubmission(): void {
   }
 }
 
+function clearSubmissionState(): void {
+  clearPendingSubmission();
+  uncertainSubmissionMarkers.clear();
+}
+
+function clearPendingSubmissionForMarker(marker: string): void {
+  if (pendingSubmission?.marker === marker) {
+    clearPendingSubmission();
+  }
+}
+
 /** Invalidate all reminder state without changing the active goal itself. */
 function invalidateReminderState(resetRun = false): void {
   clearReminderTimer();
-  clearPendingSubmission();
+  clearSubmissionState();
   pendingReminder = null;
   if (currentRun) {
     currentRun.candidate = null;
@@ -170,6 +187,9 @@ function currentSessionIdentity(): { active: boolean; sessionId: string | null }
     if (key !== observedSessionKey) {
       observedSessionKey = key;
       sessionEpoch += 1;
+      // A session switch invalidates any fire-and-forget acknowledgement from
+      // the previous session; never let its marker acknowledge new work.
+      clearSubmissionState();
     }
     return { active: session.active, sessionId: session.sessionId };
   } catch {
@@ -350,6 +370,15 @@ function buildReminderText(candidate: GoalReminderCandidate): string {
   );
 }
 
+/**
+ * Carry a non-rendered correlation marker through pi's before_agent_start event.
+ * The marker is an HTML comment so it does not alter the visible reminder,
+ * while the exact prompt remains available to the LLM runtime.
+ */
+function buildReminderPrompt(candidate: GoalReminderCandidate, marker: string): string {
+  return `${buildReminderText(candidate)}\n\n${marker} -->`;
+}
+
 function sendReminderSafely(
   pi: ExtensionAPI,
   text: string,
@@ -425,25 +454,74 @@ function notifyReminderFailure(pi: ExtensionAPI, error: unknown): void {
   }
 }
 
+function notifyReminderUnconfirmed(pi: ExtensionAPI, error: unknown): void {
+  try {
+    const sendMessage = (pi as unknown as {
+      sendMessage?: (message: {
+        customType: string;
+        content: string;
+        display: boolean;
+      }) => unknown;
+    }).sendMessage;
+    if (typeof sendMessage !== "function") return;
+    const result = sendMessage.call(pi, {
+      customType: "team-message",
+      content:
+        `⚠️ 目标提醒未确认（原因：${describeReminderFailure(error)}）。` +
+        "pi 当前版本不提供 sendUserMessage 的可观察结果，未将其他 agent_start 视为确认；后续目标检查仍会继续。",
+      display: true,
+    });
+    if (result && typeof (result as { then?: unknown }).then === "function") {
+      void Promise.resolve(result).catch(() => {
+        // The diagnostic itself is best effort.
+      });
+    }
+  } catch {
+    // Failure reporting must not turn a best-effort reminder into an
+    // unhandled lifecycle error.
+  }
+}
+
 function armUnobservableSubmission(
   candidate: GoalReminderCandidate,
+  marker: string,
   pi: ExtensionAPI,
 ): void {
   clearPendingSubmission();
   const watchdog = setTimeout(() => {
-    // A fresh agent_start acknowledges the fire-and-forget request and clears
-    // this watchdog. Only the still-current attempt may enter fallback.
+    // A matching before_agent_start clears this watchdog. Do not restore the
+    // candidate here: the request may still be accepted after this timeout,
+    // and restoring it could cause a duplicate reminder. Keep the timed-out
+    // marker matchable so a delayed accepted prompt cannot be mistaken for a
+    // new request.
     if (!pendingSubmission || pendingSubmission.candidate !== candidate) return;
+    const submission = pendingSubmission;
     clearPendingSubmission();
-    restoreFailedCandidate(
-      candidate,
+    uncertainSubmissionMarkers.add(submission.marker);
+    notifyReminderUnconfirmed(
       pi,
       new Error(
-        `pi 0.83.0 sendUserMessage returned no Promise and no agent_start was observed within ${REMINDER_SUBMISSION_ACK_TIMEOUT_MS}ms`,
+        `pi 0.83.0 sendUserMessage returned no Promise and no matching before_agent_start was observed within ${REMINDER_SUBMISSION_ACK_TIMEOUT_MS}ms`,
       ),
     );
   }, REMINDER_SUBMISSION_ACK_TIMEOUT_MS);
-  pendingSubmission = { candidate, watchdog };
+  pendingSubmission = { candidate, marker, watchdog };
+}
+
+function acknowledgeReminderPrompt(prompt: unknown): void {
+  if (typeof prompt !== "string") return;
+
+  if (pendingSubmission && prompt.includes(pendingSubmission.marker)) {
+    clearPendingSubmission();
+    return;
+  }
+
+  for (const marker of uncertainSubmissionMarkers) {
+    if (prompt.includes(marker)) {
+      uncertainSubmissionMarkers.delete(marker);
+      return;
+    }
+  }
 }
 
 function restoreFailedCandidate(candidate: GoalReminderCandidate, pi: ExtensionAPI, error: unknown): void {
@@ -710,15 +788,24 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
         goalGeneration: candidate.goalGeneration,
         at: now,
       };
+      const marker = `${REMINDER_MARKER_PREFIX}${++nextSubmissionId}`;
+      const prompt = buildReminderPrompt(candidate, marker);
       sendReminderSafely(
         pi,
-        buildReminderText(candidate),
+        prompt,
         (error) => restoreFailedCandidate(candidate, pi, error),
-        () => clearPendingSubmission(),
-        () => armUnobservableSubmission(candidate, pi),
+        () => clearPendingSubmissionForMarker(marker),
+        () => armUnobservableSubmission(candidate, marker, pi),
       );
     }, 0);
   };
+
+  // before_agent_start is the first lifecycle event carrying the prompt. It
+  // is the only event that can associate a fire-and-forget request with the
+  // run it eventually starts; agent_start has no payload in pi 0.83.0.
+  pi.on("before_agent_start", (event) => {
+    acknowledgeReminderPrompt((event as { prompt?: unknown } | null | undefined)?.prompt);
+  });
 
   // agent_start begins (or resumes) an outer AgentSession run. Retry,
   // compaction, and queued continuation starts occur before agent_settled and
@@ -726,9 +813,9 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
   pi.on("agent_start", (_event, ctx) => {
     const run = ensureStartRun(ctx);
     if (!run) return;
-    // The real pi 0.83.0 sender returns void. A following agent_start is the
-    // only runtime acknowledgement available to the extension in that path.
-    clearPendingSubmission();
+    // Do not acknowledge a reminder here: agent_start has no prompt and may
+    // belong to an unrelated user run. Correlation was completed above by
+    // before_agent_start.
     if (runWasAborted(run)) {
       pendingReminder = null;
     }

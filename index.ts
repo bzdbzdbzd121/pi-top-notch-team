@@ -572,12 +572,6 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // Register the goal lifecycle handlers after the shared settled handler so
-  // callers that inspect the first agent_settled listener continue to receive
-  // the team-member status behavior above. The goal handler itself is safe to
-  // register at module initialization and guards on active session state.
-  registerGoalAgentHandler(pi);
-
   // ── session_shutdown: clean up team state on /new, /resume, /fork ──
   // The session DIRECTORY IS PRESERVED (member contexts stay resumable via
   // /team resume; manifest status stays "active" = interrupted). Member
@@ -1137,4 +1131,10 @@ Member 进程保持运行以便继续接收新任务。仅当成员进程异常�
       return { systemPrompt: event.systemPrompt + sessionEndedBanner + resumeBanner + extraPrompt };
     }
   });
+
+  // Register goal lifecycle handlers after the TL before_agent_start handler.
+  // This preserves the existing prompt-injection callback as the primary
+  // before_agent_start listener while still letting goal-tools correlate its
+  // fire-and-forget marker from the same event.
+  registerGoalAgentHandler(pi);
 }

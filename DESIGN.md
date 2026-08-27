@@ -74,7 +74,7 @@ pi-top-notch-team/
 │   │   └── status.ts           ← StatusProvider type export
 │   ├── tools/
 │   │   ├── tl-tools.ts         ← 7 TL process management tools (DI-based dependencies)
-│   │   └── goal-tools.ts        ← Goal system: set_goal/finish_goal + agent_end reminder
+│   │   └── goal-tools.ts        ← Goal system: set_goal/finish_goal + settled-boundary reminder delivery
 │   │   (team_send_message is in member.ts directly)
 │   ├── channel/
 │   │   ├── message-queue.ts    ← Serial FIFO message queue (event-driven drain)
