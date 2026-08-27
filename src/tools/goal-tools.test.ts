@@ -510,50 +510,39 @@ describe("registerGoalAgentHandler reminder", () => {
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
   });
 
-  it("does not evict a still-valid marker after more than 32 failed reminders", async () => {
+  it("does not submit more reminders while an earlier void request remains uncertain", async () => {
     vi.useFakeTimers();
     setupActiveGoal();
     const { pi, handlers } = createMockPi();
     registerGoalAgentHandler(pi as any);
     pi.sendUserMessage.mockImplementation(() => undefined as any);
 
-    let firstReminderPrompt = "";
+    await finishLowLevelRun(handlers);
+    await settleRun(handlers);
+    await vi.advanceTimersByTimeAsync(0);
+    const firstReminderPrompt = pi.sendUserMessage.mock.calls[0][0];
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    // Once the first void request is uncertain, lifecycle retries are
+    // suppressed rather than evicting its marker to make room for another.
     for (let i = 0; i < 33; i += 1) {
+      await vi.advanceTimersByTimeAsync(10_001);
       await finishLowLevelRun(handlers);
       await settleRun(handlers);
       await vi.advanceTimersByTimeAsync(0);
-      if (i === 0) {
-        firstReminderPrompt = pi.sendUserMessage.mock.calls[0][0];
-      }
-      await vi.advanceTimersByTimeAsync(1_000);
-      if (i < 32) {
-        // Default auto-compaction timeout is 10 minutes, so the first marker
-        // is still valid after these 33 cooldown-spaced failed attempts.
-        await vi.advanceTimersByTimeAsync(10_001);
-      }
     }
 
-    // Move beyond the latest reminder's cooldown so a missing first marker
-    // would permit a duplicate. A retained first marker refreshes the
-    // cooldown and keeps the accepted delayed request one-shot.
-    await vi.advanceTimersByTimeAsync(10_001);
-    await handlers["before_agent_start"]({ prompt: firstReminderPrompt }, activeContext());
-    const signal = { aborted: false };
-    await handlers["agent_start"]({}, activeContext(signal));
-    await handlers["agent_end"]({ messages: [] }, activeContext(signal));
-    await settleRun(handlers, activeContext(signal));
-    await flushReminderTimer();
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
 
-    expect(pi.sendUserMessage).toHaveBeenCalledTimes(33);
+    // The original marker remains matchable after more than 32 cooldowns.
+    await handlers["before_agent_start"]({ prompt: firstReminderPrompt }, activeContext());
   });
 
-  it("keeps uncertain acknowledgement state through the configured compaction timeout", async () => {
+  it("retains a marker beyond the configured lease for unbounded native preflight", async () => {
     vi.useFakeTimers();
     setupActiveGoal();
     const { pi, handlers } = createMockPi();
-    registerGoalAgentHandler(pi as any, {
-      getAutoCompactTimeoutMinutes: () => 2,
-    });
+    registerGoalAgentHandler(pi as any);
     pi.sendUserMessage.mockImplementation(() => undefined as any);
     const signal = { aborted: false };
 
@@ -562,9 +551,10 @@ describe("registerGoalAgentHandler reminder", () => {
     await vi.advanceTimersByTimeAsync(0);
     const reminderPrompt = pi.sendUserMessage.mock.calls[0][0];
 
-    // The configured 2-minute lease must outlive the 60s base TTL. The
-    // reminder is accepted only after that base interval has elapsed.
-    await vi.advanceTimersByTimeAsync(60_001);
+    // Native AgentSession compaction/preflight has no plugin lease bound. Even
+    // if autoCompact.timeoutMinutes is one minute, this accepted reminder's
+    // marker must remain matchable beyond that setting.
+    await vi.advanceTimersByTimeAsync(61_001);
     expect(pi.sendMessage).toHaveBeenCalledTimes(1);
     await handlers["before_agent_start"]({ prompt: reminderPrompt }, activeContext(signal));
     await handlers["agent_start"]({}, activeContext(signal));

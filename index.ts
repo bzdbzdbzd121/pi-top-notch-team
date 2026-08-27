@@ -1136,7 +1136,5 @@ Member 进程保持运行以便继续接收新任务。仅当成员进程异常�
   // This preserves the existing prompt-injection callback as the primary
   // before_agent_start listener while still letting goal-tools correlate its
   // fire-and-forget marker from the same event.
-  registerGoalAgentHandler(pi, {
-    getAutoCompactTimeoutMinutes: () => loadSettings(getRootDir()).autoCompact.timeoutMinutes,
-  });
+  registerGoalAgentHandler(pi);
 }

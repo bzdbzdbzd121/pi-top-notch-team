@@ -1,7 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getSessionState, isActive } from "../session/state";
 import { syncActiveManifest } from "../session/manifest";
-import { DEFAULT_SETTINGS } from "../settings/settings";
 
 // ── Types ──────────────────────────────────────────────────
 
@@ -79,20 +78,12 @@ interface ReminderSubmission {
 
 interface UncertainSubmission {
   candidate: GoalReminderCandidate;
-  expiresAt: number;
-}
-
-export interface GoalAgentHandlerOptions {
-  /** Auto-compaction lease in minutes; used to retain delayed prompt markers. */
-  getAutoCompactTimeoutMinutes?: () => number | undefined;
 }
 
 /** pi 0.83.0's sendUserMessage wrapper returns void; bound the no-ack fallback. */
 const REMINDER_SUBMISSION_ACK_TIMEOUT_MS = 1_000;
 const REMINDER_MARKER_PREFIX = "<!-- top-notch-team:goal-reminder:";
 const REMINDER_MARKER_SUFFIX = " -->";
-const MIN_UNCERTAIN_SUBMISSION_TTL_MS = 60_000;
-const DEFAULT_UNCERTAIN_SUBMISSION_TTL_MS = DEFAULT_SETTINGS.autoCompact.timeoutMinutes * 60_000;
 
 let nextRunId = 0;
 let goalGeneration = 0;
@@ -108,9 +99,10 @@ let freshRunRequiresSignal = false;
 let resetBarrier: ResetBarrier | null = null;
 let pendingSubmission: ReminderSubmission | null = null;
 /**
- * Timed-out void submissions remain matchable by their complete marker. The
- * TTL and reminder cooldown naturally bound this map; capacity eviction is
- * deliberately avoided because an unexpired marker may still be valid.
+ * Timed-out void submissions remain matchable by their complete marker until
+ * acknowledgement or goal/session reset. The dispatch gate below permits only
+ * one uncertain submission, so this lifecycle-bound map cannot grow without
+ * bound and no legal in-flight acknowledgement is evicted.
  */
 const uncertainSubmissions = new Map<string, UncertainSubmission>();
 let nextSubmissionId = 0;
@@ -196,30 +188,6 @@ function signalAborted(signal: unknown): boolean {
 
 function sessionKey(session: { active: boolean; sessionId: string | null }): string {
   return session.active ? `active:${session.sessionId ?? "<none>"}` : "inactive";
-}
-
-function resolveUncertainSubmissionTtlMs(options: GoalAgentHandlerOptions): number {
-  let timeoutMinutes: number | undefined = DEFAULT_SETTINGS.autoCompact.timeoutMinutes;
-  try {
-    timeoutMinutes = options.getAutoCompactTimeoutMinutes?.() ?? timeoutMinutes;
-  } catch {
-    return DEFAULT_UNCERTAIN_SUBMISSION_TTL_MS;
-  }
-  if (typeof timeoutMinutes !== "number" || !Number.isFinite(timeoutMinutes) || timeoutMinutes <= 0) {
-    return DEFAULT_UNCERTAIN_SUBMISSION_TTL_MS;
-  }
-  const configuredTtl = timeoutMinutes * 60_000;
-  return Number.isFinite(configuredTtl)
-    ? Math.max(MIN_UNCERTAIN_SUBMISSION_TTL_MS, configuredTtl)
-    : Number.MAX_SAFE_INTEGER;
-}
-
-function pruneUncertainSubmissions(now = Date.now()): void {
-  for (const [marker, submission] of uncertainSubmissions) {
-    if (submission.expiresAt <= now) {
-      uncertainSubmissions.delete(marker);
-    }
-  }
 }
 
 function currentSessionIdentity(): { active: boolean; sessionId: string | null } | null {
@@ -510,7 +478,7 @@ function notifyReminderUnconfirmed(pi: ExtensionAPI, error: unknown): void {
       customType: "team-message",
       content:
         `⚠️ 目标提醒未确认（原因：${describeReminderFailure(error)}）。` +
-        "pi 当前版本不提供 sendUserMessage 的可观察结果，未将其他 agent_start 视为确认；后续目标检查仍会继续。",
+        "pi 当前版本不提供 sendUserMessage 的可观察结果，未将其他 agent_start 视为确认；在确认或会话/目标重置前不会再次提交该提醒。",
       display: true,
     });
     if (result && typeof (result as { then?: unknown }).then === "function") {
@@ -528,7 +496,6 @@ function armUnobservableSubmission(
   candidate: GoalReminderCandidate,
   marker: string,
   pi: ExtensionAPI,
-  options: GoalAgentHandlerOptions,
 ): void {
   clearPendingSubmission();
   const watchdog = setTimeout(() => {
@@ -542,9 +509,7 @@ function armUnobservableSubmission(
     clearPendingSubmission();
     uncertainSubmissions.set(submission.marker, {
       candidate: submission.candidate,
-      expiresAt: Date.now() + resolveUncertainSubmissionTtlMs(options),
     });
-    pruneUncertainSubmissions();
     notifyReminderUnconfirmed(
       pi,
       new Error(
@@ -591,10 +556,6 @@ function acknowledgeReminderPrompt(prompt: unknown): void {
 
   const uncertainSubmission = uncertainSubmissions.get(marker);
   if (!uncertainSubmission) return;
-  if (uncertainSubmission.expiresAt <= Date.now()) {
-    uncertainSubmissions.delete(marker);
-    return;
-  }
   uncertainSubmissions.delete(marker);
   refreshReminderCooldown(uncertainSubmission.candidate);
 }
@@ -766,10 +727,7 @@ export function registerGoalTools(pi: ExtensionAPI): void {
 
 // ── Agent lifecycle reminder handler (safe to register at module init) ─
 
-export function registerGoalAgentHandler(
-  pi: ExtensionAPI,
-  options: GoalAgentHandlerOptions = {},
-): void {
+export function registerGoalAgentHandler(pi: ExtensionAPI): void {
   const scheduleReminder = (ctx: unknown): void => {
     if (reminderTimer !== null) return;
 
@@ -843,6 +801,15 @@ export function registerGoalAgentHandler(
         return;
       }
 
+      // An unobservable request remains in flight until its correlated
+      // before_agent_start arrives. Do not submit another candidate while its
+      // outcome is unknown: native compaction has no bounded lease, so any
+      // timeout-based retry could duplicate a request that is merely delayed.
+      if (pendingSubmission || uncertainSubmissions.size > 0) {
+        pendingReminder = null;
+        return;
+      }
+
       const now = Date.now();
       if (
         lastReminder &&
@@ -873,7 +840,7 @@ export function registerGoalAgentHandler(
         prompt,
         (error) => restoreFailedCandidate(candidate, pi, error),
         () => clearPendingSubmissionForMarker(marker),
-        () => armUnobservableSubmission(candidate, marker, pi, options),
+        () => armUnobservableSubmission(candidate, marker, pi),
       );
     }, 0);
   };
