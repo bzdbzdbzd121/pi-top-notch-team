@@ -16,6 +16,7 @@ function createMockPi() {
       handlers[event] = cb;
     }),
     sendUserMessage: vi.fn(),
+    sendMessage: vi.fn(),
     registerTool: vi.fn(),
   };
   return { pi, handlers };
@@ -281,24 +282,33 @@ describe("registerGoalAgentHandler reminder", () => {
     expect(pi.sendUserMessage).not.toHaveBeenCalled();
   });
 
-  it("ignores a reset run's late end even after a new run has started", async () => {
+  it("blocks an unknown reset-time continuation until the old outer run settles", async () => {
     vi.useFakeTimers();
     setupActiveGoal();
     const { pi, handlers } = createMockPi();
     registerGoalAgentHandler(pi as any);
     const oldSignal = { aborted: false };
-    const newSignal = { aborted: false };
+    const continuationSignal = { aborted: false };
+    const freshSignal = { aborted: false };
 
     await finishLowLevelRun(handlers, { messages: [] }, activeContext(oldSignal));
     resetGoal();
     startSession({ name: "new-team", description: "", members: [] } as any);
     setGoalForTesting({ text: "new goal", criteria: "new criteria", completed: false });
-    await handlers["agent_start"]({}, activeContext(newSignal));
 
-    // The old event must not overwrite the new run's signal or candidate.
-    await handlers["agent_end"]({ messages: [] }, activeContext(oldSignal));
-    await handlers["agent_end"]({ messages: [] }, activeContext(newSignal));
-    await settleRun(handlers, activeContext(newSignal));
+    // This start/end pair belongs to the old outer run but uses a controller
+    // first observed after reset. It must be blocked by the lifecycle barrier.
+    await handlers["agent_start"]({}, activeContext(continuationSignal));
+    await handlers["agent_end"]({ messages: [] }, activeContext(continuationSignal));
+    await settleRun(handlers, activeContext(continuationSignal));
+    await flushReminderTimer();
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+
+    // Once the old outer run's settled event has crossed the barrier, a truly
+    // fresh run is allowed to produce the new-session reminder.
+    await handlers["agent_start"]({}, activeContext(freshSignal));
+    await handlers["agent_end"]({ messages: [] }, activeContext(freshSignal));
+    await settleRun(handlers, activeContext(freshSignal));
     await flushReminderTimer();
 
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
@@ -390,6 +400,13 @@ describe("registerGoalAgentHandler reminder", () => {
 
     // The failed Promise must clear its cooldown and leave one candidate for
     // the next settled boundary rather than silently losing the reminder.
+    expect(pi.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customType: "team-message",
+        content: expect.stringContaining("目标提醒提交失败"),
+        display: true,
+      }),
+    );
     await settleRun(handlers);
     await flushReminderTimer();
 

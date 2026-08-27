@@ -59,6 +59,17 @@ interface LastReminder {
   at: number;
 }
 
+/**
+ * A reset can happen while the old outer run is still in post-agent_end
+ * processing. No new run may be accepted until that old run emits its
+ * agent_settled boundary; otherwise an unseen continuation signal could be
+ * mistaken for a fresh run in the replacement session.
+ */
+interface ResetBarrier {
+  runId: number;
+  signals: Set<unknown>;
+}
+
 let nextRunId = 0;
 let goalGeneration = 0;
 let sessionEpoch = 0;
@@ -70,8 +81,9 @@ let lastReminder: LastReminder | null = null;
 /** After reset, an agent_start must establish a new outer run before end events are accepted. */
 let awaitingFreshRun = false;
 let freshRunRequiresSignal = false;
-/** Signal identities from runs invalidated by reset/session replacement. */
-const invalidatedSignals = new Set<unknown>();
+let resetBarrier: ResetBarrier | null = null;
+/** Signal identities from invalidated runs; objects are weakly held to avoid unbounded growth. */
+const invalidatedSignalObjects = new WeakSet<object>();
 
 function clearReminderTimer(): void {
   if (reminderTimer !== null) {
@@ -91,9 +103,14 @@ function invalidateReminderState(resetRun = false): void {
     // Keep signal identities as tombstones: an old agent_end can arrive after
     // /team stop and a new session starts, but it must not be reinterpreted as
     // a run belonging to that new session.
-    freshRunRequiresSignal = Boolean(currentRun && currentRun.signals.size > 0);
-    for (const signal of currentRun?.signals ?? []) {
-      invalidatedSignals.add(signal);
+    const runToInvalidate = currentRun && !currentRun.settled ? currentRun : null;
+    freshRunRequiresSignal = Boolean(runToInvalidate && runToInvalidate.signals.size > 0);
+    if (runToInvalidate) {
+      tombstoneRun(runToInvalidate);
+      resetBarrier = {
+        runId: runToInvalidate.runId,
+        signals: new Set(runToInvalidate.signals),
+      };
     }
     currentRun = null;
     awaitingFreshRun = true;
@@ -159,9 +176,19 @@ function runWasAborted(run: GoalReminderRunState): boolean {
   return false;
 }
 
+function tombstoneSignal(signal: unknown): void {
+  if (typeof signal === "object" && signal !== null) {
+    invalidatedSignalObjects.add(signal);
+  }
+}
+
+function isTombstonedSignal(signal: unknown): boolean {
+  return typeof signal === "object" && signal !== null && invalidatedSignalObjects.has(signal);
+}
+
 function tombstoneRun(run: GoalReminderRunState): void {
   for (const signal of run.signals) {
-    invalidatedSignals.add(signal);
+    tombstoneSignal(signal);
   }
 }
 
@@ -176,7 +203,7 @@ function addRunSignal(
     // continuation of this run.
     return run.signals.size === 0;
   }
-  if (invalidatedSignals.has(signal)) return false;
+  if (isTombstonedSignal(signal)) return false;
   if (!allowNewSignal && run.signals.size > 0 && !run.signals.has(signal)) {
     return false;
   }
@@ -204,8 +231,12 @@ function createRun(ctx: unknown): GoalReminderRunState {
 
 /** Ensure a run for agent_start; unlike agent_end, this may introduce a new low-level signal. */
 function ensureStartRun(ctx: unknown): GoalReminderRunState | null {
+  // A reset barrier stays closed until the invalidated outer run emits its
+  // agent_settled event. This rejects even an unseen continuation controller.
+  if (resetBarrier) return null;
+
   const signal = readSignal(ctx);
-  if (hasSignal(signal) && invalidatedSignals.has(signal)) return null;
+  if (hasSignal(signal) && isTombstonedSignal(signal)) return null;
   // If reset invalidated an identifiable old run, a late start without a new
   // controller is not enough to establish a fresh run. This keeps an old
   // continuation from clearing the reset tombstone.
@@ -236,8 +267,10 @@ function ensureStartRun(ctx: unknown): GoalReminderRunState | null {
 
 /** Ensure a run for agent_end; unknown/missing signals are rejected once a run has an identity. */
 function ensureEndRun(ctx: unknown): GoalReminderRunState | null {
+  if (resetBarrier) return null;
+
   const signal = readSignal(ctx);
-  if (hasSignal(signal) && invalidatedSignals.has(signal)) return null;
+  if (hasSignal(signal) && isTombstonedSignal(signal)) return null;
 
   if (!currentRun) {
     // A post-reset late end must never lazily create a run in the new session.
@@ -307,11 +340,11 @@ function buildReminderText(candidate: GoalReminderCandidate): string {
 function sendReminderSafely(
   pi: ExtensionAPI,
   text: string,
-  onFailure: () => void,
+  onFailure: (error?: unknown) => void,
 ): void {
-  const recover = (): void => {
+  const recover = (error?: unknown): void => {
     try {
-      onFailure();
+      onFailure(error);
     } catch {
       // Recovery is best effort and must not escape a lifecycle callback.
     }
@@ -325,15 +358,47 @@ function sendReminderSafely(
     if (result && typeof (result as { then?: unknown }).then === "function") {
       void Promise.resolve(result).catch(recover);
     }
-  } catch {
+  } catch (error) {
     // A new run can begin between the idle check and this call. Do not retry
     // with followUp: that would reintroduce the original premature-trigger
     // behavior. Restore the candidate for a later settled boundary instead.
-    recover();
+    recover(error);
   }
 }
 
-function restoreFailedCandidate(candidate: GoalReminderCandidate): void {
+function describeReminderFailure(error: unknown): string {
+  if (error instanceof Error && error.message) return error.message;
+  if (typeof error === "string" && error) return error;
+  return "未知错误";
+}
+
+function notifyReminderFailure(pi: ExtensionAPI, error: unknown): void {
+  try {
+    const sendMessage = (pi as unknown as {
+      sendMessage?: (message: {
+        customType: string;
+        content: string;
+        display: boolean;
+      }) => unknown;
+    }).sendMessage;
+    if (typeof sendMessage !== "function") return;
+    const result = sendMessage.call(pi, {
+      customType: "team-message",
+      content: `⚠️ 目标提醒提交失败（原因：${describeReminderFailure(error)}），已保留并将在下一次完全结算后重试。`,
+      display: true,
+    });
+    if (result && typeof (result as { then?: unknown }).then === "function") {
+      void Promise.resolve(result).catch(() => {
+        // The diagnostic itself is best effort.
+      });
+    }
+  } catch {
+    // Failure reporting must not turn a best-effort reminder into an
+    // unhandled lifecycle error.
+  }
+}
+
+function restoreFailedCandidate(candidate: GoalReminderCandidate, pi: ExtensionAPI, error: unknown): void {
   if (!candidateMatchesCurrentGoal(candidate)) return;
   const run = currentRun;
   if (!run || run.runId !== candidate.runId || !run.settled || runWasAborted(run)) {
@@ -346,6 +411,7 @@ function restoreFailedCandidate(candidate: GoalReminderCandidate): void {
   ) {
     lastReminder = null;
   }
+  notifyReminderFailure(pi, error);
 }
 
 // ── Public helpers (for tests and index.ts integration) ────
@@ -599,7 +665,7 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
       sendReminderSafely(
         pi,
         buildReminderText(candidate),
-        () => restoreFailedCandidate(candidate),
+        (error) => restoreFailedCandidate(candidate, pi, error),
       );
     }, 0);
   };
@@ -669,7 +735,16 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
   // not attempt to infer lifecycle state from a timer tick.
   pi.on("agent_settled", async (_event, ctx) => {
     const run = currentRun;
-    if (!run) return;
+    if (!run) {
+      // The old run was invalidated by resetGoal while still in its
+      // post-agent_end window. Consume its settlement to open the barrier;
+      // no candidate can be revived because reset already cleared all goal
+      // state and pending timers.
+      if (resetBarrier) {
+        resetBarrier = null;
+      }
+      return;
+    }
 
     const settledSignal = readContextSignalState(ctx);
     if (settledSignal.aborted || runWasAborted(run)) {
