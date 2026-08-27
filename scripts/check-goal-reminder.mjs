@@ -43,7 +43,11 @@ forbidMatch("auto-compact-owned batch budget", lifecycleDocs, /自动压缩[^\n]
 forbidMatch("registry disappearance wording", lifecycleDocs, /会话之外，这些工具不存在于工具注册表中/);
 forbidMatch("registry disappearance wording", lifecycleDocs, /Not registered and not available outside a Team Session/);
 forbidMatch("registry disappearance wording", lifecycleDocs, /Outside a session the tool registry contains none of them\./);
+forbidMatch("registry disappearance wording", lifecycleDocs, /They are \*\*not\*\* available outside a team session\./);
+forbidMatch("registry disappearance wording", lifecycleDocs, /会话外工具注册表与活跃集均不含任何团队工具/);
 forbidMatch("agent teardown directory cleanup wording", lifecycleDocs, /widgets off,\s*dir cleanup/);
+requireMatch("fresh registry qualification", lifecycleDocs, /fresh pi 初始 registry 为空/);
+requireMatch("existing registry qualification", lifecycleDocs, /已有进程[\s\S]{0,80}registry 仍保留[\s\S]{0,80}activeTools/);
 requireMatch("fully-settled wording", source, /一次运行完全结算/);
 requireMatch("fully-settled wording in design", read("DESIGN.md"), /Goal Reminder Lifecycle/i);
 

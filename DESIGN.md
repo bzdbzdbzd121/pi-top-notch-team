@@ -451,7 +451,7 @@ The TL follows the **Orchestration Playbook** (`src/prompts/orchestration-playbo
 
 ## 6. TL Process Management Tools
 
-Nine session-scoped TL tools are registered while a team session is active (six process tools, `write_shared_context`, `set_goal`, and `finish_goal`). They are **not** available outside a team session. `add_dynamic_member` is additionally available in dynamic mode; `start_team_session` is the deliberate load-time exception described in §18.
+Nine session-scoped TL tools are registered while a team session is active (six process tools, `write_shared_context`, `set_goal`, and `finish_goal`). They are active and visible only during a team session; because pi has no unregister API, once registered they remain in the registry after teardown and are removed from `activeTools` outside the session, so they are not visible or callable. `add_dynamic_member` is additionally available in dynamic mode; `start_team_session` is the deliberate load-time exception described in §18.
 
 ### `write_shared_context`
 
