@@ -25,8 +25,8 @@ pi install ./pi-top-notch-team
 
 ```
 User's pi session (TL extension)
-  ├── 11 subcommands (/team create, dynamic, edit, cancel, start, stop, list, show, delete, status, help)
-  ├── 10 个 TL 工具（9 个会话专用工具 start_member, stop_member, list_members, get_member_log, wait_and_get_member_status, team_send_and_wait, write_shared_context, set_goal, finish_goal + 动态模式专用 add_dynamic_member）——仅在团队会话期间注册+激活
+  ├── 14 subcommands (/team create, dynamic, edit, done, cancel, start, stop, resume, list, show, delete, status, setting, help)
+  ├── TL tools：load-time `start_team_session`；9 个 session-scoped 工具首次会话按需注册、会话期间激活（teardown 后 registry 保留，会话外从 activeTools 移除）；agent session 激活 `stop_team_session`，dynamic mode 提供 `add_dynamic_member`
 
 Batch send: team_send_and_wait now supports tasks array for concurrent dispatch to multiple members. Previously single-target to/content/nextSteps; now unified tasks:[{to, content}] + nextSteps. **Batch when tasks are independent (parallel execution); sequential when task B depends on task A's output. See TL Tools table for decision rules.**
   ├── Message channel (queue → router → responseWaiter)
@@ -95,7 +95,7 @@ src/
 │   ├── goal-tools.agent-session.test.ts  ← Real pi 0.83.0 AgentSession lifecycle/void-wrapper integration tests
 │   ├── agent-session-tools.ts ← start_team_session（加载时注册，ADR-0003 例外）+ stop_team_session（会话作用域，仅自主会话激活）
 │   ├── agent-session-tool-names.ts ← 工具名常量（叶子模块，防循环依赖）
-│   ├── session-tool-visibility.ts ← 会话工具可见性强制（纯函数）：9 个团队会话工具（start_member…finish_goal）仅在会话期间注册+可见，before_agent_start 回合边界强制执行；AGENT_SESSION_TOOL_NAMES 按 origin 条件激活
+│   ├── session-tool-visibility.ts ← 会话工具可见性强制（纯函数）：9 个团队会话工具首次会话按需注册、会话期间激活，teardown 后 registry 保留、会话外从 activeTools 移除；before_agent_start 回合边界强制执行；AGENT_SESSION_TOOL_NAMES 按 origin 条件激活
 │   ├── shared-context-tool.ts ← write_shared_context 工具：唯一合法的共享上下文写入入口，成功后标记会话状态（start_member 门控依赖）
 │   └── tl-tools-add-dynamic.test.ts  ← add_dynamic_member tool tests
 ├── team/

@@ -48,6 +48,10 @@ if (statusHandlerIndex < 0 || goalRegistrationIndex < statusHandlerIndex) {
 // Active documentation must not reintroduce old lifecycle wording.
 forbidMatch("legacy stop wording", lifecycleDocs, /在你停止时提醒|目标达成前停下时系统会自动重新触发/);
 forbidMatch("auto-compact-owned batch budget", lifecycleDocs, /自动压缩[^\n]*可配置[^\n]*批预算/);
+forbidMatch("stale team subcommand count", lifecycleDocs, /11 subcommands|11\+ 个子命令|11 个子命令/i);
+forbidMatch("stale command diagram count", lifecycleDocs, /\(8 total\)/i);
+forbidMatch("stale TL tool count", lifecycleDocs, /10 个 TL 工具/);
+forbidMatch("stale session tool registration wording", lifecycleDocs, /仅在团队会话期间注册\+激活|仅在会话期间注册\+激活|仅在会话期间注册\+可见/);
 forbidMatch("registry disappearance wording", lifecycleDocs, /会话之外，这些工具不存在于工具注册表中/);
 forbidMatch("registry disappearance wording", lifecycleDocs, /Not registered and not available outside a Team Session/);
 forbidMatch("registry disappearance wording", lifecycleDocs, /Outside a session the tool registry contains none of them\./);
@@ -66,6 +70,11 @@ requireMatch("AGENTS #21 existing registry qualification", agents, /已有进程
 requireMatch("DESIGN §6 registry/activeTools distinction", design, /remain in the registry after teardown[\s\S]{0,120}removed from `activeTools`/);
 requireMatch("DESIGN §18 resumable teardown", design, /preserve resumable[\s\S]{0,80}disk cleanup via \/team delete/);
 requireMatch("DESIGN session-ended banner", design, /no regular TL instructions[\s\S]{0,180}one-shot session-ended banner may be injected on the next turn/);
+requireMatch("AGENTS current team subcommand count", agents, /14 subcommands/);
+requireMatch("README current team subcommand count", readme, /\/team 命令（14 个子命令/);
+requireMatch("DESIGN current team subcommand count", design, /14 subcommands/);
+requireMatch("AGENTS load-time tool entry", agents, /load-time `start_team_session`/);
+requireMatch("README load-time tool entry", readme, /load-time `start_team_session`/);
 requireMatch("ADR-0003 fresh registry qualification", adrAgentSessions, /A fresh pi process starts with no session-scoped team tools in its registry/);
 requireMatch("ADR-0003 activeTools qualification", adrAgentSessions, /remain in the registry after teardown[\s\S]{0,180}removes them from `activeTools` outside a session/);
 requireMatch("fully-settled wording", source, /一次运行完全结算/);

@@ -202,10 +202,10 @@ members:
 
 ```
 你的 pi 会话（TL 扩展）
-  ├── /team 命令（11+ 个子命令）
-  ├── 10 个 TL 工具（9 个仅会话期间可用：start_member、stop_member、list_members、
-  │   get_member_log、wait_and_get_member_status、team_send_and_wait、
-  │   write_shared_context、set_goal、finish_goal；动态模式另有 add_dynamic_member）
+  ├── /team 命令（14 个子命令：含 done/cancel、resume、setting）
+  ├── TL tools：load-time `start_team_session`；9 个 session-scoped 工具首次会话按需注册、
+  │   会话期间激活（teardown 后 registry 保留，会话外从 activeTools 移除）；agent session 激活
+  │   `stop_team_session`，dynamic mode 提供 `add_dynamic_member`
   ├── 消息通道（event-handler → queue → router → response-waiter）
   └── Member 进程管理器
         ├── Member A（pi --mode rpc）

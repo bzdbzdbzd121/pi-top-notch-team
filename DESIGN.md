@@ -17,7 +17,8 @@ The TL clarifies requirements with the user, breaks down tasks into a plan, spaw
 │  │                                                    │    │
 │  │  ┌─────────────┐  ┌──────────────┐  ┌──────────┐  │    │
 │  │  │  Commands   │  │  TL Tools    │  │ Message  │  │    │
-│  │  │  (8 total)  │  │ (process mgt)│  │ Router   │  │    │
+│  │  │  (14 cmds)  │  │ (session +   │  │ Router   │  │    │
+│  │  │             │  │ autonomous) │  │          │  │    │
 │  │  └─────────────┘  └──────────────┘  └─────┬────┘  │    │
 │  │                                            │       │    │
 │  │  ┌─────────────────────────────────────────┴───┐   │    │
@@ -72,7 +73,7 @@ pi-top-notch-team/
 ├── member.ts                 ← Extension entry point — Member side (auto-discovered via pi manifest)
 ├── src/
 │   ├── commands/
-│   │   ├── team.ts             ← Single /team command (11 subcommands + autocomplete)
+│   │   ├── team.ts             ← Single /team command (14 subcommands + autocomplete)
 │   │   └── status.ts           ← StatusProvider type export
 │   ├── tools/
 │   │   ├── tl-tools.ts         ← 6 TL process management tools (DI-based dependencies)
@@ -99,7 +100,7 @@ pi-top-notch-team/
 │   ├── session/
 │   │   ├── state.ts            ← Team session state tracking (structuredClone deep copy)
 │   │   ├── context.ts          ← TeamContext shared mutable state interface
-│   │   ├── session-tool-visibility.ts ← 会话工具可见性强制（纯函数）：9 个团队会话工具（start_member…finish_goal）仅在会话期间注册+激活，before_agent_start 回合边界强制执行
+│   │   ├── session-tool-visibility.ts ← 会话工具可见性强制（纯函数）：9 个团队会话工具首次会话按需注册、会话期间激活，teardown 后 registry 保留、会话外从 activeTools 移除；before_agent_start 回合边界强制执行
 │   │   └── state-machine.ts    ← Pure function: MemberOperationalState transitions
 │   ├── config.ts               ← getRootDir() env var override
 │   ├── test/
@@ -145,7 +146,7 @@ Since TL and Member are declared as two separate extensions, but both are loaded
 
 | Scenario | `ctx.mode` | Role |
 |----------|-----------|------|
-| User's interactive session | `"tui"`, `"rpc"`, `"json"`, `"print"` | **TL** — registers /team command with 11 subcommands, waits for `/team start` or `/team dynamic` to activate tools |
+| User's interactive session | `"tui"`, `"rpc"`, `"json"`, `"print"` | **TL** — registers /team command with 14 subcommands, waits for `/team start` or `/team dynamic` to activate session tools |
 | Member RPC process | `"rpc"` | **Member** — registers `team_send_message` tool, injects team system prompt via env vars |
 
 **Detection logic:**
