@@ -125,7 +125,7 @@ export function registerStopTeamSessionTool(deps: AgentSessionToolsDeps): void {
     name: STOP_TEAM_SESSION_TOOL_NAME,
     label: "Stop Team Session",
     description:
-      "End the current agent-initiated team session: stop all member processes, deactivate session tools, remove the team widget, and clean up session data. " +
+      "End the current agent-initiated team session: stop all member processes, deactivate session tools, remove the team widget, and preserve session data for /team resume; use /team delete for disk cleanup. " +
       "Only available in sessions started via start_team_session — user-initiated sessions (/team start, /team dynamic) are ended by the user with /team stop. " +
       "No parameters.",
     promptGuidelines: [
@@ -152,7 +152,7 @@ export function registerStopTeamSessionTool(deps: AgentSessionToolsDeps): void {
 
       const { teamName } = await teardownTeamSession(pi, teamCtx);
       return textResult(
-        `✅ 团队会话「${teamName}」已结束：成员进程已全部停止，会话数据已清理。`,
+        `✅ 团队会话「${teamName}」已结束：成员进程已全部停止，会话数据已保留，可用 /team resume 恢复；磁盘清理请使用 /team delete。`,
         { teamName, stopped: true },
       );
     },

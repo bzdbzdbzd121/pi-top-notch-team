@@ -37,10 +37,10 @@ A Markdown document (`.shared-context.md`) maintained by the TL during a team se
 _Avoid_: Mission brief, team doc, session context
 
 **Session Isolation**:
-Each team session gets a unique `sessionId` (timestamp + random suffix). Session data is isolated under `sessions/<team-name>/<sessionId>/` to prevent conflicts when the same pre-defined team is used across multiple sessions. Dynamic mode sessions use timestamp-based team names (`_dynamic_<ts>`) for the same purpose. All session directories are cleaned up on `/team stop`.
+Each team session gets a unique `sessionId` (timestamp + random suffix). Session data is isolated under `sessions/<team-name>/<sessionId>/` to prevent conflicts when the same pre-defined team is used across multiple sessions. Dynamic mode sessions use timestamp-based team names (`_dynamic_<ts>`) for the same purpose. Session directories are retained on `/team stop` and marked stopped in `session.json`; use `/team resume` to continue or `/team delete` for explicit disk cleanup.
 
 **Dynamic Team Mode** (`/team dynamic`):
-A free-form session mode where the Team Definition is built at runtime rather than loaded from YAML. The TL enters a session with 0 members, discusses requirements with the user, and uses `add_dynamic_member` to register each role. Session data lives in `sessions/_dynamic_<ts>/` and is cleaned up on `/team stop`. The session guard blocks code file writes from the moment of entry. During the design phase, the TL follows the **Orchestration Playbook** (below).
+A free-form session mode where the Team Definition is built at runtime rather than loaded from YAML. The TL enters a session with 0 members, discusses requirements with the user, and uses `add_dynamic_member` to register each role. Session data lives in `sessions/_dynamic_<ts>/` and remains resumable after `/team stop`; use `/team delete` for explicit disk cleanup. The session guard blocks code file writes from the moment of entry. During the design phase, the TL follows the **Orchestration Playbook** (below).
 _Avoid_: Ad-hoc team, on-the-fly team, temporary team
 
 **Orchestration Playbook**:
@@ -48,7 +48,7 @@ A methodology document (`src/prompts/orchestration-playbook.md`) injected into t
 _Avoid_: Workflow guide, design checklist
 
 **Goal**:
-A session-scoped objective set by the TL at the start of a task using the `set_goal` tool. Consists of a summary text and verifiable completion criteria. When the TL finishes a turn (`agent_end`) with an active, incomplete goal, the system automatically sends a user message reminding the TL to continue working rather than asking the user for permission. The TL calls `finish_goal` when the goal is met or an unresolvable blocker prevents completion.
+A session-scoped objective set by the TL at the start of a task using the `set_goal` tool. Consists of a summary text and verifiable completion criteria. When the TL run is fully settled—after any retry, compaction, or queued continuation has finished—with an active, incomplete goal, the system submits a reminder to continue rather than asking the user for permission. `agent_end` is only an intermediate boundary and does not send the reminder. The TL calls `finish_goal` when the goal is met or an unresolvable blocker prevents completion.
 _Avoid_: Task objective, milestone, checkpoint
 
 **Auto-Compaction** (自动压缩):
@@ -60,7 +60,7 @@ A Member operational state (`idle` / `working` / `compacting` / `crashed` / `sto
 _Avoid_: compressing, summarizing
 
 **Member Inspector** (成员检视浮窗):
-A full-keyboard overlay summoned by the user with `alt+t` during an active Team Session. Displays a horizontal tab per Member (including crashed/stopped ones, marked with status icons), the selected Member's conversation content (user/assistant messages rendered in full, tool calls collapsed to one-line summaries with an `e` key toggle, thinking hidden), and a footer with each Member's operational state, context usage %, and key hints. The user can send messages directly to a Member via an input box (`i`/`Enter` to open; Enter sends `prompt` when idle or `follow_up` when busy, `Ctrl+Enter` sends `steer`), and run control commands (`ctrl+a` abort, `ctrl+m` compact). Direct user messages are prefixed with `[用户直接指令（非 TL）]:` so the Member can distinguish the source; user interventions are not mirrored into the TL session. Content refresh is event-driven: Member RPC events mark the tab dirty and trigger a throttled `get_messages` refetch. Not available outside a Team Session.
+A full-keyboard overlay summoned by the user with `alt+t` during an active Team Session. Displays a horizontal tab per Member (including crashed/stopped ones, marked with status icons), the selected Member's conversation content (user/assistant messages rendered in full, tool calls collapsed to one-line summaries with an `e` key toggle, thinking hidden), and a footer with each Member's operational state, context usage %, and key hints. The user can send messages directly to a Member via an input box (`i`/`Enter` to open; Enter sends `prompt` when idle or `follow_up` when busy, `Ctrl+Enter` sends `steer`), and run control commands (`ctrl+a` abort, `ctrl+o` compact). Direct user messages are prefixed with `[用户直接指令（非 TL）]:` so the Member can distinguish the source; user interventions are not mirrored into the TL session. Content refresh is event-driven: Member RPC events mark the tab dirty and trigger a throttled `get_messages` refetch. Not available outside a Team Session.
 _Avoid_: 监控面板, 第二终端
 
 **Session Origin** (会话来源):
@@ -82,7 +82,7 @@ _Avoid_: manual session
 5. TL uses `start_member` to launch Member RPC processes (each receives role info via env vars)
 6. TL sends Shared Context to Members along with initial task assignments
 7. TL and Members communicate via the message channel; TL monitors progress
-8. If TL finishes a turn with an incomplete goal, the system auto-reminds the TL to continue
+8. After the TL run is fully settled (not merely at `agent_end`), an incomplete goal produces a reminder to continue
 9. TL calls `finish_goal` when all criteria are met
 10. TL reports completion to user when all tasks are done
 11. User decides when to run `/team stop` to terminate all Member processes

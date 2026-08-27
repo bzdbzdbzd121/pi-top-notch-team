@@ -45,7 +45,8 @@ Batch send: team_send_and_wait now supports tasks array for concurrent dispatch 
 |------|------|
 | `index.ts` (~400 lines) | TL extension entry point. Registers `/team` command, wires DI dependencies, `before_agent_start` injection, team-status + edit-mode widget lifecycle, autocomplete provider, `agent_settled` interrupt handler (Esc detection with member-running notification). Refactored from ~800 lines via modular extraction. |
 | `member.ts` | Member extension entry point. Registers `team_send_message` tool, injects team awareness via env vars. Uses `JSON.parse` for TEAM_MEMBERS (no longer comma-delimited). |
-| `package.json` | pi package manifest with `pi.extensions` pointing to `["./index.ts", "./member.ts"]` |
+| `package.json` | pi package manifest with `pi.extensions` pointing to `["./index.ts", "./member.ts"]`; includes `check:goal-reminder` release scan |
+| `scripts/check-goal-reminder.mjs` | Stage 3 static guard for settled-boundary, first-user marker correlation, API-only cooldown, and legacy wording |
 
 ## Source Map
 
@@ -88,8 +89,10 @@ src/
 │   ├── member-process.ts  ← pi --mode rpc spawn wrapper (write queue, size guard)
 │   └── manager.ts    ← Multi-member lifecycle + operational state + auto-restart
 ├── tools/
-│   ├── tl-tools.ts   ← 7 TL process management tools (Deps-based DI)
+│   ├── tl-tools.ts   ← 6 TL process management tools (Deps-based DI)
 │   ├── goal-tools.ts  ← Goal system: set_goal/finish_goal + settled-boundary reminder delivery
+│   ├── goal-tools.test.ts  ← Lifecycle, rollover, abort, cooldown, failure, and marker unit tests
+│   ├── goal-tools.agent-session.test.ts  ← Real pi 0.83.0 AgentSession lifecycle/void-wrapper integration tests
 │   ├── agent-session-tools.ts ← start_team_session（加载时注册，ADR-0003 例外）+ stop_team_session（会话作用域，仅自主会话激活）
 │   ├── agent-session-tool-names.ts ← 工具名常量（叶子模块，防循环依赖）
 │   ├── session-tool-visibility.ts ← 会话工具可见性强制（纯函数）：9 个团队会话工具（start_member…finish_goal）仅在会话期间注册+可见，before_agent_start 回合边界强制执行；AGENT_SESSION_TOOL_NAMES 按 origin 条件激活
@@ -163,11 +166,15 @@ src/
    - `channel/response-waiter.ts` — correlation matching with response buffering
    - `session/state-machine.ts` — pure state transitions
 
-8. **Dynamic team mode (`/team dynamic`)** — A free-form mode where the TL designs the team at runtime. No YAML is written to disk. The TL enters a session with 0 members, discusses requirements with the user, uses `add_dynamic_member` to register member roles, then starts and dispatches them via the standard tool chain. The session guard blocks code file writes from the moment `/team dynamic` is entered. On `/team stop`, the temporary session directory (`sessions/_dynamic_<ts>/`) is cleaned up.
+8. **Dynamic team mode (`/team dynamic`)** — A free-form mode where the TL designs the team at runtime. No YAML is written to disk. The TL enters a session with 0 members, discusses requirements with the user, uses `add_dynamic_member` to register member roles, then starts and dispatches them via the standard tool chain. The session guard blocks code file writes from the moment `/team dynamic` is entered. Session data is retained in `sessions/_dynamic_<ts>/` after stop so it can be resumed; `/team delete` is the explicit disk cleanup path.
 
-9. **Session isolation via sessionId** — Each team session generates a unique `sessionId` in `TeamSessionState`. `buildMemberConfig` uses this ID to nest session data under `sessions/<team-name>/<sessionId>/` instead of the flat `sessions/<team-name>/`. This prevents conflicts when the same pre-defined team is used across multiple sessions. On `/team stop`, the session subdirectory is cleaned up. Dynamic mode sessions (`_dynamic_<ts>`) use their unique team name for the same purpose — the entire team directory is removed on stop.
+9. **Session isolation via sessionId** — Each team session generates a unique `sessionId` in `TeamSessionState`. `buildMemberConfig` uses this ID to nest session data under `sessions/<team-name>/<sessionId>/` instead of the flat `sessions/<team-name>/`. This prevents conflicts when the same pre-defined team is used across multiple sessions. `/team stop` and `session_shutdown` preserve the session directory and mark its manifest stopped/interrupted for `/team resume`; `/team delete` performs explicit disk cleanup. Dynamic mode sessions (`_dynamic_<ts>`) use their unique team name for the same isolation and resume semantics.
 
-10. **Goal system for TL autonomy** — `src/tools/goal-tools.ts` registers `set_goal` and `finish_goal` tools plus lifecycle handlers. When the TL sets a goal at session start and later finishes a turn, `agent_end` records a candidate while `agent_settled` is the sole delivery boundary; a `setTimeout(0)` only prevents re-entry from inside the settled callback. The reminder prompt carries a non-rendered correlation marker, and `before_agent_start` confirms the matching prompt; `agent_start` alone is never treated as an acknowledgement because pi 0.83.0's event has no prompt. The real `ExtensionAPI.sendUserMessage` is fire-and-forget (`void`), so a bounded no-ack watchdog emits a visible uncertainty diagnostic without restoring the candidate (restoring could duplicate an accepted-but-delayed request); timed-out markers remain matchable for delayed prompts; ACK only clears uncertainty and leaves `lastReminder.at` anchored at the API submission, while the confirmed reminder run gets one-shot candidate suppression. Because native AgentSession compaction before `before_agent_start` has no plugin lease upper bound, markers have no time-based expiry and are retained until matching or goal/session reset. While one void submission is pending or uncertain, the dispatch gate suppresses further reminder submissions, keeping the lifecycle-bound map at one entry without evicting a legal ACK. Observable test/adaptor senders still recover synchronous/Promise failures by restoring the candidate. This prevents the TL from unnecessarily asking the user "should I continue?" mid-task. The goal is stored in module-level memory, has a 10-second cooldown between reminders to prevent loops, checks captured abort signals to skip reminders when the user pressed Esc or redirected the agent, and is reset on session shutdown.
+10. **Goal system for TL autonomy** — `src/tools/goal-tools.ts` registers `set_goal` and `finish_goal` tools plus lifecycle handlers. A low-level `agent_end` only records the current run's candidate; `agent_settled` is the sole reminder delivery boundary, and its one-shot `setTimeout(0)` is only a listener re-entry barrier. Run state carries a stable `runId`, signal set, session ID/epoch, goal generation, abort state, settled state, first-user-prompt association, candidate, and one-shot suppression for a confirmed reminder continuation. Retry, compaction, and queued continuations reuse the outer run until settlement. The dispatch timer revalidates session/goal identity, completion, abort state, settled state, and `ctx.isIdle()`; busy contexts retain the candidate and never receive a queued reminder.
+   - **Cooldown** is anchored exactly once immediately before `pi.sendUserMessage`; matching ACKs never refresh `lastReminder.at`.
+   - **Fire-and-forget correlation** uses the complete hidden HTML marker in `before_agent_start`; `agent_start` without a prompt is never an ACK. A void/no-ACK watchdog only reports uncertainty and never retries; observable sync/Promise failures restore the candidate.
+   - **Rollover isolation** captures live markers across session or goal-generation changes. The exact marker map is keyed by marker ID, capped at 64 unresolved entries, and stores only numeric identity metadata. A captured marker is stale only after its own `before_agent_start` is observed; `message_start` then examines only the first `role === "user"` prompt. Assistant/tool-result text, later user messages, consumed historical IDs, and unrelated markers cannot suppress or abort a fresh run.
+   - A confirmed reminder continuation is suppressed once so it cannot generate a second candidate. `finish_goal`, reset/teardown, abort, and session changes invalidate candidates; `session_shutdown` clears timers, submissions, and rollover quarantine. The marker protocol is confirmation/de-duplication protection, not an independent retry watchdog.
    **会话工具注册与可见性（turn-boundary enforcement）**：全部 9 个团队会话工具（`start_member`/`stop_member`/`list_members`/`get_member_log`/`team_send_and_wait`/`wait_and_get_member_status`/`write_shared_context`/`set_goal`/`finish_goal`）**只在团队会话（`/team start` 或 `/team dynamic`）期间注册**——扩展加载时不注册任何团队工具（见决策 #21）。由于 pi 没有 unregisterTool API，首次会话后工具会永久留在注册表中——活跃工具集是唯一可见性闸门，因此 `src/session/session-tool-visibility.ts` 的 `enforceSessionToolVisibility()`（纯函数 + DI，`SESSION_TOOL_NAMES` 与 `teamCtx.tlToolNames` 同源）在每个 `before_agent_start` 回合边界强制该不变式：会话活跃 → 确保注册（幂等）+ 激活；会话不活跃 → 从活跃集移除（绝不注册）。防止扩展重载/其他扩展 setActiveTools/plan-mode 切换等产生陈旧活跃列表导致工具泄漏到会话外。
 
 11. **Defensive parsing for `tasks` parameter** — `src/tools/tl-tools.ts` includes a `parseTasks()` function that handles four formats for the `tasks` parameter:
@@ -379,8 +386,10 @@ Validation rules in `src/team/schema.ts`.
 ## Testing
 
 ```bash
-npm test          # Run all tests (vitest)
-npm run test:watch  # Watch mode
+npm test                         # Run all tests (vitest)
+npm run test:watch               # Watch mode
+npm run check:goal-reminder      # Stage 3 static Goal lifecycle/wording scan
+printf '' | timeout 10 ./node_modules/.bin/pi --mode json --no-tools -e ./index.ts  # 0.83.0 CLI smoke
 ```
 
 测试覆盖面较广（状态机、member-process 含 resume 参数、manifest、resume-handler、event-handler、response-waiter、message-channel、member、save-team-definition、config、UI widget、member-inspector、agent-session-tools、agent-initiated-mode 提示词等）。测试以 `*.test.ts` 形式与源码同目录存放，具体数量以 `npm test` 实时输出为准。
@@ -389,7 +398,7 @@ npm run test:watch  # Watch mode
 |-----------|------|-----|
 | Unit | schema, store, message-queue, router, config, state-machine, response-waiter | Pure functions, no mocking |
 | Integration | commands, tl-tools, index, member-process, manager, event-handler, member-lifecycle, message-channel | Mock ExtensionAPI / child_process |
-| E2E | Manual via `pi --mode json -e ./index.ts` | Real pi binary |
+| E2E | `./node_modules/.bin/pi --mode json --no-tools -e ./index.ts` smoke; `src/tools/goal-tools.agent-session.test.ts` high-fidelity lifecycle | Installed pi 0.83.0 runtime; provider transport is deterministic/fake in the AgentSession fixture |
 
 ## Environment Variables
 
@@ -430,13 +439,13 @@ npm run test:watch  # Watch mode
 | Tool | Description |
 |------|-------------|
 | `start_team_session(task)` | **加载时注册**（决策 #21 唯一例外）。agent 自主启动动态团队会话（`origin: "agent"`）：`task` 必填——自动置 Goal + 注入自主版设计阶段提示词。全程无确认门；读/分析自由（无派发管制守卫），代码写入仍归成员。已有活跃会话时返回错误。成员进程结构性无法调用（`TEAM_ROLE` 早退）。 |
-| `stop_team_session()` | 结束 agent 自主会话（停成员、摘 widget、清理会话目录）。会话作用域注册，**仅自主会话出现在活跃工具集**；对 `origin: "user"` 的会话拒绝执行（手动会话归用户 `/team stop`）。与 `/team stop` 共享 `teardownTeamSession()`。 |
+| `stop_team_session()` | 结束 agent 自主会话（停成员、摘 widget、保留会话目录供 `/team resume`；磁盘清理由 `/team delete` 负责）。会话作用域注册，**仅自主会话出现在活跃工具集**；对 `origin: "user"` 的会话拒绝执行（手动会话归用户 `/team stop`）。与 `/team stop` 共享 `teardownTeamSession()`。 |
 
 | Tool | Description |
 |------|-------------|
 | `write_shared_context(content)` | Write the team shared context to the session's `.shared-context.md` (overwrite). **Must be called before the first `start_member` — start_member is blocked until then.** Sets the session `sharedContextWritten` flag; direct `write`/`edit` of `.shared-context.md` is intercepted and redirected here. Call again to update, then notify members to re-read. |
 | `add_dynamic_member(name, label, systemPrompt, model?)` | Register a member in `/team dynamic` mode. Name is the identifier, label is Chinese display name, systemPrompt is role definition. Only available in dynamic mode. |
-| `set_goal(text, criteria)` | Set a session goal with verifiable completion criteria. The system will automatically re-trigger the TL with a reminder if it stops working before the goal is met. Call at the start of a task to prevent unnecessary mid-task interruptions. **可见性**：仅团队会话（`/team start`/`/team dynamic`）期间可见——`onSessionStart` 注册，`before_agent_start` 回合边界强制（见决策 #10）。 |
+| `set_goal(text, criteria)` | Set a session goal with verifiable completion criteria. The system reminds the TL only after one run is fully settled (with no automatic retry, compaction, or queued continuation) while the goal remains incomplete; `agent_end` alone never sends a reminder. **可见性**：仅团队会话（`/team start`/`/team dynamic`）期间可见——`onSessionStart` 注册，`before_agent_start` 回合边界强制（见决策 #10）。 |
 | `finish_goal()` | Mark the current goal as completed and stop the reminder system. Call when all goal criteria are met, or when an unresolvable blocker is encountered. |
 | `start_member(name)` | Launch a Member's pi RPC process. In dynamic mode, the first call triggers the design→execution phase transition. |
 | `stop_member(name)` | Gracefully terminate a Member process |
@@ -557,7 +566,8 @@ TL: team_send_and_wait(...)
 TL: 监控进展、协调异常、write_shared_context 更新共享上下文（更新后通知成员重新阅读）
 
 /team stop
-  → stopAll() → rm -rf sessions/_dynamic_<ts>/ → endSession() → dynamicPhase = "design"
+  → stopAll() → manifest=stopped (保留 sessions/_dynamic_<ts>/) → endSession() → dynamicPhase = "design"
+  → 可用 /team resume 恢复；/team delete 负责显式磁盘清理
 ```
 
 
@@ -596,4 +606,4 @@ TL: 监控进展、协调异常、write_shared_context 更新共享上下文（�
 
 ## Design Document
 
-See [DESIGN.md](./DESIGN.md) for the full design specification (20 sections).
+See [DESIGN.md](./DESIGN.md) for the full design specification (26 sections), including the Goal reminder lifecycle and release verification checklist.

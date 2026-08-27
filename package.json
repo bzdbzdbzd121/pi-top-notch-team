@@ -34,7 +34,8 @@
   },
   "scripts": {
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "check:goal-reminder": "node scripts/check-goal-reminder.mjs"
   },
   "devDependencies": {
     "typescript": "^5.9.0",

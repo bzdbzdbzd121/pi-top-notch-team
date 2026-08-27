@@ -117,7 +117,7 @@ function executionPhasePrompt(sharedCtxPath: string, memberLines: string, team: 
 1. 汇总各成员产出，验证使命的验收标准逐条满足
 2. 向用户汇报最终结果（交付物清单 + 验收对照）
 3. 调用 \`finish_goal\` 关闭目标提醒
-4. 调用 \`stop_team_session\` 结束会话（停止全部成员进程、清理会话数据）
+4. 调用 \`stop_team_session\` 结束会话（停止全部成员进程、保留可恢复的会话数据；磁盘清理用 \`/team delete\`）
    - 例外：预判用户会立即追问/追加任务时，可保留团队运行——但必须在汇报中明确告知"团队会话仍在运行"
 
 ### 用户干预通道（始终有效）

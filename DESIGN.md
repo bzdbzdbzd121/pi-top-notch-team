@@ -65,6 +65,8 @@ pi-top-notch-team/
 │       ├── 0001-members-as-independent-pi-rpc-processes.md
 │       └── 0002-tl-as-central-message-router.md
 ├── package.json              ← pi package manifest (see below)
+├── scripts/
+│   └── check-goal-reminder.mjs ← Stage 3 static lifecycle/wording/release guard
 ├── tsconfig.json
 ├── index.ts                  ← Extension entry point — TL side (auto-discovered via pi manifest)
 ├── member.ts                 ← Extension entry point — Member side (auto-discovered via pi manifest)
@@ -73,8 +75,10 @@ pi-top-notch-team/
 │   │   ├── team.ts             ← Single /team command (11 subcommands + autocomplete)
 │   │   └── status.ts           ← StatusProvider type export
 │   ├── tools/
-│   │   ├── tl-tools.ts         ← 7 TL process management tools (DI-based dependencies)
-│   │   └── goal-tools.ts        ← Goal system: set_goal/finish_goal + settled-boundary reminder delivery
+│   │   ├── tl-tools.ts         ← 6 TL process management tools (DI-based dependencies)
+│   │   ├── goal-tools.ts        ← Goal system: set_goal/finish_goal + settled-boundary reminder delivery
+│   │   ├── goal-tools.test.ts   ← Goal lifecycle, rollover, abort, cooldown, failure, and marker unit tests
+│   │   └── goal-tools.agent-session.test.ts ← Real pi 0.83.0 AgentSession lifecycle/void-wrapper integration tests
 │   │   (team_send_message is in member.ts directly)
 │   ├── channel/
 │   │   ├── message-queue.ts    ← Serial FIFO message queue (event-driven drain)
@@ -447,7 +451,7 @@ The TL follows the **Orchestration Playbook** (`src/prompts/orchestration-playbo
 
 ## 6. TL Process Management Tools
 
-Eight tools are registered when a team session is active. They are **not** available outside a team session.
+Nine session-scoped TL tools are registered while a team session is active (six process tools, `write_shared_context`, `set_goal`, and `finish_goal`). They are **not** available outside a team session. `add_dynamic_member` is additionally available in dynamic mode; `start_team_session` is the deliberate load-time exception described in §18.
 
 ### `write_shared_context`
 
@@ -589,7 +593,7 @@ team_send_and_wait({
   - **Mixed strategy**: batch independent discovery tasks (A+B), then use combined outputs to craft a dependent task (C). This is often the most efficient pattern.
 - **Correlation matching**: each task gets its own `<corr:...>` tag for independent matching. Supports chain workflows: Member A can forward the tag to Member B
 - **Auto-injection**: if a member's reply is directed to `"tl"` but lacks a `<corr:...>` tag, the TL extension automatically appends the most recent pending correlation ID for that member. This ensures responses are matched even if the member AI forgets to include the tag
-- **No timeout**: waits indefinitely. The only exit paths are: all members respond, all members become idle, or `/team stop` cancels all pending waits
+- **Wait budget**: by default the all-idle wait has a 15-minute diagnostic deadline (`waitTimeoutMinutes`; `0` restores unlimited waiting). On expiry it returns partial results plus suspected stuck members and recovery guidance instead of hanging forever. `/team stop` also cancels all pending waits
 - **Cancellation**: on `/team stop`, all pending waits are cancelled
 
 **防截断协议（P3）**：promptGuidelines 内置 5 条，从源头降低截断概率（长 content 是校验失败首要诱因）。P1/P2 已保证截断形态不再以误导性框架错误出现（schema 放宽 + prepareArguments 规范化 + 截断语义提示），本协议在此基础上降低**截断发生的概率**：
@@ -920,14 +924,14 @@ Session state (active + team definition) is stored in `session/state.ts` as a mo
 
 1. The Member's `ChildProcess` emits `"exit"` with non-zero code
 2. `MemberProcessManager` detects the unexpected exit
-3. Manager logs the crash and notifies TL; no auto-restart (prevents crash loops)
+3. Manager logs the crash, notifies TL, and applies bounded auto-restart with exponential backoff; crash-loop detection freezes repeated failures
 4. TL is notified via a custom message: "Member 'analyzer' 进程异常退出（code: 1），需检查崩溃原因。"
    - Exit code 143 (SIGTERM) is treated as normal stop via `stop_member`, no notification sent
-5. TL can use `start_member` to manually restart after investigating
+5. TL can use `stop_member` + `start_member` to intervene manually; a restarted Member resumes its persisted session when available
 
 ### Member process stuck / unresponsive
 
-- `wait_and_get_member_status` RPC command times out → status is reported as "error"
+- `wait_and_get_member_status` waits for the all-idle condition until the configured diagnostic deadline (`waitTimeoutMinutes`, default 15 minutes; `0` means unlimited); expiry returns the current statuses and stuck-member recovery guidance
 - TL can use `stop_member` + `start_member` to restart
 
 ### TL crash
@@ -968,7 +972,7 @@ Dynamic sessions (`_dynamic_<ts>`) use their unique team name for isolation:
 ```
 
 Member sessions use `pi --mode rpc --session-dir <path>` so session files are persisted and recoverable.
-On `/team stop`, the session subdirectory (`<sessionId>`) is removed entirely.
+On `/team stop` and `session_shutdown`, the session subdirectory (`<sessionId>`) is preserved and its manifest is marked `stopped` (or left `active` for an interrupted shutdown); use `/team resume` to restore it and `/team delete` for explicit disk cleanup.
 
 ## 14. Shared Context
 
@@ -1049,7 +1053,7 @@ TEAM_SHARED_CONTEXT_PATH=~/.pi/top-notch-team/sessions/refactoring/.shared-conte
 |-------|------|---------------|----------------|
 | **Unit** | Pure logic: YAML validation, message queue, routing, session state, env var helpers | None (pure functions) | vitest |
 | **Integration** | pi-dependent: command handlers, tl-tools, member.ts, process manager | Mock `ExtensionAPI`, `ChildProcess`, `WritableStream` via `vi.mock()` or factory injection | vitest + vi |
-| **E2E** | Real pi RPC: spawn `pi --mode rpc`, send JSONL, verify events | Real pi binary (no mocking) | vitest + exec |
+| **E2E** | `src/tools/goal-tools.agent-session.test.ts` uses the installed pi 0.83.0 AgentSession with a deterministic in-process provider; CLI smoke loads `./index.ts` with no tools | Real pi 0.83.0 host lifecycle; provider transport only is faked | vitest + `./node_modules/.bin/pi --mode json --no-tools -e ./index.ts` |
 
 ### Patterns
 
@@ -1781,3 +1785,103 @@ seg += t.contextInfo.percent === null ? " ?" : ` ${Math.round(t.contextInfo.perc
 ### 验收对照
 
 显示层 percent null 显示 "?"（无 0% 误导）✓（widget + inspector 两处）；数值仍原样百分比 ✓（既有用例锁定）；ADR-0007 记录完成（含实现位置与成本说明）✓；未引入其他本地功能变更 ✓（严格 Phase 2 范围）；全量测试绿色 ✓。
+
+## 26. Goal Reminder Lifecycle（阶段 1–3 收口）
+
+本节是 Goal reminder 的实现契约。Goal reminder 只约束 TL 自己的 outer `AgentSession` 生命周期，不等待 Member idle，也不改变消息路由、Member 状态机或自动压缩算法。当前高保真夹具固定使用安装的 pi `0.83.0`；`sendUserMessage` 的 API 形态和事件时序以该版本为准，不能把其他版本的实现细节当作本地保证。
+
+### 26.1 核心不变式
+
+- `agent_end` 是低层回合的中间结束点，只记录本 outer run 的最新 candidate，**绝不发送提醒**。
+- `agent_settled` 是唯一提醒投递边界。retry、native compaction、queued continuation 等 post-run 工作结束前，任何回调都不能进入提醒 API。settled listener 内仅使用一次 `setTimeout(0)` 隔离 listener 重入，不把 timer 当作生命周期判断或重试机制。
+- 只有 session active、Goal 存在且未完成、candidate 身份仍匹配、run 未 abort、settled context 可读且未 abort、`ctx.isIdle() === true` 时才调用普通 `pi.sendUserMessage(prompt)`；不传 `deliverAs: "followUp"`。忙态保留单 candidate，等待下一次合法 settled，而不是向忙碌 TL 排队。
+- `finish_goal` 是完成状态的权威来源；完成、reset、teardown、session/Goal rollover 或取消都会使旧 candidate 失效。
+
+### 26.2 RunState 与身份令牌
+
+`goal-tools.ts` 的模块级状态分成 Goal、outer run、candidate 和投递确认四层：
+
+| 层 | 关键字段 | 作用 |
+|---|---|---|
+| Goal | `activeGoal`, `goalGeneration` | 目标文本、可验证条件、完成状态；替换 Goal 时递增 generation |
+| Session | `sessionId`, `sessionEpoch` | 防止旧团队会话的 late event 污染新会话 |
+| RunState | `runId`, `signals`, `sawAgentEnd`, `settled`, `aborted`, `candidate` | 将 retry/compaction/queued continuation 归并到同一个 outer run，并在 reset barrier 解除前拒绝旧 continuation |
+| Marker association | `suppressReminderCandidate`, `stalePromptPending`, `sawUserPrompt` | 关联已确认 reminder continuation；stale marker 只在首个用户 prompt 上判定 |
+| Submission | `pendingSubmission`, `acknowledgedSubmission`, `uncertainSubmissions` | 区分待 ACK、已关联下一 run、void 无 ACK 的不确定投递 |
+
+`resetGoal()`、session 变化和 `finish_goal` 先捕获仍可能在宿主中继续的旧 run/marker，再清除当前 candidate；reset barrier 在旧 run 的 `agent_settled` 到达前关闭新 run 接纳。旧 signal 以 `WeakSet` tombstone 保存，避免无界保留 signal 对象。
+
+### 26.3 从 `agent_end` 到唯一投递出口
+
+```mermaid
+sequenceDiagram
+    participant Host as pi 0.83.0 AgentSession
+    participant Goal as goal-tools
+    participant TL as TL run
+
+    TL->>Host: prompt / queued continuation / retry
+    Host-->>Goal: agent_start（建立或复用 outer RunState）
+    Host-->>Goal: agent_end（只记录 candidate）
+    Note over Host,Goal: post-run retry、compaction、queued continuation 仍可能继续
+    Host-->>Goal: agent_settled（唯一 delivery boundary）
+    Goal->>Goal: setTimeout(0) + identity/abort/idle re-check
+    alt valid settled idle run
+        Goal->>Host: sendUserMessage(prompt + hidden marker)
+        Host-->>Goal: before_agent_start(prompt)（marker ACK，可延迟）
+        Host-->>Goal: agent_start / message_start / agent_end / agent_settled
+        Goal->>Goal: suppress this confirmed reminder continuation once
+    else busy, aborted, stale, completed, or invalid identity
+        Goal-->>Goal: retain or discard candidate; no follow-up enqueue
+    end
+```
+
+`agent_settled` 的上下文再次读取 signal 与 `isIdle`。`isIdle` 返回 false 时 candidate 留在单槽 pending，后续 settled 才重试；如果 callback 期间发生 Goal/session 变化或新的 run，则发送前再次校验，避免 check→send race。post-run completion 与 Member idle 无关，成员继续运行不会阻止 TL reminder 的合法投递。
+
+### 26.4 API-only cooldown 与失败语义
+
+冷却窗口为 10 秒，`lastReminder.at` 只在所有 guard 通过、即将调用 `sendUserMessage` 的同步点写入一次。`before_agent_start` ACK、延迟 ACK、1 秒 no-ACK watchdog 都不刷新 cooldown。这样 cooldown 锚定唯一可观察的 API submission 点，不受 native preflight 或 provider 延迟影响。
+
+`sendReminderSafely` 兼容三类适配器结果：
+
+1. 安装 pi 0.83.0 的 `sendUserMessage` 返回 `void`：启动 1000ms 有界诊断 watchdog；无 ACK 仅转入 `uncertainSubmissions` 并通知用户，**不恢复 candidate、不自动重发**。在 marker 被确认或 Goal/session reset 前，新的 reminder submission 被阻止。
+2. 测试/适配器返回 Promise：resolve 视为接受，reject 恢复仍有效 candidate、清除本次 cooldown 并发出失败诊断。
+3. 同步抛错：同样恢复 candidate 并诊断；任何失败路径都不使用 `followUp` 规避生命周期边界。
+
+### 26.5 Marker ACK、stale rollover 与消息角色
+
+每个 reminder prompt 追加 HTML 注释 marker `<!-- top-notch-team:goal-reminder:<id> -->`。marker 不显示给用户，但用于关联 fire-and-forget 请求：只有携带完整 prompt 的 `before_agent_start` 能确认 `pendingSubmission` 或 `uncertainSubmissions`；没有 prompt 的 `agent_start` 不是 ACK。
+
+Goal/session rollover 会把仍可能被宿主接受的 pending、uncertain、acknowledged marker 放入精确 `staleRolloverMarkers` Map。Map key 是真实 marker ID，value 只保存 `markerSeen`、来源 `goalGeneration` 与 `sessionEpoch`，最多保留 64 个未解决 marker；达到上限时暂缓新的 reminder submission，`session_shutdown` 清理所有 marker、timer 和 submission。这里的上限是资源保护，不是 marker 过期或自动重试策略。
+
+`before_agent_start` 看到本次 rollover 捕获的完整 marker 后只标记该 marker；`agent_start` 设置 provisional stale association，但不直接 abort。`message_start` 只检查当前 outer run 的**首个 `role === "user"` message**：
+
+- 首个用户 prompt 是该 captured marker → consume 该 marker、抑制 stale run 并 abort 当前 stale prompt；
+- 首个用户 prompt 是普通文本 → 清除 provisional association，fresh run 正常完成；
+- assistant、toolResult、后续 user message、未被本次 rollover 捕获的历史 marker 或已 consume ID → 不参与 stale 判定，不会 abort fresh run。
+
+这一区分是必要的：AgentCore 会为 assistant response、tool/result 发送 `message_start`，模型或工具可能原样回显 HTML 注释；不能把 response-side 文本当作用户 prompt。marker 协议只负责 ACK、stale 隔离和重复提交防护，不是独立 watchdog，也不提供 outbox 或跨 session 持久提醒。
+
+### 26.6 用户可见契约与工具文案
+
+`set_goal` description、prompt guideline、tool result 及 TL 注入均使用同一语义：
+
+> 系统只会在 TL 的一次运行完全结算（不会再自动重试、自动压缩或处理排队续跑）且目标仍未完成时提醒你检查进度；`agent_end` 只是中间结束点，不会触发提醒。完成目标后请调用 `finish_goal` 工具。
+
+英文 description 使用等价表述：`The system reminds you only after the TL run is fully settled (without automatic retry, compaction, or queued continuation) and the goal remains incomplete.` 不得写成“TL 停止时提醒”或把 `agent_end` 描述成发送边界。`finish_goal` 只标记完成并停止当前 Goal reminder；它不会隐式停止 Team Session 或 Member 进程。
+
+### 26.7 Verification and release boundary
+
+高保真测试 `src/tools/goal-tools.agent-session.test.ts` 使用真实 `AgentSession`、`ExtensionRunner`、`ExtensionAPI.sendUserMessage` void wrapper 与 `VERSION === "0.83.0"` 断言，仅 provider transport 使用进程内 deterministic fake。覆盖正常 settled、queued continuation、native auto-compaction、post-run retry、延迟 marker ACK、无 ACK/孤立 `agent_start`、abort、Goal replacement 与 session rollover。
+
+单元测试 `src/tools/goal-tools.test.ts` 覆盖 run/session/Goal 代际、reset barrier、busy/idle、finish、cooldown、sync/Promise/void failure、精确 marker quarantine 上限，以及 assistant/toolResult/后续 user 回显旧 marker的角色过滤。
+
+发布前执行：
+
+```bash
+npx tsc --noEmit
+npm test
+npm run check:goal-reminder
+printf '' | timeout 10 ./node_modules/.bin/pi --mode json --no-tools -e ./index.ts
+```
+
+最后一条命令必须以状态码 0 结束、stderr 为空，并输出一个 `{"type":"session", ...}` JSON 行；CLI 与高保真测试均应使用安装的 pi 0.83.0（不要用系统 PATH 中的其他 pi 版本）。静态检查只扫描 Goal reminder source/docs；Member channel 的 `followUp` 仍是有意保留的独立语义。阶段 3 不引入 outbox、完整 watchdog、Member idle gate、消息路由或新的 ADR。

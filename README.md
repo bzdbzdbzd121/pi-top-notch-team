@@ -249,7 +249,7 @@ members:
 | `wait_and_get_member_status()` | 等待所有 Member 空闲后查看运行状态：idle/working/crashed/stopped。有 Member 在工作则阻塞。无参数。 |
 | `add_dynamic_member(name, label, systemPrompt, model?)` | 在 /team dynamic 模式下注册成员（name=标识符，label=中文显示名） |
 | `team_send_and_wait({tasks: [{to, content}], nextSteps})` | 向一个或多个成员发送消息并等待全部响应。tasks 数组支持向不同成员并发派发以并行执行；部分成员失败时返回部分结果。nextSteps 在 wait 结束后随结果返回。 |
-| `set_goal(text, criteria)` | 设定带可验证完成标准的会话目标；TL 在目标达成前停下时系统会自动重新触发它。 |
+| `set_goal(text, criteria)` | 设定带可验证完成标准的会话目标；仅在 TL 一次运行完全结算（不会再自动重试、自动压缩或处理排队续跑）且目标未完成时提醒继续，`agent_end` 不会单独触发提醒。 |
 | `finish_goal()` | 标记当前目标完成，停止提醒系统。 |
 
 这些工具仅在团队会话活跃期间注册并可用。

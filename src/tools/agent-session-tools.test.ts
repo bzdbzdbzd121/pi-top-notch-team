@@ -213,6 +213,8 @@ describe("stop_team_session (ADR-0003)", () => {
     expect(teamCtx.agentInitiatedTask).toBeNull();
 
     expect(result.content[0].text).toContain("已结束");
+    expect(result.content[0].text).toContain("会话数据已保留");
+    expect(result.content[0].text).toContain("/team resume");
     expect(result.details.stopped).toBe(true);
   });
 });

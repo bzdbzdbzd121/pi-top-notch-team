@@ -18,7 +18,7 @@ export async function handleStop(
   }
 
   // Shared teardown with the stop_team_session tool (ADR-0003): stop members,
-  // deactivate tools, remove widgets, clean up session dir, end session.
+  // deactivate tools, remove widgets, preserve the resumable session dir, end session.
   const { teamName } = await teardownTeamSession(pi, teamCtx);
 
   // Clear stale "团队成员运行中" status bar (belt-and-suspenders with agent_settled)

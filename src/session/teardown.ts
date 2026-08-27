@@ -11,7 +11,7 @@ import { markManifestStopped, resetManifestRuntimeContext } from "./manifest";
  * Single implementation behind both `/team stop` (user-initiated sessions)
  * and the `stop_team_session` tool (agent-initiated sessions): stop all
  * member processes, cancel pending waiters, deactivate session tools,
- * remove widgets, best-effort session directory cleanup, reset session/goal
+ * remove widgets, preserve the resumable session directory, reset session/goal
  * state. UI concerns (notify / status bar) stay with the caller.
  *
  * @returns the ended team's name (for caller messaging)

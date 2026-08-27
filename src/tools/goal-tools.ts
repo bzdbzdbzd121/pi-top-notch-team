@@ -538,7 +538,7 @@ function sendReminderSafely(
     }
   } catch (error) {
     // A new run can begin between the idle check and this call. Do not retry
-    // with followUp: that would reintroduce the original premature-trigger
+    // with queued delivery: that would reintroduce the original premature-trigger
     // behavior. Restore the candidate for a later settled boundary instead.
     recover(error);
   }
@@ -917,7 +917,7 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
       }
       if (!idle.idle) {
         // Preserve the candidate. A later settled event can retry it without
-        // using followUp (which would hide the lifecycle race).
+        // using member-style queued delivery (which would hide the lifecycle race).
         return;
       }
 
