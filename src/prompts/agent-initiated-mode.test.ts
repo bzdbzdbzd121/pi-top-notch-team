@@ -46,8 +46,22 @@ describe("buildAgentInitiatedPrompt (ADR-0003)", () => {
       expect(prompt).toContain("无读取频率限制");
     });
 
-    it("keeps the code-write boundary (structural safety)", () => {
-      expect(prompt).toContain("不得写代码文件");
+    it("allows ALL tools in the design phase (write/edit/bash unrestricted)", () => {
+      expect(prompt).not.toContain("不得写代码文件");
+      expect(prompt).not.toContain("设计阶段不可用");
+      expect(prompt).toContain("全部工具可用");
+      expect(prompt).toContain("任意扩展名");
+    });
+
+    it("keeps delegation-first as a SOFT guideline, not a hard block", () => {
+      expect(prompt).toContain("把重活交给成员");
+      expect(prompt).toContain("修补/收尾/验证");
+      expect(prompt).not.toContain("系统硬阻断");
+    });
+
+    it("keeps the .shared-context.md write_shared_context contract", () => {
+      expect(prompt).toContain(".shared-context.md");
+      expect(prompt).toContain("write_shared_context");
     });
 
     it("guides the autonomous landing sequence", () => {
@@ -79,8 +93,17 @@ describe("buildAgentInitiatedPrompt (ADR-0003)", () => {
       expect(prompt).toContain("无派发管制守卫");
     });
 
-    it("keeps the code-write boundary with filesystem rationale", () => {
-      expect(prompt).toContain("共享同一文件系统");
+    it("replaces the hard code-write boundary with write discipline", () => {
+      expect(prompt).not.toContain("不得写代码文件");
+      expect(prompt).not.toContain("一律委派给成员");
+      expect(prompt).not.toContain("系统硬阻断");
+      // 自由编辑 + 写纪律（共享文件系统）
+      expect(prompt).toContain("任意扩展名");
+      expect(prompt).toContain("编辑前确认");
+      expect(prompt).toContain("避免互相覆盖");
+      expect(prompt).toContain("重新验证");
+      // 委派为主、亲手为辅（兜底能力）
+      expect(prompt).toContain("兜底");
     });
 
     it("defines the closing sequence: report → finish_goal → stop_team_session", () => {

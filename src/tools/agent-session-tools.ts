@@ -101,7 +101,7 @@ export function registerStartTeamSessionTool(deps: AgentSessionToolsDeps): void 
       return textResult(
         `✅ 团队会话「${teamName}」已启动（agent 自主模式，当前为设计阶段）。任务目标已自动设定为会话 Goal。\n\n` +
         `接下来按顺序推进（全程自主，无需等待用户确认）：\n` +
-        `1. **任务拆分与团队设计** — 围绕 task 拆交付物、画依赖图；可自由 read 代码/文档做侦察（此模式下无读取频率限制），但不得写代码文件\n` +
+        `1. **任务拆分与团队设计** — 围绕 task 拆交付物、画依赖图；可自由 read 代码/文档做侦察（此模式下无读取频率限制），可自由编辑文件（写纪律见系统提示词）\n` +
         `2. **add_dynamic_member** — 逐个注册成员（name 英文小写标识符，label 中文，systemPrompt 写清职责与输出规范）\n` +
         `3. **write_shared_context** — 写入项目背景、任务书（含验收标准）、成员分工、工作流、协作规则（未写入前 start_member 会被拦截）\n` +
         `4. **start_member** — 启动成员，自动进入执行阶段\n` +

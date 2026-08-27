@@ -436,11 +436,40 @@ export default function (pi: ExtensionAPI) {
     const sessionForGuard = getSessionState();
     if (!sessionForGuard.active) return; // only block during active team session
 
-    // ADR-0003: dispatch-policing guards (design read limiter, TL pre-dispatch
-    // guard) apply ONLY to user-initiated sessions. In agent-initiated sessions
-    // the team is the agent's own chosen means — reading/analyzing freely is
-    // legitimate. Write guards (below) apply to both origins.
+    // ADR-0003 (revised): dispatch-policing guards (design read limiter, TL
+    // pre-dispatch guard) AND the write restriction apply ONLY to
+    // user-initiated sessions. Agent-initiated sessions get full tool freedom
+    // via the early-exit branch below; the only origin-independent rule is the
+    // .shared-context.md redirect (write_shared_context gate).
     const isAgentInitiated = sessionForGuard.origin === "agent";
+
+    // ── Agent-initiated session: full tool freedom (ADR-0003 revision) ──
+    // The team is the agent's own chosen means — the user only cares about the
+    // final result — so the TL's tool surface is unrestricted: design AND
+    // execution phases both allow write/edit (any extension), bash,
+    // fetch_content, ctx_execute, mcp, etc. (same surface as normal mode).
+    // This early exit fires BEFORE phase/whitelist resolution, so both phases
+    // are identical by construction.
+    // The single origin-independent rule that remains: .shared-context.md must
+    // be written via write_shared_context — the start_member hard gate depends
+    // on that tool setting the sharedContextWritten flag (mechanism contract,
+    // not a file-type restriction; applies to user-origin sessions too).
+    // Note: this branch skips tlReadGuard.recordDispatch — that guard is
+    // user-origin-only; if it is ever reused with origin-specific thresholds,
+    // the dispatch recording must be handled here as well.
+    if (isAgentInitiated) {
+      if (event.toolName === "write" || event.toolName === "edit") {
+        const filePath = extractPathFromInput(event.input) ?? "";
+        if (filePath.endsWith(".shared-context.md")) {
+          return {
+            block: true,
+            reason:
+              `共享上下文必须通过 \`write_shared_context\` 工具写入（该工具会记录写入状态，未写入前 start_member 会被拦截）。`,
+          };
+        }
+      }
+      return; // allowed — all tools pass in agent-initiated sessions
+    }
 
     // ── Resolve current phase ──
     const isDesignPhase = teamCtx.isDynamicSession && teamCtx.dynamicPhase === "design";

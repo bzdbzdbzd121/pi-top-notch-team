@@ -12,8 +12,14 @@ import { getSharedContextPath } from "../session/shared-context";
  * - Contains no first-action protocol — dispatch-policing guards do not apply
  *   to agent-initiated sessions. Reading/analyzing to ground task design and
  *   write high-quality briefs is explicitly allowed.
- * - Keeps the write guards: the TL still may not edit code — TL and member
- *   processes share one filesystem (structural safety, not distrust).
+ * - Write guards are LIFTED (ADR-0003 revision): the TL may freely read AND
+ *   edit files (any extension, both phases) — the team is the agent's own
+ *   chosen means and the user only cares about the result. The prompt guides
+ *   a delegation-first work style with write discipline (check no member is
+ *   working on the same file before editing) instead of hard blocks.
+ * - Keeps the .shared-context.md contract: it must be written via
+ *   write_shared_context (the start_member hard gate depends on the flag it
+ *   sets) in both phases.
  * - Defines the full lifecycle: design → execute → report → finish_goal →
  *   stop_team_session.
  *
@@ -61,14 +67,14 @@ function designPhasePrompt(sharedCtxPath: string, memberLines: string, team: Tea
 
 ### 本阶段的自由度与边界
 
-**自由（与手动会话不同，你不受读取限制）：**
+**自由（与普通模式一致，不受任何工具限制）：**
+  ✅ 全部工具可用 — write / edit（任意扩展名，含代码文件）/ bash / fetch_content / ctx_execute / mcp 等不限
   ✅ read — 自由读取代码与文档（此模式下无读取频率限制）。侦察代码结构、确认事实、评估工作量，是写出高质量任务书和成员职责的必要基础
-  ✅ add_dynamic_member / write_shared_context / write（仅 .md）/ start_member / stop_team_session
-  ✅ 其他团队管理工具
+  ✅ add_dynamic_member / write_shared_context / start_member / stop_team_session 及其他团队管理工具
 
-**边界（系统硬阻断，结构性安全而非不信任）：**
-  ❌ bash / edit / write（非 .md 文件）/ fetch_content — 设计阶段不可用，不得写代码文件
-  ❌ 自己动手完成使命中的实际工作——那是成员的职责
+**软引导（非硬阻断）：**
+  ⚠️ 自己动手完成使命中的实际工作不是默认选择——把重活交给成员，自己只做必要的修补/收尾/验证
+  ⚠️ 唯一机制契约：.shared-context.md 必须通过 \`write_shared_context\` 写入（该工具会记录写入状态，未写入前 start_member 会被系统拦截）
 
 若中途判断使命不可行或不值得用团队完成 → 调用 \`stop_team_session\` 放弃委派，回到单 agent 模式直接向用户说明。
 
@@ -101,11 +107,13 @@ function executionPhasePrompt(sharedCtxPath: string, memberLines: string, team: 
 
 **自由：**
   ✅ read / bash / web_search 等只读侦察不受拦截（自主会话无派发管制守卫）——核查成员产出、定位问题、撰写精准派发指令都需要
-  ✅ 全部团队管理工具 + write/edit（仅 .md）
+  ✅ 全部团队管理工具 + write / edit — 任意扩展名文件均可自由编辑（含代码文件）
 
-**边界（系统硬阻断，结构性安全而非不信任）：**
-  ❌ write/edit 代码文件 — TL 与成员进程共享同一文件系统，同时写入会物理性互相覆盖。代码修改一律委派给成员
-  🚪 想亲手改代码的退路永远存在：\`stop_team_session\` 结束会话后自由编辑——但既然选择了团队，就把代码工作交给成员
+**写纪律（共享文件系统，非硬阻断）：**
+  ⚠️ 编辑前确认没有成员正在处理同一文件（\`list_members\` / \`get_member_log\` 探查，或 \`team_send_and_wait\` 告知成员）——避免互相覆盖
+  ⚠️ 修改后如影响成员产出，通知成员重读/重新验证
+  ⚠️ 仍以委派为主、亲手修改为辅——亲手修改是兜底能力（修复成员产出、收尾、补测试/构建配置），不是替代成员
+  ⚠️ .shared-context.md 必须通过 \`write_shared_context\` 写入（该工具会记录写入状态，未写入前 start_member 会被系统拦截）
 
 ### 委派规范
 1. 用 \`team_send_and_wait\` 派发，消息中明确：任务完成后必须回复 TL；报告/方案/设计文档**写入文件**，不要在消息通道塞大段内容；说明前置依赖

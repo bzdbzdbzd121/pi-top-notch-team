@@ -808,6 +808,162 @@ describe("write_shared_context in tool_call guard", () => {
   });
 });
 
+// ── Agent-initiated session: full tool freedom (ADR-0003 revision) ────
+
+// Sessions started via start_team_session (origin: "agent") no longer restrict
+// the TL's tools: the early-exit branch fires BEFORE phase/whitelist resolution,
+// so design + execution phases both allow write/edit (any extension), bash,
+// ctx_execute, fetch_content, mcp, etc. — the same tool surface as normal mode.
+// The single origin-independent rule that remains: .shared-context.md must be
+// written via write_shared_context (the start_member hard gate depends on that
+// tool setting the session flag — a mechanism contract, not a file-type
+// restriction). User-origin sessions (/team start, /team dynamic) are untouched.
+
+describe("agent-initiated session tool_call guard (ADR-0003 revision)", () => {
+  let pi: ExtensionAPI;
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    delete process.env.TEAM_ROLE;
+    tmpDir = mkdtempSync(join(tmpdir(), "agent-guard-"));
+    process.env.TOP_NOTCH_TEAM_ROOT = tmpDir;
+    pi = createMockPi();
+    const mod = await import("../index");
+    mod.default(pi);
+  });
+
+  afterEach(() => {
+    delete process.env.TOP_NOTCH_TEAM_ROOT;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function getHandler(name: string): Function {
+    const onCalls = (pi.on as ReturnType<typeof vi.fn>).mock.calls;
+    return onCalls.find((c: any) => c[0] === name)![1];
+  }
+
+  async function startAgentSession() {
+    const { startSession, endSession } = await import("./session/state");
+    endSession();
+    startSession(
+      {
+        name: "test-agent-team",
+        description: "Test",
+        members: [{ name: "worker", systemPrompt: "do work" }],
+      },
+      { origin: "agent" },
+    );
+  }
+
+  /** Enter the REAL design phase via /team dynamic, then flip origin to agent. */
+  async function startAgentDesignPhase() {
+    const cmdDef = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    await cmdDef.handler("dynamic", createMockContext());
+    const { startSession, endSession } = await import("./session/state");
+    endSession();
+    startSession(
+      { name: "test-agent-team", description: "Test", members: [] },
+      { origin: "agent" },
+    );
+  }
+
+  it("design phase: write to a code file is allowed", async () => {
+    await startAgentDesignPhase();
+    const toolCall = getHandler("tool_call");
+    expect(toolCall({ toolName: "write", input: { path: "/tmp/src/a.ts", content: "code" } })).toBeUndefined();
+  });
+
+  it("design phase: edit to a code file is allowed", async () => {
+    await startAgentDesignPhase();
+    const toolCall = getHandler("tool_call");
+    expect(toolCall({ toolName: "edit", input: { path: "/tmp/src/a.ts", edits: [] } })).toBeUndefined();
+  });
+
+  it("design phase: bash is allowed (inverse of the user-origin design-phase block)", async () => {
+    await startAgentDesignPhase();
+    const toolCall = getHandler("tool_call");
+    expect(toolCall({ toolName: "bash", input: { command: "cat src/a.ts" } })).toBeUndefined();
+  });
+
+  it("design phase: non-whitelist tools (fetch_content, ctx_execute) are allowed", async () => {
+    await startAgentDesignPhase();
+    const toolCall = getHandler("tool_call");
+    expect(toolCall({ toolName: "fetch_content", input: { url: "https://example.com" } })).toBeUndefined();
+    expect(toolCall({ toolName: "ctx_execute", input: { language: "bash", code: "ls" } })).toBeUndefined();
+  });
+
+  it("execution phase: write/edit to code files are allowed", async () => {
+    await startAgentSession();
+    const toolCall = getHandler("tool_call");
+    expect(toolCall({ toolName: "write", input: { path: "src/lib.ts", content: "code" } })).toBeUndefined();
+    expect(toolCall({ toolName: "edit", input: { path: "src/lib.ts", edits: [] } })).toBeUndefined();
+  });
+
+  it("execution phase: non-whitelist tool (ctx_execute) is allowed", async () => {
+    await startAgentSession();
+    const toolCall = getHandler("tool_call");
+    expect(toolCall({ toolName: "ctx_execute", input: { language: "bash", code: "ls" } })).toBeUndefined();
+  });
+
+  it("design phase: write to .shared-context.md still blocked, redirected to write_shared_context", async () => {
+    await startAgentDesignPhase();
+    const toolCall = getHandler("tool_call");
+    const blocked = toolCall({
+      toolName: "write",
+      input: { path: "/tmp/sessions/test-agent-team/abc/.shared-context.md", content: "# doc" },
+    });
+    expect(blocked).toEqual(expect.objectContaining({ block: true }));
+    expect(blocked.reason).toContain("write_shared_context");
+  });
+
+  it("execution phase: edit to .shared-context.md still blocked", async () => {
+    await startAgentSession();
+    const toolCall = getHandler("tool_call");
+    const blocked = toolCall({
+      toolName: "edit",
+      input: { path: "sessions/test-agent-team/abc/.shared-context.md", edits: [] },
+    });
+    expect(blocked).toEqual(expect.objectContaining({ block: true }));
+    expect(blocked.reason).toContain("write_shared_context");
+  });
+
+  it("write_shared_context itself is allowed", async () => {
+    await startAgentSession();
+    const toolCall = getHandler("tool_call");
+    expect(toolCall({ toolName: "write_shared_context", input: { content: "# doc" } })).toBeUndefined();
+  });
+
+  it("management tools still pass through (dispatch tracking unaffected)", async () => {
+    await startAgentSession();
+    const toolCall = getHandler("tool_call");
+    expect(toolCall({ toolName: "team_send_and_wait", input: { tasks: [{ to: "worker", content: "go" }] } })).toBeUndefined();
+    expect(toolCall({ toolName: "list_members", input: {} })).toBeUndefined();
+    expect(toolCall({ toolName: "start_member", input: { name: "worker" } })).toBeUndefined();
+  });
+
+  it("regression: user-origin sessions still block code writes and design-phase bash", async () => {
+    const { startSession, endSession } = await import("./session/state");
+
+    // user-origin execution phase: code write blocked
+    endSession();
+    startSession({ name: "test-team", description: "Test", members: [{ name: "w", systemPrompt: "x" }] });
+    const toolCall = getHandler("tool_call");
+    const blockedExec = toolCall({ toolName: "write", input: { path: "/tmp/src/a.ts", content: "code" } });
+    expect(blockedExec).toEqual(expect.objectContaining({ block: true }));
+    expect(blockedExec.reason).toContain("代码文件");
+
+    // user-origin design phase (real /team dynamic): code write + bash blocked
+    endSession();
+    const cmdDef = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    await cmdDef.handler("dynamic", createMockContext());
+    const blockedDesign = toolCall({ toolName: "write", input: { path: "/tmp/src/a.ts", content: "code" } });
+    expect(blockedDesign).toEqual(expect.objectContaining({ block: true }));
+    expect(blockedDesign.reason).toContain("代码文件");
+    expect(toolCall({ toolName: "bash", input: { command: "ls" } })).toEqual(expect.objectContaining({ block: true }));
+  });
+});
+
 // ── Session-ended banner in before_agent_start ─────────────────────
 
 // After the user exits a team session (/team stop or stop_team_session), the
