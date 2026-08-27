@@ -47,6 +47,8 @@ interface GoalReminderRunState {
   settled: boolean;
   /** Suppress the candidate produced by the run started by a reminder. */
   suppressReminderCandidate: boolean;
+  /** A rollover marker was seen, but the corresponding user message is not classified yet. */
+  stalePromptPending: boolean;
   /** Every low-level prompt/continue signal seen in this outer run. */
   signals: Set<unknown>;
   /** Session identity captured when this outer run started. */
@@ -356,6 +358,7 @@ function createRun(ctx: unknown): GoalReminderRunState {
     aborted: signalAborted(signal),
     settled: false,
     suppressReminderCandidate: false,
+    stalePromptPending: false,
     signals,
     sessionId: session?.sessionId ?? null,
     sessionEpoch,
@@ -622,6 +625,18 @@ function extractReminderMarker(prompt: string): string | null {
     marker.length - REMINDER_MARKER_SUFFIX.length,
   );
   return /^\d+$/.test(id) ? marker : null;
+}
+
+function messageText(message: unknown): string {
+  const content = (message as { content?: unknown } | null | undefined)?.content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((part): part is { type?: unknown; text: string } =>
+      Boolean(part) && typeof part === "object" && typeof (part as { text?: unknown }).text === "string",
+    )
+    .map((part) => part.text)
+    .join("");
 }
 
 function acknowledgeReminderPrompt(prompt: unknown): boolean {
@@ -959,17 +974,11 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
   // before_agent_start is the first lifecycle event carrying the prompt. It
   // is the only event that can associate a fire-and-forget request with the
   // run it eventually starts; agent_start has no payload in pi 0.83.0.
-  pi.on("before_agent_start", (event, ctx) => {
-    const stale = acknowledgeReminderPrompt((event as { prompt?: unknown } | null | undefined)?.prompt);
-    if (stale) {
-      // Best-effort cancellation while the stale prompt is entering the new
-      // session. agent_start below repeats the cancellation once a run exists.
-      try {
-        ctx.abort();
-      } catch {
-        // A stale context must never break the host lifecycle.
-      }
-    }
+  pi.on("before_agent_start", (event) => {
+    // Do not abort from this preflight callback: pi 0.83.0 has not created the
+    // run signal yet. The following agent/message lifecycle events decide
+    // whether this marker actually started a stale prompt.
+    acknowledgeReminderPrompt((event as { prompt?: unknown } | null | undefined)?.prompt);
   });
 
   // agent_start begins (or resumes) an outer AgentSession run. Retry,
@@ -1005,19 +1014,50 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
         staleRolloverSourceSessionEpoch < run.sessionEpoch;
       staleRolloverMarkerRunCount -= 1;
       if (staleIdentity) {
-        run.suppressReminderCandidate = true;
-        try {
-          ctx.abort();
-        } catch {
-          // Stale prompt cancellation is best effort; candidate suppression
-          // remains the correctness guard if the host cannot abort here.
-        }
+        // Defer suppression until message_start. If the host rejected the old
+        // prompt after before_agent_start, this agent_start may instead belong
+        // to a genuinely fresh prompt and must not be swallowed.
+        run.stalePromptPending = true;
       }
     }
 
     if (runWasAborted(run)) {
       pendingReminder = null;
     }
+  });
+
+  // A stale before_agent_start marker is not enough to identify the run: pi
+  // can reject the prompt before agent_start. The first prompt message
+  // provides the decisive association. A normal prompt message clears the
+  // provisional stale flag; the old reminder text marks the run for suppression.
+  pi.on("message_start", (event, ctx) => {
+    const run = currentRun;
+    if (!run) return;
+    const message = (event as { message?: unknown } | null | undefined)?.message;
+    if (!message) return;
+    const marker = extractReminderMarker(messageText(message));
+    const markerId = marker ? reminderMarkerId(marker) : null;
+    const isStaleMarker =
+      markerId !== null &&
+      staleRolloverMarkerWatermark !== null &&
+      markerId <= staleRolloverMarkerWatermark;
+    if (isStaleMarker) {
+      // Also inspect the message itself: an old prompt can be delayed until
+      // after a fresh run consumed the provisional slot at agent_start.
+      run.stalePromptPending = false;
+      run.suppressReminderCandidate = true;
+      try {
+        // At message_start the AgentCore run owns an active signal, so this
+        // abort can stop the stale prompt rather than touching a fresh run.
+        ctx.abort();
+      } catch {
+        // Candidate suppression remains the correctness guard if abort fails.
+      }
+      return;
+    }
+    // A normal message proves that this run is not the stale prompt. This is
+    // the key recovery path when the old host prompt had no agent_start.
+    run.stalePromptPending = false;
   });
 
   // agent_end only records the outcome and a candidate. It is deliberately
@@ -1035,6 +1075,14 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
     const assistantMsg = messages.findLast?.((m: any) => m?.role === "assistant");
     if (assistantMsg?.stopReason === "aborted") {
       run.aborted = true;
+    }
+
+    // If no user message arrived, the host aborted/rejected the provisional
+    // stale prompt after agent_start. Treat that run as stale as well; a normal
+    // successful run has already cleared stalePromptPending in message_start.
+    if (run.stalePromptPending) {
+      run.stalePromptPending = false;
+      run.suppressReminderCandidate = true;
     }
 
     // The run started by a confirmed reminder must not feed that same goal
@@ -1100,8 +1148,10 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
     }
     // Mark the outer run settled even when it was aborted. Otherwise a later
     // legitimate agent_start would be mistaken for the same aborted run and
-    // could never produce a fresh candidate.
+    // could never produce a fresh candidate. A run that reaches settlement
+    // without a message_start cannot keep a provisional stale association.
     run.settled = true;
+    run.stalePromptPending = false;
     if (run.aborted) {
       run.candidate = null;
       pendingReminder = null;

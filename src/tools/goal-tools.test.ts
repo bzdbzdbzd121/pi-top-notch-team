@@ -295,6 +295,51 @@ describe("registerGoalAgentHandler reminder", () => {
     expect(pi.sendUserMessage.mock.calls[1][0]).toContain("replacement goal");
   });
 
+  it("does not let a stale marker without agent_start swallow the next fresh run", async () => {
+    vi.useFakeTimers();
+    setupActiveGoal();
+    const { pi, handlers } = createMockPi();
+    registerGoalAgentHandler(pi as any);
+    pi.sendUserMessage.mockImplementation(() => undefined as any);
+
+    await finishLowLevelRun(handlers);
+    await settleRun(handlers);
+    await flushReminderTimer();
+    const staleReminderPrompt = pi.sendUserMessage.mock.calls[0][0];
+
+    // Rollover the goal while the accepted marker is still unresolved. Then
+    // before_agent_start observes the old marker, but the host rejects/aborts
+    // that prompt before emitting agent_start. The next real run must not
+    // consume the old marker's suppression slot.
+    resetGoal();
+    setGoalForTesting({ text: "replacement goal", criteria: "- replacement", completed: false });
+    const staleContext = {
+      signal: { aborted: false },
+      isIdle: () => true,
+      abort: vi.fn(),
+    };
+    await handlers["before_agent_start"]({ prompt: staleReminderPrompt }, staleContext);
+
+    const freshContext = activeContext();
+    await handlers["agent_start"]({}, freshContext);
+    await handlers["message_start"](
+      {
+        message: {
+          role: "user",
+          content: [{ type: "text", text: "fresh user prompt" }],
+        },
+      },
+      freshContext,
+    );
+    await handlers["agent_end"]({ messages: [] }, freshContext);
+    await settleRun(handlers, freshContext);
+    await flushReminderTimer();
+
+    expect(staleContext.abort).not.toHaveBeenCalled();
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
+    expect(pi.sendUserMessage.mock.calls[1][0]).toContain("replacement goal");
+  });
+
   it("retains multiple stale markers across two session rollovers", async () => {
     vi.useFakeTimers();
     setupActiveGoal();
