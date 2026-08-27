@@ -43,6 +43,7 @@ forbidMatch("auto-compact-owned batch budget", lifecycleDocs, /自动压缩[^\n]
 forbidMatch("registry disappearance wording", lifecycleDocs, /会话之外，这些工具不存在于工具注册表中/);
 forbidMatch("registry disappearance wording", lifecycleDocs, /Not registered and not available outside a Team Session/);
 forbidMatch("registry disappearance wording", lifecycleDocs, /Outside a session the tool registry contains none of them\./);
+forbidMatch("agent teardown directory cleanup wording", lifecycleDocs, /widgets off,\s*dir cleanup/);
 requireMatch("fully-settled wording", source, /一次运行完全结算/);
 requireMatch("fully-settled wording in design", read("DESIGN.md"), /Goal Reminder Lifecycle/i);
 

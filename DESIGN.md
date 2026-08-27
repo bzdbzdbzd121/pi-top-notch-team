@@ -1353,7 +1353,8 @@ TL calls stop_team_session()               ← session-scoped; ACTIVATED only in
   │          (user-initiated lifecycle stays user-owned, /team stop)
   └─ teardownTeamSession()                   src/session/teardown.ts — shared with
                                                /team stop: stop members, deactivate
-                                               tools, widgets off, dir cleanup,
+                                               tools, widgets off, preserve resumable
+                                               dir; disk cleanup via /team delete;
                                                endSession + resetGoal
 ```
 
