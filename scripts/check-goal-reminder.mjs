@@ -16,7 +16,9 @@ function forbidMatch(label, text, pattern) {
 
 const source = read("src/tools/goal-tools.ts");
 const index = read("index.ts");
-const lifecycleDocs = ["AGENTS.md", "DESIGN.md", "README.md", "CONTEXT.md"].map(read).join("\n");
+const agents = read("AGENTS.md");
+const design = read("DESIGN.md");
+const lifecycleDocs = [agents, design, read("README.md"), read("CONTEXT.md")].join("\n");
 
 // Goal reminders use the ordinary sendUserMessage path. Member-channel
 // follow-up delivery is intentionally outside this scan.
@@ -47,10 +49,13 @@ forbidMatch("registry disappearance wording", lifecycleDocs, /They are \*\*not\*
 forbidMatch("registry disappearance wording", lifecycleDocs, /会话外工具注册表与活跃集均不含任何团队工具/);
 forbidMatch("agent teardown directory cleanup wording", lifecycleDocs, /widgets off,\s*dir cleanup/);
 forbidMatch("session-ended banner omission wording", lifecycleDocs, /When `\/team stop` ends the session, `session\.active` becomes `false` and no extra prompt is injected\./);
-requireMatch("fresh registry qualification", lifecycleDocs, /fresh pi 初始 registry 为空/);
-requireMatch("existing registry qualification", lifecycleDocs, /已有进程[\s\S]{0,80}registry 仍保留[\s\S]{0,80}activeTools/);
+requireMatch("AGENTS #21 fresh registry qualification", agents, /fresh pi 初始 registry 为空/);
+requireMatch("AGENTS #21 existing registry qualification", agents, /已有进程[\s\S]{0,80}registry 仍保留[\s\S]{0,80}activeTools/);
+requireMatch("DESIGN §6 registry/activeTools distinction", design, /remain in the registry after teardown[\s\S]{0,120}removed from `activeTools`/);
+requireMatch("DESIGN §18 resumable teardown", design, /preserve resumable[\s\S]{0,80}disk cleanup via \/team delete/);
+requireMatch("DESIGN session-ended banner", design, /no regular TL instructions[\s\S]{0,180}one-shot session-ended banner may be injected on the next turn/);
 requireMatch("fully-settled wording", source, /一次运行完全结算/);
-requireMatch("fully-settled wording in design", read("DESIGN.md"), /Goal Reminder Lifecycle/i);
+requireMatch("fully-settled wording in design", design, /Goal Reminder Lifecycle/i);
 
 if (failures.length > 0) {
   console.error("Goal reminder static check failed:");
