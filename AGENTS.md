@@ -432,7 +432,7 @@ printf '' | timeout 10 ./node_modules/.bin/pi --mode json --no-tools -e ./index.
 | `/team setting` | Interactive settings menu — member default model (follow TL current model / fixed available model) + auto-compaction (toggle / percent & token thresholds / timeout) + wait budget (等待上限, 0=永不超时 — wait 工具 all-idle deadline 与批屏障共享的顶层通用预算). Also allowed during a session |
 | `/team help` | Display usage help for all subcommands |
 
-## TL Tools (registered + active only during team session)
+## TL Tools (session-scoped registration + activation; exception below)
 
 > **例外（ADR-0003）**：`start_team_session` 在**扩展加载时注册**、会话外可见（见下表）；`stop_team_session` 会话作用域注册、仅自主会话激活。
 
