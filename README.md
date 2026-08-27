@@ -229,7 +229,7 @@ members:
 
 完整架构规范见 [DESIGN.md](DESIGN.md)，决策记录见 [docs/adr/](docs/adr/)。
 
-**TL** — 用户的 pi 会话，扩展加载时注册 `/team` 命令；团队工具在会话启动时按需注册，会话结束时停用。
+**TL** — 用户的 pi 会话，扩展加载时注册 `/team` 命令与 load-time `start_team_session`；9 个 session-scoped tools 在会话启动时按需注册、会话结束时从 activeTools 移除（registry 保留）。
 
 **Member** — 独立的 `pi --mode rpc` 子进程，各自保持上下文。
 
@@ -252,7 +252,7 @@ members:
 | `set_goal(text, criteria)` | 设定带可验证完成标准的会话目标；仅在 TL 一次运行完全结算（不会再自动重试、自动压缩或处理排队续跑）且目标未完成时提醒继续，`agent_end` 不会单独触发提醒。 |
 | `finish_goal()` | 标记当前目标完成，停止提醒系统。 |
 
-这些工具在 fresh pi 进程中尚未注册；首次启动团队会话时按需注册。由于 pi 不提供 unregister API，teardown 后仍保留在 registry；会话外仅从 activeTools 移除，因此不可见且不可调用。
+上述 9 个 session-scoped tools 在 fresh pi 进程中尚未注册；首次启动团队会话时按需注册并在会话期间激活。由于 pi 不提供 unregister API，teardown 后仍保留在 registry；会话外仅从 activeTools 移除，因此不可见且不可调用。`add_dynamic_member` 不属于上述 9 个 session-scoped tools，仅在 dynamic mode bootstrap 时按需注册，预定义 `/team start` 不会注册它。
 
 ## 安装
 

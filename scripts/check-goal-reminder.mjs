@@ -64,6 +64,7 @@ forbidMatch("index registry disappearance wording", index, /outside a session th
 forbidMatch("visibility registry disappearance wording", sessionToolVisibility, /outside a session the tool[\s\S]{0,40}registry contains none of them\./i);
 forbidMatch("shared-context registry disappearance wording", sharedContextTool, /Outside a team session[\s\S]{0,50}it does not exist in the tool registry at all\./i);
 forbidMatch("README registration-only wording", readme, /这些工具仅在团队会话活跃期间注册并可用。/);
+forbidMatch("README mixed-scope registration wording", readme, /这些工具在 fresh pi 进程中尚未注册；首次启动团队会话时按需注册。/);
 forbidMatch("fresh-load test scope wording", indexTests, /must NOT[\s\S]{0,100}exist in the tool registry outside a team session/i);
 forbidMatch("agent teardown directory cleanup wording", lifecycleDocs, /widgets off,\s*dir cleanup/);
 forbidMatch("session-ended banner omission wording", lifecycleDocs, /When `\/team stop` ends the session, `session\.active` becomes `false` and no extra prompt is injected\./);
@@ -89,6 +90,7 @@ for (const adrFile of [
 }
 requireMatch("AGENTS load-time tool entry", agents, /load-time `start_team_session`/);
 requireMatch("README load-time tool entry", readme, /load-time `start_team_session`/);
+requireMatch("README session/dynamic tool scope", readme, /上述 9 个 session-scoped tools[\s\S]{0,220}`add_dynamic_member`[\s\S]{0,120}dynamic mode/);
 requireMatch("AGENTS TL tools scoped title", agents, /## TL Tools \(session-scoped registration \+ activation; exception below\)/);
 requireMatch("ADR-0003 fresh registry qualification", adrAgentSessions, /A fresh pi process starts with no session-scoped team tools in its registry/);
 requireMatch("ADR-0003 activeTools qualification", adrAgentSessions, /remain in the registry after teardown[\s\S]{0,180}removes them from `activeTools` outside a session/);
