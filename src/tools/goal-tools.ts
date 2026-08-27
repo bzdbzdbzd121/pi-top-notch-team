@@ -71,14 +71,22 @@ interface ResetBarrier {
 
 interface ReminderSubmission {
   candidate: GoalReminderCandidate;
-  /** Prompt marker carried through before_agent_start for correlation. */
+  /** Complete prompt marker carried through before_agent_start for correlation. */
   marker: string;
   watchdog: ReturnType<typeof setTimeout>;
+}
+
+interface UncertainSubmission {
+  candidate: GoalReminderCandidate;
+  expiresAt: number;
 }
 
 /** pi 0.83.0's sendUserMessage wrapper returns void; bound the no-ack fallback. */
 const REMINDER_SUBMISSION_ACK_TIMEOUT_MS = 1_000;
 const REMINDER_MARKER_PREFIX = "<!-- top-notch-team:goal-reminder:";
+const REMINDER_MARKER_SUFFIX = " -->";
+const UNCERTAIN_SUBMISSION_TTL_MS = 60_000;
+const MAX_UNCERTAIN_SUBMISSIONS = 32;
 
 let nextRunId = 0;
 let goalGeneration = 0;
@@ -93,8 +101,8 @@ let awaitingFreshRun = false;
 let freshRunRequiresSignal = false;
 let resetBarrier: ResetBarrier | null = null;
 let pendingSubmission: ReminderSubmission | null = null;
-/** Timed-out void submissions remain matchable if their delayed prompt arrives later. */
-const uncertainSubmissionMarkers = new Set<string>();
+/** Timed-out void submissions remain matchable by their complete marker. */
+const uncertainSubmissions = new Map<string, UncertainSubmission>();
 let nextSubmissionId = 0;
 /** Signal identities from invalidated runs; objects are weakly held to avoid unbounded growth. */
 const invalidatedSignalObjects = new WeakSet<object>();
@@ -115,7 +123,7 @@ function clearPendingSubmission(): void {
 
 function clearSubmissionState(): void {
   clearPendingSubmission();
-  uncertainSubmissionMarkers.clear();
+  uncertainSubmissions.clear();
 }
 
 function clearPendingSubmissionForMarker(marker: string): void {
@@ -178,6 +186,19 @@ function signalAborted(signal: unknown): boolean {
 
 function sessionKey(session: { active: boolean; sessionId: string | null }): string {
   return session.active ? `active:${session.sessionId ?? "<none>"}` : "inactive";
+}
+
+function pruneUncertainSubmissions(now = Date.now()): void {
+  for (const [marker, submission] of uncertainSubmissions) {
+    if (submission.expiresAt <= now) {
+      uncertainSubmissions.delete(marker);
+    }
+  }
+  while (uncertainSubmissions.size > MAX_UNCERTAIN_SUBMISSIONS) {
+    const oldest = uncertainSubmissions.keys().next().value;
+    if (typeof oldest !== "string") break;
+    uncertainSubmissions.delete(oldest);
+  }
 }
 
 function currentSessionIdentity(): { active: boolean; sessionId: string | null } | null {
@@ -376,7 +397,7 @@ function buildReminderText(candidate: GoalReminderCandidate): string {
  * while the exact prompt remains available to the LLM runtime.
  */
 function buildReminderPrompt(candidate: GoalReminderCandidate, marker: string): string {
-  return `${buildReminderText(candidate)}\n\n${marker} -->`;
+  return `${buildReminderText(candidate)}\n\n${marker}`;
 }
 
 function sendReminderSafely(
@@ -497,7 +518,11 @@ function armUnobservableSubmission(
     if (!pendingSubmission || pendingSubmission.candidate !== candidate) return;
     const submission = pendingSubmission;
     clearPendingSubmission();
-    uncertainSubmissionMarkers.add(submission.marker);
+    uncertainSubmissions.set(submission.marker, {
+      candidate: submission.candidate,
+      expiresAt: Date.now() + UNCERTAIN_SUBMISSION_TTL_MS,
+    });
+    pruneUncertainSubmissions();
     notifyReminderUnconfirmed(
       pi,
       new Error(
@@ -508,20 +533,48 @@ function armUnobservableSubmission(
   pendingSubmission = { candidate, marker, watchdog };
 }
 
+function extractReminderMarker(prompt: string): string | null {
+  const markerStart = prompt.lastIndexOf(REMINDER_MARKER_PREFIX);
+  if (markerStart < 0) return null;
+  const markerEnd = prompt.indexOf(REMINDER_MARKER_SUFFIX, markerStart);
+  if (markerEnd < 0) return null;
+  const marker = prompt.slice(markerStart, markerEnd + REMINDER_MARKER_SUFFIX.length);
+  const id = marker.slice(
+    REMINDER_MARKER_PREFIX.length,
+    marker.length - REMINDER_MARKER_SUFFIX.length,
+  );
+  return /^\d+$/.test(id) ? marker : null;
+}
+
+function refreshReminderCooldown(candidate: GoalReminderCandidate): void {
+  if (!candidateMatchesCurrentGoal(candidate)) return;
+  lastReminder = {
+    sessionId: candidate.sessionId,
+    goalGeneration: candidate.goalGeneration,
+    at: Date.now(),
+  };
+}
+
 function acknowledgeReminderPrompt(prompt: unknown): void {
   if (typeof prompt !== "string") return;
+  const marker = extractReminderMarker(prompt);
+  if (!marker) return;
 
-  if (pendingSubmission && prompt.includes(pendingSubmission.marker)) {
+  if (pendingSubmission?.marker === marker) {
+    const candidate = pendingSubmission.candidate;
     clearPendingSubmission();
+    refreshReminderCooldown(candidate);
     return;
   }
 
-  for (const marker of uncertainSubmissionMarkers) {
-    if (prompt.includes(marker)) {
-      uncertainSubmissionMarkers.delete(marker);
-      return;
-    }
+  const uncertainSubmission = uncertainSubmissions.get(marker);
+  if (!uncertainSubmission) return;
+  if (uncertainSubmission.expiresAt <= Date.now()) {
+    uncertainSubmissions.delete(marker);
+    return;
   }
+  uncertainSubmissions.delete(marker);
+  refreshReminderCooldown(uncertainSubmission.candidate);
 }
 
 function restoreFailedCandidate(candidate: GoalReminderCandidate, pi: ExtensionAPI, error: unknown): void {
@@ -788,7 +841,7 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
         goalGeneration: candidate.goalGeneration,
         at: now,
       };
-      const marker = `${REMINDER_MARKER_PREFIX}${++nextSubmissionId}`;
+      const marker = `${REMINDER_MARKER_PREFIX}${++nextSubmissionId}${REMINDER_MARKER_SUFFIX}`;
       const prompt = buildReminderPrompt(candidate, marker);
       sendReminderSafely(
         pi,

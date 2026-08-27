@@ -473,6 +473,43 @@ describe("registerGoalAgentHandler reminder", () => {
     await settleRun(handlers, activeContext(unrelatedSignal));
   });
 
+  it("does not accept a marker that only shares a numeric prefix", async () => {
+    vi.useFakeTimers();
+    setupActiveGoal();
+    const { pi, handlers } = createMockPi();
+    registerGoalAgentHandler(pi as any);
+    pi.sendUserMessage.mockImplementation(() => undefined as any);
+
+    await finishLowLevelRun(handlers);
+    await settleRun(handlers);
+    await vi.advanceTimersByTimeAsync(0);
+    const reminderPrompt = pi.sendUserMessage.mock.calls[0][0];
+    const markerStart = reminderPrompt.indexOf("<!-- top-notch-team:goal-reminder:");
+    const markerEnd = reminderPrompt.indexOf(" -->", markerStart);
+    const markerWithoutClosing = reminderPrompt.slice(markerStart, markerEnd);
+    const prefixCollisionPrompt = `${markerWithoutClosing}0 -->`;
+
+    // First move the request into the uncertain-marker table, then submit a
+    // prefix collision. `...:1` must not match `...:10`; match the complete
+    // marker including its closing delimiter before the watchdog can be
+    // cancelled.
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+    await handlers["before_agent_start"]({ prompt: prefixCollisionPrompt }, activeContext());
+
+    // A real delayed prompt with the complete marker must still be able to
+    // refresh the cooldown, proving the prefix collision did not consume it.
+    await vi.advanceTimersByTimeAsync(10_001);
+    await handlers["before_agent_start"]({ prompt: reminderPrompt }, activeContext());
+    const signal = { aborted: false };
+    await handlers["agent_start"]({}, activeContext(signal));
+    await handlers["agent_end"]({ messages: [] }, activeContext(signal));
+    await settleRun(handlers, activeContext(signal));
+    await flushReminderTimer();
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+
   it("correlates a delayed fire-and-forget acknowledgement by before_agent_start prompt", async () => {
     vi.useFakeTimers();
     setupActiveGoal();
@@ -486,9 +523,10 @@ describe("registerGoalAgentHandler reminder", () => {
     await vi.advanceTimersByTimeAsync(0);
     const reminderPrompt = pi.sendUserMessage.mock.calls[0][0];
 
-    // A slow but accepted reminder may cross the old 1s watchdog. It must not
-    // cause a second reminder once its own prompt is finally observable.
-    await vi.advanceTimersByTimeAsync(1_000);
+    // A slow but accepted reminder may cross both the old 1s watchdog and the
+    // 10s reminder cooldown. It must not cause a second reminder once its own
+    // prompt is finally observable.
+    await vi.advanceTimersByTimeAsync(10_001);
     expect(pi.sendMessage).toHaveBeenCalledTimes(1);
     await handlers["before_agent_start"]({ prompt: reminderPrompt }, activeContext(signal));
     await handlers["agent_start"]({}, activeContext(signal));
