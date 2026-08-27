@@ -482,7 +482,7 @@ These tools are dynamically registered and only available during their respectiv
 
 ### Team Session Guards (Whitelist-based)
 
-During an active team session (including `/team dynamic`), a `tool_call` event handler enforces tool restrictions using a **whitelist** (not a blocklist). Any tool not on the whitelist is blocked at runtime.
+During an active team session (including `/team dynamic`), a `tool_call` event handler enforces tool restrictions using a **whitelist** (not a blocklist). Any tool not on the whitelist is blocked at runtime. **白名单仅约束 `origin: "user"` 会话**——agent 来源会话（start_team_session）早退旁路白名单与扩展名检查（ADR-0003 修订，见决策 #22）。
 
 **Design phase whitelist (`DESIGN_PHASE_WHITELIST`):**
 ```
@@ -491,7 +491,7 @@ get_member_log, wait_and_get_member_status, team_send_and_wait,
 set_goal, finish_goal, write_shared_context,
 start_team_session, stop_team_session,   ← ADR-0003（重入报错/放弃委派）
 read (unrestricted),
-write (only .md files — checked per-call)
+write (only .md files — checked per-call)   ← 仅约束 user 来源会话；agent 来源早退旁路（ADR-0003 修订，见决策 #22)
 ```
 
 **Execution phase whitelist (`EXECUTION_PHASE_WHITELIST`):**
@@ -513,7 +513,7 @@ true_sight_diff_impact, true_sight_verify_evidence
 
 Key points:
 - **No more blocklist gaps** — tools like `ctx_execute`, `ctx_execute_file`, `ctx_batch_execute`, `mcp`, `ctx_upgrade` are NOT on either whitelist, so they're automatically blocked. No need to manually track every tool that could write files.
-- **`write`/`edit` are on both whitelists** — but an additional per-call check restricts them to `.md` files only.
+- **`write`/`edit` are on both whitelists** — but an additional per-call check restricts them to `.md` files only. **仅 user 来源会话**：agent 来源会话早退旁路白名单与扩展名检查（ADR-0003 修订，见决策 #22）。
 - **`.shared-context.md` 专属拦截** — `write`/`edit` 的目标若是 `.shared-context.md`，无论哪个阶段都会被 block 并重定向到 `write_shared_context` 工具（保证 start_member 门控标记准确）。
 - **TL 预派发守卫（执行阶段）** — `read`/`bash`/`web_search` 等虽在白名单中，但 `src/session/tl-read-guard.ts` 会对"turn 内未派发任务且非管理工具调用超过 3 次"的情况**持续拦截**（sticky block）：派发前每次非管理工具调用都被 block（首次含用户可见通知），直到 `team_send_and_wait` 发生。防止 TL 亲自分析代码而不派发，且无法用 grep/rg 绕过。详见 DESIGN.md。**仅 `origin: "user"` 会话生效**——自主会话（ADR-0003 修订）移除此守卫、设计阶段 read 软限制**与代码写入守卫**（读与分析自由、可自由编辑任意文件，写纪律见系统提示词）。
 - The design phase whitelist lifts to the execution phase whitelist on the first `start_member` call.

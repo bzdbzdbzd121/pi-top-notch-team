@@ -64,10 +64,10 @@ A full-keyboard overlay summoned by the user with `alt+t` during an active Team 
 _Avoid_: 监控面板, 第二终端
 
 **Session Origin** (会话来源):
-A Team Session attribute (`origin: "user" | "agent"`) recording how the session was started. Determines guard strength (dispatch-policing guards apply only to user-initiated sessions; write guards apply to both) and tool visibility (`stop_team_session` is offered only in agent-initiated sessions). See ADR-0003.
+A Team Session attribute (`origin: "user" | "agent"`) recording how the session was started. Determines guard strength (dispatch-policing guards AND write guards apply only to user-initiated sessions; the `.shared-context.md` → `write_shared_context` redirect applies to both) and tool visibility (`stop_team_session` is offered only in agent-initiated sessions). See ADR-0003.
 
 **Agent-initiated Team Session** (自主会话):
-A Dynamic Team Mode session started by the TL itself via the `start_team_session(task)` tool — registered at extension load time, the single deliberate exception to session-scoped tool registration. Fully autonomous: no requirements grilling, no plan confirmation gate; the TL designs, launches, coordinates, reports, and tears the session down via `stop_team_session`. Dispatch-policing guards (TL read guard, design-phase read soft limit, first-action protocol) do not apply — the user cares about the result, not the process; write guards (TL may not edit code) still apply because TL and Members share one filesystem. The team status widget carries a persistent 🤖 origin marker.
+A Dynamic Team Mode session started by the TL itself via the `start_team_session(task)` tool — registered at extension load time, the single deliberate exception to session-scoped tool registration. Fully autonomous: no requirements grilling, no plan confirmation gate; the TL designs, launches, coordinates, reports, and tears the session down via `stop_team_session`. Dispatch-policing guards (TL read guard, design-phase read soft limit, first-action protocol) and write guards are lifted (ADR-0003 revision) — the TL may freely read and edit files (any extension, both phases), the user cares about the result, not the process; only the `.shared-context.md` → `write_shared_context` redirect remains. The team status widget carries a persistent 🤖 origin marker.
 _Avoid_: sub-agent delegation, self-spawned team
 
 **User-initiated Team Session** (手动会话):

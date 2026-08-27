@@ -330,7 +330,7 @@ The dynamic mode is split into two phases: **design** and **execution**.
 
 **Phase 1: Design phase** — entered on `/team dynamic`
 - `teamCtx.dynamicPhase` is set to `"design"`
-- A **whitelist-based** tool guard activates: only team management tools + `write` (`.md` only) are allowed. All other tools (including `bash`, `read`, `web_search`, `fetch_content`, `edit`, `ctx_*`, `mcp`, etc.) are blocked at runtime.
+- A **whitelist-based** tool guard activates: only team management tools + `write` (`.md` only) are allowed. All other tools (including `bash`, `read`, `web_search`, `fetch_content`, `edit`, `ctx_*`, `mcp`, etc.) are blocked at runtime. （user 来源会话路径——agent 来源会话早退旁路白名单，见 §18）
 - TL can only discuss with the user, register members with `add_dynamic_member`, and write `.shared-context.md`
 - This forces TL to focus on requirements alignment and team design rather than exploring code
 
@@ -358,7 +358,7 @@ The TL follows the **Orchestration Playbook** (`src/prompts/orchestration-playbo
 
 **Phase 2: Execution phase** — entered automatically on first `start_member` success
 - `start_member` tool calls `onDynamicPhaseTransition()` callback → `teamCtx.dynamicPhase = "execution"`
-- The design-phase tool guard lifts; execution phase whitelist applies (team management + read-only analysis tools + `write`/`edit` on `.md` only)
+- The design-phase tool guard lifts; execution phase whitelist applies (team management + read-only analysis tools + `write`/`edit` on `.md` only)（user 来源会话路径；agent 来源会话早退旁路，见 §18）
 - TL regains access to `bash`/`read`/`web_search`/`fetch_content`/`ctx_search`/`true_sight_*` for monitoring and coordination, but tools like `ctx_execute`/`mcp` remain blocked
 - The `before_agent_start` handler switches to **execution phase** prompt injection
 - TL starts remaining Members, dispatches work via `team_send_and_wait`, monitors progress
