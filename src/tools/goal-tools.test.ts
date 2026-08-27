@@ -416,6 +416,16 @@ describe("registerGoalAgentHandler reminder", () => {
       },
       freshContext,
     );
+    // A later queued user message is also not the run's first user prompt.
+    await handlers["message_start"](
+      {
+        message: {
+          role: "user",
+          content: [{ type: "text", text: `queued echo ${staleReminderPrompt}` }],
+        },
+      },
+      freshContext,
+    );
     await handlers["agent_end"]({ messages: [] }, freshContext);
     await settleRun(handlers, freshContext);
     await flushReminderTimer();

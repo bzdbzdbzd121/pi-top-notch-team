@@ -1064,8 +1064,9 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
     const run = currentRun;
     if (!run) return;
     const message = (event as { message?: unknown } | null | undefined)?.message;
-    if (!message || (message as { role?: unknown }).role !== "user") return;
-    if (run.sawUserPrompt) return;
+    // Never inspect response/tool content for rollover markers. Only the first
+    // user prompt can establish which prompt this run represents.
+    if (!message || (message as { role?: unknown }).role !== "user" || run.sawUserPrompt) return;
     run.sawUserPrompt = true;
     const marker = extractReminderMarker(messageText(message));
     const markerId = marker ? reminderMarkerId(marker) : null;
