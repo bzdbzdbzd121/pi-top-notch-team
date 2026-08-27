@@ -368,6 +368,27 @@ export default function (pi: ExtensionAPI) {
     return undefined;
   }
 
+  // ── Helper: redirect direct write/edit of .shared-context.md ──
+  // Shared between the user-origin whitelist path and the agent-origin early
+  // exit: .shared-context.md must be written via write_shared_context — the
+  // start_member hard gate depends on that tool setting the
+  // sharedContextWritten flag. A mechanism contract, not a file-type
+  // restriction: applies to ALL origins in both phases.
+  function blockSharedContextWrite(
+    toolName: string,
+    input: unknown,
+  ): { block: true; reason: string } | undefined {
+    if (toolName !== "write" && toolName !== "edit") return undefined;
+    const filePath = extractPathFromInput(input) ?? "";
+    if (!filePath.endsWith(".shared-context.md")) return undefined;
+    return {
+      block: true,
+      reason:
+        `共享上下文必须通过 \`write_shared_context\` 工具写入（该工具会记录写入状态，未写入前 start_member 会被拦截）。` +
+        `请调用 write_shared_context 工具，而不是用 ${toolName} 直接写 .shared-context.md。`,
+    };
+  }
+
   // ── Tool whitelists for team sessions ───────────────────
   //
   // Instead of blacklisting specific tools (which always misses something),
@@ -445,30 +466,16 @@ export default function (pi: ExtensionAPI) {
 
     // ── Agent-initiated session: full tool freedom (ADR-0003 revision) ──
     // The team is the agent's own chosen means — the user only cares about the
-    // final result — so the TL's tool surface is unrestricted: design AND
-    // execution phases both allow write/edit (any extension), bash,
-    // fetch_content, ctx_execute, mcp, etc. (same surface as normal mode).
-    // This early exit fires BEFORE phase/whitelist resolution, so both phases
-    // are identical by construction.
-    // The single origin-independent rule that remains: .shared-context.md must
-    // be written via write_shared_context — the start_member hard gate depends
-    // on that tool setting the sharedContextWritten flag (mechanism contract,
-    // not a file-type restriction; applies to user-origin sessions too).
+    // result — so the TL's tool surface is unrestricted in BOTH phases
+    // (write/edit any extension, bash, fetch_content, ctx_execute, mcp, …).
+    // The early exit fires BEFORE phase/whitelist resolution, so design and
+    // execution phases are identical by construction; the only rule kept is
+    // the .shared-context.md redirect (blockSharedContextWrite).
     // Note: this branch skips tlReadGuard.recordDispatch — that guard is
     // user-origin-only; if it is ever reused with origin-specific thresholds,
     // the dispatch recording must be handled here as well.
     if (isAgentInitiated) {
-      if (event.toolName === "write" || event.toolName === "edit") {
-        const filePath = extractPathFromInput(event.input) ?? "";
-        if (filePath.endsWith(".shared-context.md")) {
-          return {
-            block: true,
-            reason:
-              `共享上下文必须通过 \`write_shared_context\` 工具写入（该工具会记录写入状态，未写入前 start_member 会被拦截）。`,
-          };
-        }
-      }
-      return; // allowed — all tools pass in agent-initiated sessions
+      return blockSharedContextWrite(event.toolName, event.input);
     }
 
     // ── Resolve current phase ──
@@ -488,18 +495,12 @@ export default function (pi: ExtensionAPI) {
     if (whitelist.has(event.toolName)) {
       // write/edit: additionally check file extension
       if (event.toolName === "write" || event.toolName === "edit") {
-        const filePath = extractPathFromInput(event.input) ?? "";
         // The shared context must be written via the dedicated tool — the
         // start_member gate depends on write_shared_context having set the
-        // session flag. Redirect direct write/edit attempts here.
-        if (filePath.endsWith(".shared-context.md")) {
-          return {
-            block: true,
-            reason:
-              `共享上下文必须通过 \`write_shared_context\` 工具写入（该工具会记录写入状态，未写入前 start_member 会被拦截）。` +
-              `请调用 write_shared_context 工具，而不是用 ${event.toolName} 直接写 .shared-context.md。`,
-          };
-        }
+        // session flag. Redirect direct write/edit attempts here (all origins).
+        const sharedContextBlock = blockSharedContextWrite(event.toolName, event.input);
+        if (sharedContextBlock) return sharedContextBlock;
+        const filePath = extractPathFromInput(event.input) ?? "";
         if (!filePath.endsWith(".md")) {
           const phaseLabel = isDesignPhase ? "设计阶段" : "团队会话";
           return {

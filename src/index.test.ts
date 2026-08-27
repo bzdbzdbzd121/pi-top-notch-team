@@ -856,16 +856,19 @@ describe("agent-initiated session tool_call guard (ADR-0003 revision)", () => {
     );
   }
 
-  /** Enter the REAL design phase via /team dynamic, then flip origin to agent. */
+  /**
+   * Start a REAL agent-initiated session via the load-time start_team_session
+   * tool (the production entry point): bootstrapDynamicSession flips the
+   * internal teamCtx to isDynamicSession=true + dynamicPhase="design" and
+   * starts the session with origin "agent" — no state-manipulation hacks.
+   */
   async function startAgentDesignPhase() {
-    const cmdDef = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
-    await cmdDef.handler("dynamic", createMockContext());
-    const { startSession, endSession } = await import("./session/state");
+    const { endSession } = await import("./session/state");
     endSession();
-    startSession(
-      { name: "test-agent-team", description: "Test", members: [] },
-      { origin: "agent" },
-    );
+    const toolDef = (pi.registerTool as ReturnType<typeof vi.fn>).mock.calls.find(
+      ([def]: any) => def.name === "start_team_session"
+    )![0];
+    await toolDef.execute("id", { task: "测试使命：验证 agent 会话守卫" }, undefined, undefined, createMockContext());
   }
 
   it("design phase: write to a code file is allowed", async () => {

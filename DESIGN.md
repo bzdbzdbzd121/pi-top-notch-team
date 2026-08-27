@@ -853,6 +853,8 @@ Strict 模式的注入结构相同，但标题为「严格模式 ⚡ — 必须�
 
 此外，扩展注册了一个 `tool_call` 事件拦截器，使用**白名单**机制限制工具调用。不在白名单上的工具会被直接阻断，不存在黑名单遗漏的风险。
 
+> **白名单仅约束 `origin: "user"` 会话**（ADR-0003 修订）：`origin: "agent"`（start_team_session）在 `tool_call` 守卫中早退旁路白名单与扩展名检查（设计+执行两阶段同权，工具面与普通模式一致），唯一保留 `.shared-context.md` → `write_shared_context` 重定向（机制契约，所有 origin 生效）。user 来源会话（`/team start`、`/team dynamic`）行为不变。
+
 **设计阶段白名单（`DESIGN_PHASE_WHITELIST`）：**
 - 仅允许：`add_dynamic_member`、`start_member`、`stop_member`、`list_members`、`get_member_log`、`wait_and_get_member_status`、`team_send_and_wait`、`set_goal`、`finish_goal`、`write_shared_context`、`read`（不受限）、`write`（仅 `.md` 文件）
 - 其他工具全部被阻断（包括 `bash`、`edit`、`web_search` 等），TL 只能讨论方案、有限度读取文件、写入共享上下文。
@@ -1369,10 +1371,10 @@ TL calls stop_team_session()               ← session-scoped; ACTIVATED only in
 | Behavior | `origin: "user"` | `origin: "agent"` |
 |----------|------------------|-------------------|
 | TL prompt | Playbook dynamic-mode prompt (grilling + confirmation gate + first-action protocol) | Autonomous prompt (`src/prompts/agent-initiated-mode.ts`) — no grilling, no gate, no first-action protocol; mission = `agentInitiatedTask` |
-| Dispatch-policing guards | tl-read-guard (execution) + design read soft limit (design) — enforced | Both skipped in the `tool_call` handler; write guards (`.md`-only write/edit, design-phase whitelist) still apply |
+| Dispatch-policing guards | tl-read-guard (execution) + design read soft limit (design) — enforced | Both skipped in the `tool_call` handler (early exit); **write guards lifted too (ADR-0003 revision)**: full tool surface in both phases, only the `.shared-context.md` → `write_shared_context` redirect remains |
 | `stop_team_session` | Registered but never activated (removed from active set by `enforceSessionToolVisibility`) | Activated at bootstrap; teardown available to the TL |
 
-Rationale (the core design philosophy): in a user-initiated session the user's expectation is "do this *as a team*", so guards enforce the team workflow; in an agent-initiated session the team is the agent's own chosen means — the user only cares about the result, so the agent gets process freedom. **Write guards are origin-independent**: TL and member processes share one filesystem, and concurrent writes physically overwrite each other — a structural hazard, not a trust issue. The escape hatch always exists: don't start a session, or `stop_team_session` and edit directly.
+Rationale (the core design philosophy): in a user-initiated session the user's expectation is "do this *as a team*", so guards enforce the team workflow; in an agent-initiated session the team is the agent's own chosen means — the user only cares about the result, so the agent gets process freedom. **Write guards are user-origin-only (ADR-0003 revision)**: agent sessions lift them in both phases — the write guard is a policy, not a hard invariant (member↔member concurrent writes were never restricted); it never eliminated the overwrite hazard, only narrowed it; and it was already bypassable via `bash` (`cat > file`) in agent sessions, so lifting write/edit converges the bypass back into sanctioned tools. The escape hatch always exists: don't start a session, or `stop_team_session` and edit directly.
 
 ### Boundaries
 

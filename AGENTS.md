@@ -229,7 +229,7 @@ src/
 
 21. **会话工具只在会话期间注册（session-scoped registration）** — 全部 9 个团队会话工具（6 个 TL 进程管理工具 + `write_shared_context` + `set_goal`/`finish_goal`）**不在扩展加载时注册**，而是由 `index.ts` 的 `ensureSessionToolsRegistered()`（内部用 `ensureToolRegistered` 幂等去重）在 `onSessionStart`（`/team start` 与 `/team dynamic` 共用，置于 widget 守卫之前）按需注册；`before_agent_start` 回合边界经 `enforceSessionToolVisibility()`（`src/session/session-tool-visibility.ts`，纯函数 + DI，`SESSION_TOOL_NAMES` 与 `teamCtx.tlToolNames` 同源）强制注册+激活/停用不变式。效果：**fresh pi 初始 registry 为空；已有进程在会话外 registry 仍保留，但 `activeTools` 不含这些工具（因此不可见/不可调用）**；`dynamic-handler` 先 `onSessionStart` 注册再 `setActiveTools` 激活（不依赖 pi 的 registerTool 自动激活行为）。模式工具（`create_team_definition`/`update_team_definition`/`add_dynamic_member`）维持各自的按需注册生命周期，不在本强制范围内。**唯一刻意例外**：`start_team_session` 在加载时注册（见决策 #22）。
 
-22. **Agent 自主会话（agent-initiated team sessions，ADR-0003）** — `start_team_session(task)` 在**扩展加载时注册**（决策 #21 的唯一例外），agent 可随时自主进入动态团队会话委派复杂任务。核心设计哲学：**会话来源（`origin: "user" | "agent"`，`TeamSessionState.origin`）决定守卫强度**——手动会话 = 用户期望「以团队方式做事」，全守卫；自主会话 = agent 自己的手段选择，用户只要结果，故移除派发管制（tl-read-guard、设计 read 软限制、第一动作协议），保留写入管制（TL 与成员共享同一文件系统，并发写会物理覆盖——结构性安全非不信任）。完全自主：无 Playbook grilling、无确认门；`task` 必填并自动置 Goal + 注入自主版提示词（`src/prompts/agent-initiated-mode.ts`）。生命周期对称：`stop_team_session` 由 agent 自主终结会话——会话作用域注册但**仅自主会话激活**（`AGENT_SESSION_TOOL_NAMES` 条件可见性），与 `/team stop` 共享 `src/session/teardown.ts`。嵌套结构性不可能（`TEAM_ROLE` 早退）；重入返回错误。可见性：启动 notify（🤖 + task 摘要）+ widget 持久来源标记（🤖/👤）。预定义团队支持明确推迟（dynamic-only 先行）。
+22. **Agent 自主会话（agent-initiated team sessions，ADR-0003）** — `start_team_session(task)` 在**扩展加载时注册**（决策 #21 的唯一例外），agent 可随时自主进入动态团队会话委派复杂任务。核心设计哲学：**会话来源（`origin: "user" | "agent"`，`TeamSessionState.origin`）决定守卫强度**——手动会话 = 用户期望「以团队方式做事」，全守卫；自主会话 = agent 自己的手段选择，用户只要结果，故移除派发管制（tl-read-guard、设计 read 软限制、第一动作协议）**与写入管制（ADR-0003 修订，见 docs/adr/0003）**：设计+执行两阶段工具面与普通模式一致（write/edit 任意扩展名、bash、ctx_execute 等全部放行，早退分支在阶段/白名单解析之前生效），仅保留 `.shared-context.md` 必须经 `write_shared_context` 写入的机制契约（start_member 硬门控依赖其置位标记）。放开理由（三路论据）：写守卫是策略而非硬不变量（成员-成员并发写从未被管制）；守卫从未消除覆盖风险、只缩小重叠面；守卫在 agent 会话已被 bash 旁路事实绕过——放开是收敛回正规工具、更可观测。残余风险（低-中）由提示词写纪律（编辑前确认无成员处理同一文件 + 修改后通知重读重验）+ git 可恢复 + TL 回合挂起语义缓解。完全自主：无 Playbook grilling、无确认门；`task` 必填并自动置 Goal + 注入自主版提示词（`src/prompts/agent-initiated-mode.ts`）。生命周期对称：`stop_team_session` 由 agent 自主终结会话——会话作用域注册但**仅自主会话激活**（`AGENT_SESSION_TOOL_NAMES` 条件可见性），与 `/team stop` 共享 `src/session/teardown.ts`。嵌套结构性不可能（`TEAM_ROLE` 早退）；重入返回错误。可见性：启动 notify（🤖 + task 摘要）+ widget 持久来源标记（🤖/👤）。预定义团队支持明确推迟（dynamic-only 先行）。
 
 23. **团队会话恢复（/team resume，ADR-0004）** — 四层设计：(a) **member 会话落盘**：移除 spawn 参数中的 `--no-session false`（pi 的 `--no-session` 是裸布尔 flag，该写法曾使 member 纯内存运行、上下文从不落盘——根因 bug）；pi session 增量 append，崩溃仅丢最后半条。(b) **重启即续接**：`MemberProcessConfig.resume` + `buildMemberConfig` 自动探测（session 目录有 `.jsonl` 则 `--continue`）+ 进程内 `startedOnce`（崩溃 auto-restart 自动续接）；`hasSessionFiles` 守卫空目录。(c) **会话清单**：`sessions/<team>/<sessionId>/session.json` 持久化名册（动态团队唯一磁盘副本）/origin/phase/Goal/sharedContextWritten/startedMembers/memberPids，所有状态变更点合并写（tmp+rename 原子，fail-open）。(d) **停止即保留**：`/team stop`/`session_shutdown` 不再 rmSync，manifest 标记 `stopped` 或保留 `active`（中断语义）；`session_start` 检测到中断会话时状态栏提示。`/team resume` 以原 sessionId 重建状态、`--continue` 重启成员（上下文完整恢复）、/proc 校验后清理孤儿进程；中断时进行中的任务不重放，由 TL 确认状态后重建编排。会话列表按 **cwd 项目作用域**过滤（对齐 `pi --resume`：manifest 记录创建时的 cwd，默认只列当前目录会话，`--all` 显示全部并附目录标注）。多会话选择器用 `src/ui/scroll-select.ts`（maxVisible 滚动窗口 + 模糊筛选）——内置 `ctx.ui.select` 全量渲染不滚动，会话多时溢出屏幕（与模型选择器同因）。
 
@@ -438,7 +438,7 @@ printf '' | timeout 10 ./node_modules/.bin/pi --mode json --no-tools -e ./index.
 
 | Tool | Description |
 |------|-------------|
-| `start_team_session(task)` | **加载时注册**（决策 #21 唯一例外）。agent 自主启动动态团队会话（`origin: "agent"`）：`task` 必填——自动置 Goal + 注入自主版设计阶段提示词。全程无确认门；读/分析自由（无派发管制守卫），代码写入仍归成员。已有活跃会话时返回错误。成员进程结构性无法调用（`TEAM_ROLE` 早退）。 |
+| `start_team_session(task)` | **加载时注册**（决策 #21 唯一例外）。agent 自主启动动态团队会话（`origin: "agent"`）：`task` 必填——自动置 Goal + 注入自主版设计阶段提示词。全程无确认门；读/分析自由（无派发管制守卫），**可自由 read 与编辑文件（任意扩展名，写纪律见系统提示词；ADR-0003 修订）**，`.shared-context.md` 仍须经 `write_shared_context` 写入。已有活跃会话时返回错误。成员进程结构性无法调用（`TEAM_ROLE` 早退）。 |
 | `stop_team_session()` | 结束 agent 自主会话（停成员、摘 widget、保留会话目录供 `/team resume`；磁盘清理由 `/team delete` 负责）。会话作用域注册，**仅自主会话出现在活跃工具集**；对 `origin: "user"` 的会话拒绝执行（手动会话归用户 `/team stop`）。与 `/team stop` 共享 `teardownTeamSession()`。 |
 
 | Tool | Description |
@@ -501,7 +501,7 @@ wait_and_get_member_status, team_send_and_wait,
 set_goal, finish_goal, add_dynamic_member, write_shared_context,
 start_team_session, stop_team_session,   ← ADR-0003
 read, bash, web_search, fetch_content, get_search_content,
-write, edit (both only .md files — checked per-call),
+write, edit (both only .md files — checked per-call)   ← 仅约束 user 来源会话；agent 来源早退旁路（ADR-0003 修订，见决策 #22）
 ctx_search, ctx_stats, ctx_doctor, ctx_insight,
 ctx_index, ctx_fetch_and_index,
 true_sight_search, true_sight_get_facts, true_sight_filter,
@@ -515,7 +515,7 @@ Key points:
 - **No more blocklist gaps** — tools like `ctx_execute`, `ctx_execute_file`, `ctx_batch_execute`, `mcp`, `ctx_upgrade` are NOT on either whitelist, so they're automatically blocked. No need to manually track every tool that could write files.
 - **`write`/`edit` are on both whitelists** — but an additional per-call check restricts them to `.md` files only.
 - **`.shared-context.md` 专属拦截** — `write`/`edit` 的目标若是 `.shared-context.md`，无论哪个阶段都会被 block 并重定向到 `write_shared_context` 工具（保证 start_member 门控标记准确）。
-- **TL 预派发守卫（执行阶段）** — `read`/`bash`/`web_search` 等虽在白名单中，但 `src/session/tl-read-guard.ts` 会对"turn 内未派发任务且非管理工具调用超过 3 次"的情况**持续拦截**（sticky block）：派发前每次非管理工具调用都被 block（首次含用户可见通知），直到 `team_send_and_wait` 发生。防止 TL 亲自分析代码而不派发，且无法用 grep/rg 绕过。详见 DESIGN.md。**仅 `origin: "user"` 会话生效**——自主会话（ADR-0003）移除此守卫与设计阶段 read 软限制（读与分析自由，代码写入守卫不变）。
+- **TL 预派发守卫（执行阶段）** — `read`/`bash`/`web_search` 等虽在白名单中，但 `src/session/tl-read-guard.ts` 会对"turn 内未派发任务且非管理工具调用超过 3 次"的情况**持续拦截**（sticky block）：派发前每次非管理工具调用都被 block（首次含用户可见通知），直到 `team_send_and_wait` 发生。防止 TL 亲自分析代码而不派发，且无法用 grep/rg 绕过。详见 DESIGN.md。**仅 `origin: "user"` 会话生效**——自主会话（ADR-0003 修订）移除此守卫、设计阶段 read 软限制**与代码写入守卫**（读与分析自由、可自由编辑任意文件，写纪律见系统提示词）。
 - The design phase whitelist lifts to the execution phase whitelist on the first `start_member` call.
 
 The design phase guard is active from the moment `/team dynamic` is entered. It lifts when the first `start_member` call succeeds, transitioning to the execution phase.
