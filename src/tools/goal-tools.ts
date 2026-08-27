@@ -83,6 +83,11 @@ interface ReminderAcknowledgement {
   marker: string;
 }
 
+interface StaleRolloverSubmission extends ReminderAcknowledgement {
+  /** The marker has reached before_agent_start and its next run is stale. */
+  markerSeen: boolean;
+}
+
 interface UncertainSubmission {
   candidate: GoalReminderCandidate;
 }
@@ -106,6 +111,7 @@ let freshRunRequiresSignal = false;
 let resetBarrier: ResetBarrier | null = null;
 let pendingSubmission: ReminderSubmission | null = null;
 let acknowledgedSubmission: ReminderAcknowledgement | null = null;
+let staleRolloverSubmission: StaleRolloverSubmission | null = null;
 /**
  * Timed-out void submissions remain matchable by their complete marker until
  * acknowledgement or goal/session reset. The dispatch gate below permits only
@@ -131,10 +137,14 @@ function clearPendingSubmission(): void {
   }
 }
 
-function clearSubmissionState(): void {
+/** Clear an in-flight submission; rollover handling may retain its stale marker. */
+function clearSubmissionState(preserveStaleRollover = false): void {
   clearPendingSubmission();
   uncertainSubmissions.clear();
   acknowledgedSubmission = null;
+  if (!preserveStaleRollover) {
+    staleRolloverSubmission = null;
+  }
 }
 
 function clearPendingSubmissionForMarker(marker: string): void {
@@ -146,7 +156,10 @@ function clearPendingSubmissionForMarker(marker: string): void {
 /** Invalidate all reminder state without changing the active goal itself. */
 function invalidateReminderState(resetRun = false): void {
   clearReminderTimer();
-  clearSubmissionState();
+  // A session rollover may have captured an accepted old marker just before a
+  // goal replacement/reset. Preserve that stale marker until its host run is
+  // rejected; ordinary same-session goal changes have no marker to preserve.
+  clearSubmissionState(staleRolloverSubmission !== null);
   pendingReminder = null;
   if (currentRun) {
     currentRun.candidate = null;
@@ -168,6 +181,10 @@ function invalidateReminderState(resetRun = false): void {
 }
 
 function advanceGoalGeneration(resetRun = false): void {
+  // Detect a TeamSession rollover before goal replacement clears submission
+  // state; otherwise an accepted old prompt could be reinterpreted under the
+  // new goal when startSession/endSession happen between lifecycle callbacks.
+  currentSessionIdentity();
   goalGeneration += 1;
   lastReminder = null;
   invalidateReminderState(resetRun);
@@ -207,8 +224,26 @@ function currentSessionIdentity(): { active: boolean; sessionId: string | null }
       observedSessionKey = key;
       sessionEpoch += 1;
       // A session switch invalidates any fire-and-forget acknowledgement from
-      // the previous session; never let its marker acknowledge new work.
-      clearSubmissionState();
+      // the previous session; never let its marker acknowledge new work. Keep
+      // the marker separately until before_agent_start/agent_start so an
+      // already accepted old reminder cannot become a candidate for the new
+      // session. If no marker arrives, a genuinely new run is unaffected.
+      const staleSubmission = pendingSubmission
+        ? { candidate: pendingSubmission.candidate, marker: pendingSubmission.marker }
+        : uncertainSubmissions.size > 0
+          ? (() => {
+              const first = uncertainSubmissions.entries().next().value as
+                | [string, UncertainSubmission]
+                | undefined;
+              return first ? { candidate: first[1].candidate, marker: first[0] } : null;
+            })()
+          : acknowledgedSubmission
+            ? { candidate: acknowledgedSubmission.candidate, marker: acknowledgedSubmission.marker }
+            : null;
+      clearSubmissionState(true);
+      staleRolloverSubmission = staleSubmission
+        ? { ...staleSubmission, markerSeen: false }
+        : null;
     }
     return { active: session.active, sessionId: session.sessionId };
   } catch {
@@ -543,10 +578,17 @@ function extractReminderMarker(prompt: string): string | null {
   return /^\d+$/.test(id) ? marker : null;
 }
 
-function acknowledgeReminderPrompt(prompt: unknown): void {
-  if (typeof prompt !== "string") return;
+function acknowledgeReminderPrompt(prompt: unknown): boolean {
+  if (typeof prompt !== "string") return false;
   const marker = extractReminderMarker(prompt);
-  if (!marker) return;
+  if (!marker) return false;
+
+  if (staleRolloverSubmission?.marker === marker) {
+    // This is an accepted prompt from the previous session. It must not ACK
+    // any new submission; its next run is cancelled/suppressed instead.
+    staleRolloverSubmission.markerSeen = true;
+    return true;
+  }
 
   if (pendingSubmission?.marker === marker) {
     const candidate = pendingSubmission.candidate;
@@ -554,15 +596,16 @@ function acknowledgeReminderPrompt(prompt: unknown): void {
     // ACK only resolves uncertainty. lastReminder remains anchored at the
     // API submission point; suppression is attached to the next run instead.
     acknowledgedSubmission = { candidate, marker };
-    return;
+    return false;
   }
 
   const uncertainSubmission = uncertainSubmissions.get(marker);
-  if (!uncertainSubmission) return;
+  if (!uncertainSubmission) return false;
   uncertainSubmissions.delete(marker);
   // Keep the cooldown anchor unchanged for the same API-only semantics as the
   // pending path; the confirmed run is suppressed separately at agent_end.
   acknowledgedSubmission = { candidate: uncertainSubmission.candidate, marker };
+  return false;
 }
 
 function restoreFailedCandidate(candidate: GoalReminderCandidate, pi: ExtensionAPI, error: unknown): void {
@@ -856,8 +899,17 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
   // before_agent_start is the first lifecycle event carrying the prompt. It
   // is the only event that can associate a fire-and-forget request with the
   // run it eventually starts; agent_start has no payload in pi 0.83.0.
-  pi.on("before_agent_start", (event) => {
-    acknowledgeReminderPrompt((event as { prompt?: unknown } | null | undefined)?.prompt);
+  pi.on("before_agent_start", (event, ctx) => {
+    const stale = acknowledgeReminderPrompt((event as { prompt?: unknown } | null | undefined)?.prompt);
+    if (stale) {
+      // Best-effort cancellation while the stale prompt is entering the new
+      // session. agent_start below repeats the cancellation once a run exists.
+      try {
+        ctx.abort();
+      } catch {
+        // A stale context must never break the host lifecycle.
+      }
+    }
   });
 
   // agent_start begins (or resumes) an outer AgentSession run. Retry,
@@ -882,6 +934,23 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
         run.suppressReminderCandidate = true;
       }
       acknowledgedSubmission = null;
+    }
+
+    const staleSubmission = staleRolloverSubmission;
+    if (staleSubmission?.markerSeen && run.runId !== staleSubmission.candidate.runId) {
+      if (
+        staleSubmission.candidate.sessionId !== run.sessionId ||
+        staleSubmission.candidate.sessionEpoch !== run.sessionEpoch
+      ) {
+        run.suppressReminderCandidate = true;
+        try {
+          ctx.abort();
+        } catch {
+          // Stale prompt cancellation is best effort; candidate suppression
+          // remains the correctness guard if the host cannot abort here.
+        }
+      }
+      staleRolloverSubmission = null;
     }
 
     if (runWasAborted(run)) {

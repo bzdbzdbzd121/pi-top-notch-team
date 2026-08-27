@@ -50,6 +50,8 @@ interface HarnessState {
   eventLog: string[];
   agentEndIdleValues: boolean[];
   agentSettledIdleValues: boolean[];
+  diagnosticMessages: string[];
+  forceNoAck: boolean;
   holdNextReminderAck?: Deferred<void>;
 }
 
@@ -57,6 +59,17 @@ interface Harness {
   session: any;
   state: HarnessState;
   dispose: () => void;
+}
+
+interface HarnessOptions {
+  retry?: boolean;
+  contextWindow?: number;
+  compaction?: {
+    enabled: boolean;
+    reserveTokens?: number;
+    keepRecentTokens?: number;
+    disableAfterFirst?: boolean;
+  };
 }
 
 const TEAM = {
@@ -168,7 +181,7 @@ function responseStream(response: FakeResponse, signal?: AbortSignal): any {
 
 async function createHarness(
   responses: FakeResponse[],
-  options: { retry?: boolean } = {},
+  options: HarnessOptions = {},
 ): Promise<Harness> {
   const state: HarnessState = {
     streamCalls: 0,
@@ -177,11 +190,17 @@ async function createHarness(
     eventLog: [],
     agentEndIdleValues: [],
     agentSettledIdleValues: [],
+    diagnosticMessages: [],
+    forceNoAck: false,
   };
 
   const settingsManager = SettingsManager.inMemory(
     {
-      compaction: { enabled: false },
+      compaction: {
+        enabled: options.compaction?.enabled ?? false,
+        reserveTokens: options.compaction?.reserveTokens ?? 16_384,
+        keepRecentTokens: options.compaction?.keepRecentTokens ?? 20_000,
+      },
       retry: {
         enabled: options.retry ?? false,
         maxRetries: 1,
@@ -191,6 +210,11 @@ async function createHarness(
     { projectTrusted: true },
   );
   const agentDir = mkdtempSync(join(tmpdir(), "pi-goal-agent-session-"));
+  const modelConfig = {
+    ...MODEL_CONFIG,
+    contextWindow: options.contextWindow ?? MODEL_CONFIG.contextWindow,
+  };
+  let sessionRef: any;
   const resourceLoader = new DefaultResourceLoader({
     cwd: process.cwd(),
     agentDir,
@@ -222,11 +246,29 @@ async function createHarness(
           // pi wrapper. The proxy only records its return value and payload.
           const instrumentedPi = Object.create(pi) as ExtensionAPI;
           instrumentedPi.sendUserMessage = (content, options) => {
-            const result = pi.sendUserMessage(content, options);
-            state.apiCalls.push({ content: String(content), options, result });
-            state.eventLog.push("api:sendUserMessage");
-            return result;
+            const previousModel = sessionRef?.agent?.state?.model;
+            if (state.forceNoAck && sessionRef) {
+              // Let the real AgentSession.sendUserMessage reject during its
+              // model preflight. Its ExtensionAPI wrapper still returns void,
+              // but no before_agent_start marker can be emitted.
+              sessionRef.agent.state.model = undefined;
+            }
+            let result: unknown;
+            try {
+              result = pi.sendUserMessage(content, options);
+              state.apiCalls.push({ content: String(content), options, result });
+              state.eventLog.push("api:sendUserMessage");
+              return result;
+            } finally {
+              if (state.forceNoAck && sessionRef) {
+                sessionRef.agent.state.model = previousModel;
+              }
+            }
           };
+          instrumentedPi.sendMessage = ((message: any, options: any) => {
+            state.diagnosticMessages.push(String(message?.content ?? ""));
+            return pi.sendMessage(message, options);
+          }) as any;
           registerGoalAgentHandler(instrumentedPi);
 
           // These observers are registered after goal-tools so the assertions
@@ -237,6 +279,9 @@ async function createHarness(
           pi.on("agent_settled", (_event, ctx) => {
             state.agentSettledIdleValues.push(ctx.isIdle());
           });
+          if (options.compaction?.disableAfterFirst) {
+            pi.on("session_compact", () => settingsManager.setCompactionEnabled(false));
+          }
         },
       },
     ],
@@ -253,13 +298,13 @@ async function createHarness(
     api: "openai-completions",
     baseUrl: "http://goal-test.invalid",
     apiKey: "in-process-test-key",
-    models: [MODEL_CONFIG],
+    models: [modelConfig],
     streamSimple: (_model, context, options) => {
       const index = state.streamCalls++;
       return responseStream(responses[index] ?? { kind: "stop" }, options?.signal);
     },
   });
-  const model = modelRuntime.getModel("goal-test", MODEL_CONFIG.id);
+  const model = modelRuntime.getModel("goal-test", modelConfig.id);
   if (!model) throw new Error("Failed to create fake test model");
 
   const session = (
@@ -274,6 +319,7 @@ async function createHarness(
       noTools: "all",
     })
   ).session;
+  sessionRef = session;
   await session.bindExtensions({ mode: "print" });
   session.subscribe((event: any) => {
     state.eventLog.push(`session:${event.type}`);
@@ -357,6 +403,52 @@ describe("goal reminder with the installed pi 0.83.0 AgentSession", () => {
       expect(harness.state.agentSettledIdleValues).toEqual([true, true]);
 
       await harness.session.waitForIdle();
+    } finally {
+      harness.dispose();
+    }
+  });
+
+  it("holds the reminder through real AgentSession auto-compaction before settled", async () => {
+    beginGoal();
+    const harness = await createHarness(
+      [
+        { kind: "stop", text: "initial response" },
+        { kind: "stop", text: "compaction summary" },
+        { kind: "stop", text: "compaction reminder response" },
+      ],
+      {
+        contextWindow: 1,
+        compaction: {
+          enabled: true,
+          reserveTokens: 0,
+          keepRecentTokens: 1,
+          // Keep the assertion focused on the post-run compaction that follows
+          // the initial answer; a one-token test model would otherwise compact
+          // the reminder response as well.
+          disableAfterFirst: true,
+        },
+      },
+    );
+
+    try {
+      await harness.session.prompt("initial user prompt");
+      expect(harness.state.apiCalls).toHaveLength(0);
+      const compactionStartIndex = harness.state.eventLog.indexOf("session:compaction_start");
+      const compactionEndIndex = harness.state.eventLog.indexOf("session:compaction_end");
+      const settledIndex = harness.state.eventLog.indexOf("session:agent_settled");
+      expect(compactionStartIndex).toBeGreaterThan(-1);
+      expect(compactionEndIndex).toBeGreaterThan(compactionStartIndex);
+      expect(compactionEndIndex).toBeLessThan(settledIndex);
+
+      await waitUntil(() => harness.state.apiCalls.length === 1);
+      await waitUntil(() => harness.state.streamCalls === 3 && harness.session.isIdle);
+      const apiIndex = harness.state.eventLog.lastIndexOf("api:sendUserMessage");
+      expect(apiIndex).toBeGreaterThan(settledIndex);
+      expect(harness.state.apiCalls[0].result).toBeUndefined();
+      expect(harness.state.apiCalls[0].options).toBeUndefined();
+      expect(harness.state.markerPrompts).toHaveLength(1);
+      expect(harness.state.agentEndIdleValues.every((value) => value === false)).toBe(true);
+      expect(harness.state.agentSettledIdleValues).toEqual([true, true]);
     } finally {
       harness.dispose();
     }
@@ -447,6 +539,90 @@ describe("goal reminder with the installed pi 0.83.0 AgentSession", () => {
       await flushMicrotasks();
       expect(harness.session.isIdle).toBe(true);
       expect(harness.state.streamCalls).toBe(4);
+    } finally {
+      harness.dispose();
+    }
+  });
+
+  it("keeps a real void submission uncertain after no ACK and ignores an isolated agent_start", async () => {
+    vi.useFakeTimers();
+    beginGoal();
+    const harness = await createHarness([
+      { kind: "stop", text: "initial response" },
+      { kind: "stop", text: "later response" },
+    ]);
+
+    try {
+      await harness.session.prompt("initial user prompt");
+      harness.state.forceNoAck = true;
+      await vi.advanceTimersByTimeAsync(0);
+      expect(harness.state.apiCalls).toHaveLength(1);
+      expect(harness.state.apiCalls[0].result).toBeUndefined();
+      expect(harness.state.markerPrompts).toHaveLength(0);
+
+      // The real wrapper's underlying prompt rejects before
+      // before_agent_start because the fixture temporarily removes the model.
+      // The goal handler can only observe void, so the watchdog must diagnose
+      // and retain uncertainty rather than retrying.
+      await vi.advanceTimersByTimeAsync(1_001);
+      harness.state.forceNoAck = false;
+      expect(harness.state.diagnosticMessages.some((message) => message.includes("目标提醒未确认"))).toBe(true);
+
+      // This is an actual ExtensionRunner event with no prompt payload. It is
+      // deliberately isolated from a user prompt and must not ACK uncertainty.
+      await harness.session.extensionRunner.emit({ type: "agent_start" } as any);
+      await harness.session.prompt("later user prompt");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(harness.state.apiCalls).toHaveLength(1);
+      expect(harness.state.markerPrompts).toHaveLength(0);
+    } finally {
+      harness.dispose();
+    }
+  });
+
+  it("invalidates an old marker/run across a real session rollover", async () => {
+    vi.useFakeTimers();
+    beginGoal();
+    const harness = await createHarness([
+      { kind: "stop", text: "old session response" },
+      { kind: "stop", text: "old reminder response" },
+      { kind: "stop", text: "new session response" },
+      { kind: "stop", text: "new reminder response" },
+    ]);
+    const oldAckGate = deferred<void>();
+
+    try {
+      await harness.session.prompt("old session prompt");
+      harness.state.holdNextReminderAck = oldAckGate;
+      await vi.advanceTimersByTimeAsync(0);
+      expect(harness.state.apiCalls).toHaveLength(1);
+      const oldMarkerPrompt = harness.state.markerPrompts[0];
+      expect(oldMarkerPrompt).toContain("top-notch-team:goal-reminder:");
+
+      endSession();
+      startSession(TEAM as any, { sessionId: "agent-session-test-new" });
+      setGoalForTesting({
+        text: "新会话目标",
+        criteria: "- 新会话完成",
+        completed: false,
+      });
+      oldAckGate.resolve(undefined);
+      await flushMicrotasks();
+      expect(harness.session.isIdle).toBe(true);
+      await vi.advanceTimersByTimeAsync(0);
+      // The old accepted prompt may finish its host run, but it must not be
+      // reinterpreted as a candidate for the replacement session/goal.
+      expect(harness.state.apiCalls).toHaveLength(1);
+
+      await harness.session.prompt("new session prompt");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(harness.state.apiCalls).toHaveLength(2);
+      expect(harness.state.apiCalls[1].content).toContain("新会话目标");
+      expect(harness.state.apiCalls[1].content).not.toContain("高保真生命周期验证");
+      expect(harness.state.markerPrompts).toHaveLength(2);
+      expect(harness.state.markerPrompts[1]).not.toBe(oldMarkerPrompt);
+      await flushMicrotasks();
+      expect(harness.session.isIdle).toBe(true);
     } finally {
       harness.dispose();
     }
