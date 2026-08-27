@@ -1077,13 +1077,12 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
       run.aborted = true;
     }
 
-    // If no user message arrived, the host aborted/rejected the provisional
-    // stale prompt after agent_start. Treat that run as stale as well; a normal
-    // successful run has already cleared stalePromptPending in message_start.
-    if (run.stalePromptPending) {
-      run.stalePromptPending = false;
-      run.suppressReminderCandidate = true;
-    }
+    // A missing message_start is intentionally ambiguous: the host may have
+    // rejected the provisional stale prompt, or this may be a direct/fresh
+    // lifecycle callback. Do not suppress solely on absence; aborted runs are
+    // rejected by runWasAborted below, while a concrete stale marker is handled
+    // by message_start itself.
+    run.stalePromptPending = false;
 
     // The run started by a confirmed reminder must not feed that same goal
     // back into the reminder pipeline, even when preflight exceeded cooldown.

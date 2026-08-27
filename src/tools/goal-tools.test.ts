@@ -46,6 +46,24 @@ async function finishLowLevelRun(
   await handlers["agent_end"](event, ctx);
 }
 
+async function finishLowLevelReminderRun(
+  handlers: Record<string, (event: any, ctx: any) => unknown>,
+  prompt: string,
+  ctx: any = activeContext(),
+) {
+  await handlers["agent_start"]({}, ctx);
+  await handlers["message_start"](
+    {
+      message: {
+        role: "user",
+        content: [{ type: "text", text: prompt }],
+      },
+    },
+    ctx,
+  );
+  await handlers["agent_end"]({ messages: [] }, ctx);
+}
+
 async function settleRun(
   handlers: Record<string, (event: any, ctx: any) => unknown>,
   ctx: any = activeContext(),
@@ -282,7 +300,7 @@ describe("registerGoalAgentHandler reminder", () => {
     resetGoal();
     setGoalForTesting({ text: "replacement goal", criteria: "- replacement", completed: false });
     await handlers["before_agent_start"]({ prompt: oldReminderPrompt }, activeContext());
-    await finishLowLevelRun(handlers);
+    await finishLowLevelReminderRun(handlers, oldReminderPrompt);
     await settleRun(handlers);
     await flushReminderTimer();
 
@@ -321,16 +339,10 @@ describe("registerGoalAgentHandler reminder", () => {
     await handlers["before_agent_start"]({ prompt: staleReminderPrompt }, staleContext);
 
     const freshContext = activeContext();
+    // This direct lifecycle sequence intentionally omits message_start: it
+    // mirrors the reviewer repro and proves the provisional slot itself does
+    // not swallow the next fresh agent_start/agent_end pair.
     await handlers["agent_start"]({}, freshContext);
-    await handlers["message_start"](
-      {
-        message: {
-          role: "user",
-          content: [{ type: "text", text: "fresh user prompt" }],
-        },
-      },
-      freshContext,
-    );
     await handlers["agent_end"]({ messages: [] }, freshContext);
     await settleRun(handlers, freshContext);
     await flushReminderTimer();
@@ -379,13 +391,13 @@ describe("registerGoalAgentHandler reminder", () => {
     // Deliver M1 after M2 was captured by the second rollover. Both old runs
     // must be suppressed; neither may create a candidate for S3.
     await handlers["before_agent_start"]({ prompt: markerM1 }, activeContext());
-    await finishLowLevelRun(handlers);
+    await finishLowLevelReminderRun(handlers, markerM1);
     await settleRun(handlers);
     await flushReminderTimer();
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
 
     await handlers["before_agent_start"]({ prompt: markerM2 }, activeContext());
-    await finishLowLevelRun(handlers);
+    await finishLowLevelReminderRun(handlers, markerM2);
     await settleRun(handlers);
     await flushReminderTimer();
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
