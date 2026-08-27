@@ -1,6 +1,6 @@
 # Agent-initiated team sessions via a load-time `start_team_session` tool
 
-The agent (as TL) can start a Dynamic Team Mode session itself by calling `start_team_session(task)` — registered at extension load time, making it the single deliberate exception to the session-scoped tool registration invariant (AGENTS.md decision #21). The session runs fully autonomously: no requirements grilling, no plan confirmation gate; the agent designs, launches, coordinates, reports, and tears the session down via `stop_team_session` (offered only in agent-initiated sessions).
+The agent (as TL) can start a Dynamic Team Mode session itself by calling `start_team_session(task)` — registered at extension load time, making it the single deliberate exception to the **load-time registration** rule (AGENTS.md decision #21). The session runs fully autonomously: no requirements grilling, no plan confirmation gate; the agent designs, launches, coordinates, reports, and tears the session down via `stop_team_session` (offered only in agent-initiated sessions). Session-scoped tools registered after the first session remain in pi's registry because pi has no unregister API; outside a session they are removed from `activeTools` and are not visible or callable.
 
 ## Status
 
@@ -13,7 +13,7 @@ Team sessions previously required the user to type `/team start` or `/team dynam
 Two facts shaped the design:
 
 1. **Session origin determines guard philosophy.** In a user-initiated session the user's expectation is "do this *as a team*", so dispatch-policing guards (TL read guard, design-phase read soft limit, first-action protocol) enforce the team workflow. In an agent-initiated session the team is the agent's own chosen means — the user only cares that the result is good, so those guards are removed. Write guards (TL may not edit code) stay in both cases: TL and Member processes share one filesystem, and concurrent writes physically overwrite each other — a coordination hazard trust cannot fix. The escape hatch always exists: don't start a session, or `stop_team_session` and edit directly.
-2. **Decision #21's invariant** ("outside a session, zero team tools in registry and active set") exists to prevent tool leakage. A load-time tool is a visible, permanent exception and must be the only one.
+2. **Decision #21's registration/activation invariant.** A fresh pi process starts with no session-scoped team tools in its registry. Session-scoped tools are registered on demand at the first session start; because pi has no unregister API, they remain in the registry after teardown, while the session visibility guard removes them from `activeTools` outside a session. `start_team_session` remains the sole load-time registration exception and is the only team-session entry point intentionally active outside a session.
 
 ## Considered Options
 

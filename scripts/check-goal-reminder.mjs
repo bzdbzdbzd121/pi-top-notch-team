@@ -18,7 +18,8 @@ const source = read("src/tools/goal-tools.ts");
 const index = read("index.ts");
 const agents = read("AGENTS.md");
 const design = read("DESIGN.md");
-const lifecycleDocs = [agents, design, read("README.md"), read("CONTEXT.md")].join("\n");
+const adrAgentSessions = read("docs/adr/0003-agent-initiated-team-sessions.md");
+const lifecycleDocs = [agents, design, read("README.md"), read("CONTEXT.md"), adrAgentSessions].join("\n");
 
 // Goal reminders use the ordinary sendUserMessage path. Member-channel
 // follow-up delivery is intentionally outside this scan.
@@ -47,6 +48,7 @@ forbidMatch("registry disappearance wording", lifecycleDocs, /Not registered and
 forbidMatch("registry disappearance wording", lifecycleDocs, /Outside a session the tool registry contains none of them\./);
 forbidMatch("registry disappearance wording", lifecycleDocs, /They are \*\*not\*\* available outside a team session\./);
 forbidMatch("registry disappearance wording", lifecycleDocs, /会话外工具注册表与活跃集均不含任何团队工具/);
+forbidMatch("ADR-0003 stale registry invariant", adrAgentSessions, /outside a session, zero team tools in registry and active set/i);
 forbidMatch("agent teardown directory cleanup wording", lifecycleDocs, /widgets off,\s*dir cleanup/);
 forbidMatch("session-ended banner omission wording", lifecycleDocs, /When `\/team stop` ends the session, `session\.active` becomes `false` and no extra prompt is injected\./);
 requireMatch("AGENTS #21 fresh registry qualification", agents, /fresh pi 初始 registry 为空/);
@@ -54,6 +56,8 @@ requireMatch("AGENTS #21 existing registry qualification", agents, /已有进程
 requireMatch("DESIGN §6 registry/activeTools distinction", design, /remain in the registry after teardown[\s\S]{0,120}removed from `activeTools`/);
 requireMatch("DESIGN §18 resumable teardown", design, /preserve resumable[\s\S]{0,80}disk cleanup via \/team delete/);
 requireMatch("DESIGN session-ended banner", design, /no regular TL instructions[\s\S]{0,180}one-shot session-ended banner may be injected on the next turn/);
+requireMatch("ADR-0003 fresh registry qualification", adrAgentSessions, /A fresh pi process starts with no session-scoped team tools in its registry/);
+requireMatch("ADR-0003 activeTools qualification", adrAgentSessions, /remain in the registry after teardown[\s\S]{0,180}removes them from `activeTools` outside a session/);
 requireMatch("fully-settled wording", source, /一次运行完全结算/);
 requireMatch("fully-settled wording in design", design, /Goal Reminder Lifecycle/i);
 
