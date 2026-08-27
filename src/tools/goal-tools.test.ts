@@ -26,8 +26,11 @@ function setupActiveGoal() {
   setGoalForTesting({ text: "探索全部模块", criteria: "- 12 个文件完成", completed: false });
 }
 
-function activeContext(signal?: { aborted?: boolean }) {
-  return { signal };
+function activeContext(
+  signal?: { aborted?: boolean },
+  isIdle: () => boolean = () => true,
+) {
+  return { signal, isIdle };
 }
 
 async function finishLowLevelRun(
@@ -170,7 +173,7 @@ describe("registerGoalAgentHandler reminder", () => {
     expect(pi.sendUserMessage).not.toHaveBeenCalled();
   });
 
-  it("does not send a reminder if finish_goal was already called this turn", async () => {
+  it("does not treat a plain finish_goal text mention as goal completion", async () => {
     vi.useFakeTimers();
     setupActiveGoal();
     const { pi, handlers } = createMockPi();
@@ -187,7 +190,154 @@ describe("registerGoalAgentHandler reminder", () => {
     await settleRun(handlers);
     await flushReminderTimer();
 
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not send a candidate when the goal is completed before settlement", async () => {
+    vi.useFakeTimers();
+    startSession({ name: "test-team", description: "", members: [] } as any);
+    const goal = { text: "g", criteria: "c", completed: false };
+    setGoalForTesting(goal);
+    const { pi, handlers } = createMockPi();
+    registerGoalAgentHandler(pi as any);
+
+    await finishLowLevelRun(handlers);
+    // Model the authoritative finish_goal state update in the settlement
+    // window without clearing the candidate, proving the final goal guard is
+    // independent of cleanup performed by finish_goal itself.
+    goal.completed = true;
+    await settleRun(handlers);
+    await flushReminderTimer();
+
     expect(pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("does not send after the session is stopped before settlement", async () => {
+    vi.useFakeTimers();
+    setupActiveGoal();
+    const { pi, handlers } = createMockPi();
+    registerGoalAgentHandler(pi as any);
+
+    await finishLowLevelRun(handlers);
+    // Keep the candidate alive to exercise the settled/timer session guard;
+    // teardown's resetGoal path is covered separately below.
+    endSession();
+    await settleRun(handlers);
+    await flushReminderTimer();
+
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("cancels a scheduled reminder when the goal is reset after settlement", async () => {
+    vi.useFakeTimers();
+    setupActiveGoal();
+    const { pi, handlers } = createMockPi();
+    registerGoalAgentHandler(pi as any);
+
+    await finishLowLevelRun(handlers);
+    await settleRun(handlers);
+    resetGoal();
+    await flushReminderTimer();
+
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("does not send when the abort signal changes after agent_end", async () => {
+    vi.useFakeTimers();
+    setupActiveGoal();
+    const { pi, handlers } = createMockPi();
+    registerGoalAgentHandler(pi as any);
+    const signal = { aborted: false };
+    const ctx = activeContext(signal);
+
+    await finishLowLevelRun(handlers, { messages: [] }, ctx);
+    signal.aborted = true;
+    await settleRun(handlers, ctx);
+    await flushReminderTimer();
+
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("starts a fresh reminder run after an aborted settled run", async () => {
+    vi.useFakeTimers();
+    setupActiveGoal();
+    const { pi, handlers } = createMockPi();
+    registerGoalAgentHandler(pi as any);
+    const abortedSignal = { aborted: true };
+
+    await finishLowLevelRun(handlers, { messages: [] }, activeContext(abortedSignal));
+    await settleRun(handlers, activeContext(abortedSignal));
+    await flushReminderTimer();
+
+    await finishLowLevelRun(handlers);
+    await settleRun(handlers);
+    await flushReminderTimer();
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not send or use followUp while the TL is busy, then retries a pending reminder on settlement", async () => {
+    vi.useFakeTimers();
+    setupActiveGoal();
+    const { pi, handlers } = createMockPi();
+    registerGoalAgentHandler(pi as any);
+    let idle = false;
+    const ctx = activeContext(undefined, () => idle);
+
+    await finishLowLevelRun(handlers, { messages: [] }, ctx);
+    await settleRun(handlers, ctx);
+    await flushReminderTimer();
+
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    idle = true;
+    await settleRun(handlers, ctx);
+    await flushReminderTimer();
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(pi.sendUserMessage.mock.calls[0]).toHaveLength(1);
+  });
+
+  it("fails closed when the settled context is stale and isIdle throws", async () => {
+    vi.useFakeTimers();
+    setupActiveGoal();
+    const { pi, handlers } = createMockPi();
+    registerGoalAgentHandler(pi as any);
+    const ctx = activeContext(undefined, () => {
+      throw new Error("stale context");
+    });
+
+    await finishLowLevelRun(handlers, { messages: [] }, ctx);
+    await settleRun(handlers, ctx);
+    await expect(flushReminderTimer()).resolves.toBeUndefined();
+
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("swallows synchronous and asynchronous sendUserMessage failures", async () => {
+    vi.useFakeTimers();
+    setupActiveGoal();
+    const { pi, handlers } = createMockPi();
+    registerGoalAgentHandler(pi as any);
+    pi.sendUserMessage
+      .mockImplementationOnce(() => {
+        throw new Error("busy race");
+      })
+      .mockImplementationOnce(() => Promise.reject(new Error("transport failure")));
+
+    await finishLowLevelRun(handlers);
+    await settleRun(handlers);
+    await expect(flushReminderTimer()).resolves.toBeUndefined();
+    await Promise.resolve();
+
+    vi.advanceTimersByTime(10_001);
+    await finishLowLevelRun(handlers);
+    await settleRun(handlers);
+    await expect(flushReminderTimer()).resolves.toBeUndefined();
+    await Promise.resolve();
+
+    // Both failed submits are handled; no synchronous exception or unhandled
+    // rejection escapes the lifecycle callback.
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
   });
 
   it("respects the reminder cooldown across settled runs", async () => {

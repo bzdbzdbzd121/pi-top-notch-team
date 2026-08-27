@@ -19,7 +19,6 @@ let activeGoal: GoalState | null = null;
 
 /** Cooldown between consecutive reminders (ms). Prevents infinite re-trigger loops. */
 const REMINDER_COOLDOWN_MS = 10_000;
-let lastReminderSeq = 0;
 
 /**
  * A low-level agent loop can end more than once before the outer AgentSession
@@ -29,7 +28,12 @@ let lastReminderSeq = 0;
  * trigger for delivery.
  */
 interface GoalReminderCandidate {
+  /** Outer run that produced the candidate. */
   runId: number;
+  /** Session identity captured with the candidate. */
+  sessionId: string | null;
+  /** Goal identity captured with the candidate. */
+  goalGeneration: number;
   text: string;
   criteria: string;
 }
@@ -39,13 +43,177 @@ interface GoalReminderRunState {
   sawAgentEnd: boolean;
   aborted: boolean;
   settled: boolean;
+  /** Captured low-level signal remains observable through the end→settled window. */
+  signal: unknown;
   candidate: GoalReminderCandidate | null;
 }
 
+interface LastReminder {
+  sessionId: string | null;
+  goalGeneration: number;
+  at: number;
+}
+
 let nextRunId = 0;
+let goalGeneration = 0;
 let currentRun: GoalReminderRunState | null = null;
 let pendingReminder: GoalReminderCandidate | null = null;
 let reminderTimer: ReturnType<typeof setTimeout> | null = null;
+let lastReminder: LastReminder | null = null;
+
+function clearReminderTimer(): void {
+  if (reminderTimer !== null) {
+    clearTimeout(reminderTimer);
+    reminderTimer = null;
+  }
+}
+
+/** Invalidate all reminder state without changing the active goal itself. */
+function invalidateReminderState(resetRun = false): void {
+  clearReminderTimer();
+  pendingReminder = null;
+  if (currentRun) {
+    currentRun.candidate = null;
+  }
+  if (resetRun) {
+    currentRun = null;
+  }
+}
+
+function advanceGoalGeneration(resetRun = false): void {
+  goalGeneration += 1;
+  lastReminder = null;
+  invalidateReminderState(resetRun);
+}
+
+function readSignal(ctx: unknown): unknown {
+  try {
+    return (ctx as { signal?: unknown } | null | undefined)?.signal;
+  } catch {
+    // A stale ExtensionContext can throw from its guarded getters. Treat the
+    // signal as unavailable here; dispatch performs an independent fail-closed
+    // context check before sending.
+    return undefined;
+  }
+}
+
+function signalAborted(signal: unknown): boolean {
+  if (!signal) return false;
+  try {
+    return (signal as { aborted?: unknown }).aborted === true;
+  } catch {
+    // A captured signal should not normally throw, but never send a reminder
+    // when its cancellation state cannot be read safely.
+    return true;
+  }
+}
+
+function createRun(ctx: unknown): GoalReminderRunState {
+  const signal = readSignal(ctx);
+  return {
+    runId: ++nextRunId,
+    sawAgentEnd: false,
+    aborted: signalAborted(signal),
+    settled: false,
+    signal,
+    candidate: null,
+  };
+}
+
+function ensureRun(ctx: unknown): GoalReminderRunState {
+  if (!currentRun || currentRun.settled) {
+    // A new outer run supersedes a timer from the previous one. Keep a
+    // still-valid pending candidate for a later settled event, but never let
+    // the old timer race the new run.
+    if (currentRun?.settled) {
+      clearReminderTimer();
+    }
+    currentRun = createRun(ctx);
+  } else {
+    const signal = readSignal(ctx);
+    if (signal !== undefined) {
+      currentRun.signal = signal;
+      if (signalAborted(signal)) {
+        currentRun.aborted = true;
+      }
+    }
+  }
+  return currentRun;
+}
+
+function currentSessionIdentity(): { active: boolean; sessionId: string | null } | null {
+  try {
+    const session = getSessionState();
+    return { active: session.active, sessionId: session.sessionId };
+  } catch {
+    return null;
+  }
+}
+
+function candidateMatchesCurrentGoal(candidate: GoalReminderCandidate): boolean {
+  const session = currentSessionIdentity();
+  if (!session || !session.active || session.sessionId !== candidate.sessionId) {
+    return false;
+  }
+  return Boolean(
+    activeGoal &&
+    !activeGoal.completed &&
+    goalGeneration === candidate.goalGeneration
+  );
+}
+
+function readContextSignalState(ctx: unknown): { readable: boolean; aborted: boolean } {
+  try {
+    const signal = (ctx as { signal?: unknown } | null | undefined)?.signal;
+    return { readable: true, aborted: signalAborted(signal) };
+  } catch {
+    return { readable: false, aborted: true };
+  }
+}
+
+function contextIsIdle(ctx: unknown): { readable: boolean; idle: boolean } {
+  try {
+    const isIdle = (ctx as { isIdle?: unknown } | null | undefined)?.isIdle;
+    if (typeof isIdle !== "function") {
+      return { readable: false, idle: false };
+    }
+    return { readable: true, idle: (isIdle as () => unknown)() === true };
+  } catch {
+    return { readable: false, idle: false };
+  }
+}
+
+function buildReminderText(candidate: GoalReminderCandidate): string {
+  return (
+    `## ⚡ 目标提醒\n\n` +
+    `当前目标 **"${candidate.text}"** 尚未完成。\n\n` +
+    `**完成条件：**\n${candidate.criteria}\n\n` +
+    `---\n` +
+    `请检查当前进度：\n\n` +
+    `1. **如果目标尚未完成** — 继续调度成员执行下一轮任务，直到所有条件满足\n` +
+    `2. **如果目标已完成** — 调用 \`finish_goal\` 工具清理此目标\n` +
+    `3. **如果遇到不可解决的阻塞问题** — 也调用 \`finish_goal\` 并告知用户情况`
+  );
+}
+
+function sendReminderSafely(pi: ExtensionAPI, text: string): void {
+  try {
+    // pi 0.83.0 types this API as void, while adapters/mocks may return a
+    // Promise. Handle both forms so a busy-race rejection cannot escape as an
+    // unhandled rejection.
+    const result = (pi.sendUserMessage as unknown as (content: string) => unknown)(text);
+    if (result && typeof (result as { then?: unknown }).then === "function") {
+      void Promise.resolve(result).catch(() => {
+        // Fire-and-forget submission: the candidate was consumed at the API
+        // boundary, and a later run will be responsible for a new reminder.
+      });
+    }
+  } catch {
+    // A new run can begin between the idle check and this call. Do not retry
+    // with followUp: that would reintroduce the original premature-trigger
+    // behavior. The failed request is intentionally fail-closed.
+  }
+}
 
 // ── Public helpers (for tests and index.ts integration) ────
 
@@ -57,11 +225,12 @@ export function getGoalState(): Readonly<GoalState | null> {
 /** Reset goal state (for testing or session cleanup). */
 export function resetGoal(): void {
   activeGoal = null;
-  lastReminderSeq = 0;
+  advanceGoalGeneration(true);
 }
 
 /** Set goal state for testing. */
 export function setGoalForTesting(goal: GoalState): void {
+  advanceGoalGeneration();
   activeGoal = goal;
 }
 
@@ -71,8 +240,8 @@ export function setGoalForTesting(goal: GoalState): void {
  * auto-seeds the goal from its `task` parameter (ADR-0003).
  */
 export function setGoalInternal(text: string, criteria: string): void {
+  advanceGoalGeneration();
   activeGoal = { text, criteria, completed: false };
-  lastReminderSeq = 0;
 }
 
 // ── Prompt snippet for TL tools ────────────────────────────
@@ -175,7 +344,10 @@ export function registerGoalTools(pi: ExtensionAPI): void {
           content: [{ type: "text" as const, text: "当前没有活跃的目标。" }],
         };
       }
+      // Mark completion before invalidating reminder state so a candidate
+      // already prepared by agent_end cannot survive the finish operation.
       goal.completed = true;
+      advanceGoalGeneration();
       // Clear the goal from the persisted manifest (completed goals don't resume).
       syncActiveManifest({ goal: null });
       return {
@@ -195,21 +367,114 @@ export function registerGoalTools(pi: ExtensionAPI): void {
 // ── Agent lifecycle reminder handler (safe to register at module init) ─
 
 export function registerGoalAgentHandler(pi: ExtensionAPI): void {
+  const scheduleReminder = (ctx: unknown): void => {
+    if (reminderTimer !== null) return;
+
+    reminderTimer = setTimeout(() => {
+      reminderTimer = null;
+      const candidate = pendingReminder;
+      if (!candidate) return;
+
+      // Re-check every identity at dispatch time. A finish_goal call, session
+      // teardown, or replacement goal may have invalidated this candidate
+      // after agent_end and before this timer executes.
+      if (!candidateMatchesCurrentGoal(candidate)) {
+        pendingReminder = null;
+        return;
+      }
+
+      const run = currentRun;
+      if (!run || run.runId !== candidate.runId) {
+        // A newer run may have started before this tick. Keep the candidate
+        // for that run's eventual settled event, but never send into a busy
+        // run or revive a run that has already settled.
+        if (run && !run.settled && !run.aborted) return;
+        pendingReminder = null;
+        return;
+      }
+      if (!run.sawAgentEnd || !run.settled || run.aborted || signalAborted(run.signal)) {
+        pendingReminder = null;
+        return;
+      }
+
+      const settledSignal = readContextSignalState(ctx);
+      if (!settledSignal.readable || settledSignal.aborted) {
+        pendingReminder = null;
+        return;
+      }
+
+      // The timer is only a re-entry barrier. It must not enqueue a reminder
+      // into a new active run; only an idle TL may receive a normal prompt.
+      const idle = contextIsIdle(ctx);
+      if (!idle.readable) {
+        pendingReminder = null;
+        return;
+      }
+      if (!idle.idle) {
+        // Preserve the candidate. A later settled event can retry it without
+        // using followUp (which would hide the lifecycle race).
+        return;
+      }
+
+      // isIdle() is user/context code and can itself trigger a new run. Close
+      // that unavoidable check→send race by validating the run again.
+      if (currentRun !== run) {
+        if (currentRun && !currentRun.settled && !currentRun.aborted) return;
+        pendingReminder = null;
+        return;
+      }
+
+      // Re-read identity and cancellation state after the idle callback too:
+      // the check itself is synchronous user/context code and can cause a
+      // goal/session transition or observe an abort in the same turn.
+      if (
+        !candidateMatchesCurrentGoal(candidate) ||
+        run.aborted ||
+        signalAborted(run.signal)
+      ) {
+        pendingReminder = null;
+        return;
+      }
+      const postIdleSignal = readContextSignalState(ctx);
+      if (!postIdleSignal.readable || postIdleSignal.aborted) {
+        pendingReminder = null;
+        return;
+      }
+
+      const now = Date.now();
+      if (
+        lastReminder &&
+        lastReminder.sessionId === candidate.sessionId &&
+        lastReminder.goalGeneration === candidate.goalGeneration &&
+        now - lastReminder.at < REMINDER_COOLDOWN_MS
+      ) {
+        // A candidate that loses the cooldown is consumed; a later run after
+        // the cooldown expires can produce a fresh candidate.
+        pendingReminder = null;
+        return;
+      }
+
+      // Clear pending before the API call so a synchronous re-entry cannot
+      // schedule/submit this candidate a second time. The API has no
+      // observable synchronous delivery result, so this is the submission
+      // point used for cooldown accounting.
+      pendingReminder = null;
+      lastReminder = {
+        sessionId: candidate.sessionId,
+        goalGeneration: candidate.goalGeneration,
+        at: now,
+      };
+      sendReminderSafely(pi, buildReminderText(candidate));
+    }, 0);
+  };
+
   // agent_start begins (or resumes) an outer AgentSession run. Retry,
   // compaction, and queued continuation starts occur before agent_settled and
   // therefore reuse this state instead of opening a new reminder window.
   pi.on("agent_start", (_event, ctx) => {
-    if (!currentRun || currentRun.settled) {
-      currentRun = {
-        runId: ++nextRunId,
-        sawAgentEnd: false,
-        aborted: false,
-        settled: false,
-        candidate: null,
-      };
-    }
-    if (ctx?.signal?.aborted) {
-      currentRun.aborted = true;
+    const run = ensureRun(ctx);
+    if (run.aborted) {
+      pendingReminder = null;
     }
   });
 
@@ -217,29 +482,20 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
   // not a delivery boundary: pi may still retry, compact, or process queued
   // messages after this event and before agent_settled.
   pi.on("agent_end", async (event, ctx) => {
-    if (!currentRun || currentRun.settled) {
-      // Be tolerant of lightweight callers/tests that emit agent_end without
-      // first emitting agent_start. Real AgentSession runs always emit both.
-      currentRun = {
-        runId: ++nextRunId,
-        sawAgentEnd: false,
-        aborted: false,
-        settled: false,
-        candidate: null,
-      };
-    }
-    const run = currentRun;
+    const run = ensureRun(ctx);
     run.sawAgentEnd = true;
 
-    // Preserve the existing abort guard at the low-level boundary. The
-    // end→settled abort window is part of the follow-up cancellation phase.
-    if (ctx?.signal?.aborted) {
-      run.aborted = true;
+    const signal = readSignal(ctx);
+    if (signal !== undefined) {
+      run.signal = signal;
+      if (signalAborted(signal)) {
+        run.aborted = true;
+      }
     }
 
-    // Check the structured assistant outcome when it is available. This is
-    // intentionally limited to recording the run outcome; agent_settled still
-    // owns the decision to schedule delivery.
+    // Record structured cancellation from the final assistant message. An
+    // abort signal can also flip after this callback, so dispatch re-checks the
+    // captured signal rather than relying on this snapshot alone.
     const messages = (event as any).messages ?? [];
     const assistantMsg = messages.findLast?.((m: any) => m?.role === "assistant");
     if (assistantMsg?.stopReason === "aborted") {
@@ -247,33 +503,27 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
     }
 
     // Guard: only prepare a candidate when a goal exists and is NOT completed.
-    if (!activeGoal || activeGoal.completed) return;
+    if (!activeGoal || activeGoal.completed) {
+      pendingReminder = null;
+      return;
+    }
 
-    // Guard: only prepare reminders during an active team session.
-    if (!getSessionState().active) return;
+    const session = currentSessionIdentity();
+    if (!session || !session.active) {
+      pendingReminder = null;
+      return;
+    }
 
     // Guard: an aborted low-level end cannot become a reminder candidate.
-    if (run.aborted) return;
-
-    // Guard: cooldown — prevent infinite re-trigger loops. The cooldown is
-    // intentionally retained at this lifecycle stage; dispatch-time
-    // re-accounting belongs to the subsequent race/guard phase.
-    const now = Date.now();
-    if (now - lastReminderSeq < REMINDER_COOLDOWN_MS) return;
-    lastReminderSeq = now;
-
-    // Check if TL *already* called finish_goal in this turn (race-safe guard).
-    // The authoritative goal-completion check is retained for the subsequent
-    // goal-generation phase; this protects existing behavior in this phase.
-    const content = typeof assistantMsg?.content === "string"
-      ? assistantMsg.content
-      : Array.isArray(assistantMsg?.content)
-        ? (assistantMsg.content as any[]).map((c: any) => c.text ?? "").join("")
-        : "";
-    if (content.includes("finish_goal")) return;
+    if (run.aborted) {
+      pendingReminder = null;
+      return;
+    }
 
     run.candidate = {
       runId: run.runId,
+      sessionId: session.sessionId,
+      goalGeneration,
       text: activeGoal.text,
       criteria: activeGoal.criteria,
     };
@@ -282,32 +532,47 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
   // agent_settled is the only reminder delivery boundary. The one-shot timer
   // merely avoids re-entering pi from inside the settled listener; it does
   // not attempt to infer lifecycle state from a timer tick.
-  pi.on("agent_settled", async () => {
+  pi.on("agent_settled", async (_event, ctx) => {
     const run = currentRun;
-    if (!run || run.settled) return;
+    if (!run) return;
+
+    const settledSignal = readContextSignalState(ctx);
+    if (settledSignal.aborted || signalAborted(run.signal)) {
+      run.aborted = true;
+    }
+    // Mark the outer run settled even when it was aborted. Otherwise a later
+    // legitimate agent_start would be mistaken for the same aborted run and
+    // could never produce a fresh candidate.
     run.settled = true;
-
-    if (!run.sawAgentEnd || run.aborted || !run.candidate) return;
-
-    pendingReminder = run.candidate;
-    if (reminderTimer) return;
-
-    reminderTimer = setTimeout(() => {
-      reminderTimer = null;
-      const candidate = pendingReminder;
+    if (run.aborted) {
+      run.candidate = null;
       pendingReminder = null;
-      if (!candidate) return;
+      return;
+    }
 
-      pi.sendUserMessage(
-        `## ⚡ 目标提醒\n\n` +
-        `当前目标 **"${candidate.text}"** 尚未完成。\n\n` +
-        `**完成条件：**\n${candidate.criteria}\n\n` +
-        `---\n` +
-        `请检查当前进度：\n\n` +
-        `1. **如果目标尚未完成** — 继续调度成员执行下一轮任务，直到所有条件满足\n` +
-        `2. **如果目标已完成** — 调用 \`finish_goal\` 工具清理此目标\n` +
-        `3. **如果遇到不可解决的阻塞问题** — 也调用 \`finish_goal\` 并告知用户情况`,
-      );
-    }, 0);
+    if (!run.sawAgentEnd) return;
+
+    // Transfer the latest candidate to the single pending slot. If a previous
+    // timer observed a busy TL, rebind its still-valid candidate to this
+    // settled run so a later settled event can safely consume it.
+    const candidate = run.candidate;
+    run.candidate = null;
+    if (candidate) {
+      if (!candidateMatchesCurrentGoal(candidate)) {
+        pendingReminder = null;
+        return;
+      }
+      pendingReminder = candidate;
+    } else if (pendingReminder) {
+      if (!candidateMatchesCurrentGoal(pendingReminder)) {
+        pendingReminder = null;
+        return;
+      }
+      pendingReminder = { ...pendingReminder, runId: run.runId };
+    }
+
+    if (pendingReminder) {
+      scheduleReminder(ctx);
+    }
   });
 }
