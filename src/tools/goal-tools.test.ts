@@ -510,6 +510,34 @@ describe("registerGoalAgentHandler reminder", () => {
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps uncertain acknowledgement state through the configured compaction timeout", async () => {
+    vi.useFakeTimers();
+    setupActiveGoal();
+    const { pi, handlers } = createMockPi();
+    registerGoalAgentHandler(pi as any, {
+      getAutoCompactTimeoutMinutes: () => 2,
+    });
+    pi.sendUserMessage.mockImplementation(() => undefined as any);
+    const signal = { aborted: false };
+
+    await finishLowLevelRun(handlers);
+    await settleRun(handlers);
+    await vi.advanceTimersByTimeAsync(0);
+    const reminderPrompt = pi.sendUserMessage.mock.calls[0][0];
+
+    // The configured 2-minute lease must outlive the 60s base TTL. The
+    // reminder is accepted only after that base interval has elapsed.
+    await vi.advanceTimersByTimeAsync(60_001);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+    await handlers["before_agent_start"]({ prompt: reminderPrompt }, activeContext(signal));
+    await handlers["agent_start"]({}, activeContext(signal));
+    await handlers["agent_end"]({ messages: [] }, activeContext(signal));
+    await settleRun(handlers, activeContext(signal));
+    await flushReminderTimer();
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+
   it("correlates a delayed fire-and-forget acknowledgement by before_agent_start prompt", async () => {
     vi.useFakeTimers();
     setupActiveGoal();

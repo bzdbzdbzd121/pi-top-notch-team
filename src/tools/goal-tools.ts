@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getSessionState, isActive } from "../session/state";
 import { syncActiveManifest } from "../session/manifest";
+import { DEFAULT_SETTINGS } from "../settings/settings";
 
 // ── Types ──────────────────────────────────────────────────
 
@@ -81,11 +82,17 @@ interface UncertainSubmission {
   expiresAt: number;
 }
 
+export interface GoalAgentHandlerOptions {
+  /** Auto-compaction lease in minutes; used to retain delayed prompt markers. */
+  getAutoCompactTimeoutMinutes?: () => number | undefined;
+}
+
 /** pi 0.83.0's sendUserMessage wrapper returns void; bound the no-ack fallback. */
 const REMINDER_SUBMISSION_ACK_TIMEOUT_MS = 1_000;
 const REMINDER_MARKER_PREFIX = "<!-- top-notch-team:goal-reminder:";
 const REMINDER_MARKER_SUFFIX = " -->";
-const UNCERTAIN_SUBMISSION_TTL_MS = 60_000;
+const MIN_UNCERTAIN_SUBMISSION_TTL_MS = 60_000;
+const DEFAULT_UNCERTAIN_SUBMISSION_TTL_MS = DEFAULT_SETTINGS.autoCompact.timeoutMinutes * 60_000;
 const MAX_UNCERTAIN_SUBMISSIONS = 32;
 
 let nextRunId = 0;
@@ -186,6 +193,22 @@ function signalAborted(signal: unknown): boolean {
 
 function sessionKey(session: { active: boolean; sessionId: string | null }): string {
   return session.active ? `active:${session.sessionId ?? "<none>"}` : "inactive";
+}
+
+function resolveUncertainSubmissionTtlMs(options: GoalAgentHandlerOptions): number {
+  let timeoutMinutes: number | undefined = DEFAULT_SETTINGS.autoCompact.timeoutMinutes;
+  try {
+    timeoutMinutes = options.getAutoCompactTimeoutMinutes?.() ?? timeoutMinutes;
+  } catch {
+    return DEFAULT_UNCERTAIN_SUBMISSION_TTL_MS;
+  }
+  if (typeof timeoutMinutes !== "number" || !Number.isFinite(timeoutMinutes) || timeoutMinutes <= 0) {
+    return DEFAULT_UNCERTAIN_SUBMISSION_TTL_MS;
+  }
+  const configuredTtl = timeoutMinutes * 60_000;
+  return Number.isFinite(configuredTtl)
+    ? Math.max(MIN_UNCERTAIN_SUBMISSION_TTL_MS, configuredTtl)
+    : Number.MAX_SAFE_INTEGER;
 }
 
 function pruneUncertainSubmissions(now = Date.now()): void {
@@ -507,6 +530,7 @@ function armUnobservableSubmission(
   candidate: GoalReminderCandidate,
   marker: string,
   pi: ExtensionAPI,
+  options: GoalAgentHandlerOptions,
 ): void {
   clearPendingSubmission();
   const watchdog = setTimeout(() => {
@@ -520,7 +544,7 @@ function armUnobservableSubmission(
     clearPendingSubmission();
     uncertainSubmissions.set(submission.marker, {
       candidate: submission.candidate,
-      expiresAt: Date.now() + UNCERTAIN_SUBMISSION_TTL_MS,
+      expiresAt: Date.now() + resolveUncertainSubmissionTtlMs(options),
     });
     pruneUncertainSubmissions();
     notifyReminderUnconfirmed(
@@ -744,7 +768,10 @@ export function registerGoalTools(pi: ExtensionAPI): void {
 
 // ── Agent lifecycle reminder handler (safe to register at module init) ─
 
-export function registerGoalAgentHandler(pi: ExtensionAPI): void {
+export function registerGoalAgentHandler(
+  pi: ExtensionAPI,
+  options: GoalAgentHandlerOptions = {},
+): void {
   const scheduleReminder = (ctx: unknown): void => {
     if (reminderTimer !== null) return;
 
@@ -848,7 +875,7 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
         prompt,
         (error) => restoreFailedCandidate(candidate, pi, error),
         () => clearPendingSubmissionForMarker(marker),
-        () => armUnobservableSubmission(candidate, marker, pi),
+        () => armUnobservableSubmission(candidate, marker, pi, options),
       );
     }, 0);
   };
