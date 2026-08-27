@@ -67,8 +67,15 @@ interface LastReminder {
  */
 interface ResetBarrier {
   runId: number;
-  signals: Set<unknown>;
 }
+
+interface ReminderSubmission {
+  candidate: GoalReminderCandidate;
+  watchdog: ReturnType<typeof setTimeout>;
+}
+
+/** pi 0.83.0's sendUserMessage wrapper returns void; bound the no-ack fallback. */
+const REMINDER_SUBMISSION_ACK_TIMEOUT_MS = 1_000;
 
 let nextRunId = 0;
 let goalGeneration = 0;
@@ -82,6 +89,7 @@ let lastReminder: LastReminder | null = null;
 let awaitingFreshRun = false;
 let freshRunRequiresSignal = false;
 let resetBarrier: ResetBarrier | null = null;
+let pendingSubmission: ReminderSubmission | null = null;
 /** Signal identities from invalidated runs; objects are weakly held to avoid unbounded growth. */
 const invalidatedSignalObjects = new WeakSet<object>();
 
@@ -92,9 +100,17 @@ function clearReminderTimer(): void {
   }
 }
 
+function clearPendingSubmission(): void {
+  if (pendingSubmission !== null) {
+    clearTimeout(pendingSubmission.watchdog);
+    pendingSubmission = null;
+  }
+}
+
 /** Invalidate all reminder state without changing the active goal itself. */
 function invalidateReminderState(resetRun = false): void {
   clearReminderTimer();
+  clearPendingSubmission();
   pendingReminder = null;
   if (currentRun) {
     currentRun.candidate = null;
@@ -107,10 +123,7 @@ function invalidateReminderState(resetRun = false): void {
     freshRunRequiresSignal = Boolean(runToInvalidate && runToInvalidate.signals.size > 0);
     if (runToInvalidate) {
       tombstoneRun(runToInvalidate);
-      resetBarrier = {
-        runId: runToInvalidate.runId,
-        signals: new Set(runToInvalidate.signals),
-      };
+      resetBarrier = { runId: runToInvalidate.runId };
     }
     currentRun = null;
     awaitingFreshRun = true;
@@ -341,6 +354,8 @@ function sendReminderSafely(
   pi: ExtensionAPI,
   text: string,
   onFailure: (error?: unknown) => void,
+  onAccepted: () => void,
+  onUnobservable: () => void,
 ): void {
   const recover = (error?: unknown): void => {
     try {
@@ -349,14 +364,26 @@ function sendReminderSafely(
       // Recovery is best effort and must not escape a lifecycle callback.
     }
   };
+  const accept = (): void => {
+    try {
+      onAccepted();
+    } catch {
+      // Acceptance bookkeeping is best effort and must not escape a lifecycle callback.
+    }
+  };
 
   try {
-    // pi 0.83.0 types this API as void, while adapters/mocks may return a
-    // Promise. Handle both forms so a busy-race rejection cannot escape as an
-    // unhandled rejection.
+    // pi 0.83.0 types this API as void and its ExtensionAPI wrapper discards
+    // the underlying AgentSession Promise. Observable adapters can still
+    // return a Promise; the void path is handled by the bounded agent_start
+    // acknowledgement watchdog below.
     const result = (pi.sendUserMessage as unknown as (content: string) => unknown)(text);
     if (result && typeof (result as { then?: unknown }).then === "function") {
-      void Promise.resolve(result).catch(recover);
+      void Promise.resolve(result).then(accept, recover);
+    } else if (result === undefined) {
+      onUnobservable();
+    } else {
+      accept();
     }
   } catch (error) {
     // A new run can begin between the idle check and this call. Do not retry
@@ -396,6 +423,27 @@ function notifyReminderFailure(pi: ExtensionAPI, error: unknown): void {
     // Failure reporting must not turn a best-effort reminder into an
     // unhandled lifecycle error.
   }
+}
+
+function armUnobservableSubmission(
+  candidate: GoalReminderCandidate,
+  pi: ExtensionAPI,
+): void {
+  clearPendingSubmission();
+  const watchdog = setTimeout(() => {
+    // A fresh agent_start acknowledges the fire-and-forget request and clears
+    // this watchdog. Only the still-current attempt may enter fallback.
+    if (!pendingSubmission || pendingSubmission.candidate !== candidate) return;
+    clearPendingSubmission();
+    restoreFailedCandidate(
+      candidate,
+      pi,
+      new Error(
+        `pi 0.83.0 sendUserMessage returned no Promise and no agent_start was observed within ${REMINDER_SUBMISSION_ACK_TIMEOUT_MS}ms`,
+      ),
+    );
+  }, REMINDER_SUBMISSION_ACK_TIMEOUT_MS);
+  pendingSubmission = { candidate, watchdog };
 }
 
 function restoreFailedCandidate(candidate: GoalReminderCandidate, pi: ExtensionAPI, error: unknown): void {
@@ -666,6 +714,8 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
         pi,
         buildReminderText(candidate),
         (error) => restoreFailedCandidate(candidate, pi, error),
+        () => clearPendingSubmission(),
+        () => armUnobservableSubmission(candidate, pi),
       );
     }, 0);
   };
@@ -675,7 +725,11 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
   // therefore reuse this state instead of opening a new reminder window.
   pi.on("agent_start", (_event, ctx) => {
     const run = ensureStartRun(ctx);
-    if (run && runWasAborted(run)) {
+    if (!run) return;
+    // The real pi 0.83.0 sender returns void. A following agent_start is the
+    // only runtime acknowledgement available to the extension in that path.
+    clearPendingSubmission();
+    if (runWasAborted(run)) {
       pendingReminder = null;
     }
   });

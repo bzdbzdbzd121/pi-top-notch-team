@@ -15,7 +15,9 @@ function createMockPi() {
     on: vi.fn((event: string, cb: (event: any, ctx: any) => unknown) => {
       handlers[event] = cb;
     }),
-    sendUserMessage: vi.fn(),
+    // Most tests use an injected observable sender. A dedicated test below
+    // models pi 0.83.0's real fire-and-forget wrapper, which returns void.
+    sendUserMessage: vi.fn(() => Promise.resolve()),
     sendMessage: vi.fn(),
     registerTool: vi.fn(),
   };
@@ -413,31 +415,72 @@ describe("registerGoalAgentHandler reminder", () => {
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
   });
 
+  it("surfaces an unobservable fire-and-forget send without silently losing the reminder", async () => {
+    vi.useFakeTimers();
+    setupActiveGoal();
+    const { pi, handlers } = createMockPi();
+    registerGoalAgentHandler(pi as any);
+    // This is the actual pi 0.83.0 ExtensionAPI shape: the underlying async
+    // failure is caught inside agent-session.js and the wrapper returns void.
+    pi.sendUserMessage.mockImplementation(() => undefined as any);
+
+    await finishLowLevelRun(handlers);
+    await settleRun(handlers);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+
+    // No following agent_start means the void API cannot be confirmed. The
+    // bounded fallback makes that uncertainty visible and retains the one
+    // candidate for a later settled retry.
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(pi.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customType: "team-message",
+        content: expect.stringContaining("目标提醒提交失败"),
+        display: true,
+      }),
+    );
+  });
+
+  it("acknowledges an unobservable send when it starts a subsequent agent run", async () => {
+    vi.useFakeTimers();
+    setupActiveGoal();
+    const { pi, handlers } = createMockPi();
+    registerGoalAgentHandler(pi as any);
+    pi.sendUserMessage.mockImplementation(() => undefined as any);
+    const signal = { aborted: false };
+
+    await finishLowLevelRun(handlers);
+    await settleRun(handlers);
+    await vi.advanceTimersByTimeAsync(0);
+    await handlers["agent_start"]({}, activeContext(signal));
+    signal.aborted = true;
+    await handlers["agent_end"]({ messages: [] }, activeContext(signal));
+    await settleRun(handlers, activeContext(signal));
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+  });
+
   it("swallows synchronous and asynchronous sendUserMessage failures", async () => {
     vi.useFakeTimers();
     setupActiveGoal();
     const { pi, handlers } = createMockPi();
     registerGoalAgentHandler(pi as any);
-    pi.sendUserMessage
-      .mockImplementationOnce(() => {
-        throw new Error("busy race");
-      })
-      .mockImplementationOnce(() => Promise.reject(new Error("transport failure")));
+    pi.sendUserMessage.mockImplementationOnce(() => {
+      throw new Error("busy race");
+    });
 
     await finishLowLevelRun(handlers);
     await settleRun(handlers);
     await expect(flushReminderTimer()).resolves.toBeUndefined();
-    await Promise.resolve();
 
-    vi.advanceTimersByTime(10_001);
-    await finishLowLevelRun(handlers);
-    await settleRun(handlers);
-    await expect(flushReminderTimer()).resolves.toBeUndefined();
-    await Promise.resolve();
-
-    // Both failed submits are handled; no synchronous exception or unhandled
-    // rejection escapes the lifecycle callback.
-    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
+    // The failed submit is handled and retained for a later settled boundary;
+    // no synchronous exception escapes the lifecycle callback.
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
   });
 
   it("respects the reminder cooldown across settled runs", async () => {
