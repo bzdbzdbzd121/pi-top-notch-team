@@ -2,6 +2,7 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import { startSession, endSession } from "../session/state";
 import {
   registerGoalAgentHandler,
+  registerGoalTools,
   setGoalForTesting,
   resetGoal,
   getGoalState,
@@ -647,6 +648,34 @@ describe("registerGoalAgentHandler reminder", () => {
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
   });
 
+  it("anchors cooldown at API submission rather than delayed ACK", async () => {
+    vi.useFakeTimers();
+    setupActiveGoal();
+    const { pi, handlers } = createMockPi();
+    registerGoalAgentHandler(pi as any);
+    pi.sendUserMessage.mockImplementation(() => undefined as any);
+
+    await finishLowLevelRun(handlers);
+    await settleRun(handlers);
+    await vi.advanceTimersByTimeAsync(0);
+    const reminderPrompt = pi.sendUserMessage.mock.calls[0][0];
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    // ACK after 9s must only clear uncertainty. Its associated reminder run
+    // is suppressed once, then the next normal run at t=10s should pass if
+    // cooldown remains anchored at the API submission.
+    await vi.advanceTimersByTimeAsync(8_000);
+    await handlers["before_agent_start"]({ prompt: reminderPrompt }, activeContext());
+    await finishLowLevelRun(handlers);
+    await settleRun(handlers);
+    await vi.advanceTimersByTimeAsync(1_001);
+    await finishLowLevelRun(handlers);
+    await settleRun(handlers);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
+  });
+
   it("respects the reminder cooldown across settled runs", async () => {
     vi.useFakeTimers();
     setupActiveGoal();
@@ -664,6 +693,31 @@ describe("registerGoalAgentHandler reminder", () => {
     await flushReminderTimer();
 
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("goal tool lifecycle wording", () => {
+  it("describes reminders at the fully-settled boundary and in the set_goal result", async () => {
+    const { pi } = createMockPi();
+    registerGoalTools(pi as any);
+    const setGoalDefinition = pi.registerTool.mock.calls.find(
+      (call: any[]) => call[0]?.name === "set_goal",
+    )?.[0] as any;
+    const expected =
+      "系统只会在 TL 的一次运行完全结算（不会再自动重试、自动压缩或处理排队续跑）且目标仍未完成时提醒你检查进度；`agent_end` 只是中间结束点，不会触发提醒。完成目标后请调用 finish_goal 工具。";
+
+    expect(setGoalDefinition.description).toContain(
+      "The system reminds you only after the TL run is fully settled",
+    );
+    expect(setGoalDefinition.description).toContain("without automatic retry, compaction, or queued continuation");
+    expect(setGoalDefinition.promptGuidelines).toContain(expected);
+
+    setupActiveGoal();
+    const result = await setGoalDefinition.execute("call-1", {
+      text: "完成目标",
+      criteria: "- 条件满足",
+    });
+    expect(result.content[0].text).toContain(expected);
   });
 });
 

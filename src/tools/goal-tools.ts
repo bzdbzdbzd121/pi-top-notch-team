@@ -45,6 +45,8 @@ interface GoalReminderRunState {
   sawAgentEnd: boolean;
   aborted: boolean;
   settled: boolean;
+  /** Suppress the candidate produced by the run started by a reminder. */
+  suppressReminderCandidate: boolean;
   /** Every low-level prompt/continue signal seen in this outer run. */
   signals: Set<unknown>;
   /** Session identity captured when this outer run started. */
@@ -76,6 +78,11 @@ interface ReminderSubmission {
   watchdog: ReturnType<typeof setTimeout>;
 }
 
+interface ReminderAcknowledgement {
+  candidate: GoalReminderCandidate;
+  marker: string;
+}
+
 interface UncertainSubmission {
   candidate: GoalReminderCandidate;
 }
@@ -98,6 +105,7 @@ let awaitingFreshRun = false;
 let freshRunRequiresSignal = false;
 let resetBarrier: ResetBarrier | null = null;
 let pendingSubmission: ReminderSubmission | null = null;
+let acknowledgedSubmission: ReminderAcknowledgement | null = null;
 /**
  * Timed-out void submissions remain matchable by their complete marker until
  * acknowledgement or goal/session reset. The dispatch gate below permits only
@@ -126,6 +134,7 @@ function clearPendingSubmission(): void {
 function clearSubmissionState(): void {
   clearPendingSubmission();
   uncertainSubmissions.clear();
+  acknowledgedSubmission = null;
 }
 
 function clearPendingSubmissionForMarker(marker: string): void {
@@ -265,6 +274,7 @@ function createRun(ctx: unknown): GoalReminderRunState {
     sawAgentEnd: false,
     aborted: signalAborted(signal),
     settled: false,
+    suppressReminderCandidate: false,
     signals,
     sessionId: session?.sessionId ?? null,
     sessionEpoch,
@@ -533,15 +543,6 @@ function extractReminderMarker(prompt: string): string | null {
   return /^\d+$/.test(id) ? marker : null;
 }
 
-function refreshReminderCooldown(candidate: GoalReminderCandidate): void {
-  if (!candidateMatchesCurrentGoal(candidate)) return;
-  lastReminder = {
-    sessionId: candidate.sessionId,
-    goalGeneration: candidate.goalGeneration,
-    at: Date.now(),
-  };
-}
-
 function acknowledgeReminderPrompt(prompt: unknown): void {
   if (typeof prompt !== "string") return;
   const marker = extractReminderMarker(prompt);
@@ -550,14 +551,18 @@ function acknowledgeReminderPrompt(prompt: unknown): void {
   if (pendingSubmission?.marker === marker) {
     const candidate = pendingSubmission.candidate;
     clearPendingSubmission();
-    refreshReminderCooldown(candidate);
+    // ACK only resolves uncertainty. lastReminder remains anchored at the
+    // API submission point; suppression is attached to the next run instead.
+    acknowledgedSubmission = { candidate, marker };
     return;
   }
 
   const uncertainSubmission = uncertainSubmissions.get(marker);
   if (!uncertainSubmission) return;
   uncertainSubmissions.delete(marker);
-  refreshReminderCooldown(uncertainSubmission.candidate);
+  // Keep the cooldown anchor unchanged for the same API-only semantics as the
+  // pending path; the confirmed run is suppressed separately at agent_end.
+  acknowledgedSubmission = { candidate: uncertainSubmission.candidate, marker };
 }
 
 function restoreFailedCandidate(candidate: GoalReminderCandidate, pi: ExtensionAPI, error: unknown): void {
@@ -608,6 +613,8 @@ export function setGoalInternal(text: string, criteria: string): void {
 // ── Prompt snippet for TL tools ────────────────────────────
 
 const GOAL_PROMPT_SNIPPET = "Set/finish a session goal to track overall objective";
+const GOAL_REMINDER_LIFECYCLE_NOTICE =
+  "系统只会在 TL 的一次运行完全结算（不会再自动重试、自动压缩或处理排队续跑）且目标仍未完成时提醒你检查进度；`agent_end` 只是中间结束点，不会触发提醒。完成目标后请调用 finish_goal 工具。";
 
 // ── Goal tool names (for setActiveTools lifecycle) ───────
 
@@ -622,14 +629,15 @@ export function registerGoalTools(pi: ExtensionAPI): void {
     label: "Set Goal",
     description:
       "Set a session goal with completion criteria. " +
-      "Call this at the start of a task so the system can remind you if you stop before the goal is met. " +
+      "The system reminds you only after the TL run is fully settled (without automatic retry, compaction, or queued continuation) and the goal remains incomplete. " +
+      "agent_end is only an intermediate end point and does not trigger a reminder. " +
       "The goal must include concrete, verifiable completion criteria so you can check progress against it. " +
       "Parameters: text (goal summary), criteria (completion conditions).",
     promptGuidelines: [
       "Use set_goal at the start of a team session to define what success looks like.",
       "Write concrete, verifiable completion criteria — not vague aspirations.",
       "Example: { text: '探索 module_a 的全部文件', criteria: '- module_a 的 12 个文件全部完成探索\\n- 所有裁决报告已合并\\n- 所有写入已通过 validate.py 校验' }",
-      "After setting the goal, if you stop and try to ask the user for permission, the system will remind you to check the goal first.",
+      GOAL_REMINDER_LIFECYCLE_NOTICE,
     ],
     promptSnippet: GOAL_PROMPT_SNIPPET,
     parameters: {
@@ -666,7 +674,7 @@ export function registerGoalTools(pi: ExtensionAPI): void {
         content: [
           {
             type: "text" as const,
-            text: `目标已设定：${params.text}\n完成条件：\n${params.criteria}\n\n系统将在你停止时提醒你检查目标进度。完成目标后请调用 finish_goal 工具。`,
+            text: `目标已设定：${params.text}\n完成条件：\n${params.criteria}\n\n${GOAL_REMINDER_LIFECYCLE_NOTICE}`,
           },
         ],
       };
@@ -858,9 +866,24 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
   pi.on("agent_start", (_event, ctx) => {
     const run = ensureStartRun(ctx);
     if (!run) return;
-    // Do not acknowledge a reminder here: agent_start has no prompt and may
-    // belong to an unrelated user run. Correlation was completed above by
-    // before_agent_start.
+
+    // The matching before_agent_start precedes this event in pi. Associate
+    // exactly the next fresh run with that reminder so its own later
+    // agent_end cannot create a second reminder after the API cooldown.
+    const acknowledgement = acknowledgedSubmission;
+    if (acknowledgement && run.runId !== acknowledgement.candidate.runId) {
+      if (
+        acknowledgement.candidate.sessionId === run.sessionId &&
+        acknowledgement.candidate.sessionEpoch === run.sessionEpoch &&
+        acknowledgement.candidate.goalGeneration === goalGeneration &&
+        activeGoal &&
+        !activeGoal.completed
+      ) {
+        run.suppressReminderCandidate = true;
+      }
+      acknowledgedSubmission = null;
+    }
+
     if (runWasAborted(run)) {
       pendingReminder = null;
     }
@@ -881,6 +904,14 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
     const assistantMsg = messages.findLast?.((m: any) => m?.role === "assistant");
     if (assistantMsg?.stopReason === "aborted") {
       run.aborted = true;
+    }
+
+    // The run started by a confirmed reminder must not feed that same goal
+    // back into the reminder pipeline, even when preflight exceeded cooldown.
+    // Keep this flag for every low-level continuation until agent_settled.
+    if (run.suppressReminderCandidate) {
+      run.candidate = null;
+      return;
     }
 
     // Guard: only prepare a candidate when a goal exists and is NOT completed.
