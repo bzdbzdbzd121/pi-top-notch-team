@@ -599,7 +599,10 @@ describe("goal reminder with the installed pi 0.83.0 AgentSession", () => {
       const oldMarkerPrompt = harness.state.markerPrompts[0];
       expect(oldMarkerPrompt).toContain("top-notch-team:goal-reminder:");
 
+      // Mirror teardown.ts exactly: stop the session first, then reset goal,
+      // and only afterwards start the replacement session.
       endSession();
+      resetGoal();
       startSession(TEAM as any, { sessionId: "agent-session-test-new" });
       setGoalForTesting({
         text: "新会话目标",

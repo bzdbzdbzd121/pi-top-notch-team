@@ -241,9 +241,13 @@ function currentSessionIdentity(): { active: boolean; sessionId: string | null }
             ? { candidate: acknowledgedSubmission.candidate, marker: acknowledgedSubmission.marker }
             : null;
       clearSubmissionState(true);
-      staleRolloverSubmission = staleSubmission
-        ? { ...staleSubmission, markerSeen: false }
-        : null;
+      if (staleSubmission) {
+        // A teardown transition can be observed twice (active → inactive,
+        // then inactive → replacement). The second transition has no live
+        // submission to capture, so retain the marker captured on the first
+        // transition until the old prompt reaches its lifecycle events.
+        staleRolloverSubmission = { ...staleSubmission, markerSeen: false };
+      }
     }
     return { active: session.active, sessionId: session.sessionId };
   } catch {
