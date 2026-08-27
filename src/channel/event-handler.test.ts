@@ -414,8 +414,8 @@ describe("createMemberEventHandler", () => {
     const deps = createMockDeps();
     const handler = createMemberEventHandler("worker", deps as any);
 
-    // First call: add to recentlyProcessedMessages (as Map<string, number>)
-    deps.recentlyProcessedMessages.set("worker:Please help", Date.now());
+    // First call: add an unexpired entry (the Map stores expiry timestamps).
+    deps.recentlyProcessedMessages.set("worker:Please help", Date.now() + 60_000);
 
     // Second call: should be skipped due to dedup
     handler({

@@ -50,6 +50,7 @@ forbidMatch("legacy stop wording", lifecycleDocs, /在你停止时提醒|目标�
 forbidMatch("auto-compact-owned batch budget", lifecycleDocs, /自动压缩[^\n]*可配置[^\n]*批预算/);
 forbidMatch("stale team subcommand count", lifecycleDocs, /11 subcommands|11\+ 个子命令|11 个子命令/i);
 forbidMatch("stale command diagram count", lifecycleDocs, /\(8 total\)/i);
+forbidMatch("missing autonomous session entry point", design, /waits for `\/team start` or `\/team dynamic` to activate session tools/);
 forbidMatch("stale TL tool count", lifecycleDocs, /10 个 TL 工具/);
 forbidMatch("stale TL tools scope title", agents, /TL Tools\s*\(registered\s*\+\s*active only during team session\)/i);
 forbidMatch("stale session tool registration wording", lifecycleDocs, /仅在团队会话期间注册\+激活|仅在会话期间注册\+激活|仅在会话期间注册\+可见/);
@@ -74,6 +75,18 @@ requireMatch("DESIGN session-ended banner", design, /no regular TL instructions[
 requireMatch("AGENTS current team subcommand count", agents, /14 subcommands/);
 requireMatch("README current team subcommand count", readme, /\/team 命令（14 个子命令/);
 requireMatch("DESIGN current team subcommand count", design, /14 subcommands/);
+requireMatch("DESIGN autonomous session entry point", design, /waits for `\/team start`, `\/team dynamic`, or `start_team_session` to activate session tools/);
+for (const adrFile of [
+  "0001-members-as-independent-pi-rpc-processes.md",
+  "0002-tl-as-central-message-router.md",
+  "0003-agent-initiated-team-sessions.md",
+  "0004-team-session-resume.md",
+  "0005-pi-upstream-truncation-marking.md",
+  "0006-pi-upstream-abort-compaction-rpc.md",
+  "0007-pi-upstream-context-usage-reason.md",
+]) {
+  requireMatch(`DESIGN ADR layout includes ${adrFile}`, design, new RegExp(adrFile.replaceAll(".", "\\.")));
+}
 requireMatch("AGENTS load-time tool entry", agents, /load-time `start_team_session`/);
 requireMatch("README load-time tool entry", readme, /load-time `start_team_session`/);
 requireMatch("AGENTS TL tools scoped title", agents, /## TL Tools \(session-scoped registration \+ activation; exception below\)/);

@@ -64,7 +64,12 @@ pi-top-notch-team/
 ├── docs/
 │   └── adr/
 │       ├── 0001-members-as-independent-pi-rpc-processes.md
-│       └── 0002-tl-as-central-message-router.md
+│       ├── 0002-tl-as-central-message-router.md
+│       ├── 0003-agent-initiated-team-sessions.md
+│       ├── 0004-team-session-resume.md
+│       ├── 0005-pi-upstream-truncation-marking.md
+│       ├── 0006-pi-upstream-abort-compaction-rpc.md
+│       └── 0007-pi-upstream-context-usage-reason.md
 ├── package.json              ← pi package manifest (see below)
 ├── scripts/
 │   └── check-goal-reminder.mjs ← Stage 3 static lifecycle/wording/release guard
@@ -146,7 +151,7 @@ Since TL and Member are declared as two separate extensions, but both are loaded
 
 | Scenario | `ctx.mode` | Role |
 |----------|-----------|------|
-| User's interactive session | `"tui"`, `"rpc"`, `"json"`, `"print"` | **TL** — registers /team command with 14 subcommands, waits for `/team start` or `/team dynamic` to activate session tools |
+| User's interactive session | `"tui"`, `"rpc"`, `"json"`, `"print"` | **TL** — registers /team command with 14 subcommands, waits for `/team start`, `/team dynamic`, or `start_team_session` to activate session tools |
 | Member RPC process | `"rpc"` | **Member** — registers `team_send_message` tool, injects team system prompt via env vars |
 
 **Detection logic:**
