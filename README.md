@@ -252,7 +252,7 @@ members:
 | `set_goal(text, criteria)` | 设定带可验证完成标准的会话目标；仅在 TL 一次运行完全结算（不会再自动重试、自动压缩或处理排队续跑）且目标未完成时提醒继续，`agent_end` 不会单独触发提醒。 |
 | `finish_goal()` | 标记当前目标完成，停止提醒系统。 |
 
-这些工具仅在团队会话活跃期间注册并可用。
+这些工具在 fresh pi 进程中尚未注册；首次启动团队会话时按需注册。由于 pi 不提供 unregister API，teardown 后仍保留在 registry；会话外仅从 activeTools 移除，因此不可见且不可调用。
 
 ## 安装
 

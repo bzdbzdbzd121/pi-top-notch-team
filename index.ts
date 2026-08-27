@@ -280,10 +280,11 @@ export default function (pi: ExtensionAPI) {
   let tlCurrentModel: string | undefined;
 
   // The goal lifecycle handlers are registered below, after the shared
-  // agent_settled status handler. The session tools themselves are NOT
+  // agent_settled status handler. In a fresh process the session tools are NOT
   // registered here — they are registered on-demand at session start via
-  // ensureSessionToolsRegistered() (see below), so outside a session the tool
-  // registry contains none of them.
+  // ensureSessionToolsRegistered() (see below). pi has no unregister API, so
+  // after that first registration they remain in the registry; outside a
+  // session, activeTools hides them from the model.
 
   // start_team_session is the SINGLE deliberate exception to session-scoped
   // registration (ADR-0003): it must be visible at all times so the agent can
@@ -340,9 +341,10 @@ export default function (pi: ExtensionAPI) {
 
   // ── Session-only tools: register on-demand, never at extension load ──
   // All team-session tools (6 TL process tools + write_shared_context +
-  // set_goal/finish_goal) are registered ONLY when a team session starts
+  // set_goal/finish_goal) are registered on-demand when a team session starts
   // (onSessionStart) and enforced at every turn boundary (before_agent_start).
-  // Outside a session the tool registry contains none of them.
+  // After first registration they remain in pi's registry; outside a session
+  // the active-tool set removes them, making them hidden and uncallable.
   const ensureSessionToolsRegistered = () => {
     // registerTlTools registers all six TL tools atomically — checking one name suffices.
     ensureToolRegistered(pi, "start_member", () => registerTlTools(tlToolsDeps));

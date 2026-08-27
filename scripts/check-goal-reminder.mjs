@@ -18,8 +18,13 @@ const source = read("src/tools/goal-tools.ts");
 const index = read("index.ts");
 const agents = read("AGENTS.md");
 const design = read("DESIGN.md");
+const readme = read("README.md");
+const context = read("CONTEXT.md");
 const adrAgentSessions = read("docs/adr/0003-agent-initiated-team-sessions.md");
-const lifecycleDocs = [agents, design, read("README.md"), read("CONTEXT.md"), adrAgentSessions].join("\n");
+const sessionToolVisibility = read("src/session/session-tool-visibility.ts");
+const sharedContextTool = read("src/tools/shared-context-tool.ts");
+const indexTests = read("src/index.test.ts");
+const lifecycleDocs = [agents, design, readme, context, adrAgentSessions].join("\n");
 
 // Goal reminders use the ordinary sendUserMessage path. Member-channel
 // follow-up delivery is intentionally outside this scan.
@@ -49,6 +54,11 @@ forbidMatch("registry disappearance wording", lifecycleDocs, /Outside a session 
 forbidMatch("registry disappearance wording", lifecycleDocs, /They are \*\*not\*\* available outside a team session\./);
 forbidMatch("registry disappearance wording", lifecycleDocs, /会话外工具注册表与活跃集均不含任何团队工具/);
 forbidMatch("ADR-0003 stale registry invariant", adrAgentSessions, /outside a session, zero team tools in registry and active set/i);
+forbidMatch("index registry disappearance wording", index, /outside a session the tool[\s\S]{0,40}registry contains none of them\./i);
+forbidMatch("visibility registry disappearance wording", sessionToolVisibility, /outside a session the tool[\s\S]{0,40}registry contains none of them\./i);
+forbidMatch("shared-context registry disappearance wording", sharedContextTool, /Outside a team session[\s\S]{0,50}it does not exist in the tool registry at all\./i);
+forbidMatch("README registration-only wording", readme, /这些工具仅在团队会话活跃期间注册并可用。/);
+forbidMatch("fresh-load test scope wording", indexTests, /must NOT[\s\S]{0,100}exist in the tool registry outside a team session/i);
 forbidMatch("agent teardown directory cleanup wording", lifecycleDocs, /widgets off,\s*dir cleanup/);
 forbidMatch("session-ended banner omission wording", lifecycleDocs, /When `\/team stop` ends the session, `session\.active` becomes `false` and no extra prompt is injected\./);
 requireMatch("AGENTS #21 fresh registry qualification", agents, /fresh pi 初始 registry 为空/);

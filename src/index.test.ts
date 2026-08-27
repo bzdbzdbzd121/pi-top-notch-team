@@ -79,13 +79,14 @@ describe("index.ts default export (integration)", () => {
     const mod = await import("../index");
     mod.default(pi);
 
-    // Session-only tools (start_member … wait_and_get_member_status,
-    // write_shared_context, set_goal/finish_goal, stop_team_session) must NOT
-    // exist in the tool registry outside a team session — they are registered
-    // on-demand at session start (onSessionStart → ensureSessionToolsRegistered)
-    // and enforced at every before_agent_start turn boundary.
-    // The single deliberate exception (ADR-0003): start_team_session is
-    // registered at load so the agent can autonomously enter a team session.
+    // In this fresh-load test, session-only tools (start_member …
+    // wait_and_get_member_status, write_shared_context, set_goal/finish_goal,
+    // stop_team_session) have not yet been registered. A real session starts
+    // registration on-demand (onSessionStart → ensureSessionToolsRegistered);
+    // after the first registration pi retains them because it has no unregister
+    // API, while before_agent_start removes them from activeTools outside a
+    // session. The single deliberate exception (ADR-0003): start_team_session
+    // is registered at load so the agent can autonomously enter a session.
     const registered = (pi.registerTool as ReturnType<typeof vi.fn>).mock.calls.map(
       (c: any) => c[0].name
     );

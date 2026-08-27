@@ -12,11 +12,11 @@ import { STOP_TEAM_SESSION_TOOL_NAME } from "../tools/agent-session-tool-names";
  *   team_send_and_wait, wait_and_get_member_status,
  *   write_shared_context, set_goal, finish_goal
  *
- * Registration: all nine are registered ON-DEMAND at session start
- * (`onSessionStart`) and never at extension load — outside a session the tool
- * registry contains none of them. pi has no unregisterTool API, so after the
- * first session they stay in the registry forever; the active-tool set
- * (pi.setActiveTools) is therefore the ONLY visibility gate.
+ * Registration: a fresh pi process starts without these nine in its registry;
+ * they are registered ON-DEMAND at the first session start (`onSessionStart`)
+ * and never at extension load. pi has no unregisterTool API, so after that
+ * first registration they stay in the registry forever; outside a session the
+ * active-tool set (`pi.setActiveTools`) is therefore the ONLY visibility gate.
  *
  * Enforcement: this pure function is applied at every `before_agent_start`
  * turn boundary. Session active → ensure registered (idempotent) + active.
