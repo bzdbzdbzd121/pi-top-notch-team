@@ -313,6 +313,59 @@ describe("registerGoalAgentHandler reminder", () => {
     expect(pi.sendUserMessage.mock.calls[1][0]).toContain("replacement goal");
   });
 
+  it("does not treat an earlier consumed marker as a stale rollover marker", async () => {
+    vi.useFakeTimers();
+    setupActiveGoal();
+    const { pi, handlers } = createMockPi();
+    registerGoalAgentHandler(pi as any);
+    pi.sendUserMessage.mockImplementation(() => undefined as any);
+
+    // M0 is a normal reminder and is fully consumed before any rollover.
+    await finishLowLevelRun(handlers);
+    await settleRun(handlers);
+    await flushReminderTimer();
+    const historicalPrompt = pi.sendUserMessage.mock.calls[0][0];
+    await handlers["before_agent_start"]({ prompt: historicalPrompt }, activeContext());
+    await finishLowLevelReminderRun(handlers, historicalPrompt);
+    await settleRun(handlers);
+    await flushReminderTimer();
+
+    // Generate M1 after cooldown, then capture only M1 in a goal rollover.
+    await vi.advanceTimersByTimeAsync(10_001);
+    await finishLowLevelRun(handlers);
+    await settleRun(handlers);
+    await flushReminderTimer();
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
+    resetGoal();
+    setGoalForTesting({ text: "replacement goal", criteria: "- replacement", completed: false });
+
+    // M0 is historical and was never captured by this rollover. A pasted or
+    // replayed M0 marker must not be widened into a stale-run token.
+    const freshContext = {
+      signal: { aborted: false },
+      isIdle: () => true,
+      abort: vi.fn(),
+    };
+    await handlers["before_agent_start"]({ prompt: historicalPrompt }, freshContext);
+    await handlers["agent_start"]({}, freshContext);
+    await handlers["message_start"](
+      {
+        message: {
+          role: "user",
+          content: [{ type: "text", text: historicalPrompt }],
+        },
+      },
+      freshContext,
+    );
+    await handlers["agent_end"]({ messages: [] }, freshContext);
+    await settleRun(handlers, freshContext);
+    await flushReminderTimer();
+
+    expect(freshContext.abort).not.toHaveBeenCalled();
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(3);
+    expect(pi.sendUserMessage.mock.calls[2][0]).toContain("replacement goal");
+  });
+
   it("does not let a stale marker without agent_start swallow the next fresh run", async () => {
     vi.useFakeTimers();
     setupActiveGoal();
@@ -471,6 +524,51 @@ describe("registerGoalAgentHandler reminder", () => {
     await flushReminderTimer();
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(3);
     expect(pi.sendUserMessage.mock.calls[2][0]).toContain("S4 goal");
+  });
+
+  it("bounds unresolved rollover markers and recovers after host shutdown", async () => {
+    vi.useFakeTimers();
+    setupActiveGoal();
+    const { pi, handlers } = createMockPi();
+    registerGoalAgentHandler(pi as any);
+    pi.sendUserMessage.mockImplementation(() => undefined as any);
+    // Tests intentionally share module-level lifecycle state; start this
+    // resource test from the same terminal cleanup used by the real host.
+    await handlers["session_shutdown"]({}, {});
+
+    // Keep every reminder unacknowledged while repeatedly replacing the team
+    // session. The fixed quarantine cap must stop new submissions rather than
+    // growing state without bound.
+    for (let i = 0; i < 65; i += 1) {
+      await finishLowLevelRun(handlers);
+      await settleRun(handlers);
+      await flushReminderTimer();
+      if (i < 64) {
+        endSession();
+        resetGoal();
+        startSession({ name: `test-team-cap-${i + 1}`, description: "", members: [] } as any, {
+          sessionId: `goal-tools-cap-${i + 1}`,
+        });
+        setGoalForTesting({ text: `cap goal ${i + 1}`, criteria: "- cap", completed: false });
+      }
+    }
+
+    // The 65th candidate is retained, not submitted, once 64 old markers are
+    // unresolved. Shutdown is the explicit safe recovery boundary.
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(64);
+    await handlers["session_shutdown"]({}, {});
+
+    endSession();
+    resetGoal();
+    startSession({ name: "test-team-cap-recovered", description: "", members: [] } as any, {
+      sessionId: "goal-tools-cap-recovered",
+    });
+    setGoalForTesting({ text: "recovered goal", criteria: "- recovered", completed: false });
+    await finishLowLevelRun(handlers);
+    await settleRun(handlers);
+    await flushReminderTimer();
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(65);
+    expect(pi.sendUserMessage.mock.calls[64][0]).toContain("recovered goal");
   });
 
   it("does not let a reset run's late agent_end create a reminder in a new session", async () => {

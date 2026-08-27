@@ -89,6 +89,13 @@ interface UncertainSubmission {
   candidate: GoalReminderCandidate;
 }
 
+interface StaleRolloverMarker {
+  markerId: number;
+  markerSeen: boolean;
+  sourceGoalGeneration: number;
+  sourceSessionEpoch: number;
+}
+
 /** pi 0.83.0's sendUserMessage wrapper returns void; bound the no-ack fallback. */
 const REMINDER_SUBMISSION_ACK_TIMEOUT_MS = 1_000;
 const REMINDER_MARKER_PREFIX = "<!-- top-notch-team:goal-reminder:";
@@ -109,17 +116,15 @@ let resetBarrier: ResetBarrier | null = null;
 let pendingSubmission: ReminderSubmission | null = null;
 let acknowledgedSubmission: ReminderAcknowledgement | null = null;
 /**
- * Marker IDs are process-wide monotonic and are generated only by this
- * module. A high-water tombstone represents all markers captured by identity
- * rollovers without retaining each full candidate (text/criteria): treating an
- * earlier marker as stale is conservative, while every later fresh marker has
- * a larger ID. This keeps quarantine memory constant while still matching
- * delayed old markers; it is cleared only at the terminal host shutdown.
+ * Exact marker tombstones for submissions captured by identity rollovers.
+ * Values contain only numeric identity metadata, never the candidate's full
+ * text/criteria. The fixed cap prevents unresolved native preflight requests
+ * from growing this state without bound; shutdown is the terminal cleanup.
  */
-let staleRolloverMarkerWatermark: number | null = null;
-let staleRolloverMarkerRunCount = 0;
-let staleRolloverSourceGoalGeneration = -1;
-let staleRolloverSourceSessionEpoch = -1;
+const MAX_STALE_ROLLOVER_MARKERS = 64;
+const staleRolloverMarkers = new Map<number, StaleRolloverMarker>();
+/** IDs already consumed as stale; used only to ignore duplicate history. */
+let consumedStaleMarkerWatermark: number | null = null;
 /**
  * Timed-out void submissions remain matchable by their complete marker until
  * acknowledgement or goal/session reset. The dispatch gate below permits only
@@ -155,24 +160,19 @@ function reminderMarkerId(marker: string): number | null {
   return Number.isSafeInteger(id) && id > 0 ? id : null;
 }
 
-/** Retain a marker as a constant-memory rollover tombstone. */
+/** Retain an exact marker tombstone without retaining its full candidate. */
 function retainStaleMarker(candidate: GoalReminderCandidate, marker: string): void {
   const markerId = reminderMarkerId(marker);
-  if (markerId === null) return;
-  if (
-    staleRolloverMarkerWatermark === null ||
-    markerId > staleRolloverMarkerWatermark
-  ) {
-    staleRolloverMarkerWatermark = markerId;
-  }
-  staleRolloverSourceGoalGeneration = Math.max(
-    staleRolloverSourceGoalGeneration,
-    candidate.goalGeneration,
-  );
-  staleRolloverSourceSessionEpoch = Math.max(
-    staleRolloverSourceSessionEpoch,
-    candidate.sessionEpoch,
-  );
+  if (markerId === null || staleRolloverMarkers.has(markerId)) return;
+  // New dispatches are blocked at the fixed cap, so this is a defensive guard
+  // for a rollover racing with the final below-cap submission.
+  if (staleRolloverMarkers.size >= MAX_STALE_ROLLOVER_MARKERS) return;
+  staleRolloverMarkers.set(markerId, {
+    markerId,
+    markerSeen: false,
+    sourceGoalGeneration: candidate.goalGeneration,
+    sourceSessionEpoch: candidate.sessionEpoch,
+  });
 }
 
 /** Move every currently live submission into the rollover quarantine. */
@@ -188,11 +188,26 @@ function captureLiveSubmissionsAsStale(): void {
   }
 }
 
+function firstSeenStaleMarker(): StaleRolloverMarker | null {
+  for (const marker of staleRolloverMarkers.values()) {
+    if (marker.markerSeen) return marker;
+  }
+  return null;
+}
+
+function consumeStaleMarker(markerId: number): void {
+  if (!staleRolloverMarkers.delete(markerId)) return;
+  if (
+    consumedStaleMarkerWatermark === null ||
+    markerId > consumedStaleMarkerWatermark
+  ) {
+    consumedStaleMarkerWatermark = markerId;
+  }
+}
+
 function clearRolloverTombstones(): void {
-  staleRolloverMarkerWatermark = null;
-  staleRolloverMarkerRunCount = 0;
-  staleRolloverSourceGoalGeneration = -1;
-  staleRolloverSourceSessionEpoch = -1;
+  staleRolloverMarkers.clear();
+  consumedStaleMarkerWatermark = null;
 }
 
 /** Clear an in-flight submission; rollover handling may retain tombstones. */
@@ -217,7 +232,7 @@ function invalidateReminderState(resetRun = false): void {
   // A session/goal rollover may have captured accepted old markers just before
   // a replacement/reset. Preserve those stale markers until their host runs
   // are rejected; ordinary changes with no stale marker have nothing to keep.
-  clearSubmissionState(staleRolloverMarkerWatermark !== null);
+  clearSubmissionState(staleRolloverMarkers.size > 0);
   pendingReminder = null;
   if (currentRun) {
     currentRun.candidate = null;
@@ -645,15 +660,24 @@ function acknowledgeReminderPrompt(prompt: unknown): boolean {
   if (!marker) return false;
 
   const markerId = reminderMarkerId(marker);
-  if (
-    markerId !== null &&
-    staleRolloverMarkerWatermark !== null &&
-    markerId <= staleRolloverMarkerWatermark
-  ) {
+  const staleMarker = markerId === null ? undefined : staleRolloverMarkers.get(markerId);
+  if (staleMarker) {
     // This is an accepted prompt from a previous session/goal generation. It
     // must not ACK any new submission; its next run is cancelled/suppressed.
-    staleRolloverMarkerRunCount += 1;
+    // Duplicate before_agent_start delivery is idempotent and cannot create a
+    // second stale-run token.
+    if (staleMarker.markerSeen) return false;
+    staleMarker.markerSeen = true;
     return true;
+  }
+  // A marker already consumed as stale is history, not a new stale run. This
+  // intentionally differs from the rollover capture set above.
+  if (
+    markerId !== null &&
+    consumedStaleMarkerWatermark !== null &&
+    markerId <= consumedStaleMarkerWatermark
+  ) {
+    return false;
   }
 
   if (pendingSubmission?.marker === marker) {
@@ -927,6 +951,14 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
         return;
       }
 
+      // Keep the exact rollover quarantine bounded. At capacity, retain this
+      // candidate for a later settlement after old markers are consumed;
+      // session_shutdown is the explicit recovery path if native preflight
+      // never acknowledges them.
+      if (staleRolloverMarkers.size >= MAX_STALE_ROLLOVER_MARKERS) {
+        return;
+      }
+
       const now = Date.now();
       if (
         lastReminder &&
@@ -1005,20 +1037,15 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
       acknowledgedSubmission = null;
     }
 
-    if (staleRolloverMarkerRunCount > 0) {
-      // A complete stale marker was observed immediately before this run. The
-      // source identity must precede the current one in at least one dimension;
-      // goalGeneration is checked explicitly for same-session replacement.
+    const staleMarker = firstSeenStaleMarker();
+    if (staleMarker) {
+      // Defer suppression until message_start. If the host rejected the old
+      // prompt after before_agent_start, this agent_start may instead belong
+      // to a genuinely fresh prompt and must not be swallowed.
       const staleIdentity =
-        staleRolloverSourceGoalGeneration < goalGeneration ||
-        staleRolloverSourceSessionEpoch < run.sessionEpoch;
-      staleRolloverMarkerRunCount -= 1;
-      if (staleIdentity) {
-        // Defer suppression until message_start. If the host rejected the old
-        // prompt after before_agent_start, this agent_start may instead belong
-        // to a genuinely fresh prompt and must not be swallowed.
-        run.stalePromptPending = true;
-      }
+        staleMarker.sourceGoalGeneration < goalGeneration ||
+        staleMarker.sourceSessionEpoch < run.sessionEpoch;
+      if (staleIdentity) run.stalePromptPending = true;
     }
 
     if (runWasAborted(run)) {
@@ -1037,15 +1064,13 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
     if (!message) return;
     const marker = extractReminderMarker(messageText(message));
     const markerId = marker ? reminderMarkerId(marker) : null;
-    const isStaleMarker =
-      markerId !== null &&
-      staleRolloverMarkerWatermark !== null &&
-      markerId <= staleRolloverMarkerWatermark;
+    const isStaleMarker = markerId !== null && staleRolloverMarkers.has(markerId);
     if (isStaleMarker) {
       // Also inspect the message itself: an old prompt can be delayed until
       // after a fresh run consumed the provisional slot at agent_start.
       run.stalePromptPending = false;
       run.suppressReminderCandidate = true;
+      consumeStaleMarker(markerId);
       try {
         // At message_start the AgentCore run owns an active signal, so this
         // abort can stop the stale prompt rather than touching a fresh run.
