@@ -32,6 +32,8 @@ interface GoalReminderCandidate {
   runId: number;
   /** Session identity captured with the candidate. */
   sessionId: string | null;
+  /** Session/lifecycle epoch captured with the candidate. */
+  sessionEpoch: number;
   /** Goal identity captured with the candidate. */
   goalGeneration: number;
   text: string;
@@ -43,8 +45,11 @@ interface GoalReminderRunState {
   sawAgentEnd: boolean;
   aborted: boolean;
   settled: boolean;
-  /** Captured low-level signal remains observable through the end→settled window. */
-  signal: unknown;
+  /** Every low-level prompt/continue signal seen in this outer run. */
+  signals: Set<unknown>;
+  /** Session identity captured when this outer run started. */
+  sessionId: string | null;
+  sessionEpoch: number;
   candidate: GoalReminderCandidate | null;
 }
 
@@ -56,10 +61,17 @@ interface LastReminder {
 
 let nextRunId = 0;
 let goalGeneration = 0;
+let sessionEpoch = 0;
+let observedSessionKey: string | null = null;
 let currentRun: GoalReminderRunState | null = null;
 let pendingReminder: GoalReminderCandidate | null = null;
 let reminderTimer: ReturnType<typeof setTimeout> | null = null;
 let lastReminder: LastReminder | null = null;
+/** After reset, an agent_start must establish a new outer run before end events are accepted. */
+let awaitingFreshRun = false;
+let freshRunRequiresSignal = false;
+/** Signal identities from runs invalidated by reset/session replacement. */
+const invalidatedSignals = new Set<unknown>();
 
 function clearReminderTimer(): void {
   if (reminderTimer !== null) {
@@ -76,7 +88,16 @@ function invalidateReminderState(resetRun = false): void {
     currentRun.candidate = null;
   }
   if (resetRun) {
+    // Keep signal identities as tombstones: an old agent_end can arrive after
+    // /team stop and a new session starts, but it must not be reinterpreted as
+    // a run belonging to that new session.
+    freshRunRequiresSignal = Boolean(currentRun && currentRun.signals.size > 0);
+    for (const signal of currentRun?.signals ?? []) {
+      invalidatedSignals.add(signal);
+    }
     currentRun = null;
+    awaitingFreshRun = true;
+    sessionEpoch += 1;
   }
 }
 
@@ -108,46 +129,132 @@ function signalAborted(signal: unknown): boolean {
   }
 }
 
-function createRun(ctx: unknown): GoalReminderRunState {
-  const signal = readSignal(ctx);
-  return {
-    runId: ++nextRunId,
-    sawAgentEnd: false,
-    aborted: signalAborted(signal),
-    settled: false,
-    signal,
-    candidate: null,
-  };
-}
-
-function ensureRun(ctx: unknown): GoalReminderRunState {
-  if (!currentRun || currentRun.settled) {
-    // A new outer run supersedes a timer from the previous one. Keep a
-    // still-valid pending candidate for a later settled event, but never let
-    // the old timer race the new run.
-    if (currentRun?.settled) {
-      clearReminderTimer();
-    }
-    currentRun = createRun(ctx);
-  } else {
-    const signal = readSignal(ctx);
-    if (signal !== undefined) {
-      currentRun.signal = signal;
-      if (signalAborted(signal)) {
-        currentRun.aborted = true;
-      }
-    }
-  }
-  return currentRun;
+function sessionKey(session: { active: boolean; sessionId: string | null }): string {
+  return session.active ? `active:${session.sessionId ?? "<none>"}` : "inactive";
 }
 
 function currentSessionIdentity(): { active: boolean; sessionId: string | null } | null {
   try {
     const session = getSessionState();
+    const key = sessionKey(session);
+    if (key !== observedSessionKey) {
+      observedSessionKey = key;
+      sessionEpoch += 1;
+    }
     return { active: session.active, sessionId: session.sessionId };
   } catch {
     return null;
   }
+}
+
+function hasSignal(signal: unknown): boolean {
+  return signal !== undefined && signal !== null;
+}
+
+function runWasAborted(run: GoalReminderRunState): boolean {
+  if (run.aborted) return true;
+  for (const signal of run.signals) {
+    if (signalAborted(signal)) return true;
+  }
+  return false;
+}
+
+function tombstoneRun(run: GoalReminderRunState): void {
+  for (const signal of run.signals) {
+    invalidatedSignals.add(signal);
+  }
+}
+
+function addRunSignal(
+  run: GoalReminderRunState,
+  signal: unknown,
+  allowNewSignal: boolean,
+): boolean {
+  if (!hasSignal(signal)) {
+    // Once a run has an identifiable controller, accepting a later event with
+    // no controller would make a delayed old event indistinguishable from a
+    // continuation of this run.
+    return run.signals.size === 0;
+  }
+  if (invalidatedSignals.has(signal)) return false;
+  if (!allowNewSignal && run.signals.size > 0 && !run.signals.has(signal)) {
+    return false;
+  }
+  run.signals.add(signal);
+  if (signalAborted(signal)) run.aborted = true;
+  return true;
+}
+
+function createRun(ctx: unknown): GoalReminderRunState {
+  const signal = readSignal(ctx);
+  const session = currentSessionIdentity();
+  const signals = new Set<unknown>();
+  if (hasSignal(signal)) signals.add(signal);
+  return {
+    runId: ++nextRunId,
+    sawAgentEnd: false,
+    aborted: signalAborted(signal),
+    settled: false,
+    signals,
+    sessionId: session?.sessionId ?? null,
+    sessionEpoch,
+    candidate: null,
+  };
+}
+
+/** Ensure a run for agent_start; unlike agent_end, this may introduce a new low-level signal. */
+function ensureStartRun(ctx: unknown): GoalReminderRunState | null {
+  const signal = readSignal(ctx);
+  if (hasSignal(signal) && invalidatedSignals.has(signal)) return null;
+  // If reset invalidated an identifiable old run, a late start without a new
+  // controller is not enough to establish a fresh run. This keeps an old
+  // continuation from clearing the reset tombstone.
+  if (awaitingFreshRun && freshRunRequiresSignal && !hasSignal(signal)) return null;
+
+  const session = currentSessionIdentity();
+  const sessionChanged = Boolean(
+    currentRun && !currentRun.settled && session && currentRun.sessionEpoch !== sessionEpoch
+  );
+  if (!currentRun || currentRun.settled || sessionChanged) {
+    if (currentRun) {
+      tombstoneRun(currentRun);
+      clearReminderTimer();
+    }
+    currentRun = createRun(ctx);
+    awaitingFreshRun = false;
+    freshRunRequiresSignal = false;
+    return currentRun;
+  }
+
+  if (!addRunSignal(currentRun, signal, true)) return null;
+  if (awaitingFreshRun) {
+    awaitingFreshRun = false;
+    freshRunRequiresSignal = false;
+  }
+  return currentRun;
+}
+
+/** Ensure a run for agent_end; unknown/missing signals are rejected once a run has an identity. */
+function ensureEndRun(ctx: unknown): GoalReminderRunState | null {
+  const signal = readSignal(ctx);
+  if (hasSignal(signal) && invalidatedSignals.has(signal)) return null;
+
+  if (!currentRun) {
+    // A post-reset late end must never lazily create a run in the new session.
+    if (awaitingFreshRun) return null;
+    currentRun = createRun(ctx);
+    return currentRun;
+  }
+  if (currentRun.settled) return null;
+
+  const session = currentSessionIdentity();
+  if (session && currentRun.sessionEpoch !== sessionEpoch) {
+    // A new session needs a fresh agent_start. Do not let an old end event
+    // migrate into it merely because its payload has no run identifier.
+    return null;
+  }
+  if (!addRunSignal(currentRun, signal, false)) return null;
+  return currentRun;
 }
 
 function candidateMatchesCurrentGoal(candidate: GoalReminderCandidate): boolean {
@@ -158,7 +265,8 @@ function candidateMatchesCurrentGoal(candidate: GoalReminderCandidate): boolean 
   return Boolean(
     activeGoal &&
     !activeGoal.completed &&
-    goalGeneration === candidate.goalGeneration
+    goalGeneration === candidate.goalGeneration &&
+    sessionEpoch === candidate.sessionEpoch
   );
 }
 
@@ -196,22 +304,47 @@ function buildReminderText(candidate: GoalReminderCandidate): string {
   );
 }
 
-function sendReminderSafely(pi: ExtensionAPI, text: string): void {
+function sendReminderSafely(
+  pi: ExtensionAPI,
+  text: string,
+  onFailure: () => void,
+): void {
+  const recover = (): void => {
+    try {
+      onFailure();
+    } catch {
+      // Recovery is best effort and must not escape a lifecycle callback.
+    }
+  };
+
   try {
     // pi 0.83.0 types this API as void, while adapters/mocks may return a
     // Promise. Handle both forms so a busy-race rejection cannot escape as an
     // unhandled rejection.
     const result = (pi.sendUserMessage as unknown as (content: string) => unknown)(text);
     if (result && typeof (result as { then?: unknown }).then === "function") {
-      void Promise.resolve(result).catch(() => {
-        // Fire-and-forget submission: the candidate was consumed at the API
-        // boundary, and a later run will be responsible for a new reminder.
-      });
+      void Promise.resolve(result).catch(recover);
     }
   } catch {
     // A new run can begin between the idle check and this call. Do not retry
     // with followUp: that would reintroduce the original premature-trigger
-    // behavior. The failed request is intentionally fail-closed.
+    // behavior. Restore the candidate for a later settled boundary instead.
+    recover();
+  }
+}
+
+function restoreFailedCandidate(candidate: GoalReminderCandidate): void {
+  if (!candidateMatchesCurrentGoal(candidate)) return;
+  const run = currentRun;
+  if (!run || run.runId !== candidate.runId || !run.settled || runWasAborted(run)) {
+    return;
+  }
+  pendingReminder = candidate;
+  if (
+    lastReminder?.sessionId === candidate.sessionId &&
+    lastReminder.goalGeneration === candidate.goalGeneration
+  ) {
+    lastReminder = null;
   }
 }
 
@@ -392,7 +525,7 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
         pendingReminder = null;
         return;
       }
-      if (!run.sawAgentEnd || !run.settled || run.aborted || signalAborted(run.signal)) {
+      if (!run.sawAgentEnd || !run.settled || runWasAborted(run)) {
         pendingReminder = null;
         return;
       }
@@ -429,8 +562,7 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
       // goal/session transition or observe an abort in the same turn.
       if (
         !candidateMatchesCurrentGoal(candidate) ||
-        run.aborted ||
-        signalAborted(run.signal)
+        runWasAborted(run)
       ) {
         pendingReminder = null;
         return;
@@ -464,7 +596,11 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
         goalGeneration: candidate.goalGeneration,
         at: now,
       };
-      sendReminderSafely(pi, buildReminderText(candidate));
+      sendReminderSafely(
+        pi,
+        buildReminderText(candidate),
+        () => restoreFailedCandidate(candidate),
+      );
     }, 0);
   };
 
@@ -472,8 +608,8 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
   // compaction, and queued continuation starts occur before agent_settled and
   // therefore reuse this state instead of opening a new reminder window.
   pi.on("agent_start", (_event, ctx) => {
-    const run = ensureRun(ctx);
-    if (run.aborted) {
+    const run = ensureStartRun(ctx);
+    if (run && runWasAborted(run)) {
       pendingReminder = null;
     }
   });
@@ -482,16 +618,9 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
   // not a delivery boundary: pi may still retry, compact, or process queued
   // messages after this event and before agent_settled.
   pi.on("agent_end", async (event, ctx) => {
-    const run = ensureRun(ctx);
+    const run = ensureEndRun(ctx);
+    if (!run) return;
     run.sawAgentEnd = true;
-
-    const signal = readSignal(ctx);
-    if (signal !== undefined) {
-      run.signal = signal;
-      if (signalAborted(signal)) {
-        run.aborted = true;
-      }
-    }
 
     // Record structured cancellation from the final assistant message. An
     // abort signal can also flip after this callback, so dispatch re-checks the
@@ -515,14 +644,20 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
     }
 
     // Guard: an aborted low-level end cannot become a reminder candidate.
-    if (run.aborted) {
+    if (runWasAborted(run)) {
+      pendingReminder = null;
+      return;
+    }
+
+    if (session.sessionId !== run.sessionId || sessionEpoch !== run.sessionEpoch) {
       pendingReminder = null;
       return;
     }
 
     run.candidate = {
       runId: run.runId,
-      sessionId: session.sessionId,
+      sessionId: run.sessionId,
+      sessionEpoch: run.sessionEpoch,
       goalGeneration,
       text: activeGoal.text,
       criteria: activeGoal.criteria,
@@ -537,7 +672,7 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
     if (!run) return;
 
     const settledSignal = readContextSignalState(ctx);
-    if (settledSignal.aborted || signalAborted(run.signal)) {
+    if (settledSignal.aborted || runWasAborted(run)) {
       run.aborted = true;
     }
     // Mark the outer run settled even when it was aborted. Otherwise a later

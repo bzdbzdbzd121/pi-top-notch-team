@@ -27,7 +27,7 @@ function setupActiveGoal() {
 }
 
 function activeContext(
-  signal?: { aborted?: boolean },
+  signal: { aborted?: boolean } | undefined = { aborted: false },
   isIdle: () => boolean = () => true,
 ) {
   return { signal, isIdle };
@@ -242,6 +242,69 @@ describe("registerGoalAgentHandler reminder", () => {
     expect(pi.sendUserMessage).not.toHaveBeenCalled();
   });
 
+  it("does not send when an earlier low-level signal aborts after a healthy continuation signal", async () => {
+    vi.useFakeTimers();
+    setupActiveGoal();
+    const { pi, handlers } = createMockPi();
+    registerGoalAgentHandler(pi as any);
+    const signalA = { aborted: false };
+    const signalB = { aborted: false };
+
+    // Pi may create one AbortController for each low-level prompt/continue.
+    await finishLowLevelRun(handlers, { messages: [] }, activeContext(signalA));
+    await finishLowLevelRun(handlers, { messages: [] }, activeContext(signalB));
+    signalA.aborted = true;
+    await settleRun(handlers, activeContext(signalB));
+    await flushReminderTimer();
+
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("does not let a reset run's late agent_end create a reminder in a new session", async () => {
+    vi.useFakeTimers();
+    setupActiveGoal();
+    const { pi, handlers } = createMockPi();
+    registerGoalAgentHandler(pi as any);
+    const oldSignal = { aborted: false };
+
+    await finishLowLevelRun(handlers, { messages: [] }, activeContext(oldSignal));
+    // /team stop/session shutdown resets the reminder run while the old TL
+    // process may still emit its delayed agent_end.
+    resetGoal();
+    startSession({ name: "new-team", description: "", members: [] } as any);
+    setGoalForTesting({ text: "new goal", criteria: "new criteria", completed: false });
+
+    await handlers["agent_end"]({ messages: [] }, activeContext(oldSignal));
+    await settleRun(handlers, activeContext({ aborted: false }));
+    await flushReminderTimer();
+
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("ignores a reset run's late end even after a new run has started", async () => {
+    vi.useFakeTimers();
+    setupActiveGoal();
+    const { pi, handlers } = createMockPi();
+    registerGoalAgentHandler(pi as any);
+    const oldSignal = { aborted: false };
+    const newSignal = { aborted: false };
+
+    await finishLowLevelRun(handlers, { messages: [] }, activeContext(oldSignal));
+    resetGoal();
+    startSession({ name: "new-team", description: "", members: [] } as any);
+    setGoalForTesting({ text: "new goal", criteria: "new criteria", completed: false });
+    await handlers["agent_start"]({}, activeContext(newSignal));
+
+    // The old event must not overwrite the new run's signal or candidate.
+    await handlers["agent_end"]({ messages: [] }, activeContext(oldSignal));
+    await handlers["agent_end"]({ messages: [] }, activeContext(newSignal));
+    await settleRun(handlers, activeContext(newSignal));
+    await flushReminderTimer();
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(pi.sendUserMessage).toHaveBeenCalledWith(expect.stringContaining("new goal"));
+  });
+
   it("does not send when the abort signal changes after agent_end", async () => {
     vi.useFakeTimers();
     setupActiveGoal();
@@ -282,7 +345,7 @@ describe("registerGoalAgentHandler reminder", () => {
     const { pi, handlers } = createMockPi();
     registerGoalAgentHandler(pi as any);
     let idle = false;
-    const ctx = activeContext(undefined, () => idle);
+    const ctx = activeContext({ aborted: false }, () => idle);
 
     await finishLowLevelRun(handlers, { messages: [] }, ctx);
     await settleRun(handlers, ctx);
@@ -302,7 +365,7 @@ describe("registerGoalAgentHandler reminder", () => {
     setupActiveGoal();
     const { pi, handlers } = createMockPi();
     registerGoalAgentHandler(pi as any);
-    const ctx = activeContext(undefined, () => {
+    const ctx = activeContext({ aborted: false }, () => {
       throw new Error("stale context");
     });
 
@@ -311,6 +374,26 @@ describe("registerGoalAgentHandler reminder", () => {
     await expect(flushReminderTimer()).resolves.toBeUndefined();
 
     expect(pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("restores a candidate after an asynchronous send failure for a later settled retry", async () => {
+    vi.useFakeTimers();
+    setupActiveGoal();
+    const { pi, handlers } = createMockPi();
+    registerGoalAgentHandler(pi as any);
+    pi.sendUserMessage.mockImplementationOnce(() => Promise.reject(new Error("transport failure")));
+
+    await finishLowLevelRun(handlers);
+    await settleRun(handlers);
+    await flushReminderTimer();
+    await Promise.resolve();
+
+    // The failed Promise must clear its cooldown and leave one candidate for
+    // the next settled boundary rather than silently losing the reminder.
+    await settleRun(handlers);
+    await flushReminderTimer();
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
   });
 
   it("swallows synchronous and asynchronous sendUserMessage failures", async () => {
