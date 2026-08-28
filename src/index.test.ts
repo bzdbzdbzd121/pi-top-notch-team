@@ -318,6 +318,34 @@ describe("index.ts default export (integration)", () => {
       expect(result.systemPrompt).toContain("Design doc");
       expect(result.systemPrompt).toContain("Use approved patterns");
     });
+
+    it("injects the mandatory goal closing protocol into the pre-defined team prompt", async () => {
+      const { startSession, endSession } = await import("./session/state");
+      endSession();
+      startSession({
+        name: "test-team",
+        description: "Test",
+        members: [{ name: "worker", systemPrompt: "do work" }],
+      });
+
+      const handler = getBeforeAgentStartHandler();
+      const result = await handler({ systemPrompt: "BASE" }, { ui: createMockUi() });
+      // 工具列表含 set_goal/finish_goal 指引
+      expect(result.systemPrompt).toContain("set_goal");
+      expect(result.systemPrompt).toContain("finish_goal");
+      // 收尾步骤：汇总并验证 → finish_goal → 向用户最终汇报 → /team stop
+      expect(result.systemPrompt).toContain("汇总并验证");
+      expect(result.systemPrompt).toContain("调用 \`finish_goal\`");
+      expect(result.systemPrompt).toContain("禁止仅口头宣称");
+      const verifyIdx = result.systemPrompt.indexOf("汇总并验证");
+      const finishIdx = result.systemPrompt.indexOf("调用 \`finish_goal\`");
+      const reportIdx = result.systemPrompt.indexOf("向用户汇报最终结果");
+      const stopIdx = result.systemPrompt.indexOf("/team stop");
+      expect(verifyIdx).toBeGreaterThan(-1);
+      expect(verifyIdx).toBeLessThan(finishIdx);
+      expect(finishIdx).toBeLessThan(reportIdx);
+      expect(reportIdx).toBeLessThan(stopIdx);
+    });
   });
 });
 

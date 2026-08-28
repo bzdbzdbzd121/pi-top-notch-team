@@ -1080,7 +1080,7 @@ describe("goal tool lifecycle wording", () => {
       (call: any[]) => call[0]?.name === "set_goal",
     )?.[0] as any;
     const expected =
-      "系统只会在 TL 的一次运行完全结算（不会再自动重试、自动压缩或处理排队续跑）且目标仍未完成时提醒你检查进度；`agent_end` 只是中间结束点，不会触发提醒。完成目标后请调用 finish_goal 工具。";
+      "系统只会在 TL 的一次运行完全结算（不会再自动重试、自动压缩或处理排队续跑）且 Goal 仍处于激活状态（尚未关闭）时提醒你检查进度；`agent_end` 只是中间结束点，不会触发提醒。完成目标后请调用 finish_goal 工具。";
 
     expect(setGoalDefinition.description).toContain(
       "The system reminds you only after the TL run is fully settled",
@@ -1094,6 +1094,161 @@ describe("goal tool lifecycle wording", () => {
       criteria: "- 条件满足",
     });
     expect(result.content[0].text).toContain(expected);
+  });
+});
+
+describe("reminder prompt content + finish_goal tool", () => {
+  it("delivered reminder contains the goal, criteria, and finish_goal-first decision structure", async () => {
+    vi.useFakeTimers();
+    setupActiveGoal();
+    const { pi, handlers } = createMockPi();
+    registerGoalAgentHandler(pi as any);
+
+    await finishLowLevelRun(handlers);
+    await settleRun(handlers);
+    await flushReminderTimer();
+
+    const prompt = pi.sendUserMessage.mock.calls[0][0] as string;
+    // 目标与完成条件原文随提醒送达
+    expect(prompt).toContain("探索全部模块");
+    expect(prompt).toContain("- 12 个文件完成");
+    // 不再断言实际工作"尚未完成"：只说目标仍激活，且明确不代表验收未完成
+    expect(prompt).toContain("仍处于激活状态");
+    expect(prompt).toContain("不代表验收未完成");
+    expect(prompt).not.toContain("尚未完成。");
+    // 强制唯一匹配分支：仅禁止用文字替代 finish_goal（分支 3 提问等待本就是文字）
+    expect(prompt).toContain("必须执行下列唯一匹配的分支");
+    expect(prompt).toContain("不得只用文字宣称目标已完成或已阻塞");
+    // 完成/阻塞分支前置，需用户输入分支在中，继续调度分支最后
+    const finishIdx = prompt.indexOf("如果全部完成条件已满足");
+    const blockerIdx = prompt.indexOf("如果遇到不可解决的阻塞问题");
+    const askIdx = prompt.indexOf("如果需要用户提供关键信息或做决策才能继续");
+    const continueIdx = prompt.indexOf("仅当确有未满足的完成条件");
+    expect(finishIdx).toBeGreaterThan(-1);
+    expect(blockerIdx).toBeGreaterThan(-1);
+    expect(askIdx).toBeGreaterThan(-1);
+    expect(continueIdx).toBeGreaterThan(-1);
+    expect(finishIdx).toBeLessThan(blockerIdx);
+    expect(blockerIdx).toBeLessThan(askIdx);
+    expect(askIdx).toBeLessThan(continueIdx);
+    // 完成分支：下一动作必须立即 finish_goal 且不再派发；需用户输入分支：提问等待、不 finish
+    expect(prompt).toContain("你的下一个动作必须立即调用 \`finish_goal\`");
+    expect(prompt).toContain("不要再派发任务");
+    expect(prompt).toContain("提出一个具体问题并等待");
+    expect(prompt).toContain("不要调用 \`finish_goal\`");
+  });
+
+  it("marker is appended after the visible reminder text without polluting it", async () => {
+    vi.useFakeTimers();
+    setupActiveGoal();
+    const { pi, handlers } = createMockPi();
+    registerGoalAgentHandler(pi as any);
+
+    await finishLowLevelRun(handlers);
+    await settleRun(handlers);
+    await flushReminderTimer();
+
+    const prompt = pi.sendUserMessage.mock.calls[0][0] as string;
+    expect(prompt).toMatch(/<!-- top-notch-team:goal-reminder:\d+ -->$/);
+    const markerStart = prompt.lastIndexOf("<!-- top-notch-team:goal-reminder:");
+    const visible = prompt.slice(0, markerStart).trimEnd();
+    expect(visible).toContain("立即调用 \`finish_goal\`");
+    expect(visible).not.toContain("top-notch-team:goal-reminder:");
+    expect(visible.endsWith("派发下一轮任务")).toBe(true);
+  });
+
+  it("finish_goal definition is distinct from set_goal (snippet + guidelines)", async () => {
+    const { pi } = createMockPi();
+    registerGoalTools(pi as any);
+    const defs = pi.registerTool.mock.calls.map((c: any[]) => c[0]);
+    const setGoalDef = defs.find((d: any) => d?.name === "set_goal") as any;
+    const finishGoalDef = defs.find((d: any) => d?.name === "finish_goal") as any;
+
+    expect(finishGoalDef.description).toContain(
+      "Mark the current goal as completed and stop the reminder system",
+    );
+    expect(finishGoalDef.description).toContain("unresolvable blocker");
+    expect(finishGoalDef.description).toContain("No parameters");
+    // snippet 与 set_goal 区分
+    expect(finishGoalDef.promptSnippet).not.toBe(setGoalDef.promptSnippet);
+    expect(finishGoalDef.promptSnippet).toMatch(/[Ff]inish/);
+    expect(setGoalDef.promptSnippet).not.toMatch(/Finish the active goal/);
+    // guidelines：精确短语断言（条件满足/阻塞时调用、条件未满足且仍可推进时不得调用、仅口头宣称不算）
+    const guidelines = finishGoalDef.promptGuidelines.join("\n");
+    expect(guidelines).toContain("the goal's completion criteria are fully met");
+    expect(guidelines).toContain("an unresolvable blocker makes the goal impossible");
+    expect(guidelines).toContain(
+      "Do NOT call finish_goal when completion criteria remain unmet and work can still progress — dispatch the next round of tasks to members instead.",
+    );
+    expect(guidelines).toContain(
+      "Merely claiming in text that the goal is done does not close it; the reminder system only stops after a real finish_goal call.",
+    );
+    // snippet 精确值
+    expect(finishGoalDef.promptSnippet).toBe(
+      "Finish the active goal — call when all criteria met or an unresolvable blocker",
+    );
+    expect(setGoalDef.promptSnippet).toBe("Set a session goal with verifiable completion criteria");
+  });
+
+  it("finish_goal execute marks the goal complete and later runs never remind again", async () => {
+    vi.useFakeTimers();
+    setupActiveGoal();
+    const { pi, handlers } = createMockPi();
+    registerGoalTools(pi as any);
+    registerGoalAgentHandler(pi as any);
+    const finishGoalDef = pi.registerTool.mock.calls
+      .map((c: any[]) => c[0])
+      .find((d: any) => d?.name === "finish_goal") as any;
+
+    const result = await finishGoalDef.execute("call-1", {});
+    expect(result.content[0].text).toContain('目标"探索全部模块"已标记为完成');
+    expect(result.content[0].text).toContain("提醒机制已停止");
+    expect(getGoalState()?.completed).toBe(true);
+
+    await finishLowLevelRun(handlers);
+    await settleRun(handlers);
+    await flushReminderTimer();
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("finish_goal execute cancels an already-pending reminder (finish after settle, before delivery)", async () => {
+    vi.useFakeTimers();
+    setupActiveGoal();
+    const { pi, handlers } = createMockPi();
+    registerGoalTools(pi as any);
+    registerGoalAgentHandler(pi as any);
+    const finishGoalDef = pi.registerTool.mock.calls
+      .map((c: any[]) => c[0])
+      .find((d: any) => d?.name === "finish_goal") as any;
+
+    await finishLowLevelRun(handlers);
+    await settleRun(handlers); // pendingReminder 已就绪，定时器已排
+    await finishGoalDef.execute("call-1", {});
+    await flushReminderTimer();
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("finish_goal execute returns a hint when no goal is active", async () => {
+    const { pi } = createMockPi();
+    startSession({ name: "test-team", description: "", members: [] } as any);
+    registerGoalTools(pi as any);
+    const finishGoalDef = pi.registerTool.mock.calls
+      .map((c: any[]) => c[0])
+      .find((d: any) => d?.name === "finish_goal") as any;
+
+    const result = await finishGoalDef.execute("call-1", {});
+    expect(result.content[0].text).toContain("当前没有活跃的目标。");
+  });
+
+  it("finish_goal execute is guarded outside an active session", async () => {
+    const { pi } = createMockPi();
+    registerGoalTools(pi as any);
+    const finishGoalDef = pi.registerTool.mock.calls
+      .map((c: any[]) => c[0])
+      .find((d: any) => d?.name === "finish_goal") as any;
+
+    const result = await finishGoalDef.execute("call-1", {});
+    expect(result.content[0].text).toContain("finish_goal 只能在活跃的团队会话中使用。");
   });
 });
 

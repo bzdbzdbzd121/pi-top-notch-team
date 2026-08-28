@@ -24,6 +24,9 @@ const adrAgentSessions = read("docs/adr/0003-agent-initiated-team-sessions.md");
 const sessionToolVisibility = read("src/session/session-tool-visibility.ts");
 const sharedContextTool = read("src/tools/shared-context-tool.ts");
 const indexTests = read("src/index.test.ts");
+const goalClosingProtocol = read("src/prompts/goal-closing-protocol.ts");
+const dynamicMode = read("src/prompts/dynamic-mode.ts");
+const agentInitiatedMode = read("src/prompts/agent-initiated-mode.ts");
 const lifecycleDocs = [agents, design, readme, context, adrAgentSessions].join("\n");
 
 // Goal reminders use the ordinary sendUserMessage path. Member-channel
@@ -96,6 +99,37 @@ requireMatch("ADR-0003 fresh registry qualification", adrAgentSessions, /A fresh
 requireMatch("ADR-0003 activeTools qualification", adrAgentSessions, /remain in the registry after teardown[\s\S]{0,180}removes them from `activeTools` outside a session/);
 requireMatch("fully-settled wording", source, /一次运行完全结算/);
 requireMatch("fully-settled wording in design", design, /Goal Reminder Lifecycle/i);
+
+// Reminder text must drive a forced finish_goal decision and never claim the
+// actual work is unfinished: the goal is only "still active / not yet closed",
+// which explicitly does not imply acceptance criteria failed.
+requireMatch("reminder goal-still-active wording", source, /仍处于激活状态（尚未调用 \\\`finish_goal\\\`）/);
+requireMatch("reminder not-verdict wording", source, /不代表验收未完成/);
+requireMatch("reminder forces tool call first", source, /必须执行下列唯一匹配的分支\*\*（不得只用文字宣称目标已完成或已阻塞）/);
+requireMatch("reminder finish branch first", source, /1\. \*\*如果全部完成条件已满足\*\* — 你的下一个动作必须立即调用 \\\`finish_goal\\\` 关闭目标，不要再派发任务/);
+requireMatch("reminder blocker branch second", source, /2\. \*\*如果遇到不可解决的阻塞问题\*\* — 你的下一个动作必须立即调用 \\\`finish_goal\\\`/);
+requireMatch("reminder continue branch gated", source, /4\. \*\*仅当确有未满足的完成条件且可以继续推进时\*\*/);
+requireMatch("reminder ask-user branch", source, /3\. \*\*如果需要用户提供关键信息或做决策才能继续\*\*[\s\S]{0,80}不要调用 \\\`finish_goal\\\`/);
+forbidMatch("reminder legacy unfinished claim", source, /尚未完成。\n/);
+requireMatch("finish_goal distinct snippet", source, /Finish the active goal — call when all criteria met or an unresolvable blocker/);
+requireMatch("finish_goal do-not-call guideline", source, /Do NOT call finish_goal when completion criteria remain unmet/);
+requireMatch("finish_goal no verbal-only closure", source, /Merely claiming in text[\s\S]{0,120}real finish_goal call/);
+requireMatch("lifecycle notice finish_goal directive", source, /完成目标后请调用 finish_goal 工具/);
+requireMatch("lifecycle notice goal-active wording", source, /Goal 仍处于激活状态（尚未关闭）/);
+
+// All three TL prompt variants must carry the shared mandatory closing
+// protocol (defined once in goal-closing-protocol.ts, imported everywhere).
+requireMatch("closing protocol shared text", goalClosingProtocol, /finish_goal[\s\S]{0,60}禁止仅口头宣称完成[\s\S]{0,60}只认真实的 finish_goal 调用/);
+requireMatch("pre-defined prompt imports closing protocol", index, /GOAL_CLOSING_PROTOCOL_PROMPT/);
+requireMatch("dynamic mode imports closing protocol", dynamicMode, /GOAL_CLOSING_PROTOCOL_PROMPT/);
+requireMatch("agent-initiated imports closing protocol", agentInitiatedMode, /GOAL_CLOSING_PROTOCOL_PROMPT/);
+requireMatch("dynamic mode lists goal tools", dynamicMode, /set_goal\(text, criteria\) \/ finish_goal\(\)/);
+
+// Closing order is verify → finish_goal → final report in all three prompt
+// variants (weak models may end the turn right after reporting).
+requireMatch("pre-defined closing order", index, /10\. \$\{GOAL_CLOSING_PROTOCOL_PROMPT\}[\s\S]{0,120}11\. 向用户汇报最终结果/);
+requireMatch("dynamic closing order", dynamicMode, /8\. \$\{GOAL_CLOSING_PROTOCOL_PROMPT\}[\s\S]{0,120}9\. 向用户汇报最终结果/);
+requireMatch("agent-initiated closing order", agentInitiatedMode, /2\. \$\{GOAL_CLOSING_PROTOCOL_PROMPT\}[\s\S]{0,120}3\. 向用户汇报最终结果/);
 
 if (failures.length > 0) {
   console.error("Goal reminder static check failed:");

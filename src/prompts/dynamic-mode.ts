@@ -3,6 +3,7 @@ import { join, dirname } from "node:path";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { FIRST_ACTION_PROTOCOL_PROMPT } from "./tl-first-action";
+import { GOAL_CLOSING_PROTOCOL_PROMPT } from "./goal-closing-protocol";
 import { getSharedContextPath } from "../session/shared-context";
 
 /**
@@ -90,6 +91,7 @@ function designPhasePrompt(sharedCtxPath: string, memberLines: string, team: Tea
   ✅ write_shared_context — 写入共享上下文（启动成员的必经步骤，未写入时 start_member 会被拦截）
   ✅ write（仅 .md 文件，如 ADR；**但 .shared-context.md 必须用 write_shared_context 工具写入**）
   ✅ start_member — 启动成员（这会自动进入执行阶段）
+  ✅ set_goal / finish_goal — 设定/结束会话目标（可选，见阶段 F）
   ✅ 其他团队管理工具
 
 ### 设计流程（六个阶段，按顺序推进，完成判据满足后才进入下一阶段）
@@ -147,6 +149,12 @@ function designPhasePrompt(sharedCtxPath: string, memberLines: string, team: Tea
    - 协作规则、术语表、关键决策记录
    ⚠️ **未调用 write_shared_context 之前，start_member 会被系统拦截。**
 3. 调用 \`start_member\` 启动第一个成员。⚠️ **这会自动进入执行阶段**，之后你将获得完整的工具权限。
+
+#### 目标（可选）
+
+若用户同意，可在落地阶段用 \`set_goal\` 设定可验证的完成条件，系统会在目标未关闭时提醒你检查进度。
+
+${GOAL_CLOSING_PROTOCOL_PROMPT}
 
 ### 当前团队：${team.name}
 ${team.description}
@@ -231,6 +239,7 @@ Member 进程保持运行以便继续接收新任务。仅当成员进程异常�
 6. **wait_and_get_member_status()** — **优先使用**。等待所有成员空闲后查看操作状态（idle/working/crashed/stopped）。如果有成员在工作会阻塞，和 team_send_and_wait 检测 all-idle 的方式相同
 7. **get_member_log(name, lines?)** — 查看 Member 最近的详细对话记录，负担较重，仅当需要了解具体内容时才使用
 8. **stop_member(name)** — 终止 Member 进程
+9. **set_goal(text, criteria) / finish_goal()** — 设定/结束会话目标（见流程）
 
 > ⚡ **Batch vs Sequential 决策规则：**
 >   - **批量（Batch）**：多个任务**相互独立**时放入同一个 tasks 数组，各 Member 同时工作（如同时派发不同文件的分析任务）。
@@ -247,8 +256,10 @@ Member 进程保持运行以便继续接收新任务。仅当成员进程异常�
 4. **分批执行** — 若工作流中定义了批次（大批量任务），按批次逐轮派发：完成一批 → 验证该批成果 → 根据经验微调 → 再派下一批。不要一次性把所有批次的任务全部铺开。每轮向用户同步进度（如"批次 2/8"）
 5. 监控进展（\`wait_and_get_member_status\` / \`get_member_log\`）
 6. 需要更新共享上下文时调用 \`write_shared_context\`，然后通知所有 Member 重新阅读
-7. 任务完成后向用户汇报结果
-8. 让用户决定是否 \`/team stop\`
+7. **汇总并验证（不要结束回合）** — 检查各成员产出，逐条对照完成条件（若已设定目标）
+8. ${GOAL_CLOSING_PROTOCOL_PROMPT}
+9. 向用户汇报最终结果（交付物清单 + 验收对照）
+10. 让用户决定是否 \`/team stop\`
 
 ### 当前团队：${team.name}
 ${team.description}

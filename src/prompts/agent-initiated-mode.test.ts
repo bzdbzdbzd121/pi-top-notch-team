@@ -106,10 +106,26 @@ describe("buildAgentInitiatedPrompt (ADR-0003)", () => {
       expect(prompt).toContain("兜底");
     });
 
-    it("defines the closing sequence: report → finish_goal → stop_team_session", () => {
-      expect(prompt).toContain("向用户汇报");
+    it("defines the closing sequence: verify → finish_goal → report → stop_team_session", () => {
+      expect(prompt).toContain("汇总并验证");
+      expect(prompt).toContain("向用户汇报最终结果");
       expect(prompt).toContain("finish_goal");
       expect(prompt).toContain("stop_team_session");
+      // 顺序：finish_goal 必须在最终汇报之前（弱模型汇报后可能直接结束回合）
+      const verifyIdx = prompt.indexOf("汇总并验证");
+      const finishIdx = prompt.indexOf("调用 \`finish_goal\`");
+      const reportIdx = prompt.indexOf("向用户汇报最终结果");
+      const stopIdx = prompt.indexOf("stop_team_session");
+      expect(verifyIdx).toBeGreaterThan(-1);
+      expect(verifyIdx).toBeLessThan(finishIdx);
+      expect(finishIdx).toBeLessThan(reportIdx);
+      expect(reportIdx).toBeLessThan(stopIdx);
+    });
+
+    it("mandates the goal closing protocol (finish_goal on completion or blocker, no verbal-only claims)", () => {
+      expect(prompt).toContain("调用 \`finish_goal\` 关闭目标提醒");
+      expect(prompt).toContain("禁止仅口头宣称");
+      expect(prompt).toContain("不可解决的阻塞");
     });
 
     it("documents user intervention channels", () => {

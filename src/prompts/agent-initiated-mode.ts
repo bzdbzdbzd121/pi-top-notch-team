@@ -1,4 +1,5 @@
 import type { TeamDefinition } from "../team/definition";
+import { GOAL_CLOSING_PROTOCOL_PROMPT } from "./goal-closing-protocol";
 import { getSharedContextPath } from "../session/shared-context";
 
 /**
@@ -122,9 +123,9 @@ function executionPhasePrompt(sharedCtxPath: string, memberLines: string, team: 
 4. 共享上下文有更新 → \`write_shared_context\` 覆盖写入后通知全体成员重读
 
 ### 收尾流程（使命达成后）
-1. 汇总各成员产出，验证使命的验收标准逐条满足
-2. 向用户汇报最终结果（交付物清单 + 验收对照）
-3. 调用 \`finish_goal\` 关闭目标提醒
+1. **汇总并验证（不要结束回合）** — 汇总各成员产出，逐条对照验收标准
+2. ${GOAL_CLOSING_PROTOCOL_PROMPT}
+3. 向用户汇报最终结果（交付物清单 + 验收对照）
 4. 调用 \`stop_team_session\` 结束会话（停止全部成员进程、保留可恢复的会话数据；磁盘清理用 \`/team delete\`）
    - 例外：预判用户会立即追问/追加任务时，可保留团队运行——但必须在汇报中明确告知"团队会话仍在运行"
 

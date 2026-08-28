@@ -67,6 +67,32 @@ describe("buildDynamicModePrompt — design phase", () => {
   });
 });
 
+describe("buildDynamicModePrompt — goal closing protocol", () => {
+  it("design phase lists goal tools (set_goal/finish_goal)", () => {
+    const prompt = buildDynamicModePrompt(emptyTeam, "design");
+    expect(prompt).toContain("set_goal");
+    expect(prompt).toContain("finish_goal");
+  });
+
+  it("execution phase lists goal tools and mandates the closing protocol", () => {
+    const prompt = buildDynamicModePrompt(teamWithMembers, "execution");
+    expect(prompt).toContain("set_goal");
+    expect(prompt).toContain("finish_goal");
+    // 收尾协议：完成/阻塞 → 强制调用 finish_goal，禁止仅口头宣称
+    expect(prompt).toContain("调用 \`finish_goal\`");
+    expect(prompt).toContain("禁止仅口头宣称");
+    // 顺序：汇总并验证（不结束回合）→ finish_goal → 向用户最终汇报 → /team stop
+    const verifyIdx = prompt.indexOf("汇总并验证");
+    const finishIdx = prompt.indexOf("调用 \`finish_goal\`");
+    const reportIdx = prompt.indexOf("向用户汇报最终结果");
+    const stopIdx = prompt.indexOf("/team stop");
+    expect(verifyIdx).toBeGreaterThan(-1);
+    expect(verifyIdx).toBeLessThan(finishIdx);
+    expect(finishIdx).toBeLessThan(reportIdx);
+    expect(reportIdx).toBeLessThan(stopIdx);
+  });
+});
+
 describe("buildDynamicModePrompt — execution phase", () => {
   const prompt = buildDynamicModePrompt(teamWithMembers, "execution");
 

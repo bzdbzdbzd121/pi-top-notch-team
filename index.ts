@@ -28,6 +28,7 @@ import {
 import { createMessageChannel } from "./src/setup/message-channel";
 import { buildDynamicModePrompt } from "./src/prompts/dynamic-mode";
 import { FIRST_ACTION_PROTOCOL_PROMPT } from "./src/prompts/tl-first-action";
+import { GOAL_CLOSING_PROTOCOL_PROMPT } from "./src/prompts/goal-closing-protocol";
 import { buildWorkflowPrompt, WORKFLOW_ACTIVATION_BANNER } from "./src/prompts/workflow-prompt";
 import { createTlReadGuard, createDesignReadGuard } from "./src/session/tl-read-guard";
 import { enforceSessionToolVisibility, SESSION_TOOL_NAMES } from "./src/session/session-tool-visibility";
@@ -1135,7 +1136,7 @@ Member 进程保持运行以便继续接收新任务。仅当成员进程异常�
 5. **wait_and_get_member_status()** — **优先使用**。等待所有成员空闲后查看操作状态（idle/working/crashed/stopped）。如有成员在工作则阻塞，和 team_send_and_wait 检测 all-idle 的方式相同
 6. **get_member_log(name, lines?)** — 查看 Member 最近的详细对话记录，负担较重，仅当需要了解具体内容时才使用
 7. **stop_member(name)** — 终止 Member 进程
-8. **set_goal(text, criteria) / finish_goal()** — 设定/结束会话目标（见流程第 2 步）
+8. **set_goal(text, criteria) / finish_goal()** — 设定/结束会话目标（见流程第 2、10 步）
 
 > 提示：team_send_and_wait 的 tasks 参数支持传入多个任务同时发送给不同 Member（如 [{to:"a", content:"..."}, {to:"b", content:"..."}]），实现并发执行。发送的消息包含 <corr:...> 标签。其他成员回复时需在内容中包含此标签。消息通道中的 Team Lead 名称是 tl。
 >
@@ -1147,15 +1148,17 @@ Member 进程保持运行以便继续接收新任务。仅当成员进程异常�
 
 ### 流程
 1. 先与用户充分讨论需求，直到和用户对齐细节
-2. **主动询问用户是否要设定目标**（\`set_goal\`）—— 如果用户同意，使用 \`set_goal\` 设定清晰的可验证完成条件；如果用户说不需要，跳过即可。目标会在 TL 的一次运行完全结算（不会再自动重试、自动压缩或处理排队续跑）且目标仍未完成时提醒继续；\`agent_end\` 只是中间结束点，不会触发提醒。
+2. **主动询问用户是否要设定目标**（\`set_goal\`）—— 如果用户同意，使用 \`set_goal\` 设定清晰的可验证完成条件；如果用户说不需要，跳过即可。目标会在 TL 的一次运行完全结算（不会再自动重试、自动压缩或处理排队续跑）且 Goal 仍处于激活状态（尚未关闭）时提醒继续；\`agent_end\` 只是中间结束点，不会触发提醒。
 3. 拆解任务，制定计划
 4. 调用 \`write_shared_context\` 编写 Shared Context（共享上下文），记录：团队成员、项目背景和目标、协作规则、术语表。**未调用前 start_member 会被系统拦截**
 5. 用 start_member 启动各 Member
 6. 将 Shared Context 随首次任务消息一起发送给各 Member。**在消息中明确告知 Member 任务完成后必须回复 TL，并指示 Member：输出报告/方案/设计文档时写入文件，不要在消息通道中塞入大量内容。**
 7. 通过消息通道与 Member 交流，监控进展（可使用 team_send_and_wait 等待成员回复）
 8. 根据需要更新 Shared Context，通知所有 Member 重新阅读
-9. 任务完成后向用户汇报结果
-10. 让用户决定是否 /team stop
+9. **汇总并验证（不要结束回合）** — 检查各成员产出，逐条对照完成条件（若已设定目标）
+10. ${GOAL_CLOSING_PROTOCOL_PROMPT}
+11. 向用户汇报最终结果（交付物清单 + 验收对照）
+12. 让用户决定是否 /team stop
 `;
     }
 

@@ -46,7 +46,7 @@ Batch send: team_send_and_wait now supports tasks array for concurrent dispatch 
 | `index.ts` (~400 lines) | TL extension entry point. Registers `/team` command, wires DI dependencies, `before_agent_start` injection, team-status + edit-mode widget lifecycle, autocomplete provider, `agent_settled` interrupt handler (Esc detection with member-running notification). Refactored from ~800 lines via modular extraction. |
 | `member.ts` | Member extension entry point. Registers `team_send_message` tool, injects team awareness via env vars. Uses `JSON.parse` for TEAM_MEMBERS (no longer comma-delimited). |
 | `package.json` | pi package manifest with `pi.extensions` pointing to `["./index.ts", "./member.ts"]`; includes `check:goal-reminder` release scan |
-| `scripts/check-goal-reminder.mjs` | Stage 3 static guard for settled-boundary, first-user marker correlation, API-only cooldown, and legacy wording |
+| `scripts/check-goal-reminder.mjs` | Stage 3 static guard for settled-boundary, first-user marker correlation, API-only cooldown, legacy wording, reminder finish_goal-first decision structure, and closing-protocol injection across all three prompt variants |
 
 ## Source Map
 
@@ -116,6 +116,7 @@ src/
 │   ├── dynamic-mode.ts  ← TL system prompt template for /team dynamic mode (design/execution phases)
 │   ├── agent-initiated-mode.ts ← agent 自主会话提示词（ADR-0003）：使命锚定、无 grilling/确认门/第一动作协议
 │   ├── tl-first-action.ts ← 共享「第一动作协议」提示词片段，注入两种模式 TL 提示词顶部
+│   ├── goal-closing-protocol.ts ← 共享「强制 Goal 关闭协议」提示词片段（预定义/dynamic/agent-initiated 三模式复用防漂移）
 │   ├── workflow-prompt.ts ← 预定义团队的工作流提示词构建（纯函数）：激活横幅 + 操作型执行协议，替代旧内联描述性注入
 │   ├── workflow-prompt.test.ts ← 工作流提示词测试
 │   ├── orchestration-playbook.md  ← TL 编排方法论：需求对齐(grilling)/任务拆分/质量加固模式库/确认门，注入设计阶段提示词
@@ -175,6 +176,7 @@ src/
    - **Fire-and-forget correlation** uses the complete hidden HTML marker in `before_agent_start`; `agent_start` without a prompt is never an ACK. A void/no-ACK watchdog only reports uncertainty and never retries; observable sync/Promise failures restore the candidate.
    - **Rollover isolation** captures live markers across session or goal-generation changes. The exact marker map is keyed by marker ID, capped at 64 unresolved entries, and stores only numeric identity metadata. A captured marker is stale only after its own `before_agent_start` is observed; `message_start` then examines only the first `role === "user"` prompt. Assistant/tool-result text, later user messages, consumed historical IDs, and unrelated markers cannot suppress or abort a fresh run.
    - A confirmed reminder continuation is suppressed once so it cannot generate a second candidate. `finish_goal`, reset/teardown, abort, and session changes invalidate candidates; `session_shutdown` clears timers, submissions, and rollover quarantine. The marker protocol is confirmation/de-duplication protection, not an independent retry watchdog.
+   - **提醒正文决策结构与强制关闭协议**：`buildReminderText` 不再断言实际工作「尚未完成」——改为「Goal 仍处于激活状态（尚未调用 `finish_goal`）」，并明确**不代表验收未完成**，要求以完成条件逐条核对。总指令为「必须执行下列唯一匹配的分支（不得只用文字宣称目标已完成或已阻塞）」，决策分支：① 全部完成条件已满足 → 下一动作必须立即调用 `finish_goal`、不要再派发；② 不可解决阻塞 → 下一动作必须立即调用 `finish_goal` 并告知用户；③ 需用户提供关键信息或做决策才能继续 → 提出一个具体问题并等待、不要调用 `finish_goal`；④ 仅当确有未满足条件且可继续时才 `team_send_and_wait` 派发下一轮。三模式 TL 提示词（预定义 index / dynamic design+execution / agent-initiated）统一注入共享的 `GOAL_CLOSING_PROTOCOL_PROMPT`（`src/prompts/goal-closing-protocol.ts`，单一事实来源防漂移，调用处直接注入不重复前缀）；**收尾顺序统一为「汇总并验证（不结束回合）→ 立即 finish_goal → 向用户最终汇报」**（finish_goal 置于最终汇报之前，防弱模型汇报后直接结束回合）；dynamic 工具列表补齐 `set_goal`/`finish_goal`。`finish_goal` 的 promptSnippet 与 promptGuidelines 区分于 `set_goal`（Finish 语义 + 仅当条件未满足且仍可推进时不得调用 + 仅口头宣称不算关闭）。生命周期通知措辞统一为「Goal 仍处于激活状态（尚未关闭）」，避免「未完成」认知偏置。
    **会话工具注册与可见性（turn-boundary enforcement）**：全部 9 个团队会话工具（`start_member`/`stop_member`/`list_members`/`get_member_log`/`team_send_and_wait`/`wait_and_get_member_status`/`write_shared_context`/`set_goal`/`finish_goal`）**只在团队会话（`/team start` 或 `/team dynamic`）期间注册**——扩展加载时不注册任何团队工具（见决策 #21）。由于 pi 没有 unregisterTool API，首次会话后工具会永久留在注册表中——活跃工具集是唯一可见性闸门，因此 `src/session/session-tool-visibility.ts` 的 `enforceSessionToolVisibility()`（纯函数 + DI，`SESSION_TOOL_NAMES` 与 `teamCtx.tlToolNames` 同源）在每个 `before_agent_start` 回合边界强制该不变式：会话活跃 → 确保注册（幂等）+ 激活；会话不活跃 → 从活跃集移除（绝不注册）。防止扩展重载/其他扩展 setActiveTools/plan-mode 切换等产生陈旧活跃列表导致工具泄漏到会话外。
 
 11. **Defensive parsing for `tasks` parameter** — `src/tools/tl-tools.ts` includes a `parseTasks()` function that handles four formats for the `tasks` parameter:
@@ -445,8 +447,8 @@ printf '' | timeout 10 ./node_modules/.bin/pi --mode json --no-tools -e ./index.
 |------|-------------|
 | `write_shared_context(content)` | Write the team shared context to the session's `.shared-context.md` (overwrite). **Must be called before the first `start_member` — start_member is blocked until then.** Sets the session `sharedContextWritten` flag; direct `write`/`edit` of `.shared-context.md` is intercepted and redirected here. Call again to update, then notify members to re-read. |
 | `add_dynamic_member(name, label, systemPrompt, model?)` | Register a member in `/team dynamic` mode. Name is the identifier, label is Chinese display name, systemPrompt is role definition. Only available in dynamic mode. |
-| `set_goal(text, criteria)` | Set a session goal with verifiable completion criteria. The system reminds the TL only after one run is fully settled (with no automatic retry, compaction, or queued continuation) while the goal remains incomplete; `agent_end` alone never sends a reminder. **可见性**：仅团队会话（`/team start`/`/team dynamic`）期间可见——`onSessionStart` 注册，`before_agent_start` 回合边界强制（见决策 #10）。 |
-| `finish_goal()` | Mark the current goal as completed and stop the reminder system. Call when all goal criteria are met, or when an unresolvable blocker is encountered. |
+| `set_goal(text, criteria)` | Set a session goal with verifiable completion criteria. The system reminds the TL only after one run is fully settled (with no automatic retry, compaction, or queued continuation) while the goal remains active (not yet closed); `agent_end` alone never sends a reminder. **可见性**：仅团队会话（`/team start`/`/team dynamic`）期间可见——`onSessionStart` 注册，`before_agent_start` 回合边界强制（见决策 #10）。 |
+| `finish_goal()` | Mark the current goal as completed and stop the reminder system. Call when all goal criteria are met, or when an unresolvable blocker is encountered. **仅条件全部满足或遇到不可解决阻塞时调用**——条件未满足且仍可推进时不得调用，继续派发任务；仅口头宣称完成不会停止提醒（提醒系统只认真实的 finish_goal 调用）。promptSnippet 区分于 set_goal（Finish 语义）。 |
 | `start_member(name)` | Launch a Member's pi RPC process. In dynamic mode, the first call triggers the design→execution phase transition. |
 | `stop_member(name)` | Gracefully terminate a Member process |
 | `list_members()` | Show all member statuses |

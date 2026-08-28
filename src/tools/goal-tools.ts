@@ -482,13 +482,15 @@ function contextIsIdle(ctx: unknown): { readable: boolean; idle: boolean } {
 function buildReminderText(candidate: GoalReminderCandidate): string {
   return (
     `## ⚡ 目标提醒\n\n` +
-    `当前目标 **"${candidate.text}"** 尚未完成。\n\n` +
+    `当前目标 **"${candidate.text}"** 仍处于激活状态（尚未调用 \`finish_goal\`）。` +
+    `这仅表示目标尚未关闭，**不代表验收未完成**——请以下方完成条件为准逐条核对。\n\n` +
     `**完成条件：**\n${candidate.criteria}\n\n` +
     `---\n` +
-    `请检查当前进度：\n\n` +
-    `1. **如果目标尚未完成** — 继续调度成员执行下一轮任务，直到所有条件满足\n` +
-    `2. **如果目标已完成** — 调用 \`finish_goal\` 工具清理此目标\n` +
-    `3. **如果遇到不可解决的阻塞问题** — 也调用 \`finish_goal\` 并告知用户情况`
+    `请逐条核对完成条件后，**必须执行下列唯一匹配的分支**（不得只用文字宣称目标已完成或已阻塞）：\n\n` +
+    `1. **如果全部完成条件已满足** — 你的下一个动作必须立即调用 \`finish_goal\` 关闭目标，不要再派发任务\n` +
+    `2. **如果遇到不可解决的阻塞问题** — 你的下一个动作必须立即调用 \`finish_goal\` 并向用户说明情况\n` +
+    `3. **如果需要用户提供关键信息或做决策才能继续** — 向用户提出一个具体问题并等待回复，不要调用 \`finish_goal\`\n` +
+    `4. **仅当确有未满足的完成条件且可以继续推进时** — 才调用 \`team_send_and_wait\` 派发下一轮任务`
   );
 }
 
@@ -748,9 +750,10 @@ export function setGoalInternal(text: string, criteria: string): void {
 
 // ── Prompt snippet for TL tools ────────────────────────────
 
-const GOAL_PROMPT_SNIPPET = "Set/finish a session goal to track overall objective";
+const GOAL_PROMPT_SNIPPET = "Set a session goal with verifiable completion criteria";
+const GOAL_FINISH_PROMPT_SNIPPET = "Finish the active goal — call when all criteria met or an unresolvable blocker";
 const GOAL_REMINDER_LIFECYCLE_NOTICE =
-  "系统只会在 TL 的一次运行完全结算（不会再自动重试、自动压缩或处理排队续跑）且目标仍未完成时提醒你检查进度；`agent_end` 只是中间结束点，不会触发提醒。完成目标后请调用 finish_goal 工具。";
+  "系统只会在 TL 的一次运行完全结算（不会再自动重试、自动压缩或处理排队续跑）且 Goal 仍处于激活状态（尚未关闭）时提醒你检查进度；`agent_end` 只是中间结束点，不会触发提醒。完成目标后请调用 finish_goal 工具。";
 
 // ── Goal tool names (for setActiveTools lifecycle) ───────
 
@@ -765,7 +768,7 @@ export function registerGoalTools(pi: ExtensionAPI): void {
     label: "Set Goal",
     description:
       "Set a session goal with completion criteria. " +
-      "The system reminds you only after the TL run is fully settled (without automatic retry, compaction, or queued continuation) and the goal remains incomplete. " +
+      "The system reminds you only after the TL run is fully settled (without automatic retry, compaction, or queued continuation) and the goal remains active (not yet closed). " +
       "agent_end is only an intermediate end point and does not trigger a reminder. " +
       "The goal must include concrete, verifiable completion criteria so you can check progress against it. " +
       "Parameters: text (goal summary), criteria (completion conditions).",
@@ -826,9 +829,11 @@ export function registerGoalTools(pi: ExtensionAPI): void {
       "Call this when the goal criteria are all met, or when an unresolvable blocker is encountered. " +
       "No parameters.",
     promptGuidelines: [
-      "Call finish_goal when the goal's completion criteria are fully met or when an unresolvable blocker makes the goal impossible.",
+      "Call finish_goal when the goal's completion criteria are fully met, or when an unresolvable blocker makes the goal impossible.",
+      "Do NOT call finish_goal when completion criteria remain unmet and work can still progress — dispatch the next round of tasks to members instead.",
+      "Merely claiming in text that the goal is done does not close it; the reminder system only stops after a real finish_goal call.",
     ],
-    promptSnippet: GOAL_PROMPT_SNIPPET,
+    promptSnippet: GOAL_FINISH_PROMPT_SNIPPET,
     parameters: {
       type: "object",
       properties: {},
