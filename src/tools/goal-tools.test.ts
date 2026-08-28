@@ -1112,13 +1112,13 @@ describe("reminder prompt content + finish_goal tool", () => {
     // 目标与完成条件原文随提醒送达
     expect(prompt).toContain("探索全部模块");
     expect(prompt).toContain("- 12 个文件完成");
-    // 不再断言实际工作"尚未完成"：只说目标仍激活，且明确不代表验收未完成
+    // 只描述 Goal 激活状态，不追加对实际验收结果的判断或解释
     expect(prompt).toContain("仍处于激活状态");
-    expect(prompt).toContain("不代表验收未完成");
     expect(prompt).not.toContain("尚未完成。");
-    // 强制唯一匹配分支：仅禁止用文字替代 finish_goal（分支 3 提问等待本就是文字）
-    expect(prompt).toContain("必须执行下列唯一匹配的分支");
-    expect(prompt).toContain("不得只用文字宣称目标已完成或已阻塞");
+    expect(prompt).not.toContain("不代表验收未完成");
+    // 用简洁指令要求 TL 选择唯一匹配分支
+    expect(prompt).toContain("执行下列唯一匹配的分支");
+    expect(prompt).not.toContain("不得只用文字宣称目标已完成或已阻塞");
     // 完成/阻塞分支前置，需用户输入分支在中，继续调度分支最后
     const finishIdx = prompt.indexOf("如果全部完成条件已满足");
     const blockerIdx = prompt.indexOf("如果遇到不可解决的阻塞问题");
@@ -1131,8 +1131,9 @@ describe("reminder prompt content + finish_goal tool", () => {
     expect(finishIdx).toBeLessThan(blockerIdx);
     expect(blockerIdx).toBeLessThan(askIdx);
     expect(askIdx).toBeLessThan(continueIdx);
-    // 完成分支：下一动作必须立即 finish_goal 且不再派发；需用户输入分支：提问等待、不 finish
-    expect(prompt).toContain("你的下一个动作必须立即调用 \`finish_goal\`");
+    // 完成分支调用 finish_goal 且不再派发；需用户输入分支提问等待、不 finish
+    expect(prompt).toContain("如果全部完成条件已满足** — 调用 \`finish_goal\` 关闭目标");
+    expect(prompt).not.toContain("你的下一个动作必须立即");
     expect(prompt).toContain("不要再派发任务");
     expect(prompt).toContain("提出一个具体问题并等待");
     expect(prompt).toContain("不要调用 \`finish_goal\`");
@@ -1152,7 +1153,7 @@ describe("reminder prompt content + finish_goal tool", () => {
     expect(prompt).toMatch(/<!-- top-notch-team:goal-reminder:\d+ -->$/);
     const markerStart = prompt.lastIndexOf("<!-- top-notch-team:goal-reminder:");
     const visible = prompt.slice(0, markerStart).trimEnd();
-    expect(visible).toContain("立即调用 \`finish_goal\`");
+    expect(visible).toContain("调用 \`finish_goal\` 关闭目标");
     expect(visible).not.toContain("top-notch-team:goal-reminder:");
     expect(visible.endsWith("派发下一轮任务")).toBe(true);
   });

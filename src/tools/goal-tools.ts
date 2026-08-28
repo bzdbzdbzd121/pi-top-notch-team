@@ -482,13 +482,12 @@ function contextIsIdle(ctx: unknown): { readable: boolean; idle: boolean } {
 function buildReminderText(candidate: GoalReminderCandidate): string {
   return (
     `## ⚡ 目标提醒\n\n` +
-    `当前目标 **"${candidate.text}"** 仍处于激活状态（尚未调用 \`finish_goal\`）。` +
-    `这仅表示目标尚未关闭，**不代表验收未完成**——请以下方完成条件为准逐条核对。\n\n` +
+    `当前目标 **"${candidate.text}"** 仍处于激活状态（尚未调用 \`finish_goal\`）。\n\n` +
     `**完成条件：**\n${candidate.criteria}\n\n` +
     `---\n` +
-    `请逐条核对完成条件后，**必须执行下列唯一匹配的分支**（不得只用文字宣称目标已完成或已阻塞）：\n\n` +
-    `1. **如果全部完成条件已满足** — 你的下一个动作必须立即调用 \`finish_goal\` 关闭目标，不要再派发任务\n` +
-    `2. **如果遇到不可解决的阻塞问题** — 你的下一个动作必须立即调用 \`finish_goal\` 并向用户说明情况\n` +
+    `请逐条核对完成条件后，**执行下列唯一匹配的分支**：\n\n` +
+    `1. **如果全部完成条件已满足** — 调用 \`finish_goal\` 关闭目标，不要再派发任务\n` +
+    `2. **如果遇到不可解决的阻塞问题** — 调用 \`finish_goal\` 并向用户说明情况\n` +
     `3. **如果需要用户提供关键信息或做决策才能继续** — 向用户提出一个具体问题并等待回复，不要调用 \`finish_goal\`\n` +
     `4. **仅当确有未满足的完成条件且可以继续推进时** — 才调用 \`team_send_and_wait\` 派发下一轮任务`
   );

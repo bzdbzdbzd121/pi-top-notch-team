@@ -100,14 +100,15 @@ requireMatch("ADR-0003 activeTools qualification", adrAgentSessions, /remain in 
 requireMatch("fully-settled wording", source, /一次运行完全结算/);
 requireMatch("fully-settled wording in design", design, /Goal Reminder Lifecycle/i);
 
-// Reminder text must drive a forced finish_goal decision and never claim the
-// actual work is unfinished: the goal is only "still active / not yet closed",
-// which explicitly does not imply acceptance criteria failed.
+// Reminder text presents a concise four-way decision without claiming the
+// actual work is unfinished: the goal is only "still active / not yet closed".
 requireMatch("reminder goal-still-active wording", source, /仍处于激活状态（尚未调用 \\\`finish_goal\\\`）/);
-requireMatch("reminder not-verdict wording", source, /不代表验收未完成/);
-requireMatch("reminder forces tool call first", source, /必须执行下列唯一匹配的分支\*\*（不得只用文字宣称目标已完成或已阻塞）/);
-requireMatch("reminder finish branch first", source, /1\. \*\*如果全部完成条件已满足\*\* — 你的下一个动作必须立即调用 \\\`finish_goal\\\` 关闭目标，不要再派发任务/);
-requireMatch("reminder blocker branch second", source, /2\. \*\*如果遇到不可解决的阻塞问题\*\* — 你的下一个动作必须立即调用 \\\`finish_goal\\\`/);
+requireMatch("reminder concise decision prompt", source, /\*\*执行下列唯一匹配的分支\*\*：/);
+requireMatch("reminder finish branch first", source, /1\. \*\*如果全部完成条件已满足\*\* — 调用 \\\`finish_goal\\\` 关闭目标，不要再派发任务/);
+requireMatch("reminder blocker branch second", source, /2\. \*\*如果遇到不可解决的阻塞问题\*\* — 调用 \\\`finish_goal\\\`/);
+forbidMatch("reminder verbose acceptance explanation", source, /不代表验收未完成/);
+forbidMatch("reminder verbose verbal-only warning", source, /不得只用文字宣称目标已完成或已阻塞/);
+forbidMatch("reminder verbose next-action wording", source, /你的下一个动作必须立即/);
 requireMatch("reminder continue branch gated", source, /4\. \*\*仅当确有未满足的完成条件且可以继续推进时\*\*/);
 requireMatch("reminder ask-user branch", source, /3\. \*\*如果需要用户提供关键信息或做决策才能继续\*\*[\s\S]{0,80}不要调用 \\\`finish_goal\\\`/);
 forbidMatch("reminder legacy unfinished claim", source, /尚未完成。\n/);

@@ -1880,14 +1880,14 @@ Goal/session rollover 会把仍可能被宿主接受的 pending、uncertain、ac
 
 ### 26.6a 提醒正文决策结构与强制关闭协议
 
-`buildReminderText` 的决策结构刻意**不以“实际工作尚未完成”为前提**——系统无法验证验收结果，只能断言 Goal 仍处于激活状态（尚未调用 `finish_goal`），并明确“不代表验收未完成”，要求 TL 以完成条件逐条核对后，**必须执行下列唯一匹配的分支**（不得只用文字宣称目标已完成或已阻塞）：
+`buildReminderText` 不以“实际工作尚未完成”为前提——系统只陈述 Goal 仍处于激活状态（尚未调用 `finish_goal`），要求 TL 逐条核对完成条件后，**执行下列唯一匹配的分支**：
 
-1. **全部完成条件已满足** → 下一动作必须立即调用 `finish_goal` 关闭目标、不再派发任务；
-2. **不可解决的阻塞** → 下一动作必须立即调用 `finish_goal` 并向用户说明；
+1. **全部完成条件已满足** → 调用 `finish_goal` 关闭目标、不再派发任务；
+2. **不可解决的阻塞** → 调用 `finish_goal` 并向用户说明；
 3. **需要用户提供关键信息或做决策才能继续** → 向用户提出一个具体问题并等待回复，不要调用 `finish_goal`；
 4. **仅当确有未满足的完成条件且可继续推进** → 才调用 `team_send_and_wait` 派发下一轮。
 
-完成/阻塞分支仍明确下一动作必须立即 `finish_goal`；分支 3 为“目标尚未过时但需要用户输入”提供出口，避免弱模型在不确定时误选继续派发或误关闭。
+分支 3 为“目标尚未过时但需要用户输入”提供出口，避免弱模型在不确定时误选继续派发或误关闭。
 
 三种 TL 提示词变体（预定义团队 index.ts、dynamic-mode.ts 的 design/execution 两阶段、agent-initiated-mode.ts）的收尾流程统一注入共享片段 `GOAL_CLOSING_PROTOCOL_PROMPT`（`src/prompts/goal-closing-protocol.ts`，单一事实来源防漂移，调用处直接注入、不重复“若已设定目标”前缀），且**收尾顺序统一为「汇总并验证（不结束回合）→ 立即 finish_goal → 向用户最终汇报」**——finish_goal 必须置于最终汇报之前，封堵弱模型“汇报后直接结束回合、永不关闭 Goal”的路径。`finish_goal` 的 promptSnippet（`Finish the active goal — call when all criteria met or an unresolvable blocker`）与 promptGuidelines（仅条件满足/阻塞时调用、**仅当条件未满足且仍可推进时不得调用**、文字宣称不算关闭）均区分于 `set_goal`。
 
