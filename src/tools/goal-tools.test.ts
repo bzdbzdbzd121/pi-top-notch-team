@@ -1253,6 +1253,107 @@ describe("reminder prompt content + finish_goal tool", () => {
   });
 });
 
+describe("mid-run session activation (start_team_session flow)", () => {
+  it("delivers a reminder when the session was activated mid-run (start_team_session)", async () => {
+    vi.useFakeTimers();
+    // No session at agent_start — mirrors start_team_session being called as a
+    // tool inside the run that also ends without finish_goal.
+    const { pi, handlers } = createMockPi();
+    registerGoalAgentHandler(pi as any);
+    const ctx = activeContext();
+
+    await handlers["agent_start"]({}, ctx);
+
+    // start_team_session equivalent: session + goal come into existence mid-run.
+    startSession({ name: "test-team", description: "", members: [] } as any, {
+      sessionId: "goal-tools-midrun",
+    });
+    setGoalForTesting({ text: "中途建会话目标", criteria: "- 提醒送达", completed: false });
+
+    await handlers["agent_end"]({ messages: [] }, ctx);
+    await settleRun(handlers, ctx);
+    await flushReminderTimer();
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(pi.sendUserMessage).toHaveBeenCalledWith(expect.stringContaining("中途建会话目标"));
+    expect(pi.sendUserMessage.mock.calls[0][0]).toContain("goal-reminder");
+  });
+
+  it("suppresses the reminder-started run after a mid-run activation (no re-remind)", async () => {
+    vi.useFakeTimers();
+    const { pi, handlers } = createMockPi();
+    registerGoalAgentHandler(pi as any);
+    pi.sendUserMessage.mockImplementation(() => undefined as any);
+    const ctx = activeContext();
+
+    await handlers["agent_start"]({}, ctx);
+    startSession({ name: "test-team", description: "", members: [] } as any, {
+      sessionId: "goal-tools-midrun",
+    });
+    setGoalForTesting({ text: "中途建会话目标", criteria: "- c", completed: false });
+    await handlers["agent_end"]({ messages: [] }, ctx);
+    await settleRun(handlers, ctx);
+    await flushReminderTimer();
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    const prompt = pi.sendUserMessage.mock.calls[0][0] as string;
+
+    // The run started by the reminder must not feed the same goal back in.
+    await handlers["before_agent_start"]({ prompt }, ctx);
+    await finishLowLevelReminderRun(handlers, prompt, ctx);
+    await settleRun(handlers, ctx);
+    await flushReminderTimer();
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not remind when the mid-run session is stopped before agent_end", async () => {
+    vi.useFakeTimers();
+    const { pi, handlers } = createMockPi();
+    registerGoalAgentHandler(pi as any);
+    const ctx = activeContext();
+
+    await handlers["agent_start"]({}, ctx);
+    startSession({ name: "test-team", description: "", members: [] } as any, {
+      sessionId: "goal-tools-midrun-stop",
+    });
+    setGoalForTesting({ text: "g", criteria: "- c", completed: false });
+    endSession();
+
+    await handlers["agent_end"]({ messages: [] }, ctx);
+    await settleRun(handlers, ctx);
+    await flushReminderTimer();
+
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("still rejects a run that started in session A when session B replaced it mid-run", async () => {
+    vi.useFakeTimers();
+    // The run starts while session A is already active — no mid-run activation.
+    startSession({ name: "test-team-a", description: "", members: [] } as any, {
+      sessionId: "goal-tools-a",
+    });
+    const { pi, handlers } = createMockPi();
+    registerGoalAgentHandler(pi as any);
+    const ctx = activeContext();
+
+    await handlers["agent_start"]({}, ctx);
+    setGoalForTesting({ text: "A goal", criteria: "- c", completed: false });
+
+    // Session A torn down and replaced by B inside the same run. The old run
+    // must not migrate into B (rollover protection preserved).
+    endSession();
+    startSession({ name: "test-team-b", description: "", members: [] } as any, {
+      sessionId: "goal-tools-b",
+    });
+    setGoalForTesting({ text: "B goal", criteria: "- c", completed: false });
+
+    await handlers["agent_end"]({ messages: [] }, ctx);
+    await settleRun(handlers, ctx);
+    await flushReminderTimer();
+
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+});
+
 describe("goal state helpers", () => {
   it("setGoalForTesting / getGoalState / resetGoal round-trip", () => {
     setGoalForTesting({ text: "g", criteria: "c", completed: false });

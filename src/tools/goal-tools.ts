@@ -56,6 +56,15 @@ interface GoalReminderRunState {
   /** Session identity captured when this outer run started. */
   sessionId: string | null;
   sessionEpoch: number;
+  /**
+   * The team session was activated mid-run (start_team_session tool call):
+   * the run's snapshot predates the session, so agent_end would otherwise
+   * drop its candidate on the identity guard. Only the run that created the
+   * session is exempted; stale runs never set this.
+   */
+  sessionActivatedMidRun: boolean;
+  activatedSessionId: string | null;
+  activatedSessionEpoch: number;
   candidate: GoalReminderCandidate | null;
 }
 
@@ -299,8 +308,24 @@ function currentSessionIdentity(): { active: boolean; sessionId: string | null }
     const session = getSessionState();
     const key = sessionKey(session);
     if (key !== observedSessionKey) {
+      const previousKey = observedSessionKey;
       observedSessionKey = key;
       sessionEpoch += 1;
+      // A team session activated mid-run (start_team_session tool call): the
+      // origin run's identity snapshot predates the session. Record the
+      // activation so the run that created the session can still produce a
+      // reminder candidate for it; a session switch between two already-active
+      // sessions never sets this (rollover protection preserved).
+      if (
+        session.active &&
+        previousKey === "inactive" &&
+        currentRun &&
+        !currentRun.settled
+      ) {
+        currentRun.sessionActivatedMidRun = true;
+        currentRun.activatedSessionId = session.sessionId;
+        currentRun.activatedSessionEpoch = sessionEpoch;
+      }
       // A session switch invalidates any fire-and-forget acknowledgement from
       // the previous session; never let its marker acknowledge new work. Keep
       // every live marker separately until before_agent_start/agent_start so
@@ -380,6 +405,9 @@ function createRun(ctx: unknown): GoalReminderRunState {
     signals,
     sessionId: session?.sessionId ?? null,
     sessionEpoch,
+    sessionActivatedMidRun: false,
+    activatedSessionId: null,
+    activatedSessionEpoch: 0,
     candidate: null,
   };
 }
@@ -436,7 +464,14 @@ function ensureEndRun(ctx: unknown): GoalReminderRunState | null {
   if (currentRun.settled) return null;
 
   const session = currentSessionIdentity();
-  if (session && currentRun.sessionEpoch !== sessionEpoch) {
+  const runActivatedThisSession = Boolean(
+    currentRun.sessionActivatedMidRun &&
+      session &&
+      session.active &&
+      session.sessionId === currentRun.activatedSessionId &&
+      sessionEpoch === currentRun.activatedSessionEpoch
+  );
+  if (session && currentRun.sessionEpoch !== sessionEpoch && !runActivatedThisSession) {
     // A new session needs a fresh agent_start. Do not let an old end event
     // migrate into it merely because its payload has no run identifier.
     return null;
@@ -1146,15 +1181,28 @@ export function registerGoalAgentHandler(pi: ExtensionAPI): void {
       return;
     }
 
-    if (session.sessionId !== run.sessionId || sessionEpoch !== run.sessionEpoch) {
+    const runActivatedThisSession = Boolean(
+      run.sessionActivatedMidRun &&
+        session.active &&
+        session.sessionId === run.activatedSessionId &&
+        sessionEpoch === run.activatedSessionEpoch
+    );
+    if (
+      (session.sessionId !== run.sessionId || sessionEpoch !== run.sessionEpoch) &&
+      !runActivatedThisSession
+    ) {
       pendingReminder = null;
       return;
     }
 
     run.candidate = {
       runId: run.runId,
-      sessionId: run.sessionId,
-      sessionEpoch: run.sessionEpoch,
+      // The guard validated the current identity (either the run's snapshot
+      // or the session it activated mid-run). The real session id must be
+      // captured here so a reminder continuation run can be correlated and
+      // suppressed in the same session.
+      sessionId: session.sessionId,
+      sessionEpoch,
       goalGeneration,
       text: activeGoal.text,
       criteria: activeGoal.criteria,

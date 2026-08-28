@@ -1814,7 +1814,7 @@ seg += t.contextInfo.percent === null ? " ?" : ` ${Math.round(t.contextInfo.perc
 |---|---|---|
 | Goal | `activeGoal`, `goalGeneration` | 目标文本、可验证条件、完成状态；替换 Goal 时递增 generation |
 | Session | `sessionId`, `sessionEpoch` | 防止旧团队会话的 late event 污染新会话 |
-| RunState | `runId`, `signals`, `sawAgentEnd`, `settled`, `aborted`, `candidate` | 将 retry/compaction/queued continuation 归并到同一个 outer run，并在 reset barrier 解除前拒绝旧 continuation |
+| RunState | `runId`, `signals`, `sawAgentEnd`, `settled`, `aborted`, `candidate`, `sessionActivatedMidRun`/`activatedSessionId`/`activatedSessionEpoch` | 将 retry/compaction/queued continuation 归并到同一个 outer run，并在 reset barrier 解除前拒绝旧 continuation；后三字段记录会话在 run 中途激活（`start_team_session` 工具调用），豁免发起会话的那一轮的身份守卫，active→active 会话切换不置位 |
 | Marker association | `suppressReminderCandidate`, `stalePromptPending`, `sawUserPrompt` | 关联已确认 reminder continuation；stale marker 只在首个用户 prompt 上判定 |
 | Submission | `pendingSubmission`, `acknowledgedSubmission`, `uncertainSubmissions` | 区分待 ACK、已关联下一 run、void 无 ACK 的不确定投递 |
 
