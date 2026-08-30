@@ -11,6 +11,7 @@ import { DEFAULT_TIMEOUT_MINUTES } from "../settings/resolve-auto-compact";
 import { createAutoCompactRuntime, type AutoCompactRuntime } from "./auto-compact";
 import {
   createMessageCoalescer,
+  DEFAULT_COALESCE_LIMITS,
   type MessageCoalescer,
   type CoalescedEntry,
 } from "./message-coalescer";
@@ -340,7 +341,12 @@ export function createMemberEventHandler(
       }
       closeCompactionAndFlush(deps, memberName);
       // S1 (阶段 2): 压缩结束 = 防御性 flush 点——桶非空则合并派发（幂等无副作用）。
-      deps.coalescer?.flush(memberName);
+      // 防御性隔离（同 agent_end，复审建议 3）。
+      try {
+        deps.coalescer?.flush(memberName);
+      } catch {
+        /* isolate */
+      }
       return;
     }
 
@@ -365,7 +371,12 @@ export function createMemberEventHandler(
 
       // S1 (阶段 2): 回合结束 = 批边界 → flush 合并桶。积压消息作为一次合并
       // prompt 派发（一个 working 周期），状态机/等待工具/all-idle 检测天然兼容。
-      deps.coalescer?.flush(memberName);
+      // 防御性隔离（复审建议 3）：flush 派发异常不得破坏状态机更新。
+      try {
+        deps.coalescer?.flush(memberName);
+      } catch {
+        /* isolate — display/auxiliary path must never break the state machine */
+      }
 
       // Agent turn ended. If member has a pending TL request and didn't
       // call team_send_message this turn, schedule an auto-reply.
@@ -853,7 +864,9 @@ export function createSendToMember(
   // member→member messages without a wait chain. The event handler flushes
   // the SAME instance at agent_end (batch boundary) / compaction_end
   // (defensive) / process_exit (drain) — bucket state is never split.
-  const coalescer = deps.coalescer ?? createMessageCoalescer();
+  // getCoalescing is injected as the per-flush limits resolver so configured
+  // non-default limits take effect at EVERY flush point (复审建议 1).
+  const coalescer = deps.coalescer ?? createMessageCoalescer(deps.getCoalescing);
 
   // Prompt dispatch deps — shared with the compaction_end flush path so
   // both use the exact same send semantics (working mark + followUp).
@@ -1178,8 +1191,7 @@ export function createSendToMember(
     // 开关关闭（getCoalescing.enabled === false）→ 完全走原路径（fail-open）。
     const coalescing = deps.getCoalescing?.() ?? {
       enabled: true,
-      maxBatchSize: 5,
-      maxBatchChars: 4000,
+      ...DEFAULT_COALESCE_LIMITS,
     };
     if (coalescing.enabled) {
       const bucketHasMessages = coalescer.has(memberName);
@@ -1189,7 +1201,6 @@ export function createSendToMember(
         (state === "working" || bucketHasMessages);
       if (canCoalesce) {
         coalescer.enqueue(memberName, {
-          seq: 0, // coalescer 内部重新分配严格递增 seq
           sender: msg.from,
           content: msg.content,
           subject: msg.subject,

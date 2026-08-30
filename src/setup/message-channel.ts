@@ -72,7 +72,9 @@ export function createMessageChannel(deps: MessageChannelDeps): MessageChannel {
   // per channel: createSendToMember registers the flush dispatcher on it and
   // the member event handlers (agent_end batch boundary / compaction_end
   // defensive flush / process-exit drain) operate on the SAME buckets.
-  const coalescer = createMessageCoalescer();
+  // getCoalescing is wired as the per-flush limits resolver (复审建议 1:
+  // configured non-default limits take effect at every flush point).
+  const coalescer = createMessageCoalescer(deps.getCoalescing);
 
   // 2. Create router (callbacks capture responseWaiter + other deps)
   const router = createRouter({

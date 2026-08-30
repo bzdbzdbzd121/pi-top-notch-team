@@ -2269,6 +2269,36 @@ describe("createSendToMember S1 coalescer (场景 A/B/D/E/F/G/I)", () => {
     expect(mockHandle.sendCommand.mock.calls[0][0].message).toContain("主题：重要");
   });
 
+  it("【复审 1】配置的非默认上限生效：maxBatchSize 2 → 首次 flush 合并 2 条，剩余 1 条下轮 flush", async () => {
+    const { createSendToMember, createMemberEventHandler } = await loadModule();
+    const { createMessageCoalescer } = await import("./message-coalescer");
+    // 模拟 createMessageChannel 接线：共享 coalescer 以 getCoalescing 为
+    // per-flush limits 解析器（复审建议 1——所有 flush 调用点生效）。
+    const limitsFn = () => ({ enabled: true, maxBatchSize: 2, maxBatchChars: 4000 });
+    const { deps, mockHandle } = setup({
+      coalescer: createMessageCoalescer(limitsFn),
+      getCoalescing: limitsFn,
+    });
+    deps.memberOpsStates.set("worker", "working");
+
+    const send = createSendToMember(deps);
+    const handler = createMemberEventHandler("worker", deps);
+    for (let i = 1; i <= 3; i++) {
+      send("worker", msg(`m${i}`, "a", `M${i}`));
+    }
+    expect(mockHandle.sendCommand).not.toHaveBeenCalled();
+
+    handler({ type: "agent_end" });
+    expect(mockHandle.sendCommand).toHaveBeenCalledTimes(1);
+    expect(mockHandle.sendCommand.mock.calls[0][0].message).toContain("共 2 条未处理消息");
+    expect(mockHandle.sendCommand.mock.calls[0][0].message).not.toContain("M3");
+
+    handler({ type: "agent_end" }); // 下一 flush 点
+    expect(mockHandle.sendCommand).toHaveBeenCalledTimes(2);
+    expect(mockHandle.sendCommand.mock.calls[1][0].message).toContain("共 1 条未处理消息");
+    expect(mockHandle.sendCommand.mock.calls[1][0].message).toContain("M3");
+  });
+
   it("合并包派发走完整派发路径：触发一次压缩检查（idle + 超阈值）", async () => {
     const { createSendToMember, createMemberEventHandler } = await loadModule();
     const { createMessageCoalescer } = await import("./message-coalescer");

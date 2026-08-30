@@ -35,24 +35,41 @@ export interface CoalescedEntry {
   at: number;
 }
 
-/** Per-entry formatting overhead of the merged package (编号 + 来源标注). */
-const ENTRY_OVERHEAD_CHARS = 40;
+/**
+ * 入桶输入：seq 由 coalescer 内部分配（严格递增），调用方无需/不可提供——
+ * 输入侧的任何 seq 都会被忽略并覆盖（复审建议 5）。
+ */
+export type CoalesceableMessage = Omit<CoalescedEntry, "seq">;
+
+/**
+ * Per-entry formatting overhead of the merged package (编号 + 来源标注 +
+ * 主题前缀) in UTF-8 BYTES — conservative estimate for the worst all-Chinese
+ * case (≈40 字符 × 3 字节).
+ */
+const ENTRY_OVERHEAD_BYTES = 128;
 /** Safety margin below the hard MAX_COMMAND_SIZE guard (merged-package framing). */
 const HARD_GUARD_MARGIN = 2048;
 
-/** Effective per-message char cost used by the prefix budget. */
+/**
+ * Effective per-message cost used by the prefix budget — measured in UTF-8
+ * BYTES (Buffer.byteLength), the SAME unit as the member-process MAX_COMMAND_SIZE
+ * guard (复审建议 2): a char-count budget would let a Chinese-heavy package
+ * pass the soft cap yet exceed the 1MB hard guard and be rejected (message
+ * loss).
+ */
 function entrySize(e: CoalescedEntry): number {
-  return e.content.length + ENTRY_OVERHEAD_CHARS;
+  return Buffer.byteLength(e.content, "utf8") + ENTRY_OVERHEAD_BYTES;
 }
 
 /**
  * Pure prefix selection: take the longest prefix of `bucket` that fits
- * `limits` — at most maxBatchSize entries and at most maxBatchChars chars.
- * A single message larger than maxBatchChars is taken alone (size 1, the
- * caller dispatches it without merging); everything else stays in the bucket
- * for the next flush point. FIFO order is never reversed.
+ * `limits` — at most maxBatchSize entries and at most maxBatchChars BYTES
+ * (UTF-8, same unit as the hard guard). A single message larger than
+ * maxBatchChars is taken alone (size 1, the caller dispatches it without
+ * merging); everything else stays in the bucket for the next flush point.
+ * FIFO order is never reversed.
  *
- * The char budget is capped below the hard MAX_COMMAND_SIZE guard
+ * The byte budget is capped below the hard MAX_COMMAND_SIZE guard
  * (1MB, member-process.ts) so a user-configured huge maxBatchChars can never
  * produce an oversized command.
  */
@@ -86,8 +103,8 @@ export function takePrefixForFlush(
 }
 
 export interface MessageCoalescer {
-  /** Buffer a message into the receiver's bucket (FIFO tail). */
-  enqueue(receiver: string, entry: CoalescedEntry): void;
+  /** Buffer a message into the receiver's bucket (FIFO tail). Caller-supplied seq is ignored. */
+  enqueue(receiver: string, entry: CoalesceableMessage): void;
   /** True when the receiver's bucket is non-empty. */
   has(receiver: string): boolean;
   /** Current bucket size (diagnostics/tests). */
@@ -106,8 +123,13 @@ export interface MessageCoalescer {
    * the full dispatch path (incl. one auto-compaction check).
    */
   setFlusher(fn: (receiver: string, entries: CoalescedEntry[]) => void): void;
-  /** Trigger a flush: take the fitting prefix and hand it to the flusher. */
-  flush(receiver: string, limits?: CoalesceLimits): void;
+  /**
+   * Trigger a flush: take the fitting prefix (limits resolved from the
+   * constructor-injected getLimits — 复审建议 1: non-default configured
+   * limits take effect at every flush point) and hand it to the flusher.
+   * This-independent (no `this` usage) so destructured calls are safe.
+   */
+  flush(receiver: string): void;
 }
 
 /**
@@ -115,16 +137,35 @@ export interface MessageCoalescer {
  * the dispatch entry (createSendToMember) enqueues/flushes and the event
  * handler (agent_end / compaction_end / process_exit) flushes/drains through
  * the same instance — bucket state is never split across paths.
+ *
+ * `getLimits` resolves the effective limits per flush (per-dispatch settings
+ * changes take effect immediately). Absent → DEFAULT_COALESCE_LIMITS.
  */
-export function createMessageCoalescer(): MessageCoalescer {
+export function createMessageCoalescer(
+  getLimits?: () => CoalesceLimits
+): MessageCoalescer {
   const buckets = new Map<string, CoalescedEntry[]>();
   let nextSeq = 1;
   let flusher: ((receiver: string, entries: CoalescedEntry[]) => void) | null = null;
 
+  const resolveLimits = (): CoalesceLimits => getLimits?.() ?? DEFAULT_COALESCE_LIMITS;
+
+  const doTake = (receiver: string, limits?: CoalesceLimits): CoalescedEntry[] => {
+    const bucket = buckets.get(receiver);
+    if (!bucket || bucket.length === 0) return [];
+    const taken = takePrefixForFlush(bucket, limits ?? resolveLimits());
+    if (taken.length === bucket.length) {
+      buckets.delete(receiver);
+    } else {
+      bucket.splice(0, taken.length);
+    }
+    return taken;
+  };
+
   return {
-    enqueue(receiver, entry) {
+    enqueue(receiver, message) {
       const bucket = buckets.get(receiver);
-      const stored: CoalescedEntry = { ...entry, seq: nextSeq++ };
+      const stored: CoalescedEntry = { ...message, seq: nextSeq++ };
       if (bucket) {
         bucket.push(stored);
       } else {
@@ -141,15 +182,7 @@ export function createMessageCoalescer(): MessageCoalescer {
     },
 
     takeForFlush(receiver, limits) {
-      const bucket = buckets.get(receiver);
-      if (!bucket || bucket.length === 0) return [];
-      const taken = takePrefixForFlush(bucket, limits ?? DEFAULT_COALESCE_LIMITS);
-      if (taken.length === bucket.length) {
-        buckets.delete(receiver);
-      } else {
-        bucket.splice(0, taken.length);
-      }
-      return taken;
+      return doTake(receiver, limits);
     },
 
     drain(receiver) {
@@ -163,9 +196,9 @@ export function createMessageCoalescer(): MessageCoalescer {
       flusher = fn;
     },
 
-    flush(receiver, limits) {
+    flush(receiver) {
       if (!flusher) return; // no dispatch capability yet — entries stay for the next flush point
-      const taken = this.takeForFlush(receiver, limits);
+      const taken = doTake(receiver);
       if (taken.length > 0) {
         flusher(receiver, taken);
       }
