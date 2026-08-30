@@ -667,7 +667,8 @@ Router (processes one message at a time)
   ├── to === "tl"
   │     → ResponseWaiter.check(msg.correlationId or scan content for <corr:...>)
   │       ├── MATCH → resolve pending wait (skip pi.sendMessage())
-  │       └── NO MATCH → inject into TL's session via pi.sendMessage()
+  │       └── NO MATCH → inject into TL's session via pi.sendMessage(msg, {deliverAs:"nextTurn"})
+  │                        (S2 阶段 1：进 _pendingNextTurnMessages，下一次任意回合统一注入，零 steer)
   │
   ├── to === "<member>"     → write prompt to target Member's RPC stdin
   ├── to === "all"          → write prompt to ALL Members' RPC stdin
@@ -696,7 +697,7 @@ Channel prompts are sent fire-and-forget (`sendCommand`, no RPC id attached). If
 
 ### Routing to TL
 
-The TL is the user's pi session, not an RPC process. Messages addressed to `"tl"` are injected into the TL's session using `pi.sendMessage()` with a custom message type, so the TL sees the incoming message in its conversation context.
+The TL is the user's pi session, not an RPC process. Messages addressed to `"tl"` are delivered with `pi.sendMessage(msg, { deliverAs: "nextTurn" })` (S2 阶段 1, 决策 #36): the message goes into pi's `_pendingNextTurnMessages` and is injected into the TL's context at the start of the **next arbitrary turn** — never steering a streaming TL turn, never spawning a turn while idle. Version-verified against peerDep 0.83.0 (dist/core/agent-session.js `sendCustomMessage` nextTurn branch at ~1075-1077, injection at prompt() ~876-880; `SendMessageHandler` type includes `"nextTurn"`). Wait replies are consumed by `resolveIfWaiting` before this path (zero impact); system notifications (crash/rejection/compaction/teardown) and `team-route` routing errors stay immediate. Consequence (accepted semantics): while the TL is idle, member messages are held until the next turn instead of appearing instantly.
 
 ### Auto-Compaction on dispatch
 

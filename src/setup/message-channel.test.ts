@@ -265,8 +265,105 @@ describe("createMessageChannel", () => {
       expect.objectContaining({
         customType: "team-message",
         display: true,
+      }),
+      { deliverAs: "nextTurn" }
+    );
+  });
+
+  it("sendToTl should deliver team-message as nextTurn (no steer, no turn trigger)", async () => {
+    const { createMessageChannel } = await loadModule();
+    const deps = {
+      pi: pi as any,
+      memberOpsStates,
+      lastPendingCorrId,
+      memberHandles,
+    };
+
+    createMessageChannel(deps as any);
+    const routerConfig = mockCreateRouter.mock.calls[0][0];
+
+    routerConfig.sendToTl({
+      id: "msg-next-1",
+      from: "worker",
+      to: "tl",
+      content: "成员汇报：任务完成",
+      timestamp: Date.now(),
+    });
+
+    // Member→TL messages must NOT steer the streaming TL turn and must NOT
+    // trigger a new turn: deliverAs:"nextTurn" queues them into pi's
+    // _pendingNextTurnMessages, injected at the next arbitrary turn start.
+    // (Version check: peerDep 0.83.0 dist/core/agent-session.js
+    // sendCustomMessage options.deliverAs === "nextTurn" → push; prompt()
+    // injects _pendingNextTurnMessages and clears them.)
+    expect(pi.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customType: "team-message",
+        content: expect.stringContaining("任务完成"),
+      }),
+      { deliverAs: "nextTurn" }
+    );
+    // No triggerTurn — idle TL must NOT get a new turn spawned by member messages.
+    expect(pi.sendMessage.mock.calls[0][1]).toEqual({ deliverAs: "nextTurn" });
+  });
+
+  it("sendToTl with unmatched correlationId still delivers as nextTurn", async () => {
+    const mockResponseWaiter = {
+      waitForResponse: vi.fn(),
+      resolveIfWaiting: vi.fn().mockReturnValue(false),
+      cancelAll: vi.fn(),
+    };
+    mockCreateResponseWaiter.mockReturnValue(mockResponseWaiter);
+
+    const { createMessageChannel } = await loadModule();
+    const deps = {
+      pi: pi as any,
+      memberOpsStates,
+      lastPendingCorrId,
+      memberHandles,
+    };
+
+    createMessageChannel(deps as any);
+    const routerConfig = mockCreateRouter.mock.calls[0][0];
+
+    // CorrId present but no waiter is listening (late reply): the message must
+    // still reach the TL context on the next turn — never a steer.
+    routerConfig.sendToTl({
+      id: "msg-late",
+      from: "worker",
+      to: "tl",
+      content: "迟到的回复\n\n<corr:corr-late>",
+      timestamp: Date.now(),
+    });
+
+    expect(pi.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ customType: "team-message" }),
+      { deliverAs: "nextTurn" }
+    );
+  });
+
+  it("onUnknownTarget should send team-route immediately (no nextTurn)", async () => {
+    const { createMessageChannel } = await loadModule();
+    const deps = {
+      pi: pi as any,
+      memberOpsStates,
+      lastPendingCorrId,
+      memberHandles,
+    };
+
+    createMessageChannel(deps as any);
+    const routerConfig = mockCreateRouter.mock.calls[0][0];
+
+    routerConfig.onUnknownTarget("worker", "ghost");
+
+    expect(pi.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customType: "team-route",
+        display: true,
       })
     );
+    // Routing errors are operational notices: stay immediate, no nextTurn.
+    expect(pi.sendMessage.mock.calls[0][1]).toBeUndefined();
   });
 
   it("onUnknownTarget should send warning message", async () => {

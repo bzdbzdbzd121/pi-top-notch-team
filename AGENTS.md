@@ -123,7 +123,7 @@ src/
 │   └── dynamic-mode.test.ts  ← 动态模式提示词测试
 ├── setup/            ← Modular extracted setup modules
 │   ├── member-lifecycle.ts  ← createAndRegisterMember, buildMemberConfig, getMemberLog
-│   ├── message-channel.ts   ← createMessageChannel factory (queue+router+waiter wiring)
+│   ├── message-channel.ts   ← createMessageChannel factory (queue+router+waiter wiring)；sendToTl 以 deliverAs:"nextTurn" 注入成员→TL 消息（S2 阶段 1，决策 #36）
 │   ├── dynamic-session-bootstrap.ts ← 动态会话共享 bootstrap（/team dynamic 与 start_team_session 复用）+ ensureAddDynamicMemberTool
 ├── settings/         ← Global settings (/team setting)
 │   ├── settings.ts        ← TeamSettings type + <rootDir>/settings.yaml read/write
@@ -279,6 +279,12 @@ src/
     - **迁移**：`loadSettings` 读旧 `autoCompact.batchMaxWaitMinutes` 一次性搬移到顶层（守卫用**原始 YAML 值**判断新键缺省——settings 克隆恒带默认 15，用克隆值判断会永不迁移）；已保存文件下次写入即为新形态。
     - **UI**：`/team setting` 顶层菜单新增「等待上限（当前：15 分钟/不限）」，自动压缩子菜单移除「设置批等待上限」；菜单标签 `等待上限`，提示语明示「0 = 永不超时（恢复原始语义）」。
     - **测试**：settings 解析/往返/迁移（3 例）、新 resolver 单测（5 例）、tl-tools deadline 配置化与 0=不限（1 例）、批屏障 budgetMinutes 接线（2 例改），全量 1155 通过。
+36. **S2：member→TL 消息以 nextTurn 注入（消息合并阶段 1）** — 用户诉求「消息合并」三阶段计划之阶段 1：成员→TL 消息（`sendToTl` 的 team-message）不再逐条即时注入，改为 `pi.sendMessage(msg, { deliverAs: "nextTurn" })`——消息进 pi 的 `_pendingNextTurnMessages`，**下一次任意回合开始时与用户消息统一注入 context**，消灭 TL streaming 期间逐条 steer 打断，idle 时也不触发新回合。
+    - **版本验证（0.83.0 实读，peerDep 实际解析版本）**：dist/core/agent-session.js `sendCustomMessage` 的 `options.deliverAs === "nextTurn"` 分支直接 `_pendingNextTurnMessages.push(appMessage)`（1075-1077 行，不 steer 不 followUp 零打断）；`prompt()` 构建 messages 时注入全部 pending 消息并清空（876-880 行）；扩展 API `SendMessageHandler` 类型含 `"nextTurn"`（dist/core/extensions/types.d.ts）；runner 绑定 `sendMessage: (message, options) => this.sendCustomMessage(message, options)` 原样透传（1846 行）。**支持存在，主路径成立**——回退方案 D（debounce 合并）不启用。
+    - **wait 回复零影响**：`resolveIfWaiting` 前置分支不变——corrId 被 wait 消费的消息根本到不了 sendMessage；迟到回复（corrId 存在但 waiter 未等待）也走 nextTurn（下回合可见）。
+    - **范围**：仅 `src/setup/message-channel.ts` 的 `sendToTl` team-message 路径。event-handler 的系统通知（崩溃/拒收/压缩/清理）与 `onUnknownTarget` 的 team-route 错误消息**保持即时**（操作通知需立刻可见，测试锁定）。
+    - **语义变化（方案接受）**：idle 时成员消息不再即时显示，滞留到下一回合——正是「不逐条触发会话」诉求（未采纳 gamma Phase 3 滞留兜底）；nextTurn 注入前消息不进 TUI 历史（不 emit message_start/end）。
+    - **测试**：sendToTl 无 corrId→nextTurn、带未匹配 corrId→仍 nextTurn、resolve 分支零影响（既有）、team-route 无 options（既有），共 3 新例；既有 2 例断言更新（参数精确匹配），全量 1250 通过。
 
 ## Dependency Injection Pattern
 
@@ -310,7 +316,7 @@ Member A calls team_send_message({to: "mover", content: "..."})
     → router.route(msg)
       ├── to="mover"  → handle.sendCommand({type:"prompt", streamingBehavior:"followUp", ...}) on Member B's stdin
       ├── to="tl"     → responseWaiter.resolveIfWaiting(corrId, ...) OR buffer
-                          → pi.sendMessage({customType:"team-message", ...})
+                          → pi.sendMessage({customType:"team-message", ...}, {deliverAs:"nextTurn"})  ← S2：下一次任意回合统一注入，零 steer（决策 #36）
       ├── to="all"    → broadcast to all (skip self)
       └── unknown     → pi.sendMessage ("无法路由消息到未知成员")
 

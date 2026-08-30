@@ -80,12 +80,24 @@ export function createMessageChannel(deps: MessageChannelDeps): MessageChannel {
           return; // consumed by waiter, skip sendMessage
         }
       }
-      pi.sendMessage({
-        customType: "team-message",
-        content: `[消息通道 - 来自 ${msg.from}]\n${msg.subject ? `主题：${msg.subject}\n` : ""}${msg.content}`,
-        display: true,
-        details: { msg },
-      });
+      pi.sendMessage(
+        {
+          customType: "team-message",
+          content: `[消息通道 - 来自 ${msg.from}]\n${msg.subject ? `主题：${msg.subject}\n` : ""}${msg.content}`,
+          display: true,
+          details: { msg },
+        },
+        // S2 (member→TL 消息合并，阶段 1): deliverAs:"nextTurn" 让成员消息进
+        // pi 的 _pendingNextTurnMessages，下一次任意回合开始时与用户消息统一
+        // 注入 context——不打断 TL 正在进行的回合（零 steer）、idle 时也不触发
+        // 新回合。版本验证：peerDep 0.83.0 dist/core/agent-session.js
+        // sendCustomMessage 的 options.deliverAs === "nextTurn" 分支直接 push
+        // （1075-1077 行）；prompt() 构建 messages 时注入全部 pending 消息并清空
+        // （876-880 行）；扩展 API SendMessageHandler 类型含 "nextTurn"
+        // （dist/core/extensions/types.d.ts）。resolveIfWaiting 前置分支不变：
+        // wait 回复被消费后根本到不了这里（零影响）。
+        { deliverAs: "nextTurn" }
+      );
     },
 
     memberNames: [],
