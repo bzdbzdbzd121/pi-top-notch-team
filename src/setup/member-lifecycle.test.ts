@@ -181,6 +181,92 @@ describe("buildMemberConfig", () => {
     buildMemberConfig("analyzer", session);
     expect(readFileSync(ctxPath, "utf-8")).toBe("# 已有内容");
   });
+
+  // ── 思考强度解析（memberThinkingLevel 设置 + 模型支持性检测）──
+
+  async function writeThinkingSetting(level: string | undefined): Promise<void> {
+    const { saveSettings } = await import("../settings/settings");
+    const { DEFAULT_SETTINGS } = await import("../settings/settings");
+    saveSettings(
+      { ...structuredClone(DEFAULT_SETTINGS), memberThinkingLevel: level as never },
+      tmpDir
+    );
+  }
+
+  it("passes thinking when the setting is set and the model supports the level", async () => {
+    const { buildMemberConfig } = await loadModule();
+    await writeThinkingSetting("high");
+    session.teamDefinition = createMockTeamDefinition({
+      defaults: { model: "anthropic/claude-sonnet-4-5" },
+    });
+    const lookups: string[] = [];
+    const result = buildMemberConfig("analyzer", session, {
+      lookupSupportedThinkingLevels: (ref) => {
+        lookups.push(ref);
+        return ["off", "low", "high"];
+      },
+    });
+    expect(lookups).toEqual(["anthropic/claude-sonnet-4-5"]);
+    expect(result!.thinking).toBe("high");
+  });
+
+  it("omits thinking when the model does NOT support the level (保持默认)", async () => {
+    const { buildMemberConfig } = await loadModule();
+    await writeThinkingSetting("xhigh");
+    session.teamDefinition = createMockTeamDefinition({
+      defaults: { model: "anthropic/claude-sonnet-4-5" },
+    });
+    const result = buildMemberConfig("analyzer", session, {
+      lookupSupportedThinkingLevels: () => ["off", "low", "medium", "high"],
+    });
+    expect(result!.thinking).toBeUndefined();
+    expect(result!.model).toBe("anthropic/claude-sonnet-4-5");
+  });
+
+  it("omits thinking when the support lookup is unavailable (fail-open)", async () => {
+    const { buildMemberConfig } = await loadModule();
+    await writeThinkingSetting("high");
+    session.teamDefinition = createMockTeamDefinition({
+      defaults: { model: "anthropic/claude-sonnet-4-5" },
+    });
+    const result = buildMemberConfig("analyzer", session, {
+      lookupSupportedThinkingLevels: () => undefined,
+    });
+    expect(result!.thinking).toBeUndefined();
+  });
+
+  it("omits thinking when no setting is configured (lookup never consulted)", async () => {
+    const { buildMemberConfig } = await loadModule();
+    session.teamDefinition = createMockTeamDefinition({
+      defaults: { model: "anthropic/claude-sonnet-4-5" },
+    });
+    let called = false;
+    const result = buildMemberConfig("analyzer", session, {
+      lookupSupportedThinkingLevels: () => {
+        called = true;
+        return ["off", "high"];
+      },
+    });
+    expect(called).toBe(false);
+    expect(result!.thinking).toBeUndefined();
+  });
+
+  it("omits thinking when no model override resolves (nothing to check)", async () => {
+    const { buildMemberConfig } = await loadModule();
+    await writeThinkingSetting("high");
+    // team defaults.model 未设置且无 global fixed（默认 follow 且无 tlCurrentModel）
+    let called = false;
+    const result = buildMemberConfig("analyzer", session, {
+      tlCurrentModel: undefined,
+      lookupSupportedThinkingLevels: () => {
+        called = true;
+        return ["off", "high"];
+      },
+    });
+    expect(result!.model).toBeUndefined();
+    expect(called).toBe(false);
+    expect(result!.thinking).toBeUndefined();
+  });
 });
 
 describe("createAndRegisterMember", () => {

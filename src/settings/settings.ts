@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
+import { isMemberThinkingLevel, type MemberThinkingLevel } from "./resolve-thinking";
 
 /** How the default model for team members is chosen. */
 export type MemberModelMode = "follow" | "fixed";
@@ -43,6 +44,13 @@ export interface TeamSettings {
    *    not-yet-started compactions are skipped and the batch dispatches).
    */
   waitTimeoutMinutes?: number;
+  /**
+   * 成员默认思考强度。undefined = 不指定（member pi 使用该模型的默认思考级别）。
+   * 配置后：若成员生效模型支持该级别 → 以 `--thinking <level>` 传给 member 进程；
+   * 不支持（或无法判定支持集）→ 不传 flag，保持现状。
+   * 仅影响之后启动的成员。支持集语义见 src/settings/resolve-thinking.ts。
+   */
+  memberThinkingLevel?: MemberThinkingLevel;
 }
 
 export const DEFAULT_SETTINGS: TeamSettings = {
@@ -137,6 +145,13 @@ export function loadSettings(rootDir: string): TeamSettings {
     const wt = rawData.waitTimeoutMinutes;
     if (typeof wt === "number" && Number.isInteger(wt) && wt >= 0) {
       settings.waitTimeoutMinutes = wt;
+    }
+
+    // memberThinkingLevel (top-level): members' preferred thinking level.
+    // Invalid values are dropped (undefined = use each model's pi default).
+    const mtl = rawData.memberThinkingLevel;
+    if (isMemberThinkingLevel(mtl)) {
+      settings.memberThinkingLevel = mtl;
     }
 
     // Migration (legacy key): batchMaxWaitMinutes used to live inside

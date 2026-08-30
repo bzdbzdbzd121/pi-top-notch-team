@@ -11,6 +11,7 @@ import type { MemberOperationalState } from "../session/context";
 import type { TeamSessionState } from "../session/state";
 import { getRootDir } from "../config";
 import { loadSettings } from "../settings/settings";
+import { resolveMemberThinking } from "../settings/resolve-thinking";
 import { resolveMemberModel } from "../settings/resolve-model";
 import { createMemberEventHandler } from "../channel/event-handler";
 import type { AutoCompactRuntime } from "../channel/auto-compact";
@@ -90,6 +91,13 @@ export interface BuildMemberConfigOptions {
    * always resumed (context continuity on restart), a fresh dir starts fresh.
    */
   resume?: boolean;
+  /**
+   * Look up the thinking levels supported by a model ("provider/id").
+   * Returns undefined when the model cannot be found / the registry is
+   * unavailable (fail-open → no `--thinking` flag, member keeps its default).
+   * Only consulted when the global `memberThinkingLevel` setting is set.
+   */
+  lookupSupportedThinkingLevels?: (modelRef: string) => readonly string[] | undefined;
 }
 
 export function buildMemberConfig(
@@ -126,6 +134,16 @@ export function buildMemberConfig(
   const settings = loadSettings(rootDir);
   const resolved = resolveMemberModel(memberDef, team, settings, options?.tlCurrentModel);
 
+  // Resolve the thinking level: only pass `--thinking` when the global setting
+  // is configured AND the resolved model supports that exact level; otherwise
+  // absent → member pi uses its own default thinking level (保持现状).
+  const requestedLevel = settings.memberThinkingLevel;
+  let thinking: string | undefined;
+  if (requestedLevel && resolved.model) {
+    const supported = options?.lookupSupportedThinkingLevels?.(resolved.model);
+    thinking = resolveMemberThinking(requestedLevel, supported);
+  }
+
   return {
     name: memberName,
     role: memberName,
@@ -144,6 +162,7 @@ export function buildMemberConfig(
     // A fresh sessionId dir has no files and starts clean.
     ...(options?.resume || hasSessionFiles(sessionDir) ? { resume: true } : {}),
     ...(resolved.model ? { model: resolved.model } : {}),
+    ...(thinking ? { thinking } : {}),
   };
 }
 

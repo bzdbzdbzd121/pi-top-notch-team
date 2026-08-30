@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { registerTeamCommand } from "./src/commands/team";
 import { TeamModeEditor } from "./src/ui/team-mode-editor";
 import { getSessionState, endSession } from "./src/session/state";
@@ -11,6 +11,7 @@ import type { TeamContext } from "./src/session/context";
 import { getRootDir } from "./src/config";
 import { loadSettings } from "./src/settings/settings";
 import { resolveAutoCompact } from "./src/settings/resolve-auto-compact";
+import { getSupportedThinkingLevelsFor } from "./src/settings/resolve-thinking";
 import { registerTlTools, type TlToolsDeps } from "./src/tools/tl-tools";
 import { registerGoalTools, registerGoalAgentHandler, resetGoal, GOAL_TOOL_NAMES } from "./src/tools/goal-tools";
 import { registerSharedContextTool, SHARED_CONTEXT_TOOL_NAME } from "./src/tools/shared-context-tool";
@@ -25,6 +26,7 @@ import {
   buildMemberConfig,
   getMemberLog,
 } from "./src/setup/member-lifecycle";
+import { splitModelRef } from "./src/settings/resolve-model";
 import { createMessageChannel } from "./src/setup/message-channel";
 import { buildDynamicModePrompt } from "./src/prompts/dynamic-mode";
 import { FIRST_ACTION_PROTOCOL_PROMPT } from "./src/prompts/tl-first-action";
@@ -280,6 +282,22 @@ export default function (pi: ExtensionAPI) {
   // the TL's current model to members spawned in "follow" mode.
   let tlCurrentModel: string | undefined;
 
+  // TL process's model registry (cached on session_start) — used to look up
+  // whether a member's resolved model supports the configured thinking level
+  // (memberThinkingLevel setting). Fail-open when unavailable.
+  let tlModelRegistry: ModelRegistry | undefined;
+
+  /** Supported thinking levels for "provider/id", or undefined when unknown. */
+  const lookupSupportedThinkingLevels = (modelRef: string): readonly string[] | undefined => {
+    if (!tlModelRegistry) return undefined;
+    const split = splitModelRef(modelRef);
+    if (!split) return undefined;
+    const model = tlModelRegistry
+      .getAvailable()
+      .find((m) => m.provider === split.provider && m.id === split.modelId);
+    return model ? getSupportedThinkingLevelsFor(model) : undefined;
+  };
+
   // The goal lifecycle handlers are registered below, after the shared
   // agent_settled status handler. In a fresh process the session tools are NOT
   // registered here — they are registered on-demand at session start via
@@ -310,7 +328,11 @@ export default function (pi: ExtensionAPI) {
       teamCtx.setHandle(config.name, handle);
       return handle;
     },
-    buildMemberConfig: (memberName) => buildMemberConfig(memberName, getSessionState(), { tlCurrentModel }),
+    buildMemberConfig: (memberName) =>
+      buildMemberConfig(memberName, getSessionState(), {
+        tlCurrentModel,
+        lookupSupportedThinkingLevels,
+      }),
     getMemberLog: async (memberName, maxLines, maxContentLength) => {
       const handle = teamCtx.getHandle(memberName);
       if (!handle) {
@@ -641,6 +663,8 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", (event, ctx) => {
     // Track TL current model for /team setting "follow" mode
     tlCurrentModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+    // Cache the model registry for member thinking-level support lookups
+    tlModelRegistry = ctx.modelRegistry;
 
     // A brand-new conversation (/new) has no team history — a pending
     // session-ended notice would be pure noise there, so drop it. /fork and
@@ -712,7 +736,11 @@ export default function (pi: ExtensionAPI) {
     {
       // /team resume: spawn a member resuming its persisted pi session.
       startResumedMember: async (name: string) => {
-        const config = buildMemberConfig(name, getSessionState(), { tlCurrentModel, resume: true });
+        const config = buildMemberConfig(name, getSessionState(), {
+          tlCurrentModel,
+          resume: true,
+          lookupSupportedThinkingLevels,
+        });
         if (!config) {
           throw new Error(`无法为成员 "${name}" 构建配置`);
         }

@@ -103,6 +103,57 @@ describe("createMemberProcess", () => {
     );
   });
 
+  it("spawns pi with --thinking when config.thinking is set (alone and with --model)", async () => {
+    const { process: mockProcess, stdout } = createMockSpawn();
+    const spawnMock = vi.fn().mockReturnValue(mockProcess);
+
+    const member = createMemberProcess(
+      { ...defaultConfig, model: "anthropic/claude-sonnet-4-5", thinking: "high" },
+      spawnMock
+    );
+    const startPromise = member.start();
+    emitReadyStdout(stdout);
+    await startPromise;
+
+    expect(spawnMock).toHaveBeenCalledWith(
+      "pi",
+      [
+        "--mode", "rpc",
+        "--session-dir", "/tmp/sessions/refactoring/analyzer",
+        "-e", "/path/to/member.ts",
+        "--model", "anthropic/claude-sonnet-4-5",
+        "--thinking", "high",
+      ],
+      expect.objectContaining({ cwd: "/test/project" })
+    );
+
+    // thinking alone (no model override)
+    const { process: p2, stdout: s2 } = createMockSpawn();
+    const spawnMock2 = vi.fn().mockReturnValue(p2);
+    const member2 = createMemberProcess({ ...defaultConfig, thinking: "off" }, spawnMock2);
+    const startPromise2 = member2.start();
+    emitReadyStdout(s2);
+    await startPromise2;
+
+    const args2 = spawnMock2.mock.calls[0][1] as string[];
+    expect(args2).toContain("--thinking");
+    expect(args2[args2.indexOf("--thinking") + 1]).toBe("off");
+    expect(args2).not.toContain("--model");
+  });
+
+  it("omits --thinking when config.thinking is unset (pi default thinking level)", async () => {
+    const { process: mockProcess, stdout } = createMockSpawn();
+    const spawnMock = vi.fn().mockReturnValue(mockProcess);
+
+    const member = createMemberProcess(defaultConfig, spawnMock);
+    const startPromise = member.start();
+    emitReadyStdout(stdout);
+    await startPromise;
+
+    const args = spawnMock.mock.calls[0][1] as string[];
+    expect(args).not.toContain("--thinking");
+  });
+
   // ── Session persistence & resume (team session resume, ADR-0004) ──
 
   it("never passes --no-session (member sessions must persist for resume)", async () => {

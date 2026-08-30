@@ -40,6 +40,13 @@ export interface MemberProcessConfig {
   cwd: string;
   /** Model override passed to pi via `--model provider/id` (e.g. "anthropic/claude-sonnet-4-5"). */
   model?: string;
+  /**
+   * Thinking level passed to pi via `--thinking <level>` (off…max). Only set
+   * when the global memberThinkingLevel setting is configured AND the member's
+   * resolved model supports that level (see src/settings/resolve-thinking.ts);
+   * otherwise absent → member pi uses its own default thinking level.
+   */
+  thinking?: string;
   /** Override the pi command path (for testing or custom installs). */
   piCommand?: string;
   /**
@@ -92,6 +99,7 @@ export function createMemberProcess(
     memberExtensionPath,
     cwd,
     model,
+    thinking,
     piCommand = "pi",
   } = config;
 
@@ -316,6 +324,9 @@ export function createMemberProcess(
         }
         if (model) {
           args.push("--model", model);
+        }
+        if (thinking) {
+          args.push("--thinking", thinking);
         }
         child = spawnFn(piCommand, args, {
           cwd,

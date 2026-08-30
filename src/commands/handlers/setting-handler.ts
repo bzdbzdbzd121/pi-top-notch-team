@@ -15,10 +15,15 @@ import {
   describeWaitTimeoutSetting,
   resolveWaitTimeoutMinutes,
 } from "../../settings/resolve-wait-timeout";
+import {
+  MEMBER_THINKING_LEVELS,
+  describeMemberThinkingSetting,
+} from "../../settings/resolve-thinking";
 import { scrollSelect } from "../../ui/scroll-select";
 
 /** Menu option identifiers (suffix after the emoji prefix is matched loosely). */
 const OPT_MEMBER_MODEL = "成员默认模型";
+const OPT_MEMBER_THINKING = "成员思考强度";
 const OPT_AUTO_COMPACT = "自动压缩";
 const OPT_WAIT_TIMEOUT = "等待上限";
 const OPT_FOLLOW = "跟随当前配置";
@@ -46,6 +51,8 @@ function currentModelRef(ctx: ExtensionCommandContext): string | undefined {
  * Currently supports:
  *   - 成员默认模型: "follow" (member uses TL's current model at spawn time)
  *                   or "fixed" (one of pi's available/logged-in models)
+ *   - 成员思考强度: a thinking level applied to members when their resolved
+ *                   model supports it (otherwise the model's default is kept)
  *
  * The setting only affects members started AFTER the change; already-running
  * member processes keep the model they were spawned with.
@@ -60,7 +67,9 @@ export async function handleSetting(
   const topChoice = await ctx.ui.select(
     "团队设置（Esc 退出）",
     [
-      `${OPT_MEMBER_MODEL}（当前：${describeMemberModelSetting(settings, currentModelRef(ctx))}）`,
+      `${OPT_MEMBER_MODEL}（当前：${describeMemberModelSetting(settings, currentModelRef(ctx))}` +
+        `${settings.memberThinkingLevel ? `，思考：${settings.memberThinkingLevel}` : ""}）`,
+      `${OPT_MEMBER_THINKING}（当前：${describeMemberThinkingSetting(settings)}）`,
       `${OPT_AUTO_COMPACT}（当前：${describeAutoCompactSetting(settings)}）`,
       `${OPT_WAIT_TIMEOUT}（当前：${describeWaitTimeoutSetting(settings)}）`,
     ]
@@ -69,6 +78,8 @@ export async function handleSetting(
 
   if (topChoice.startsWith(OPT_MEMBER_MODEL)) {
     await configureMemberModel(ctx, settings, rootDir);
+  } else if (topChoice.startsWith(OPT_MEMBER_THINKING)) {
+    await configureMemberThinking(ctx, settings, rootDir);
   } else if (topChoice.startsWith(OPT_AUTO_COMPACT)) {
     await configureAutoCompact(ctx, settings, rootDir);
   } else if (topChoice.startsWith(OPT_WAIT_TIMEOUT)) {
@@ -186,6 +197,50 @@ async function configureAutoCompact(
  * wait_and_get_member_status / team_send_and_wait and the batch barrier
  * (maxWait). 0 = never time out (the original wait-tool semantics).
  */
+/**
+ * 成员思考强度子菜单：选择一个思考级别（或「默认」不指定）。
+ *
+ * 语义：配置后，成员启动时若其生效模型支持该级别 → 以 `--thinking` 传给
+ * member 进程；不支持（或无法判定支持集）→ 不传 flag，保持 pi 默认。
+ * 仅影响之后启动的成员。
+ */
+const THINKING_DEFAULT_LABEL = "默认（不指定 — 使用 pi 对该模型的默认思考级别）";
+
+async function configureMemberThinking(
+  ctx: ExtensionCommandContext,
+  settings: TeamSettings,
+  rootDir: string,
+): Promise<void> {
+  const items = [
+    THINKING_DEFAULT_LABEL,
+    ...MEMBER_THINKING_LEVELS.map(
+      (l) => (settings.memberThinkingLevel === l ? "● " : "") + l
+    ),
+  ];
+  const choice = await ctx.ui.select(
+    `成员思考强度（当前：${describeMemberThinkingSetting(settings)}）— 仅对之后启动的成员生效（Esc 返回）`,
+    items
+  );
+  if (choice === undefined) return; // Esc
+
+  if (choice === THINKING_DEFAULT_LABEL) {
+    settings.memberThinkingLevel = undefined;
+    saveSettings(settings, rootDir);
+    ctx.ui.notify("成员思考强度已设为「默认（不指定）」。\n仅对之后启动的成员生效。", "info");
+    return;
+  }
+
+  // Strip the "● " current-marker prefix before matching
+  const level = choice.replace(/^● /, "");
+  if (!(MEMBER_THINKING_LEVELS as readonly string[]).includes(level)) return;
+  settings.memberThinkingLevel = level as (typeof MEMBER_THINKING_LEVELS)[number];
+  saveSettings(settings, rootDir);
+  ctx.ui.notify(
+    `成员思考强度已设为「${level}」。\n模型不支持该级别的成员保持默认；仅对之后启动的成员生效。`,
+    "info"
+  );
+}
+
 async function configureWaitTimeout(
   ctx: ExtensionCommandContext,
   settings: TeamSettings,

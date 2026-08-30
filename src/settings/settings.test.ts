@@ -207,3 +207,50 @@ describe("describeMemberModelSetting", () => {
     expect(text).toBe("跟随当前配置");
   });
 });
+
+describe("memberThinkingLevel (成员思考强度)", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "team-settings-thinking-test-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("is undefined by default", () => {
+    const settings = loadSettings(tmpDir);
+    expect(settings.memberThinkingLevel).toBeUndefined();
+  });
+
+  it("round-trips a configured level through save/load", () => {
+    saveSettings(
+      { ...structuredClone(DEFAULT_SETTINGS), memberThinkingLevel: "high" },
+      tmpDir
+    );
+    const loaded = loadSettings(tmpDir);
+    expect(loaded.memberThinkingLevel).toBe("high");
+  });
+
+  it("drops invalid levels from the settings file (fall back to undefined)", () => {
+    writeFileSync(
+      getSettingsPath(tmpDir),
+      "memberModel:\n  mode: follow\nmemberThinkingLevel: ultra\n",
+      "utf-8"
+    );
+    const loaded = loadSettings(tmpDir);
+    expect(loaded.memberThinkingLevel).toBeUndefined();
+  });
+
+  it("accepts all seven valid levels on load", () => {
+    for (const level of ["off", "minimal", "low", "medium", "high", "xhigh", "max"]) {
+      writeFileSync(
+        getSettingsPath(tmpDir),
+        `memberThinkingLevel: ${level}\n`,
+        "utf-8"
+      );
+      expect(loadSettings(tmpDir).memberThinkingLevel).toBe(level);
+    }
+  });
+});

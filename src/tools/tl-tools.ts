@@ -166,7 +166,10 @@ export function registerTlTools(deps: TlToolsDeps): void {
           content: [
             {
               type: "text" as const,
-              text: `成员 "${params.name}" 已启动 (PID: ${handle.getState().pid})。使用 list_members 查看状态，通过消息通道分配任务。`,
+              text:
+                `成员 "${params.name}" 已启动 (PID: ${handle.getState().pid})。` +
+                (config.thinking ? `思考强度：${config.thinking}（模型支持该级别，已显式指定）。` : "") +
+                `使用 list_members 查看状态，通过消息通道分配任务。`,
             },
           ],
         };

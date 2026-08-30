@@ -128,6 +128,7 @@ src/
 ├── settings/         ← Global settings (/team setting)
 │   ├── settings.ts        ← TeamSettings type + <rootDir>/settings.yaml read/write
 │   ├── resolve-model.ts   ← Pure function: member model precedence resolution
+│   ├── resolve-thinking.ts ← 纯函数：成员思考强度解析（支持集复刻 pi-ai getSupportedThinkingLevels + 支持→传 --thinking / 不支持→保持默认）
 │   ├── resolve-auto-compact.ts ← Pure functions: auto-compaction resolution + threshold check + menu label
 │   └── resolve-wait-timeout.ts ← Pure functions: 顶层通用等待预算 waitTimeoutMinutes（wait 工具 all-idle deadline + 批屏障共享，独立于自动压缩）
 ├── ui/               ← TUI components for team mode
@@ -279,6 +280,12 @@ src/
     - **迁移**：`loadSettings` 读旧 `autoCompact.batchMaxWaitMinutes` 一次性搬移到顶层（守卫用**原始 YAML 值**判断新键缺省——settings 克隆恒带默认 15，用克隆值判断会永不迁移）；已保存文件下次写入即为新形态。
     - **UI**：`/team setting` 顶层菜单新增「等待上限（当前：15 分钟/不限）」，自动压缩子菜单移除「设置批等待上限」；菜单标签 `等待上限`，提示语明示「0 = 永不超时（恢复原始语义）」。
     - **测试**：settings 解析/往返/迁移（3 例）、新 resolver 单测（5 例）、tl-tools deadline 配置化与 0=不限（1 例）、批屏障 budgetMinutes 接线（2 例改），全量 1155 通过。
+35. **成员思考强度配置（memberThinkingLevel）** — `/team setting` 新增顶层项「成员思考强度」：配置一个思考级别（off/minimal/low/medium/high/xhigh/max），成员启动时**若其生效模型支持该级别则传 `--thinking <level>`，否则不传 flag 保持 pi 默认思考级别**（用户裁决：不支持时保持现状，不做就近 clamp——pi 自身的 `setThinkingLevel` 会 clamp 到最近支持级别，语义不符）。
+    - **支持集语义**（`src/settings/resolve-thinking.ts`，逐字复刻 pi-ai `getSupportedThinkingLevels` 并版本锚定；不 import pi-ai——非本包依赖且 jiti 深导入有拼坏前科）：非 reasoning 模型仅 `off`；reasoning 模型 off/minimal/low/medium/high 默认支持（thinkingLevelMap 映射为 null 者除外），xhigh/max 仅当 thinkingLevelMap 有对应条目。
+    - **接线**：`loadSettings` 新增顶层 `memberThinkingLevel?`（非法值丢弃）；`buildMemberConfig` 新增 `lookupSupportedThinkingLevels?` 选项——index.ts 在 `session_start` 缓存 `ctx.modelRegistry`，lookup 按 `provider/modelId` 在 `getAvailable()` 里查模型（查不到/注册表不可用均 fail-open 不传 flag）；两个 buildMemberConfig 调用点（start_member 工具 + /team resume 的 startResumedMember）均传入。崩溃 auto-restart 复用已存 config，flag 自然保留。
+    - **边界**：无生效模型覆盖（source=none）时不检测不传 flag；团队 YAML `model` 写 `provider/id:high` 后缀的逃生口不受影响（`splitModelRef` 的 id 含后缀匹配不到注册表 → fail-open）。仅影响之后启动的成员。
+    - **可观测性**：start_member 结果文本在指定成功时附「思考强度：<level>（模型支持该级别，已显式指定）」。
+    - **测试**：resolve-thinking 单测（支持集语义表 5 例 + 解析器 4 例 + 校验/标签 3 例）、settings 往返/非法丢弃/七级别接受（4 例）、member-process spawn 参数（3 例）、buildMemberConfig 集成（5 例），全量 1247 通过。
 36. **S2：member→TL 消息以 nextTurn 注入（消息合并阶段 1）** — 用户诉求「消息合并」三阶段计划之阶段 1：成员→TL 消息（`sendToTl` 的 team-message）不再逐条即时注入，改为 `pi.sendMessage(msg, { deliverAs: "nextTurn" })`——消息进 pi 的 `_pendingNextTurnMessages`，**下一次任意回合开始时与用户消息统一注入 context**，消灭 TL streaming 期间逐条 steer 打断，idle 时也不触发新回合。
     - **版本验证（0.83.0 实读，peerDep 实际解析版本）**：dist/core/agent-session.js `sendCustomMessage` 的 `options.deliverAs === "nextTurn"` 分支直接 `_pendingNextTurnMessages.push(appMessage)`（1075-1077 行，不 steer 不 followUp 零打断）；`prompt()` 构建 messages 时注入全部 pending 消息并清空（876-880 行）；扩展 API `SendMessageHandler` 类型含 `"nextTurn"`（dist/core/extensions/types.d.ts）；runner 绑定 `sendMessage: (message, options) => this.sendCustomMessage(message, options)` 原样透传（1846 行）。**支持存在，主路径成立**——回退方案 D（debounce 合并）不启用。
     - **wait 回复零影响**：`resolveIfWaiting` 前置分支不变——corrId 被 wait 消费的消息根本到不了 sendMessage；迟到回复（corrId 存在但 waiter 未等待）也走 nextTurn（下回合可见）。
@@ -437,7 +444,7 @@ printf '' | timeout 10 ./node_modules/.bin/pi --mode json --no-tools -e ./index.
 | `/team cancel`           | Alias for `/team done` (backward compatibility) |
 | `/team delete <name>` | Delete a team definition (with confirmation) |
 | `/team status` | Show active session + member process statuses |
-| `/team setting` | Interactive settings menu — member default model (follow TL current model / fixed available model) + auto-compaction (toggle / percent & token thresholds / timeout) + wait budget (等待上限, 0=永不超时 — wait 工具 all-idle deadline 与批屏障共享的顶层通用预算). Also allowed during a session |
+| `/team setting` | Interactive settings menu — member default model (follow TL current model / fixed available model) + member thinking level (成员思考强度: 模型支持则传 `--thinking`，否则保持默认) + auto-compaction (toggle / percent & token thresholds / timeout) + wait budget (等待上限, 0=永不超时 — wait 工具 all-idle deadline 与批屏障共享的顶层通用预算). Also allowed during a session |
 | `/team help` | Display usage help for all subcommands |
 
 ## TL Tools (session-scoped registration + activation; exception below)
