@@ -28,6 +28,16 @@ export interface AutoCompactSetting {
   timeoutMinutes: number;
 }
 
+/** 成员消息合并（S1 coalescer）设置：member→member 消息在接收方回合边界合并为单条 prompt。 */
+export interface MessageCoalescingSetting {
+  /** Master toggle. Default: true (缺省即开启；关闭则完全走原逐条路径). */
+  enabled: boolean;
+  /** 合并包最多条数（>=1）。Undefined = 默认 5. */
+  maxBatchSize?: number;
+  /** 合并包总字符软上限（>=1）。Undefined = 默认 4000. 硬守卫 MAX_COMMAND_SIZE 恒不超。 */
+  maxBatchChars?: number;
+}
+
 /** Global top-notch-team settings (apply to all team sessions). */
 export interface TeamSettings {
   memberModel: MemberModelSetting;
@@ -51,12 +61,15 @@ export interface TeamSettings {
    * 仅影响之后启动的成员。支持集语义见 src/settings/resolve-thinking.ts。
    */
   memberThinkingLevel?: MemberThinkingLevel;
+  /** 消息合并（S1，阶段 2）。缺省 = 开启（默认 5 条 / 4000 字符）。 */
+  messageCoalescing?: MessageCoalescingSetting;
 }
 
 export const DEFAULT_SETTINGS: TeamSettings = {
   memberModel: { mode: "follow" },
   autoCompact: { enabled: true, thresholdPercent: 80, timeoutMinutes: 10 },
   waitTimeoutMinutes: 15,
+  messageCoalescing: { enabled: true, maxBatchSize: 5, maxBatchChars: 4000 },
 };
 
 const SETTINGS_FILE = "settings.yaml";
@@ -152,6 +165,39 @@ export function loadSettings(rootDir: string): TeamSettings {
     const mtl = rawData.memberThinkingLevel;
     if (isMemberThinkingLevel(mtl)) {
       settings.memberThinkingLevel = mtl;
+    }
+
+    // messageCoalescing (top-level): member→member message batching. Invalid
+    // values are dropped (fall back to defaults); explicit null clears a
+    // field (default applies at resolve time).
+    const mc = rawData.messageCoalescing;
+    if (typeof mc === "object" && mc !== null) {
+      const mcObj = mc as Record<string, unknown>;
+      if (typeof mcObj.enabled === "boolean") {
+        settings.messageCoalescing!.enabled = mcObj.enabled;
+      }
+      if (mcObj.maxBatchSize === null || mcObj.maxBatchSize === undefined) {
+        settings.messageCoalescing!.maxBatchSize = undefined;
+      } else if (
+        typeof mcObj.maxBatchSize === "number" &&
+        Number.isInteger(mcObj.maxBatchSize) &&
+        mcObj.maxBatchSize >= 1
+      ) {
+        settings.messageCoalescing!.maxBatchSize = mcObj.maxBatchSize;
+      } else {
+        settings.messageCoalescing!.maxBatchSize = undefined;
+      }
+      if (mcObj.maxBatchChars === null || mcObj.maxBatchChars === undefined) {
+        settings.messageCoalescing!.maxBatchChars = undefined;
+      } else if (
+        typeof mcObj.maxBatchChars === "number" &&
+        Number.isInteger(mcObj.maxBatchChars) &&
+        mcObj.maxBatchChars >= 1
+      ) {
+        settings.messageCoalescing!.maxBatchChars = mcObj.maxBatchChars;
+      } else {
+        settings.messageCoalescing!.maxBatchChars = undefined;
+      }
     }
 
     // Migration (legacy key): batchMaxWaitMinutes used to live inside

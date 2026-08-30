@@ -11,6 +11,10 @@ import {
   describeAutoCompactSetting,
 } from "../../settings/resolve-auto-compact";
 import {
+  describeMessageCoalescingSetting,
+  resolveMessageCoalescing,
+} from "../../settings/resolve-message-coalescing";
+import {
   DEFAULT_WAIT_TIMEOUT_MINUTES,
   describeWaitTimeoutSetting,
   resolveWaitTimeoutMinutes,
@@ -26,6 +30,7 @@ const OPT_MEMBER_MODEL = "成员默认模型";
 const OPT_MEMBER_THINKING = "成员思考强度";
 const OPT_AUTO_COMPACT = "自动压缩";
 const OPT_WAIT_TIMEOUT = "等待上限";
+const OPT_COALESCE = "消息合并";
 const OPT_FOLLOW = "跟随当前配置";
 const OPT_FIXED = "指定模型";
 
@@ -36,6 +41,11 @@ const AC_SET_TOKENS = "设置 token 阈值";
 const AC_CLEAR_PERCENT = "清除百分比阈值";
 const AC_CLEAR_TOKENS = "清除 token 阈值";
 const AC_SET_TIMEOUT = "设置超时（分钟）";
+
+// Message-coalescing submenu options (S1, 阶段 2)
+const COALESCE_TOGGLE = "开关切换";
+const COALESCE_SET_SIZE = "设置批量上限（条数）";
+const COALESCE_SET_CHARS = "设置总字符上限";
 
 function formatModel(m: { provider: string; id: string; name?: string }): string {
   return `${m.provider}/${m.id}`;
@@ -72,6 +82,7 @@ export async function handleSetting(
       `${OPT_MEMBER_THINKING}（当前：${describeMemberThinkingSetting(settings)}）`,
       `${OPT_AUTO_COMPACT}（当前：${describeAutoCompactSetting(settings)}）`,
       `${OPT_WAIT_TIMEOUT}（当前：${describeWaitTimeoutSetting(settings)}）`,
+      `${OPT_COALESCE}（当前：${describeMessageCoalescingSetting(settings)}）`,
     ]
   );
   if (topChoice === undefined) return; // Esc
@@ -84,6 +95,8 @@ export async function handleSetting(
     await configureAutoCompact(ctx, settings, rootDir);
   } else if (topChoice.startsWith(OPT_WAIT_TIMEOUT)) {
     await configureWaitTimeout(ctx, settings, rootDir);
+  } else if (topChoice.startsWith(OPT_COALESCE)) {
+    await configureMessageCoalescing(ctx, settings, rootDir);
   }
 }
 
@@ -187,6 +200,70 @@ async function configureAutoCompact(
       }
       ac.timeoutMinutes = n;
       saveAndMaybeNotifyFallback();
+    }
+  }
+}
+
+/**
+ * 消息合并子菜单（S1，阶段 2）：开关 + 批量上限 + 总字符上限。
+ * 循环直至 Esc；每次变更即保存。关闭时派发层完全走原逐条路径（fail-open）。
+ */
+async function configureMessageCoalescing(
+  ctx: ExtensionCommandContext,
+  settings: TeamSettings,
+  rootDir: string,
+): Promise<void> {
+  for (;;) {
+    const mc = resolveMessageCoalescing(settings);
+    const items = [
+      `${COALESCE_TOGGLE}（当前：${mc.enabled ? "开启" : "关闭"}）`,
+      `${COALESCE_SET_SIZE}（当前：${mc.maxBatchSize} 条）`,
+      `${COALESCE_SET_CHARS}（当前：${mc.maxBatchChars} 字符）`,
+    ];
+    const choice = await ctx.ui.select(
+      `消息合并 — 生效中：${describeMessageCoalescingSetting(settings)}（Esc 返回）`,
+      items
+    );
+    if (choice === undefined) return; // Esc
+
+    if (choice.startsWith(COALESCE_TOGGLE)) {
+      settings.messageCoalescing = {
+        ...(settings.messageCoalescing ?? { enabled: true }),
+        enabled: !mc.enabled,
+      };
+      saveSettings(settings, rootDir);
+      ctx.ui.notify(
+        mc.enabled
+          ? "消息合并已关闭：成员消息恢复逐条立即派发。"
+          : "消息合并已开启：接收方回合结束时积压消息合并为单条派发。",
+        "info"
+      );
+    } else if (choice.startsWith(COALESCE_SET_SIZE)) {
+      const text = await ctx.ui.input("合并包最多条数（≥1 的整数）", String(mc.maxBatchSize));
+      if (text === undefined) continue;
+      const n = parsePositiveInt(text);
+      if (n === undefined) {
+        ctx.ui.notify("无效输入：请输入 ≥1 的整数。", "warning");
+        continue;
+      }
+      settings.messageCoalescing = {
+        ...(settings.messageCoalescing ?? { enabled: true }),
+        maxBatchSize: n,
+      };
+      saveSettings(settings, rootDir);
+    } else if (choice.startsWith(COALESCE_SET_CHARS)) {
+      const text = await ctx.ui.input("合并包总字符软上限（≥1 的整数）", String(mc.maxBatchChars));
+      if (text === undefined) continue;
+      const n = parsePositiveInt(text);
+      if (n === undefined) {
+        ctx.ui.notify("无效输入：请输入 ≥1 的整数。", "warning");
+        continue;
+      }
+      settings.messageCoalescing = {
+        ...(settings.messageCoalescing ?? { enabled: true }),
+        maxBatchChars: n,
+      };
+      saveSettings(settings, rootDir);
     }
   }
 }

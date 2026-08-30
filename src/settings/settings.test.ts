@@ -9,6 +9,7 @@ import {
   describeMemberModelSetting,
   getSettingsPath,
 } from "./settings";
+import { resolveMessageCoalescing } from "./resolve-message-coalescing";
 
 describe("settings store", () => {
   let tmpDir: string;
@@ -252,5 +253,90 @@ describe("memberThinkingLevel (成员思考强度)", () => {
       );
       expect(loadSettings(tmpDir).memberThinkingLevel).toBe(level);
     }
+  });
+});
+
+describe("messageCoalescing (消息合并设置)", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "team-settings-coalesce-test-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("defaults to enabled with standard limits when unset", () => {
+    const settings = loadSettings(tmpDir);
+    expect(settings.messageCoalescing).toEqual({
+      enabled: true,
+      maxBatchSize: 5,
+      maxBatchChars: 4000,
+    });
+  });
+
+  it("round-trips messageCoalescing settings", () => {
+    const settings = structuredClone(DEFAULT_SETTINGS);
+    settings.messageCoalescing = { enabled: true, maxBatchSize: 3, maxBatchChars: 2000 };
+    saveSettings(settings, tmpDir);
+    const loaded = loadSettings(tmpDir);
+    expect(loaded.messageCoalescing).toEqual({
+      enabled: true,
+      maxBatchSize: 3,
+      maxBatchChars: 2000,
+    });
+  });
+
+  it("parses explicit disabled", () => {
+    writeFileSync(
+      getSettingsPath(tmpDir),
+      `messageCoalescing:\n  enabled: false\n`,
+      "utf-8"
+    );
+    const loaded = loadSettings(tmpDir);
+    expect(loaded.messageCoalescing?.enabled).toBe(false);
+    // 未配置的字段在 load 层清空、由 resolve 层补默认
+    expect(loaded.messageCoalescing?.maxBatchSize).toBeUndefined();
+    expect(resolveMessageCoalescing(loaded).maxBatchSize).toBe(5);
+  });
+
+  it("drops invalid limit values (fall back to defaults at resolve time)", () => {
+    writeFileSync(
+      getSettingsPath(tmpDir),
+      `messageCoalescing:\n  enabled: true\n  maxBatchSize: 0\n  maxBatchChars: -5\n`,
+      "utf-8"
+    );
+    const loaded = loadSettings(tmpDir);
+    expect(loaded.messageCoalescing?.enabled).toBe(true);
+    const r = resolveMessageCoalescing(loaded);
+    expect(r.maxBatchSize).toBe(5);
+    expect(r.maxBatchChars).toBe(4000);
+  });
+
+  it("drops non-integer limit values", () => {
+    writeFileSync(
+      getSettingsPath(tmpDir),
+      `messageCoalescing:\n  enabled: true\n  maxBatchSize: "3"\n  maxBatchChars: 1.5\n`,
+      "utf-8"
+    );
+    const loaded = loadSettings(tmpDir);
+    const r = resolveMessageCoalescing(loaded);
+    expect(r.maxBatchSize).toBe(5);
+    expect(r.maxBatchChars).toBe(4000);
+  });
+
+  it("clears limits with explicit null (defaults applied at resolve time)", () => {
+    writeFileSync(
+      getSettingsPath(tmpDir),
+      `messageCoalescing:\n  enabled: true\n  maxBatchSize: null\n  maxBatchChars: null\n`,
+      "utf-8"
+    );
+    const loaded = loadSettings(tmpDir);
+    expect(loaded.messageCoalescing?.maxBatchSize).toBeUndefined();
+    expect(loaded.messageCoalescing?.maxBatchChars).toBeUndefined();
+    const r = resolveMessageCoalescing(loaded);
+    expect(r.maxBatchSize).toBe(5);
+    expect(r.maxBatchChars).toBe(4000);
   });
 });

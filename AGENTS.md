@@ -82,9 +82,11 @@ src/
 │   ├── router.ts     ← Routes to member / tl / all / self-skip
 │   ├── response-waiter.ts  ← team_send_and_wait correlation matching + response buffer
 │   ├── auto-compact.ts    ← Shared Auto-Compaction runtime (primitives + pending/flush)
+│   ├── message-coalescer.ts ← S1 合并运行时（决策 #37）：per-receiver 桶 + 前缀上限 + flusher 钩子（纯状态，派发由 createSendToMember 注入）
+│   ├── message-coalescer.test.ts ← 前缀选择/上限降级/drain/flusher 生命周期（14 例）
 │   ├── activity-tracker.ts  ← 细粒度活动状态纯函数层（阶段 1 + v2 简化）：ActivityPhase/MemberActivity、applyActivityEvent()/derivePhase()/createActivityTracker()；N5 硬性 O(1) 纪律（零 import、零字符串构建）+ v2 删 toolName/phaseSince（仅 icon+label+百分比）
 │   ├── activity-tracker.test.ts ← 转换表全映射/多流优先级/陈旧判定边界/agent_end 丢弃门/N5 纪律静态锁定（44 例）
-│   └── event-handler.ts    ← Member RPC event handler (state machine, dedup, routing; N4 调用点隔离)
+│   └── event-handler.ts    ← Member RPC event handler (state machine, dedup, routing; N4 调用点隔离)；S1 接线：入桶判定 + agent_end flush + compaction_end 后 flush + process_exit drain（决策 #37）
 ├── process/          ← Member process lifecycle
 │   ├── member-process.ts  ← pi --mode rpc spawn wrapper (write queue, size guard)
 │   └── manager.ts    ← Multi-member lifecycle + operational state + auto-restart
@@ -123,13 +125,14 @@ src/
 │   └── dynamic-mode.test.ts  ← 动态模式提示词测试
 ├── setup/            ← Modular extracted setup modules
 │   ├── member-lifecycle.ts  ← createAndRegisterMember, buildMemberConfig, getMemberLog
-│   ├── message-channel.ts   ← createMessageChannel factory (queue+router+waiter wiring)；sendToTl 以 deliverAs:"nextTurn" 注入成员→TL 消息（S2 阶段 1，决策 #36）
+│   ├── message-channel.ts   ← createMessageChannel factory (queue+router+waiter wiring)；sendToTl 以 deliverAs:"nextTurn" 注入成员→TL 消息（S2 阶段 1，决策 #36）；创建共享 coalescer 实例（S1 阶段 2，决策 #37）
 │   ├── dynamic-session-bootstrap.ts ← 动态会话共享 bootstrap（/team dynamic 与 start_team_session 复用）+ ensureAddDynamicMemberTool
 ├── settings/         ← Global settings (/team setting)
 │   ├── settings.ts        ← TeamSettings type + <rootDir>/settings.yaml read/write
 │   ├── resolve-model.ts   ← Pure function: member model precedence resolution
 │   ├── resolve-thinking.ts ← 纯函数：成员思考强度解析（支持集复刻 pi-ai getSupportedThinkingLevels + 支持→传 --thinking / 不支持→保持默认）
 │   ├── resolve-auto-compact.ts ← Pure functions: auto-compaction resolution + threshold check + menu label
+│   ├── resolve-message-coalescing.ts ← 纯函数：消息合并设置解析（enabled + 上限回退默认）与菜单标签
 │   └── resolve-wait-timeout.ts ← Pure functions: 顶层通用等待预算 waitTimeoutMinutes（wait 工具 all-idle deadline + 批屏障共享，独立于自动压缩）
 ├── ui/               ← TUI components for team mode
 │   ├── team-status-widget.ts  ← Bordered widget: live member status + context %；阶段 2 实时化 + v2 简化：细粒度阶段渲染（💭×2/🔧×2/✏️/✅——working 与 thinking 同 💭 靠颜色区分（默认 vs accent），无耗时无工具名）+ N1 双层渲染去重（调度侧签名 logical|phase + 渲染侧 styled 行比较闸门）+ N2 轮询完成保留 refresh + N3 轮询并行化 + 合并节流（120ms + nextStreamFlushDelay 自适应退避，上限 1s）
@@ -292,6 +295,14 @@ src/
     - **范围**：仅 `src/setup/message-channel.ts` 的 `sendToTl` team-message 路径。event-handler 的系统通知（崩溃/拒收/压缩/清理）与 `onUnknownTarget` 的 team-route 错误消息**保持即时**（操作通知需立刻可见，测试锁定）。
     - **语义变化（方案接受）**：idle 时成员消息不再即时显示，滞留到下一回合——正是「不逐条触发会话」诉求（未采纳 gamma Phase 3 滞留兜底）；nextTurn 注入前消息不进 TUI 历史（不 emit message_start/end）。
     - **测试**：sendToTl 无 corrId→nextTurn、带未匹配 corrId→仍 nextTurn、resolve 分支零影响（既有）、team-route 无 options（既有），共 3 新例；既有 2 例断言更新（参数精确匹配），全量 1250 通过。
+37. **S1：member→member 派发层回合边界合流（消息合并阶段 2，本需求主体）** — 无等待链消息（无 corrId ∧ 非 `to:"all"` ∧ 非 Inspector 直发（直发不经通道天然绕过））在接收方 working 或桶非空时入 per-receiver 桶（`src/channel/message-coalescer.ts`，纯状态 + flusher 钩子，跨 sender 合并、来源逐条标注）；**flush 点 = 接收方 `agent_end`（主）+ corrId 消息到达且桶非空（先 flush 合并包再派发 corrId，FIFO 保序）+ `compaction_end` 后（防御性钩子）+ 进程退出/teardown（drain + 通知条数，复用 `drainPendingOnProcessExit` 模式）**。合并包经完整派发路径（`dispatchWithAutoCompact`：compacting 分支 + 一次压缩检查 + flushPending + dispatch）——合并 = 一次 working 周期，状态机/等待工具/显示层零改动。
+    - **合并格式**：`[消息通道 - 来自 <sender>]（合并包：共 N 条未处理消息，请在一个回合内全部处理）\n【消息 i/N｜来自 <sender>】<content>…\n处理要求：逐条处理；如需分别回复，请在回复中注明对应消息编号（如「回复 2：…」）。`（subject 保留在来源标注行内）。
+    - **上限与降级**：flush 取「满足上限的最长前缀」——≤`maxBatchSize`（默认 5）条且总长 ≤`maxBatchChars`（默认 4000）；剩余留桶等下一 flush 点；单条超限单独派发（不合并）；字符预算封顶于硬守卫 `MAX_COMMAND_SIZE`（1MB）之下（`takePrefixForFlush` 纯函数）。
+    - **corrId 红线（结构性保证）**：带 corrId 消息在任何阶段都不入桶——wait 链消息绝不合并（防死锁）；`skipAutoCompact` 标记消息恒带 corrId，天然绕过。
+    - **设置**：`TeamSettings.messageCoalescing { enabled?, maxBatchSize?, maxBatchChars? }`（默认 enabled:true），`/team setting` 新增「消息合并」子菜单（开关/条数/字符），关闭时完全走原逐条路径（fail-open，场景 I）。
+    - **与既有机制交互**：压缩 pending 桶与合并桶**双桶正交**——compacting 期间消息走既有 `queueDuringCompaction`/`flushPending`（逐条、在飞租约/超时 mark/flush 顺序测试零触碰）；合并包触发压缩时作为单条消息入压缩 pending，压缩后整体派发（至多一次压缩检查，省 RPC）；settlement 窗口（agent_end 后 idle、pi 仍 streaming）内到达消息按「idle+桶空」立即派发（followUp 保序，方案接受）；flush 失败（拒收）→ 复用既有拒收分支（状态纠正 + 通知），通知注明合并包条数，**清桶不重试**（无等待链消息无重试契约，同时消除 idle+桶非空停滞态）。
+    - **DI/接线**：`createMessageChannel` 创建共享 coalescer 实例（返回 `MessageChannel.coalescer`），`createSendToMember` 注册 flusher（合并包构建 + `dispatchWithAutoCompact`）；`EventHandlerDeps`/`MemberLifecycleDeps` 转发（agent_end flush / compaction_end 后 flush / process_exit·process_error drain）；`getCoalescing` per-dispatch 解析（设置即时生效）。
+    - **测试（35 新例）**：coalescer 模块 14（前缀/上限/单条超限/原子取出/flusher 生命周期/drain）；settings 5 + resolve 6；event-handler 场景 A（忙时 3→1 回合）/B（idle 突发 2 回合）/D（corrId 保序）/E（旁路）/F（5+1 分批留桶）/G（退出 drain 通知）/I（开关）+ subject 保留 + 合并包触发一次压缩检查（9 新 + 2 更新），全量 1285 通过；压缩全链既有测试零改动。
 
 ## Dependency Injection Pattern
 
@@ -300,10 +311,10 @@ The codebase uses an explicit Dependency Injection (DI) pattern to decouple modu
 | DI Interface | Module | Dependencies |
 |-------------|--------|-------------|
 | `TlToolsDeps` | `tools/tl-tools.ts` | `pi`, `manager`, `responseWaiter`, `memberOpsStates`, `lastPendingCorrId`, `messageQueue`, `createMember?`, `buildMemberConfig?`, `getMemberLog?`, `isDynamicSession?`, `addMemberToSession?`, `onDynamicMemberAdded?`, `onDynamicPhaseTransition?`, `getAutoCompact?`, `getSettings?`, `getHandle?`, `autoCompact?` |
-| `MemberLifecycleDeps` | `setup/member-lifecycle.ts` | `pi`, `memberOpsStates`, `messageQueue`, `responseWaiter`, `lastPendingCorrId`, `recentlyProcessedMessages`, `processManager?` |
-| `MessageChannelDeps` | `setup/message-channel.ts` | `pi`, `memberOpsStates`, `lastPendingCorrId`, `memberHandles`, `onRouteNotification?`, `getAutoCompact?` |
-| `EventHandlerDeps` | `channel/event-handler.ts` | `pi`, `memberOpsStates`, `messageQueue`, `responseWaiter`, `lastPendingCorrId`, `recentlyProcessedMessages`, `processManager?`, `onMemberActivity?` |
-| `SendToMemberDeps` | `channel/event-handler.ts` | `pi`, `memberOpsStates`, `memberHandles`, `getAutoCompact?`, `autoCompact?` |
+| `MemberLifecycleDeps` | `setup/member-lifecycle.ts` | `pi`, `memberOpsStates`, `messageQueue`, `responseWaiter`, `lastPendingCorrId`, `recentlyProcessedMessages`, `processManager?`, `memberHandles?`, `autoCompact?`, `coalescer?`, `onMemberActivity?` |
+| `MessageChannelDeps` | `setup/message-channel.ts` | `pi`, `memberOpsStates`, `lastPendingCorrId`, `memberHandles`, `onRouteNotification?`, `getAutoCompact?`, `getCoalescing?` |
+| `EventHandlerDeps` | `channel/event-handler.ts` | `pi`, `memberOpsStates`, `messageQueue`, `responseWaiter`, `lastPendingCorrId`, `recentlyProcessedMessages`, `processManager?`, `onMemberActivity?`, `memberHandles?`, `autoCompact?`, `coalescer?` |
+| `SendToMemberDeps` | `channel/event-handler.ts` | `pi`, `memberOpsStates`, `memberHandles`, `getAutoCompact?`, `autoCompact?`, `coalescer?`, `getCoalescing?` |
 
 Benefits:
 - **Testability**: each module can be tested with mocked dependencies
@@ -444,7 +455,7 @@ printf '' | timeout 10 ./node_modules/.bin/pi --mode json --no-tools -e ./index.
 | `/team cancel`           | Alias for `/team done` (backward compatibility) |
 | `/team delete <name>` | Delete a team definition (with confirmation) |
 | `/team status` | Show active session + member process statuses |
-| `/team setting` | Interactive settings menu — member default model (follow TL current model / fixed available model) + member thinking level (成员思考强度: 模型支持则传 `--thinking`，否则保持默认) + auto-compaction (toggle / percent & token thresholds / timeout) + wait budget (等待上限, 0=永不超时 — wait 工具 all-idle deadline 与批屏障共享的顶层通用预算). Also allowed during a session |
+| `/team setting` | Interactive settings menu — member default model (follow TL current model / fixed available model) + member thinking level (成员思考强度: 模型支持则传 `--thinking`，否则保持默认) + auto-compaction (toggle / percent & token thresholds / timeout) + wait budget (等待上限, 0=永不超时 — wait 工具 all-idle deadline 与批屏障共享的顶层通用预算) + message coalescing (消息合并: 开关/批量上限/字符上限，S1 阶段 2). Also allowed during a session |
 | `/team help` | Display usage help for all subcommands |
 
 ## TL Tools (session-scoped registration + activation; exception below)

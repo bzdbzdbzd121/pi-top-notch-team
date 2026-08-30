@@ -9,6 +9,12 @@ import type { ProcessManager } from "../process/manager";
 import type { ResolvedAutoCompact } from "../settings/resolve-auto-compact";
 import { DEFAULT_TIMEOUT_MINUTES } from "../settings/resolve-auto-compact";
 import { createAutoCompactRuntime, type AutoCompactRuntime } from "./auto-compact";
+import {
+  createMessageCoalescer,
+  type MessageCoalescer,
+  type CoalescedEntry,
+} from "./message-coalescer";
+import type { ResolvedMessageCoalescing } from "../settings/resolve-message-coalescing";
 
 // ── Constants ──────────────────────────────────────────────
 
@@ -70,6 +76,14 @@ export interface EventHandlerDeps {
    * corresponding branches are inert.
    */
   autoCompact?: AutoCompactRuntime;
+  /**
+   * Shared message coalescer (S1, 阶段 2, from createMessageChannel). The
+   * agent_end branch flushes the receiver's merge bucket (batch boundary),
+   * the compaction_end branch flushes defensively and process_exit/error
+   * drains it. Absent = the corresponding branches are inert (no S1
+   * behavior in legacy minimal setups).
+   */
+  coalescer?: MessageCoalescer;
 }
 
 // ── Dedup helpers ───────────────────────────────────────────
@@ -325,6 +339,8 @@ export function createMemberEventHandler(
         return;
       }
       closeCompactionAndFlush(deps, memberName);
+      // S1 (阶段 2): 压缩结束 = 防御性 flush 点——桶非空则合并派发（幂等无副作用）。
+      deps.coalescer?.flush(memberName);
       return;
     }
 
@@ -346,6 +362,10 @@ export function createMemberEventHandler(
       // Bump the state-generation (see agent_start).
       stateGeneration++;
       states.set(memberName, transitionState(states.get(memberName) ?? "idle", { type: "task_completed" }));
+
+      // S1 (阶段 2): 回合结束 = 批边界 → flush 合并桶。积压消息作为一次合并
+      // prompt 派发（一个 working 周期），状态机/等待工具/all-idle 检测天然兼容。
+      deps.coalescer?.flush(memberName);
 
       // Agent turn ended. If member has a pending TL request and didn't
       // call team_send_message this turn, schedule an auto-reply.
@@ -468,6 +488,9 @@ export function createMemberEventHandler(
       // notify) and notify the TL with a summary. Runs on intentional stops
       // too (wasRunning=false) — a stopped member orphans pending as well.
       drainPendingOnProcessExit(exitMemberName, deps);
+      // S1 (阶段 2): 同模式——coalescer 桶里的消息也不会有 agent_end 来 flush
+      // （进程已退出），drain + 通知条数（不补发）。
+      drainCoalescerOnProcessExit(exitMemberName, deps);
       if (!event.wasRunning) return;
 
       if (!isNormalExit) {
@@ -512,6 +535,8 @@ export function createMemberEventHandler(
       states.set(errMemberName, transitionState(currentState, { type: "process_exit", isCrashLoop: true }));
       // Phase 2 (三出口之③): same pending drain as process_exit.
       drainPendingOnProcessExit(errMemberName, deps);
+      // S1 (阶段 2): 同 process_exit——清 coalescer 桶 + 通知。
+      drainCoalescerOnProcessExit(errMemberName, deps);
       const pendingCorrId = lpc.get(errMemberName);
       if (pendingCorrId) {
         rw.resolveIfWaiting(
@@ -635,6 +660,25 @@ function drainPendingOnProcessExit(memberName: string, deps: EventHandlerDeps): 
     customType: "team-message",
     content: `⚠️ 成员 "${memberName}" 进程已退出，其待派发队列中的 ${pending.length} 条消息已移除（概要：${summary}）。进程重启后请重新派发。`,
     display: true,
+  });
+}
+
+/**
+ * S1 (阶段 2): drain a member's coalescer bucket after its process
+ * exits/errors. Messages sitting in the merge bucket would be orphaned
+ * forever — no agent_end will ever flush them (the process is gone).
+ * Notifies the TL with the dropped count (「含 N 条消息的合并包未送达」,
+ * 复用 drainPendingOnProcessExit 模式) and clears the bucket. No-op when
+ * the bucket is empty.
+ */
+function drainCoalescerOnProcessExit(memberName: string, deps: EventHandlerDeps): void {
+  const coalescer = deps.coalescer;
+  if (!coalescer) return;
+  const drained = coalescer.drain(memberName);
+  if (drained.length === 0) return;
+  deps.pi.sendMessage({
+    customType: "team-message",
+    content: `⚠️ 成员 "${memberName}" 进程已退出，其待派发合并包中的 ${drained.length} 条消息未送达（已丢弃，不补发）。`, display: true,
   });
 }
 
@@ -779,6 +823,20 @@ export interface SendToMemberDeps {
    * created (behavior unchanged).
    */
   autoCompact?: AutoCompactRuntime;
+  /**
+   * Shared message coalescer (S1, 阶段 2). When provided (see
+   * createMessageChannel), the event handler flushes/drains the SAME
+   * instance (agent_end batch boundary / process-exit drain). Absent = a
+   * private instance is created (messages still coalesce at the dispatch
+   * layer; corrId arrivals flush the bucket; process-exit drain is inert).
+   */
+  coalescer?: MessageCoalescer;
+  /**
+   * Resolve the effective message-coalescing config. Called on every
+   * dispatch so /team setting changes take effect immediately. Absent =
+   * defaults (enabled: true, 5 条 / 4000 字符).
+   */
+  getCoalescing?: () => ResolvedMessageCoalescing;
 }
 
 export function createSendToMember(
@@ -790,6 +848,12 @@ export function createSendToMember(
   // transitions, pending queue, flush) live here so the inline path and the
   // batch pre-check barrier use the same pending/flush mechanism.
   const autoCompact = deps.autoCompact ?? createAutoCompactRuntime(memberOpsStates);
+
+  // Shared message coalescer (S1, 阶段 2): per-receiver merge buckets for
+  // member→member messages without a wait chain. The event handler flushes
+  // the SAME instance at agent_end (batch boundary) / compaction_end
+  // (defensive) / process_exit (drain) — bucket state is never split.
+  const coalescer = deps.coalescer ?? createMessageCoalescer();
 
   // Prompt dispatch deps — shared with the compaction_end flush path so
   // both use the exact same send semantics (working mark + followUp).
@@ -816,6 +880,40 @@ export function createSendToMember(
   function notify(content: string): void {
     pi.sendMessage({ customType: "team-message", content, display: true });
   }
+
+  // ── S1 (阶段 2): coalescer flush — merged-package build + full dispatch ──
+  // The flusher is registered on the shared coalescer instance so the event
+  // handler (agent_end / compaction_end) can trigger flushes that go through
+  // the EXACT same dispatch path as the entry point — including ONE
+  // auto-compaction check for the whole merged package (省 RPC) and the
+  // compacting/queue branches (a merged package that triggers a compaction
+  // enters the compaction pending queue as a single message).
+  let mergedPackageSeq = 1;
+
+  function buildMergedMessage(receiver: string, entries: CoalescedEntry[]): TeamMessage {
+    const total = entries.length;
+    const lines = entries.map((e, i) => {
+      const head = `【消息 ${i + 1}/${total}｜来自 ${e.sender}】`;
+      return e.subject ? `${head}主题：${e.subject}\n${e.content}` : `${head}${e.content}`;
+    });
+    return {
+      id: `coalesced-${receiver}-${Date.now()}-${mergedPackageSeq++}`,
+      from: entries[0].sender,
+      to: receiver,
+      content:
+        `[消息通道 - 来自 ${entries[0].sender}]（合并包：共 ${total} 条未处理消息，请在一个回合内全部处理）\n` +
+        lines.join("\n") +
+        `\n处理要求：逐条处理；如需分别回复，请在回复中注明对应消息编号（如「回复 2：…」）。`,
+      timestamp: Date.now(),
+    };
+  }
+
+  function flushCoalesced(receiver: string, entries: CoalescedEntry[]): void {
+    if (entries.length === 0) return;
+    dispatchWithAutoCompact(receiver, buildMergedMessage(receiver, entries));
+  }
+
+  coalescer.setFlusher(flushCoalesced);
 
   // ── Phase 2: stuck-compaction fallback (三出口之②) ──
   // After a compactNow lease TIMEOUT the message is queued (never dispatched
@@ -1004,18 +1102,17 @@ export function createSendToMember(
     }
   }
 
-  return (memberName: string, msg: TeamMessage) => {
+  /**
+   * Full dispatch path shared by the entry point and the coalescer flush:
+   * compacting → compaction-queue; idle + enabled → one auto-compaction
+   * check; otherwise drain the compaction pending (FIFO) then dispatch.
+   * A merged package goes through this EXACT path, so it gets at most one
+   * compaction check and, when compacting is triggered, enters the
+   * compaction pending queue as a single message (整体派发).
+   */
+  function dispatchWithAutoCompact(memberName: string, msg: TeamMessage): void {
     const handle = memberHandles.get(memberName);
-    if (!handle) {
-      resolvePendingWaitIfAny(memberName, `消息目标 "${memberName}" 不存在或未启动。请先使用 start_member 启动该成员。`);
-      pi.sendMessage({
-        customType: "team-route",
-        content: `无法路由消息到未知成员 "${memberName}"（该成员可能未启动）`,
-        display: true,
-      });
-      return;
-    }
-
+    if (!handle) return; // entry point already checked; defensive
     const state = memberOpsStates.get(memberName) ?? "idle";
 
     // A compaction is already in progress for this member — queue the message
@@ -1055,5 +1152,58 @@ export function createSendToMember(
       dispatchPromptToMember(promptDeps, memberName, pendingMsg);
     }
     dispatchPromptToMember(promptDeps, memberName, msg);
+  }
+
+  return (memberName: string, msg: TeamMessage) => {
+    const handle = memberHandles.get(memberName);
+    if (!handle) {
+      resolvePendingWaitIfAny(memberName, `消息目标 "${memberName}" 不存在或未启动。请先使用 start_member 启动该成员。`);
+      pi.sendMessage({
+        customType: "team-route",
+        content: `无法路由消息到未知成员 "${memberName}"（该成员可能未启动）`,
+        display: true,
+      });
+      return;
+    }
+
+    const state = memberOpsStates.get(memberName) ?? "idle";
+
+    // ── S1 coalescer (阶段 2): per-receiver 回合边界合流 ──
+    // 入桶判定（全部满足才入桶，否则走原立即派发路径）：
+    //   1. 无 corrId（结构性绕过——wait 链消息绝不合并，防死锁）;
+    //   2. 非 to:"all" 广播;
+    //   3. 非 Inspector 直发（直发不经通道，天然绕过）;
+    //   4. 接收方 working（dispatchPromptToMember 同步置 working 标记，紧邻
+    //      两条消息不会竞态双派发）或桶已非空（idle+积压也入桶，防乱序）。
+    // 开关关闭（getCoalescing.enabled === false）→ 完全走原路径（fail-open）。
+    const coalescing = deps.getCoalescing?.() ?? {
+      enabled: true,
+      maxBatchSize: 5,
+      maxBatchChars: 4000,
+    };
+    if (coalescing.enabled) {
+      const bucketHasMessages = coalescer.has(memberName);
+      const canCoalesce =
+        !msg.correlationId &&
+        msg.to !== "all" &&
+        (state === "working" || bucketHasMessages);
+      if (canCoalesce) {
+        coalescer.enqueue(memberName, {
+          seq: 0, // coalescer 内部重新分配严格递增 seq
+          sender: msg.from,
+          content: msg.content,
+          subject: msg.subject,
+          at: msg.timestamp,
+        });
+        return;
+      }
+      // corrId 消息到达且桶有积压 → 先 flush 桶（合并包先入 pi 队列，followUp
+      // 保序），再派发本消息——跨消息 FIFO 不反转（gamma D6 红线）。
+      if (bucketHasMessages) {
+        coalescer.flush(memberName);
+      }
+    }
+
+    dispatchWithAutoCompact(memberName, msg);
   };
 }

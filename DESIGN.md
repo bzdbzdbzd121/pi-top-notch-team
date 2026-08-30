@@ -676,8 +676,11 @@ Router (processes one message at a time)
   │       └── NO MATCH → inject into TL's session via pi.sendMessage(msg, {deliverAs:"nextTurn"})
   │                        (S2 阶段 1：进 _pendingNextTurnMessages，下一次任意回合统一注入，零 steer)
   │
-  ├── to === "<member>"     → write prompt to target Member's RPC stdin
-  ├── to === "all"          → write prompt to ALL Members' RPC stdin
+  ├── to === "<member>"     → S1 coalescer (阶段 2): 无 corrId ∧ 非 "all" ∧ 接收方
+  │                           working/桶非空 → 入 per-receiver 桶（agent_end 回合
+  │                           边界合并派发，单次 working 周期）；否则立即派发 prompt
+  │                           （含 corrId 到达且桶非空时先 flush 合并包再派发，FIFO 保序）
+  ├── to === "all"          → write prompt to ALL Members' RPC stdin (不合并)
   └── to === unknown        → log warning, drop
 ```
 
@@ -700,6 +703,19 @@ interface TeamMessage {
 Messages addressed to a member are written to the member's RPC stdin as a `prompt` command carrying `streamingBehavior: "followUp"`. The TL-side operational state (`memberOpsStates`) is derived from `agent_start`/`agent_end` events and cannot exactly track pi's streaming window: pi keeps `isStreaming` true through the post-`agent_end` settlement phase (listener drain, auto-retry, auto-compaction continuation — potentially tens of seconds), while the state machine already shows `idle`. With `followUp`, a prompt that arrives while the member is still streaming is queued by pi itself (the ground truth) and delivered when the current run finishes, instead of being rejected with `Agent is already processing` and silently lost. When the member is idle the flag has no effect.
 
 Channel prompts are sent fire-and-forget (`sendCommand`, no RPC id attached). If the member's RPC layer still rejects a prompt (e.g. member model/auth failure), the error response arrives as a plain event with no id. `createMemberEventHandler` matches `{type:"response", command:"prompt", success:false, id:undefined}`: it resolves any pending `team_send_and_wait` for that member with a `[消息未送达]` reason and notifies the TL via a `team-route` message. Responses carrying an id belong to `sendCommandAndWait` callers (stats / compact / Member Inspector), which consume their own errors and are skipped.
+
+### S1 message coalescing (消息合并, 阶段 2)
+
+Member→member messages WITHOUT a wait chain (no `correlationId` ∧ not `to:"all"` ∧ not an Inspector direct message — direct messages bypass the channel entirely) are merged per receiver at the dispatch layer (`src/channel/message-coalescer.ts`, pure state + flusher hook; `createSendToMember` registers the flusher, the event handler flushes/drains the SAME shared instance):
+
+- **Bucket** (`Map<receiver, CoalescedEntry[]>`): cross-sender, per-message sender annotation preserved. Enqueue only when the receiver is `working` or the bucket is already non-empty — an idle receiver with an empty bucket still gets immediate dispatch (zero added latency).
+- **Flush points**: ① receiver `agent_end` (the turn boundary — the batch concept: busy-arriving messages were going to wait for the current turn anyway, so merging adds zero delay); ② a corrId message arriving while the bucket is non-empty (flush the merged package FIRST, then dispatch the corrId message — both go into pi's followUp queue, FIFO preserved, gamma D6); ③ after `compaction_end` close+flush (defensive, idempotent); ④ process_exit / process_error / teardown → drain + notify the TL with the dropped count (no retry — no wait chain, no retry contract; also eliminates any idle+bucket stall state).
+- **Merged package format**: `[消息通道 - 来自 <sender>]（合并包：共 N 条未处理消息，请在一个回合内全部处理）` + numbered per-message lines `【消息 i/N｜来自 <sender>】<content>` (subject preserved) + `处理要求：逐条处理；如需分别回复，请在回复中注明对应消息编号`. One merge = one working cycle — state machine / wait tools / widget / inspector need zero changes.
+- **Limits & degradation**: `takePrefixForFlush` (pure) takes the longest prefix ≤ `maxBatchSize` (default 5) messages AND ≤ `maxBatchChars` (default 4000) chars; leftovers stay in the bucket for the next flush point; a single oversized message is taken alone (dispatched unmerged); the char budget is capped below the hard `MAX_COMMAND_SIZE` (1MB) guard.
+- **corrId red line (structural)**: corrId messages never enter the bucket — a wait chain merged into a batch would deadlock (the wait never closes) and multi-corrId batches break the single `lastPendingCorrId`. `skipAutoCompact` messages always carry a corrId, so they bypass too.
+- **Compaction interaction**: two orthogonal buckets — during `compacting` messages go through the EXISTING `queueDuringCompaction`/`flushPending` path (per-message, all locked invariants untouched); a merged package goes through the FULL dispatch path (`dispatchWithAutoCompact`: compacting branch + ONE auto-compaction check + pending drain + dispatch), so a package that triggers compaction enters the compaction pending as a single message and dispatches whole afterwards.
+- **Settlement window** (agent_end → TL sees idle, pi still streaming): messages arriving then match "idle + empty bucket" → immediate followUp dispatch (queued by pi, FIFO). Correct and accepted (alpha B-3).
+- **Settings**: `TeamSettings.messageCoalescing { enabled?, maxBatchSize?, maxBatchChars? }` (default enabled), `/team setting` menu entry; disabled → the pre-S1 per-message path (fail-open, 场景 I).
 
 ### Routing to TL
 

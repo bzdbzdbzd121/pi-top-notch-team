@@ -15,6 +15,7 @@ import { resolveMemberThinking } from "../settings/resolve-thinking";
 import { resolveMemberModel } from "../settings/resolve-model";
 import { createMemberEventHandler } from "../channel/event-handler";
 import type { AutoCompactRuntime } from "../channel/auto-compact";
+import type { MessageCoalescer } from "../channel/message-coalescer";
 import { mkdirSync } from "node:fs";
 import { transitionState } from "../session/state-machine";
 import { ensureSharedContextFile } from "../session/shared-context";
@@ -48,6 +49,12 @@ export interface MemberLifecycleDeps {
    * the event handler (Phase 1: the compaction_end consumption branch).
    */
   autoCompact?: AutoCompactRuntime;
+  /**
+   * Shared message coalescer (from createMessageChannel, S1 阶段 2) —
+   * forwarded to the event handler (agent_end flush / compaction_end flush /
+   * process-exit drain). Absent = the S1 branches are inert.
+   */
+  coalescer?: MessageCoalescer;
 }
 
 // ── createAndRegisterMember ────────────────────────────────

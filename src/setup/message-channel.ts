@@ -11,7 +11,10 @@ import type { TeamMessage } from "../channel/types";
 import { createSendToMember } from "../channel/event-handler";
 import { createAutoCompactRuntime } from "../channel/auto-compact";
 import type { AutoCompactRuntime } from "../channel/auto-compact";
+import { createMessageCoalescer } from "../channel/message-coalescer";
+import type { MessageCoalescer } from "../channel/message-coalescer";
 import type { ResolvedAutoCompact } from "../settings/resolve-auto-compact";
+import type { ResolvedMessageCoalescing } from "../settings/resolve-message-coalescing";
 
 // ── Dependency Injection Interface ─────────────────────────
 
@@ -24,6 +27,8 @@ export interface MessageChannelDeps {
   onRouteNotification?: (target: string) => void;
   /** Resolve the effective Auto-Compaction config (per dispatch). Absent = disabled. */
   getAutoCompact?: () => ResolvedAutoCompact;
+  /** Resolve the effective message-coalescing config (per dispatch). Absent = defaults (enabled). */
+  getCoalescing?: () => ResolvedMessageCoalescing;
 }
 
 export interface MessageChannel {
@@ -36,6 +41,13 @@ export interface MessageChannel {
    * (tl-tools) compose it, so pending/flush is shared across paths.
    */
   autoCompact: AutoCompactRuntime;
+  /**
+   * The single shared message coalescer for this channel (S1, 阶段 2). The
+   * dispatch entry (createSendToMember) enqueues/flushes and the member
+   * event handlers (agent_end / compaction_end / process_exit) flush/drain
+   * the SAME instance — bucket state is never split across paths.
+   */
+  coalescer: MessageCoalescer;
 }
 
 // ── createMessageChannel ───────────────────────────────────
@@ -56,6 +68,12 @@ export function createMessageChannel(deps: MessageChannelDeps): MessageChannel {
   // barrier compaction are never orphaned (D2 structural fix).
   const autoCompact = createAutoCompactRuntime(memberOpsStates);
 
+  // 1c. Create the single shared message coalescer (S1, 阶段 2). One instance
+  // per channel: createSendToMember registers the flush dispatcher on it and
+  // the member event handlers (agent_end batch boundary / compaction_end
+  // defensive flush / process-exit drain) operate on the SAME buckets.
+  const coalescer = createMessageCoalescer();
+
   // 2. Create router (callbacks capture responseWaiter + other deps)
   const router = createRouter({
     sendToMember: createSendToMember({
@@ -66,6 +84,8 @@ export function createMessageChannel(deps: MessageChannelDeps): MessageChannel {
       lastPendingCorrId,
       getAutoCompact: deps.getAutoCompact,
       autoCompact,
+      coalescer,
+      getCoalescing: deps.getCoalescing,
     }),
 
     sendToTl: (msg: TeamMessage) => {
@@ -130,5 +150,5 @@ export function createMessageChannel(deps: MessageChannelDeps): MessageChannel {
     }
   );
 
-  return { router, messageQueue, responseWaiter, autoCompact };
+  return { router, messageQueue, responseWaiter, autoCompact, coalescer };
 }

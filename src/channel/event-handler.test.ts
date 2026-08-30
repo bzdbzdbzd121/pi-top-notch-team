@@ -1242,6 +1242,9 @@ describe("createSendToMember", () => {
       sendCommand: vi.fn(),
     };
     deps.memberHandles.set("worker", mockHandle);
+    // Coalescing disabled: the busy-member dispatch keeps the pre-S1
+    // per-message followUp semantics (场景 I — 开关关闭时行为与现状一致).
+    deps.getCoalescing = () => ({ enabled: false, maxBatchSize: 5, maxBatchChars: 4000 });
     // Member is busy (or in its post-agent_end settlement window — TL cannot
     // distinguish). Without streamingBehavior, pi RPC rejects the prompt and
     // the message is lost.
@@ -1494,7 +1497,12 @@ describe("createSendToMember auto-compaction", () => {
 
   it("skips compaction entirely when member is not idle", async () => {
     const { createSendToMember } = await loadModule();
-    const deps = createMockDeps({ getAutoCompact: () => enabledCfg }) as any;
+    // Coalescing disabled: keeps the pre-S1 per-message dispatch semantics —
+    // the point of this test is the NOT-idle compaction skip, not merging.
+    const deps = createMockDeps({
+      getAutoCompact: () => enabledCfg,
+      getCoalescing: () => ({ enabled: false, maxBatchSize: 5, maxBatchChars: 4000 }),
+    }) as any;
     const handle = makeHandle(usageResponse(95, 190000), { success: true });
     deps.memberHandles.set("worker", handle as any);
     deps.memberOpsStates.set("worker", "working");
@@ -2081,5 +2089,237 @@ describe("createSendToMember auto-compaction", () => {
 
     expect(handle.sendCommand).toHaveBeenCalledTimes(1);
     expect(handle.sendCommandAndWait).not.toHaveBeenCalled();
+  });
+});
+
+// ── S1 message coalescer (消息合并, 阶段 2) ─────────────────
+
+describe("createSendToMember S1 coalescer (场景 A/B/D/E/F/G/I)", () => {
+  const defaults = { enabled: true, maxBatchSize: 5, maxBatchChars: 4000 };
+
+  function setup(overrides?: Record<string, any>) {
+    const deps = createMockDeps({
+      coalescer: undefined as any,
+      getCoalescing: () => defaults,
+      ...overrides,
+    }) as any;
+    deps.coalescer = overrides?.coalescer;
+    const mockHandle = { sendCommand: vi.fn() };
+    deps.memberHandles.set("worker", mockHandle);
+    return { deps, mockHandle };
+  }
+
+  function msg(id: string, from: string, content: string, extra?: Record<string, any>) {
+    return { id, from, to: "worker", content, timestamp: 1, ...extra };
+  }
+
+  it("场景 A: working 中 A 连发 3 条 → 全部入桶；agent_end → 仅 1 次派发，内容含 3 条编号消息", async () => {
+    const { createSendToMember, createMemberEventHandler } = await loadModule();
+    const { createMessageCoalescer } = await import("./message-coalescer");
+    const { deps, mockHandle } = setup({ coalescer: createMessageCoalescer() });
+    deps.memberOpsStates.set("worker", "working");
+
+    const send = createSendToMember(deps);
+    const handler = createMemberEventHandler("worker", deps);
+
+    send("worker", msg("m1", "a", "M1"));
+    send("worker", msg("m2", "b", "M2"));
+    send("worker", msg("m3", "a", "M3"));
+    expect(mockHandle.sendCommand).not.toHaveBeenCalled();
+
+    handler({ type: "agent_end" });
+    expect(mockHandle.sendCommand).toHaveBeenCalledTimes(1);
+    const cmd = mockHandle.sendCommand.mock.calls[0][0];
+    expect(cmd.type).toBe("prompt");
+    expect(cmd.streamingBehavior).toBe("followUp");
+    expect(cmd.message).toContain("共 3 条未处理消息");
+    expect(cmd.message).toContain("【消息 1/3｜来自 a】M1");
+    expect(cmd.message).toContain("【消息 2/3｜来自 b】M2");
+    expect(cmd.message).toContain("【消息 3/3｜来自 a】M3");
+    expect(cmd.message).toContain("处理要求：逐条处理");
+    // 派发后成员进入 working（一次合并 = 一次 working 周期）
+    expect(deps.memberOpsStates.get("worker")).toBe("working");
+  });
+
+  it("场景 B: idle 快速 3 条 → msg1 立即派发（回合 1），msg2/3 入桶；agent_end → 合并派发（回合 2）", async () => {
+    const { createSendToMember, createMemberEventHandler } = await loadModule();
+    const { createMessageCoalescer } = await import("./message-coalescer");
+    const { deps, mockHandle } = setup({ coalescer: createMessageCoalescer() });
+
+    const send = createSendToMember(deps);
+    const handler = createMemberEventHandler("worker", deps);
+
+    send("worker", msg("m1", "a", "M1"));
+    expect(mockHandle.sendCommand).toHaveBeenCalledTimes(1); // idle+桶空 → 立即
+    send("worker", msg("m2", "b", "M2"));
+    send("worker", msg("m3", "a", "M3"));
+    expect(mockHandle.sendCommand).toHaveBeenCalledTimes(1); // 后两条入桶
+
+    handler({ type: "agent_end" });
+    expect(mockHandle.sendCommand).toHaveBeenCalledTimes(2); // 恰好 2 回合，非 3
+    expect(mockHandle.sendCommand.mock.calls[1][0].message).toContain("【消息 1/2｜来自 b】M2");
+    expect(mockHandle.sendCommand.mock.calls[1][0].message).toContain("【消息 2/2｜来自 a】M3");
+  });
+
+  it("场景 D: corrId 消息到达且桶有积压 → 先 flush 合并包再派发 corrId（FIFO 保序）", async () => {
+    const { createSendToMember } = await loadModule();
+    const { createMessageCoalescer } = await import("./message-coalescer");
+    const { deps, mockHandle } = setup({ coalescer: createMessageCoalescer() });
+    deps.memberOpsStates.set("worker", "working");
+
+    const send = createSendToMember(deps);
+    send("worker", msg("m1", "a", "M1")); // 入桶
+    send("worker", msg("corr-1", "tl", "Task", { correlationId: "c1" }));
+
+    expect(mockHandle.sendCommand).toHaveBeenCalledTimes(2);
+    expect(mockHandle.sendCommand.mock.calls[0][0].message).toContain("合并包");
+    expect(mockHandle.sendCommand.mock.calls[0][0].message).toContain("M1");
+    expect(mockHandle.sendCommand.mock.calls[1][0].message).toContain("Task");
+    // 桶已清空
+    expect(deps.coalescer.has("worker")).toBe(false);
+  });
+
+  it("场景 E: to:\"all\" 广播与 corrId 消息均不合并，立即派发", async () => {
+    const { createSendToMember } = await loadModule();
+    const { createMessageCoalescer } = await import("./message-coalescer");
+    const { deps, mockHandle } = setup({ coalescer: createMessageCoalescer() });
+    deps.memberOpsStates.set("worker", "working");
+
+    const send = createSendToMember(deps);
+    send("worker", msg("b1", "a", "Hi all", { to: "all" }));
+    expect(mockHandle.sendCommand).toHaveBeenCalledTimes(1);
+    send("worker", msg("corr-2", "tl", "Task", { correlationId: "c2" }));
+    expect(mockHandle.sendCommand).toHaveBeenCalledTimes(2);
+    expect(deps.coalescer.has("worker")).toBe(false);
+  });
+
+  it("场景 F: 6 条积压 → 首次 flush 取 5 条（共 5 条），剩余 1 条留桶等下一 flush 点", async () => {
+    const { createSendToMember, createMemberEventHandler } = await loadModule();
+    const { createMessageCoalescer } = await import("./message-coalescer");
+    const { deps, mockHandle } = setup({
+      coalescer: createMessageCoalescer(),
+      getCoalescing: () => ({ enabled: true, maxBatchSize: 5, maxBatchChars: 4000 }),
+    });
+    deps.memberOpsStates.set("worker", "working");
+
+    const send = createSendToMember(deps);
+    const handler = createMemberEventHandler("worker", deps);
+    for (let i = 1; i <= 6; i++) {
+      send("worker", msg(`m${i}`, "a", `M${i}`));
+    }
+    expect(mockHandle.sendCommand).not.toHaveBeenCalled();
+
+    handler({ type: "agent_end" });
+    expect(mockHandle.sendCommand).toHaveBeenCalledTimes(1);
+    expect(mockHandle.sendCommand.mock.calls[0][0].message).toContain("共 5 条未处理消息");
+    expect(mockHandle.sendCommand.mock.calls[0][0].message).not.toContain("M6");
+
+    handler({ type: "agent_end" }); // 下一 flush 点
+    expect(mockHandle.sendCommand).toHaveBeenCalledTimes(2);
+    expect(mockHandle.sendCommand.mock.calls[1][0].message).toContain("共 1 条未处理消息");
+    expect(mockHandle.sendCommand.mock.calls[1][0].message).toContain("M6");
+  });
+
+  it("场景 G: process_exit 时桶非空 → drain 通知 TL「N 条未送达」+ 清桶（无孤儿）", async () => {
+    const { createSendToMember, createMemberEventHandler } = await loadModule();
+    const { createMessageCoalescer } = await import("./message-coalescer");
+    const { deps, mockHandle } = setup({ coalescer: createMessageCoalescer() });
+    deps.memberOpsStates.set("worker", "working");
+
+    const send = createSendToMember(deps);
+    const handler = createMemberEventHandler("worker", deps);
+    send("worker", msg("m1", "a", "M1"));
+    send("worker", msg("m2", "b", "M2"));
+    expect(mockHandle.sendCommand).not.toHaveBeenCalled();
+
+    handler({ type: "process_exit", memberName: "worker", exitCode: 1, wasRunning: true });
+    expect(deps.pi.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customType: "team-message",
+        content: expect.stringContaining("2 条消息未送达"),
+      })
+    );
+    expect(deps.coalescer.has("worker")).toBe(false);
+    expect(mockHandle.sendCommand).not.toHaveBeenCalled(); // 不补发
+  });
+
+  it("场景 I: getCoalescing enabled:false → 完全走原逐条路径（fail-open）", async () => {
+    const { createSendToMember } = await loadModule();
+    const { deps, mockHandle } = setup({
+      getCoalescing: () => ({ enabled: false, maxBatchSize: 5, maxBatchChars: 4000 }),
+    });
+    deps.memberOpsStates.set("worker", "working");
+
+    const send = createSendToMember(deps);
+    send("worker", msg("m1", "a", "M1"));
+    send("worker", msg("m2", "b", "M2"));
+    expect(mockHandle.sendCommand).toHaveBeenCalledTimes(2); // 逐条立即派发
+  });
+
+  it("合并包保留 subject（来源标注行内）", async () => {
+    const { createSendToMember, createMemberEventHandler } = await loadModule();
+    const { createMessageCoalescer } = await import("./message-coalescer");
+    const { deps, mockHandle } = setup({ coalescer: createMessageCoalescer() });
+    deps.memberOpsStates.set("worker", "working");
+
+    const send = createSendToMember(deps);
+    const handler = createMemberEventHandler("worker", deps);
+    send("worker", msg("m1", "a", "M1", { subject: "重要" }));
+    handler({ type: "agent_end" });
+    expect(mockHandle.sendCommand.mock.calls[0][0].message).toContain("主题：重要");
+  });
+
+  it("合并包派发走完整派发路径：触发一次压缩检查（idle + 超阈值）", async () => {
+    const { createSendToMember, createMemberEventHandler } = await loadModule();
+    const { createMessageCoalescer } = await import("./message-coalescer");
+    const enabledCfg2 = {
+      enabled: true,
+      thresholdPercent: 80,
+      thresholdTokens: undefined,
+      timeoutMinutes: 10,
+      percentIsDefaultFallback: false,
+    };
+    const handle = {
+      sendCommand: vi.fn(),
+      sendCommandAndWait: vi.fn().mockImplementation((cmd: any) => {
+        if (cmd.type === "get_session_stats") {
+          return Promise.resolve({
+            type: "response",
+            command: "get_session_stats",
+            success: true,
+            data: { contextUsage: { percent: 95, tokens: 5000, contextWindow: 10000 } },
+          });
+        }
+        if (cmd.type === "compact") return Promise.resolve({ success: true });
+        return Promise.reject(new Error("unexpected command"));
+      }),
+    };
+    const deps = createMockDeps({
+      coalescer: undefined as any,
+      getCoalescing: () => defaults,
+      getAutoCompact: () => enabledCfg2,
+      memberHandles: new Map([["worker", handle]]),
+    }) as any;
+    deps.coalescer = createMessageCoalescer();
+    deps.memberOpsStates.set("worker", "working"); // 两条都入桶，agent_end 后整体触发压缩
+
+    const send = createSendToMember(deps);
+    const handler = createMemberEventHandler("worker", deps);
+    send("worker", msg("m1", "a", "M1"));
+    send("worker", msg("m2", "b", "M2"));
+    handler({ type: "agent_end" }); // idle → 压缩检查 → compact → 合并包整体派发
+
+    await vi.waitFor(() => {
+      expect(handle.sendCommand).toHaveBeenCalledTimes(1);
+    });
+    expect(handle.sendCommandAndWait).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "compact" }),
+      expect.any(Function),
+      600000
+    );
+    const cmd = handle.sendCommand.mock.calls[0][0];
+    expect(cmd.message).toContain("共 2 条未处理消息");
+    expect(cmd.message).toContain("M1");
+    expect(cmd.message).toContain("M2");
   });
 });

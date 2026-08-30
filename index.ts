@@ -11,6 +11,7 @@ import type { TeamContext } from "./src/session/context";
 import { getRootDir } from "./src/config";
 import { loadSettings } from "./src/settings/settings";
 import { resolveAutoCompact } from "./src/settings/resolve-auto-compact";
+import { resolveMessageCoalescing } from "./src/settings/resolve-message-coalescing";
 import { getSupportedThinkingLevelsFor } from "./src/settings/resolve-thinking";
 import { registerTlTools, type TlToolsDeps } from "./src/tools/tl-tools";
 import { registerGoalTools, registerGoalAgentHandler, resetGoal, GOAL_TOOL_NAMES } from "./src/tools/goal-tools";
@@ -207,7 +208,7 @@ export default function (pi: ExtensionAPI) {
   let uiNotify: ((msg: string, type?: "info" | "warning" | "error") => void) | null = null;
 
   // ── Message channel: queue → router (extracted to src/setup/message-channel.ts) ──
-  const { router, messageQueue, responseWaiter, autoCompact } = createMessageChannel({
+  const { router, messageQueue, responseWaiter, autoCompact, coalescer } = createMessageChannel({
     pi,
     memberOpsStates,
     lastPendingCorrId,
@@ -217,6 +218,8 @@ export default function (pi: ExtensionAPI) {
     },
     // Resolve per dispatch so /team setting changes take effect immediately.
     getAutoCompact: () => resolveAutoCompact(loadSettings(getRootDir())),
+    // S1 (阶段 2): 消息合并设置 per-dispatch 解析（开关/上限即时生效）。
+    getCoalescing: () => resolveMessageCoalescing(loadSettings(getRootDir())),
   });
 
   teamCtx.router = router;
@@ -242,6 +245,9 @@ export default function (pi: ExtensionAPI) {
     // map) — both fix the compaction-timeout permanent-working black hole.
     memberHandles,
     autoCompact,
+    // S1 (阶段 2): 共享 coalescer 转发给 event handler（agent_end flush /
+    // compaction_end flush / process-exit drain）。
+    coalescer,
     onMemberActivity: (memberName: string, event: any) => {
       // Multi-cast to all activity consumers with PER-CONSUMER isolation (N4):
       // a throwing observer must never break the other observers — and the
