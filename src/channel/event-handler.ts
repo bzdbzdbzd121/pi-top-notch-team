@@ -282,13 +282,22 @@ export function createMemberEventHandler(
       }
       // Honest notification (Phase 1, beta E): the message is LOST — the
       // member's pi rejected the prompt. The old wording ("已直接派发任务")
-      // claimed the opposite. The state correction below restores the
-      // operational state to what the member actually reports (compacting /
-      // idle) — never a fabricated `working` (that was the permanent-hang
-      // black hole after a compaction timeout).
+      // claimed the opposite. 核对退回 1: when the rejected prompt was the
+      // member's most recent merged package, the blast radius is stated
+      // (「合并包含 N 条消息」; the count is consumed once). The state
+      // correction below restores the operational state to what the member
+      // actually reports (compacting / idle) — never a fabricated `working`
+      // (that was the permanent-hang black hole after a compaction timeout).
+      const mergedNote =
+        deps.coalescer !== undefined
+          ? (() => {
+              const n = deps.coalescer!.takeMergedCount(memberName);
+              return n !== undefined ? `（合并包含 ${n} 条消息）` : "";
+            })()
+          : "";
       deps.pi.sendMessage({
         customType: "team-route",
-        content: `⚠️ 成员 "${memberName}" 拒收了消息通道下发的 prompt，消息未送达（已丢失，请稍后重试）。\n原因：${reason}\n已查询成员实际状态并按实际恢复；若成员仍在压缩，积压消息将在压缩结束后自动补发。`,
+        content: `⚠️ 成员 "${memberName}" 拒收了消息通道下发的 prompt${mergedNote}，消息未送达（已丢失，请稍后重试）。\n原因：${reason}\n已查询成员实际状态并按实际恢复；若成员仍在压缩，积压消息将在压缩结束后自动补发。`,
         display: true,
       });
       // State correction: ask the member (get_state.isCompacting) instead of
@@ -356,6 +365,12 @@ export function createMemberEventHandler(
       // async rejection correction must not overwrite its state (建议 2).
       stateGeneration++;
       states.set(memberName, transitionState(states.get(memberName) ?? "idle", { type: "task_started" }));
+
+      // 核对退回 1: a new turn means the previous merged-package dispatch
+      // (successful or not) is no longer "the most recent dispatch" — clear
+      // the annotation count so a later failure never carries a stale
+      // merged-package note.
+      deps.coalescer?.clearMergedCount(memberName);
 
       // Cancel any pending auto-reply — more turns are coming
       cancelPendingAutoReply(memberName, deps);
@@ -707,6 +722,12 @@ export interface PromptDispatchDeps {
   memberHandles: Map<string, MemberProcessHandle>;
   lastPendingCorrId: Map<string, string>;
   responseWaiter: ResponseWaiter;
+  /**
+   * Shared message coalescer (S1, 阶段 2) — lets the dispatch-error branch
+   * annotate 「合并包含 N 条消息」 when the failed dispatch was a merged
+   * package (核对退回 1). Absent = plain per-message notification.
+   */
+  coalescer?: MessageCoalescer;
 }
 
 /** Build the channel prompt text for a TeamMessage. */
@@ -744,7 +765,18 @@ export function dispatchPromptToMember(
       streamingBehavior: "followUp",
     });
   } catch (err) {
-    const reason = `发送消息给成员 "${memberName}" 失败：${err instanceof Error ? err.message : String(err)}`;
+    // 核对退回 1: when the failed dispatch was the member's most recent
+    // merged package, the notification states the batch size (「合并包含
+    // N 条消息」) so the TL knows the blast radius of the loss. The count is
+    // consumed once (takeMergedCount) — a later single-message failure never
+    // carries a stale annotation.
+    const mergedNote = deps.coalescer
+      ? (() => {
+          const n = deps.coalescer!.takeMergedCount(memberName);
+          return n !== undefined ? `（合并包含 ${n} 条消息）` : "";
+        })()
+      : "";
+    const reason = `发送消息给成员 "${memberName}" 失败${mergedNote}：${err instanceof Error ? err.message : String(err)}`;
     const pendingCorrId = deps.lastPendingCorrId.get(memberName);
     if (pendingCorrId) {
       deps.responseWaiter.resolveIfWaiting(pendingCorrId, memberName, reason);
@@ -763,6 +795,7 @@ function toPromptDispatchDeps(deps: CompactionCloseDeps): PromptDispatchDeps | n
     memberHandles: deps.memberHandles,
     lastPendingCorrId: deps.lastPendingCorrId,
     responseWaiter: deps.responseWaiter,
+    coalescer: deps.coalescer,
   };
 }
 
@@ -774,6 +807,8 @@ interface CompactionCloseDeps {
   lastPendingCorrId: Map<string, string>;
   responseWaiter: ResponseWaiter;
   autoCompact?: AutoCompactRuntime;
+  /** Forwarded to PromptDispatchDeps for merged-package failure annotations (核对退回 1). */
+  coalescer?: MessageCoalescer;
 }
 
 /**
@@ -876,6 +911,7 @@ export function createSendToMember(
     memberHandles,
     lastPendingCorrId: deps.lastPendingCorrId,
     responseWaiter: deps.responseWaiter,
+    coalescer,
   };
 
   // Compaction-lifecycle close deps — shared by the compaction_end branch
@@ -887,6 +923,7 @@ export function createSendToMember(
     lastPendingCorrId: deps.lastPendingCorrId,
     responseWaiter: deps.responseWaiter,
     autoCompact,
+    coalescer,
   };
 
   /** Auto-compaction notices go to the TL session as team messages. */
@@ -1126,6 +1163,13 @@ export function createSendToMember(
   function dispatchWithAutoCompact(memberName: string, msg: TeamMessage): void {
     const handle = memberHandles.get(memberName);
     if (!handle) return; // entry point already checked; defensive
+    // 核对退回 1: a single-message dispatch is no longer "the most recent
+    // merged-package dispatch" — clear the annotation count (a merged
+    // package keeps it: it was just recorded by flush and a synchronous
+    // dispatch failure inside it must still see the count).
+    if (!msg.id.startsWith("coalesced-")) {
+      coalescer.clearMergedCount(memberName);
+    }
     const state = memberOpsStates.get(memberName) ?? "idle";
 
     // A compaction is already in progress for this member — queue the message

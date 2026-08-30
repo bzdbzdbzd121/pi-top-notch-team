@@ -128,8 +128,20 @@ export interface MessageCoalescer {
    * constructor-injected getLimits — 复审建议 1: non-default configured
    * limits take effect at every flush point) and hand it to the flusher.
    * This-independent (no `this` usage) so destructured calls are safe.
+   * The merged count is recorded BEFORE the flusher runs, so a dispatch
+   * failure inside the flusher can annotate the notification with
+   * 「合并包含 N 条消息」(核对退回 1).
    */
   flush(receiver: string): void;
+  /**
+   * Read-and-consume the count of the receiver's most recent merged-package
+   * dispatch (recorded by flush). One-shot — a second read returns
+   * undefined, preventing stale annotations on later single-message
+   * failures. Undefined when nothing merged was dispatched (yet).
+   */
+  takeMergedCount(receiver: string): number | undefined;
+  /** Clear the recorded merged count (agent_start / single-message dispatch). */
+  clearMergedCount(receiver: string): void;
 }
 
 /**
@@ -145,6 +157,12 @@ export function createMessageCoalescer(
   getLimits?: () => CoalesceLimits
 ): MessageCoalescer {
   const buckets = new Map<string, CoalescedEntry[]>();
+  // 核对退回 1: per-receiver count of the most recent merged-package dispatch,
+  // consumed (takeMergedCount) by the rejection / dispatch-error notification
+  // branches to annotate 「合并包含 N 条消息」; cleared on agent_start and on
+  // single-message dispatches so stale annotations never attach to a later
+  // unrelated failure.
+  const lastMergedCounts = new Map<string, number>();
   let nextSeq = 1;
   let flusher: ((receiver: string, entries: CoalescedEntry[]) => void) | null = null;
 
@@ -200,8 +218,22 @@ export function createMessageCoalescer(
       if (!flusher) return; // no dispatch capability yet — entries stay for the next flush point
       const taken = doTake(receiver);
       if (taken.length > 0) {
+        // Record BEFORE the flusher runs: a synchronous dispatch failure
+        // inside it must see the count for its annotation (核对退回 1).
+        lastMergedCounts.set(receiver, taken.length);
         flusher(receiver, taken);
       }
+    },
+
+    takeMergedCount(receiver) {
+      const count = lastMergedCounts.get(receiver);
+      if (count === undefined) return undefined;
+      lastMergedCounts.delete(receiver);
+      return count;
+    },
+
+    clearMergedCount(receiver) {
+      lastMergedCounts.delete(receiver);
     },
   };
 }

@@ -2352,4 +2352,108 @@ describe("createSendToMember S1 coalescer (场景 A/B/D/E/F/G/I)", () => {
     expect(cmd.message).toContain("M1");
     expect(cmd.message).toContain("M2");
   });
+
+  it("【核对 1】合并包拒收：通知注明「合并包含 N 条消息」（拒收分支）", async () => {
+    const { createSendToMember, createMemberEventHandler } = await loadModule();
+    const { createMessageCoalescer } = await import("./message-coalescer");
+    const { deps, mockHandle } = setup({ coalescer: createMessageCoalescer() });
+    deps.memberOpsStates.set("worker", "working");
+
+    const send = createSendToMember(deps);
+    const handler = createMemberEventHandler("worker", deps);
+    send("worker", msg("m1", "a", "M1"));
+    send("worker", msg("m2", "b", "M2"));
+    handler({ type: "agent_end" }); // 合并包派发成功（sendCommand 已调用）
+
+    handler({
+      type: "response",
+      command: "prompt",
+      success: false,
+      id: undefined,
+      error: "Cannot submit a prompt while compaction is in progress",
+    });
+    expect(deps.pi.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customType: "team-route",
+        content: expect.stringContaining("合并包含 2 条消息"),
+      })
+    );
+  });
+
+  it("【核对 1】合并包派发错误：通知注明「合并包含 N 条消息」（sendCommand 抛错）", async () => {
+    const { createSendToMember, createMemberEventHandler } = await loadModule();
+    const { createMessageCoalescer } = await import("./message-coalescer");
+    const { deps } = setup({ coalescer: createMessageCoalescer() });
+    deps.memberOpsStates.set("worker", "working");
+    (deps.memberHandles.get("worker").sendCommand as ReturnType<typeof vi.fn>).mockImplementation(
+      () => {
+        throw new Error("Connection lost");
+      }
+    );
+
+    const send = createSendToMember(deps);
+    const handler = createMemberEventHandler("worker", deps);
+    send("worker", msg("m1", "a", "M1"));
+    send("worker", msg("m2", "b", "M2"));
+    handler({ type: "agent_end" }); // flush → 合并包派发抛错
+
+    expect(deps.pi.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customType: "team-route",
+        content: expect.stringContaining("合并包含 2 条消息"),
+      })
+    );
+  });
+
+  it("【核对 1】合并包后的单条消息派发失败：不再携带合并注记（清除语义）", async () => {
+    const { createSendToMember, createMemberEventHandler } = await loadModule();
+    const { createMessageCoalescer } = await import("./message-coalescer");
+    const { deps, mockHandle } = setup({ coalescer: createMessageCoalescer() });
+    deps.memberOpsStates.set("worker", "working");
+
+    const send = createSendToMember(deps);
+    const handler = createMemberEventHandler("worker", deps);
+    send("worker", msg("m1", "a", "M1"));
+    send("worker", msg("m2", "b", "M2"));
+    handler({ type: "agent_end" }); // 合并包派发成功
+
+    // 合并包派发后成员 working；单条消息立即派发路径（coalescing 下 working 入桶，
+    // 故用 corrId 消息走立即派发）——成功派发（单条清除标记）
+    send("worker", msg("corr-3", "tl", "Task", { correlationId: "c3" }));
+    expect(mockHandle.sendCommand).toHaveBeenCalledTimes(2); // 单条成功
+
+    // 之后单条消息派发失败：不带合并注记
+    (mockHandle.sendCommand as ReturnType<typeof vi.fn>).mockImplementation(() => {
+      throw new Error("Connection lost");
+    });
+    send("worker", msg("corr-4", "tl", "Task2", { correlationId: "c4" }));
+    const lastCall = deps.pi.sendMessage.mock.calls.at(-1)[0];
+    expect(lastCall.content).toContain("发送消息给成员 \"worker\" 失败");
+    expect(lastCall.content).not.toContain("合并包含");
+  });
+
+  it("【核对 1】agent_start 清除标记：新回合后的拒收不再携带合并注记", async () => {
+    const { createSendToMember, createMemberEventHandler } = await loadModule();
+    const { createMessageCoalescer } = await import("./message-coalescer");
+    const { deps } = setup({ coalescer: createMessageCoalescer() });
+    deps.memberOpsStates.set("worker", "working");
+
+    const send = createSendToMember(deps);
+    const handler = createMemberEventHandler("worker", deps);
+    send("worker", msg("m1", "a", "M1"));
+    send("worker", msg("m2", "b", "M2"));
+    handler({ type: "agent_end" }); // 合并包派发成功，标记已记录
+
+    handler({ type: "agent_start" }); // 新回合 → 清除标记
+    handler({
+      type: "response",
+      command: "prompt",
+      success: false,
+      id: undefined,
+      error: "model error",
+    });
+    const lastCall = deps.pi.sendMessage.mock.calls.at(-1)[0];
+    expect(lastCall.content).toContain("拒收了消息通道下发的 prompt");
+    expect(lastCall.content).not.toContain("合并包含");
+  });
 });

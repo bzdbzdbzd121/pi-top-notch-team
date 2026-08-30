@@ -244,4 +244,54 @@ describe("createMessageCoalescer", () => {
       maxBatchChars: DEFAULT_MAX_BATCH_CHARS,
     });
   });
+
+  it("【核对 1】flush records the merged count; takeMergedCount consumes it once", () => {
+    const c = createMessageCoalescer();
+    c.setFlusher(vi.fn());
+    c.enqueue("worker", entry("a", "m1"));
+    c.enqueue("worker", entry("b", "m2"));
+    expect(c.takeMergedCount("worker")).toBeUndefined(); // 尚无合并包派发
+    c.flush("worker");
+    expect(c.takeMergedCount("worker")).toBe(2); // 最近派发为合并包（2 条）
+    expect(c.takeMergedCount("worker")).toBeUndefined(); // 一次性消费，防陈旧
+  });
+
+  it("【核对 1】a size-1 flush (oversized single message) also records count 1", () => {
+    const c = createMessageCoalescer(() => ({ maxBatchSize: 5, maxBatchChars: 10 }));
+    c.setFlusher(vi.fn());
+    c.enqueue("worker", entry("a", "超长内容超过预算"));
+    c.flush("worker");
+    expect(c.takeMergedCount("worker")).toBe(1);
+  });
+
+  it("【核对 1】a later flush overwrites the previous merged count", () => {
+    const c = createMessageCoalescer();
+    const flusher = vi.fn();
+    c.setFlusher(flusher);
+    c.enqueue("worker", entry("a", "m1"));
+    c.flush("worker"); // 记录 1
+    c.enqueue("worker", entry("a", "m2"));
+    c.enqueue("worker", entry("b", "m3"));
+    c.flush("worker"); // 覆盖为 2
+    expect(c.takeMergedCount("worker")).toBe(2);
+  });
+
+  it("【核对 1】clearMergedCount clears the recorded count (agent_start / single dispatch)", () => {
+    const c = createMessageCoalescer();
+    c.setFlusher(vi.fn());
+    c.enqueue("worker", entry("a", "m1"));
+    c.flush("worker");
+    expect(c.takeMergedCount("worker")).toBe(1); // 消费
+    c.enqueue("worker", entry("a", "m2"));
+    c.flush("worker");
+    c.clearMergedCount("worker");
+    expect(c.takeMergedCount("worker")).toBeUndefined();
+  });
+
+  it("【核对 1】flush with no flusher registered records nothing", () => {
+    const c = createMessageCoalescer();
+    c.enqueue("worker", entry("a", "m1"));
+    c.flush("worker");
+    expect(c.takeMergedCount("worker")).toBeUndefined();
+  });
 });
