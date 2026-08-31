@@ -342,6 +342,101 @@ describe("createMessageChannel", () => {
     );
   });
 
+  // ── S3（阶段 3）：等待期缓冲 —— gate 活跃时非回复消息入缓冲而非 nextTurn ──
+
+  it("S3: sendToTl buffers the message while a wait gate is active (no sendMessage)", async () => {
+    const { createMessageChannel } = await loadModule();
+    const deps = {
+      pi: pi as any,
+      memberOpsStates,
+      lastPendingCorrId,
+      memberHandles,
+    };
+
+    const result = createMessageChannel(deps as any);
+    const routerConfig = mockCreateRouter.mock.calls[0][0];
+
+    // team_send_and_wait 在飞（gate active）
+    result.tlWaitGate.beginWait();
+    routerConfig.sendToTl({
+      id: "msg-s3-1",
+      from: "worker",
+      to: "tl",
+      content: "等待期间的补充汇报",
+      timestamp: Date.now(),
+    });
+
+    // 不进 pi 的 nextTurn 队列（否则要等 TL 回合结束才可见）——入扩展侧缓冲
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+    const buffered = result.tlWaitGate.drain();
+    expect(buffered).toHaveLength(1);
+    expect(buffered[0].content).toBe("等待期间的补充汇报");
+    expect(result.tlWaitGate.drain()).toEqual([]); // drain 原子清空
+  });
+
+  it("S3: gate inactive → nextTurn 语义不变（等待结束后到达的消息）", async () => {
+    const { createMessageChannel } = await loadModule();
+    const deps = {
+      pi: pi as any,
+      memberOpsStates,
+      lastPendingCorrId,
+      memberHandles,
+    };
+
+    const result = createMessageChannel(deps as any);
+    const routerConfig = mockCreateRouter.mock.calls[0][0];
+
+    // 等待已结束（endWait 后）：消息走 S2 nextTurn
+    result.tlWaitGate.beginWait();
+    result.tlWaitGate.endWait();
+    routerConfig.sendToTl({
+      id: "msg-s3-2",
+      from: "worker",
+      to: "tl",
+      content: "等待结束后的消息",
+      timestamp: Date.now(),
+    });
+
+    expect(pi.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ customType: "team-message", display: true }),
+      { deliverAs: "nextTurn" }
+    );
+  });
+
+  it("S3: corrId 回复仍由 waiter 消费（优先于缓冲，不重复投递）", async () => {
+    const mockResponseWaiter = {
+      waitForResponse: vi.fn(),
+      resolveIfWaiting: vi.fn().mockReturnValue(true),
+      cancelAll: vi.fn(),
+    };
+    mockCreateResponseWaiter.mockReturnValue(mockResponseWaiter);
+
+    const { createMessageChannel } = await loadModule();
+    const deps = {
+      pi: pi as any,
+      memberOpsStates,
+      lastPendingCorrId,
+      memberHandles,
+    };
+
+    const result = createMessageChannel(deps as any);
+    const routerConfig = mockCreateRouter.mock.calls[0][0];
+
+    result.tlWaitGate.beginWait();
+    routerConfig.sendToTl({
+      id: "msg-s3-3",
+      from: "worker",
+      to: "tl",
+      content: "正式回复\n\n<corr:corr-1>",
+      timestamp: Date.now(),
+    });
+
+    // 回复进工具结果（waiter 消费），既不缓冲也不 sendMessage
+    expect(mockResponseWaiter.resolveIfWaiting).toHaveBeenCalled();
+    expect(result.tlWaitGate.drain()).toEqual([]);
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+  });
+
   it("onUnknownTarget should send team-route immediately (no nextTurn)", async () => {
     const { createMessageChannel } = await loadModule();
     const deps = {

@@ -673,8 +673,12 @@ Router (processes one message at a time)
   ├── to === "tl"
   │     → ResponseWaiter.check(msg.correlationId or scan content for <corr:...>)
   │       ├── MATCH → resolve pending wait (skip pi.sendMessage())
-  │       └── NO MATCH → inject into TL's session via pi.sendMessage(msg, {deliverAs:"nextTurn"})
-  │                        (S2 阶段 1：进 _pendingNextTurnMessages，下一次任意回合统一注入，零 steer)
+  │       └── NO MATCH → team_send_and_wait 等待在飞（S3，决策 #39）：
+  │                     入 tlWaitGate 扩展侧缓冲，all-idle 门控打开时经
+  │                     pi.sendMessage（无 deliverAs → 工具执行期 = steer 分支）
+  │                     注入——工具结果之后、同一回合内（不等 TL 回合结束）
+  │                     否则 → inject into TL's session via pi.sendMessage(msg, {deliverAs:"nextTurn"})
+  │                     (S2 阶段 1：进 _pendingNextTurnMessages，下一次任意回合统一注入，零 steer)
   │
   ├── to === "<member>"     → S1 coalescer (阶段 2): 无 corrId ∧ 非 "all" ∧ 接收方
   │                           working/桶非空 → 入 per-receiver 桶（agent_end 回合
@@ -720,6 +724,8 @@ Member→member messages WITHOUT a wait chain (no `correlationId` ∧ not `to:"a
 ### Routing to TL
 
 The TL is the user's pi session, not an RPC process. Messages addressed to `"tl"` are delivered with `pi.sendMessage(msg, { deliverAs: "nextTurn" })` (S2 阶段 1, 决策 #36): the message goes into pi's `_pendingNextTurnMessages` and is injected into the TL's context at the start of the **next arbitrary turn** — never steering a streaming TL turn, never spawning a turn while idle. Version-verified against peerDep 0.83.0 (dist/core/agent-session.js `sendCustomMessage` nextTurn branch at ~1075-1077, injection at prompt() ~876-880; `SendMessageHandler` type includes `"nextTurn"`). Wait replies are consumed by `resolveIfWaiting` before this path (zero impact); system notifications (crash/rejection/compaction/teardown) and `team-route` routing errors stay immediate. Consequence (accepted semantics): while the TL is idle, member messages are held until the next turn instead of appearing instantly.
+
+**S3 amendment (阶段 3, 决策 #39 — wait-gate buffered flush)**: while a `team_send_and_wait` wait is in flight, non-reply member→TL messages buffer in the extension-side `tlWaitGate` (`src/channel/tl-wait-gate.ts`) instead of pi's nextTurn queue (which has no public drain API — the buffering decision must be made at message-arrival time). The moment the mandatory all-idle gate opens (decision #38), `waitWithAllIdleCheck` drains the gate and re-delivers everything via a plain `pi.sendMessage` **without** `deliverAs`: during tool execution the agent run is active (`_isAgentRunActive` spans the whole run), so pi takes the **steer branch**, and the agent loop drains the steering queue **after tool results are appended and before the next assistant completion** (pi-agent-core agent-loop.js `runLoop`) — the TL sees the messages in the SAME turn, right after the tool result, with zero streaming interruption (nothing streams during tool execution). If the run was aborted just before the flush, pi's not-streaming/no-triggerTurn branch appends the message to history without a turn — no loss. Multiple buffered messages merge into a single injection (per-message `【消息 i/N｜来自 X】` annotations); a single message keeps the exact S2 format. Verified end-to-end against the real AgentSession in `src/tools/tl-wait-gate.agent-session.test.ts` (custom message lands after toolResult, before the final assistant message). No-wait periods keep pure S2 semantics; the batch-barrier window (before `beginWait`) also stays S2.
 
 ### Auto-Compaction on dispatch
 

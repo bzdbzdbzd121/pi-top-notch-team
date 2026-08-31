@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { Compile } from "typebox/compile";
 import { registerTlTools, WAIT_IDLE_CHECK_INTERVAL_MS, WAIT_IDLE_REQUIRED_CONSECUTIVE, prepareTeamSendAndWaitArgs } from "./tl-tools";
+import { createTlWaitGate } from "../channel/tl-wait-gate";
 import { startSession, endSession, markSharedContextWritten } from "../session/state";
 import { DEFAULT_SETTINGS } from "../settings/settings";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -815,6 +816,129 @@ describe("registerTlTools", () => {
         expect(result.details).toEqual({ nextSteps: "汇总" });
         expect(result.content[0].text).toContain("已回复，但别人还在干活");
         expect(result.content[0].text).not.toContain("等待超时");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("S3: 等待期间到达的 member→TL 消息在门控打开时经 steer 即时注入（不等 TL 回合结束）", { timeout: 5000 }, async () => {
+      // 阶段 3：gate 活跃时 sendToTl 会把非回复消息缓冲到 tlWaitGate；
+      // all-idle 门控打开的瞬间，waitWithAllIdleCheck 把缓冲消息经
+      // pi.sendMessage（无 deliverAs → 工具执行期 = steer 分支，注入在
+      // 工具结果之后、同一回合内）投递给 TL。
+      memberOpsStates.set("worker", "idle");
+
+      const gate = createTlWaitGate();
+      const piFlush = {
+        ...createMockPi(),
+        sendMessage: vi.fn(),
+      };
+      const mockResponseWaiter = createMockResponseWaiter();
+      mockResponseWaiter.waitForResponse = vi.fn().mockResolvedValue({
+        status: "response",
+        from: "worker",
+        content: "Task done",
+      });
+
+      let executeFn: Function = () => {};
+      piFlush.registerTool = vi.fn((def: any) => {
+        if (def.name === "team_send_and_wait") {
+          executeFn = def.execute;
+        }
+      });
+
+      registerTlTools({
+        pi: piFlush as any,
+        manager,
+        responseWaiter: mockResponseWaiter,
+        memberOpsStates,
+        lastPendingCorrId,
+        messageQueue,
+        tlWaitGate: gate,
+      });
+
+      vi.useFakeTimers();
+      try {
+        const resultPromise = executeFn("call-s3", {
+          tasks: [{ to: "worker", content: "Do the task" }],
+          nextSteps: "next",
+        });
+
+        // 等待期间（去抖窗口内）模拟通道投递：成员的非回复消息进缓冲。
+        // sendToTl 的缓冲分支已在 message-channel.test.ts 锁定；此处直接
+        // 向 gate 注入以驱动 flush 路径。
+        gate.buffer({ id: "m1", from: "worker", to: "tl", content: "等待期间的补充汇报", timestamp: Date.now() });
+        gate.buffer({ id: "m2", from: "analyst", to: "tl", content: "顺手发现的问题", subject: "侧线发现", timestamp: Date.now() });
+
+        await vi.advanceTimersByTimeAsync(
+          WAIT_IDLE_CHECK_INTERVAL_MS * (WAIT_IDLE_REQUIRED_CONSECUTIVE + 2)
+        );
+        const result = await resultPromise;
+
+        // 门控打开：缓冲消息以 steer 投递（单参数调用——无 nextTurn/followUp）
+        expect(piFlush.sendMessage).toHaveBeenCalledTimes(1);
+        const [msgArg, optionsArg] = (piFlush.sendMessage as ReturnType<typeof vi.fn>).mock.calls[0];
+        expect(msgArg.customType).toBe("team-message");
+        expect(msgArg.display).toBe(true);
+        expect(optionsArg).toBeUndefined(); // steer：注入在工具结果之后、同一回合
+        // 多条消息合并为一个注入：带合并包头 + 逐条标注（含 subject）
+        expect(msgArg.content).toContain("2 条消息");
+        expect(msgArg.content).toContain("来自 worker");
+        expect(msgArg.content).toContain("等待期间的补充汇报");
+        expect(msgArg.content).toContain("来自 analyst");
+        expect(msgArg.content).toContain("主题：侧线发现");
+        // 缓冲已清空；工具结果本身不受影响
+        expect(gate.drain()).toEqual([]);
+        expect(result.content[0].text).toContain("Task done");
+        expect(result.content[0].text).toContain("下一步计划");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("S3: 无 tlWaitGate 接线时零行为变化（legacy 路径，flush 直接跳过）", { timeout: 5000 }, async () => {
+      memberOpsStates.set("worker", "idle");
+      const piNoGate = {
+        ...createMockPi(),
+        sendMessage: vi.fn(),
+      };
+      const mockResponseWaiter = createMockResponseWaiter();
+      mockResponseWaiter.waitForResponse = vi.fn().mockResolvedValue({
+        status: "response",
+        from: "worker",
+        content: "Task done",
+      });
+
+      let executeFn: Function = () => {};
+      piNoGate.registerTool = vi.fn((def: any) => {
+        if (def.name === "team_send_and_wait") {
+          executeFn = def.execute;
+        }
+      });
+
+      registerTlTools({
+        pi: piNoGate as any,
+        manager,
+        responseWaiter: mockResponseWaiter,
+        memberOpsStates,
+        lastPendingCorrId,
+        messageQueue,
+        // 故意不传 tlWaitGate
+      });
+
+      vi.useFakeTimers();
+      try {
+        const resultPromise = executeFn("call-s3b", {
+          tasks: [{ to: "worker", content: "Do the task" }],
+          nextSteps: "next",
+        });
+        await vi.advanceTimersByTimeAsync(
+          WAIT_IDLE_CHECK_INTERVAL_MS * (WAIT_IDLE_REQUIRED_CONSECUTIVE + 2)
+        );
+        const result = await resultPromise;
+
+        expect(piNoGate.sendMessage).not.toHaveBeenCalled();
+        expect(result.content[0].text).toContain("Task done");
       } finally {
         vi.useRealTimers();
       }

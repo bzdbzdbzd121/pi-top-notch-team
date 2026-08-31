@@ -5,6 +5,7 @@ import type { ResponseWaiter, WaitResult } from "../channel/response-waiter";
 import type { MessageQueue } from "../channel/message-queue";
 import type { TeamMessage } from "../channel/types";
 import type { AutoCompactRuntime } from "../channel/auto-compact";
+import type { TlWaitGate } from "../channel/tl-wait-gate";
 import type { ResolvedAutoCompact } from "../settings/resolve-auto-compact";
 import type { TeamSettings } from "../settings/settings";
 import {
@@ -55,9 +56,15 @@ export interface TlToolsDeps {
    * Absent = the batch barrier is disabled (legacy path).
    */
   autoCompact?: AutoCompactRuntime;
+  /**
+   * TL wait gate (S3, from createMessageChannel): buffers member→TL messages
+   * during the wait so they can be steer-delivered at all-idle gate open.
+   * Absent = no buffering/flush (member→TL messages always nextTurn).
+   */
+  tlWaitGate?: TlWaitGate;
 }
 
-// ── Tool result types ──────────────────────────────────────
+// ── Tool result types ──────────────────────────────
 
 /** JSON Schema property descriptor (recursive). */
 export interface ToolParameterProperty {
@@ -444,7 +451,9 @@ export function registerTlTools(deps: TlToolsDeps): void {
         memberOpsStates,
         lastPendingCorrId,
         messageQueue,
+        pi: deps.pi,
         autoCompact: deps.autoCompact,
+        tlWaitGate: deps.tlWaitGate,
         getAutoCompact: deps.getAutoCompact,
         getSettings: deps.getSettings,
         getHandle: deps.getHandle,
@@ -622,10 +631,17 @@ interface SendAndWaitCtx {
   memberOpsStates: Map<string, MemberOperationalState>;
   lastPendingCorrId: Map<string, string>;
   messageQueue: MessageQueue;
+  /** TL extension API — used by the S3 wait-gate flush (steer delivery). */
+  pi?: ExtensionAPI;
   /** Shared auto-compaction runtime — required for the batch barrier. Absent = legacy path. */
   autoCompact?: AutoCompactRuntime;
   /** Resolve the effective auto-compaction config. Absent = feature disabled. */
   getAutoCompact?: () => ResolvedAutoCompact;
+  /**
+   * TL wait gate (S3): buffers member→TL messages during the wait; flushed
+   * via steer at all-idle gate open. Absent = no buffering/flush.
+   */
+  tlWaitGate?: TlWaitGate;
   /**
    * Resolve global team settings (per call). Powers the unified wait budget
    * (`waitTimeoutMinutes`) for the all-idle deadline and the batch barrier.
@@ -891,6 +907,56 @@ function generateCorrId(): string {
 }
 
 /**
+ * S3: deliver messages buffered during the wait (member→TL, non-reply) the
+ * moment the all-idle gate opens — no waiting for the TL's turn to end.
+ *
+ * Delivery: plain pi.sendMessage WITHOUT deliverAs — during tool execution
+ * the agent run is active (_isAgentRunActive covers tool execution), so pi
+ * takes the steer branch: the agent loop drains the steering queue AFTER
+ * tool results are appended and BEFORE the next assistant completion
+ * (pi 0.83.0 pi-agent-core agent-loop.js runLoop). The TL sees these
+ * messages in the SAME turn, immediately after the team_send_and_wait tool
+ * result; nothing is streaming during tool execution, so no interruption.
+ * If the run was aborted just before the flush, pi's not-streaming +
+ * no-triggerTurn branch appends the message to history without a turn —
+ * the message still lands in context, never lost.
+ *
+ * Fire-and-forget: delivery failure must not fail the tool result (the TL
+ * can still recover content via get_member_log).
+ */
+function flushTlWaitBuffer(ctx: SendAndWaitCtx): void {
+  const gate = ctx.tlWaitGate;
+  const pi = ctx.pi;
+  if (!gate || !pi) return;
+  const buffered = gate.drain();
+  if (buffered.length === 0) return;
+  const text =
+    buffered.length === 1
+      ? `[消息通道 - 来自 ${buffered[0].from}]\n${buffered[0].subject ? `主题：${buffered[0].subject}\n` : ""}${buffered[0].content}`
+      : `[消息通道]（等待期间到达的 ${buffered.length} 条消息，已随全员空闲即时注入）\n` +
+        buffered
+          .map(
+            (m, i) =>
+              `【消息 ${i + 1}/${buffered.length}｜来自 ${m.from}】${m.subject ? `主题：${m.subject}\n` : ""}${m.content}`
+          )
+          .join("\n\n");
+  try {
+    void Promise.resolve(
+      pi.sendMessage({
+        customType: "team-message",
+        content: text,
+        display: true,
+        details: { flushedFromWait: true, count: buffered.length },
+      })
+    ).catch(() => {
+      // Async delivery failure — fail-open (tool result unaffected).
+    });
+  } catch {
+    // Synchronous throw — fail-open.
+  }
+}
+
+/**
  * Wait until ALL members are idle, collecting task replies as they arrive.
  *
  * The all-idle gate is MANDATORY (consistent with wait_and_get_member_status,
@@ -928,10 +994,27 @@ async function waitWithAllIdleCheck(
   // compaction-timeout black hole) must not block team_send_and_wait
   // forever. On expiry the gate resolves with a diagnostic instead of
   // hanging — replies collected so far are returned as partial results.
-  const idleResult = await waitForAllIdle(
-    memberOpsStates,
-    resolveWaitIdleDeadlineMs(ctx.getSettings)
-  );
+  //
+  // S3 wait gate: while this wait is in flight, member→TL messages arriving
+  // through the channel buffer in tlWaitGate (instead of pi's nextTurn
+  // queue) so they can be delivered the moment the gate opens — see the
+  // flush right after.
+  ctx.tlWaitGate?.beginWait();
+  let idleResult: WaitForAllIdleResult;
+  try {
+    idleResult = await waitForAllIdle(
+      memberOpsStates,
+      resolveWaitIdleDeadlineMs(ctx.getSettings)
+    );
+  } finally {
+    ctx.tlWaitGate?.endWait();
+  }
+
+  // S3 flush: all members idle (or deadline expired) — deliver the buffered
+  // member→TL messages NOW via steer, in the same turn right after this
+  // tool result. Not waiting for the TL's turn to end is the whole point of
+  // the all-idle gate (decision #38) + S3 flush (decision #39).
+  flushTlWaitBuffer(ctx);
 
   // CorrId cleanup: resolved waits clear the lastPending registry; the rest
   // are cancelled so they don't leak in the waiter's pending map.

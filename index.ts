@@ -208,7 +208,7 @@ export default function (pi: ExtensionAPI) {
   let uiNotify: ((msg: string, type?: "info" | "warning" | "error") => void) | null = null;
 
   // ── Message channel: queue → router (extracted to src/setup/message-channel.ts) ──
-  const { router, messageQueue, responseWaiter, autoCompact, coalescer } = createMessageChannel({
+  const { router, messageQueue, responseWaiter, autoCompact, coalescer, tlWaitGate } = createMessageChannel({
     pi,
     memberOpsStates,
     lastPendingCorrId,
@@ -329,6 +329,9 @@ export default function (pi: ExtensionAPI) {
     memberOpsStates,
     lastPendingCorrId,
     messageQueue,
+    // S3（阶段 3）：等待期 member→TL 消息缓冲门控——team_send_and_wait 的
+    // all-idle 门控打开时经 steer 即时注入（同一回合、工具结果之后）。
+    tlWaitGate,
     createMember: (config) => {
       const handle = createAndRegisterMember(pi, config, memberLifecycleDeps);
       teamCtx.setHandle(config.name, handle);

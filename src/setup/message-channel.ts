@@ -13,6 +13,8 @@ import { createAutoCompactRuntime } from "../channel/auto-compact";
 import type { AutoCompactRuntime } from "../channel/auto-compact";
 import { createMessageCoalescer } from "../channel/message-coalescer";
 import type { MessageCoalescer } from "../channel/message-coalescer";
+import { createTlWaitGate } from "../channel/tl-wait-gate";
+import type { TlWaitGate } from "../channel/tl-wait-gate";
 import type { ResolvedAutoCompact } from "../settings/resolve-auto-compact";
 import type { ResolvedMessageCoalescing } from "../settings/resolve-message-coalescing";
 
@@ -48,6 +50,13 @@ export interface MessageChannel {
    * the SAME instance — bucket state is never split across paths.
    */
   coalescer: MessageCoalescer;
+  /**
+   * The TL wait gate (S3): buffers member→TL messages while a
+   * team_send_and_wait wait is in flight; the wait flushes them via steer
+   * the moment the all-idle gate opens (decision #38/39) — no waiting for
+   * the TL's turn to end (pi nextTurn queue).
+   */
+  tlWaitGate: TlWaitGate;
 }
 
 // ── createMessageChannel ───────────────────────────────────
@@ -76,6 +85,11 @@ export function createMessageChannel(deps: MessageChannelDeps): MessageChannel {
   // configured non-default limits take effect at every flush point).
   const coalescer = createMessageCoalescer(deps.getCoalescing);
 
+  // 1d. Create the TL wait gate (S3): member→TL messages buffer here while a
+  // team_send_and_wait wait is in flight; the wait drains + steer-delivers
+  // them at all-idle gate open (see tl-wait-gate.ts for the delivery timing).
+  const tlWaitGate = createTlWaitGate();
+
   // 2. Create router (callbacks capture responseWaiter + other deps)
   const router = createRouter({
     sendToMember: createSendToMember({
@@ -101,6 +115,15 @@ export function createMessageChannel(deps: MessageChannelDeps): MessageChannel {
           lastPendingCorrId.delete(msg.from);
           return; // consumed by waiter, skip sendMessage
         }
+      }
+      // S3（等待期缓冲，阶段 3）：team_send_and_wait 等待期间到达的非回复消息
+      // 改入 tlWaitGate 缓冲——等待的门控（全员空闲，决策 #38）一打开就由
+      // waitWithAllIdleCheck 经 steer 即时注入（工具结果之后、同一回合内），
+      // 不再等到 TL 回合结束。pi 的 nextTurn 队列无公开 drain API，故缓冲
+      // 决策必须在消息到达时做出。无等待在飞时保持 S2 nextTurn 语义不变。
+      if (tlWaitGate.isWaitActive()) {
+        tlWaitGate.buffer(msg);
+        return;
       }
       pi.sendMessage(
         {
@@ -152,5 +175,5 @@ export function createMessageChannel(deps: MessageChannelDeps): MessageChannel {
     }
   );
 
-  return { router, messageQueue, responseWaiter, autoCompact, coalescer };
+  return { router, messageQueue, responseWaiter, autoCompact, coalescer, tlWaitGate };
 }
