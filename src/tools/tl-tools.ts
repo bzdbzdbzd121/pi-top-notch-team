@@ -930,29 +930,25 @@ function flushTlWaitBuffer(ctx: SendAndWaitCtx): void {
   if (!gate || !pi) return;
   const buffered = gate.drain();
   if (buffered.length === 0) return;
-  const text =
-    buffered.length === 1
-      ? `[消息通道 - 来自 ${buffered[0].from}]\n${buffered[0].subject ? `主题：${buffered[0].subject}\n` : ""}${buffered[0].content}`
-      : `[消息通道]（等待期间到达的 ${buffered.length} 条消息，已随全员空闲即时注入）\n` +
-        buffered
-          .map(
-            (m, i) =>
-              `【消息 ${i + 1}/${buffered.length}｜来自 ${m.from}】${m.subject ? `主题：${m.subject}\n` : ""}${m.content}`
-          )
-          .join("\n\n");
-  try {
-    void Promise.resolve(
-      pi.sendMessage({
-        customType: "team-message",
-        content: text,
-        display: true,
-        details: { flushedFromWait: true, count: buffered.length },
-      })
-    ).catch(() => {
-      // Async delivery failure — fail-open (tool result unaffected).
-    });
-  } catch {
-    // Synchronous throw — fail-open.
+  // 注入格式（用户裁决：保持 TL 上下文干净）：每条缓冲消息以 S2 原格式
+  // 逐条独立注入——与 nextTurn 路径的消息外观完全一致，不加合并包头、
+  // 编号标注等元信息。多条 = 多个独立 custom message，全部落在同一个
+  // steering batch（下一 completion 前一次性注入，时序上仍紧随工具结果）。
+  for (const m of buffered) {
+    try {
+      void Promise.resolve(
+        pi.sendMessage({
+          customType: "team-message",
+          content: `[消息通道 - 来自 ${m.from}]\n${m.subject ? `主题：${m.subject}\n` : ""}${m.content}`,
+          display: true,
+          details: { msg: m },
+        })
+      ).catch(() => {
+        // Async delivery failure — fail-open (tool result unaffected).
+      });
+    } catch {
+      // Synchronous throw — fail-open.
+    }
   }
 }
 

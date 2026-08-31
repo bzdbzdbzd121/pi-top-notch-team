@@ -875,18 +875,20 @@ describe("registerTlTools", () => {
         );
         const result = await resultPromise;
 
-        // 门控打开：缓冲消息以 steer 投递（单参数调用——无 nextTurn/followUp）
-        expect(piFlush.sendMessage).toHaveBeenCalledTimes(1);
-        const [msgArg, optionsArg] = (piFlush.sendMessage as ReturnType<typeof vi.fn>).mock.calls[0];
-        expect(msgArg.customType).toBe("team-message");
-        expect(msgArg.display).toBe(true);
-        expect(optionsArg).toBeUndefined(); // steer：注入在工具结果之后、同一回合
-        // 多条消息合并为一个注入：带合并包头 + 逐条标注（含 subject）
-        expect(msgArg.content).toContain("2 条消息");
-        expect(msgArg.content).toContain("来自 worker");
-        expect(msgArg.content).toContain("等待期间的补充汇报");
-        expect(msgArg.content).toContain("来自 analyst");
-        expect(msgArg.content).toContain("主题：侧线发现");
+        // 门控打开：缓冲消息逐条以 S2 原格式 steer 投递（单参数调用——无 nextTurn/followUp）
+        expect(piFlush.sendMessage).toHaveBeenCalledTimes(2);
+        const calls = (piFlush.sendMessage as ReturnType<typeof vi.fn>).mock.calls;
+        for (const [m, opt] of calls) {
+          expect(m.customType).toBe("team-message");
+          expect(m.display).toBe(true);
+          expect(opt).toBeUndefined(); // steer：注入在工具结果之后、同一回合
+        }
+        // 逐条 S2 原格式、精确匹配：无合并包头 / 编号标注等元信息
+        //（用户裁决：保持 TL 上下文干净，与 nextTurn 路径消息外观完全一致）
+        expect(calls[0][0].content).toBe("[消息通道 - 来自 worker]\n等待期间的补充汇报");
+        expect(calls[1][0].content).toBe("[消息通道 - 来自 analyst]\n主题：侧线发现\n顺手发现的问题");
+        expect(calls[0][0].content).not.toContain("条消息");
+        expect(calls[0][0].content).not.toContain("【消息");
         // 缓冲已清空；工具结果本身不受影响
         expect(gate.drain()).toEqual([]);
         expect(result.content[0].text).toContain("Task done");
