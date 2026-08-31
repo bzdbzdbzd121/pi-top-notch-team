@@ -1,7 +1,13 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
-import type { TeamSettings } from "./settings";
+import { isMemberThinkingLevel } from "./resolve-thinking";
+import type {
+  AutoCompactSetting,
+  MemberModelSetting,
+  MessageCoalescingSetting,
+  TeamSettings,
+} from "./settings";
 
 /**
  * 临时设置（per-session settings）数据层。
@@ -15,7 +21,9 @@ import type { TeamSettings } from "./settings";
  *  3. /team resume 仅在内存 overlay 为空时从目标会话目录加载。
  *  4. 清除动作（clear/clearAll）同时清除内存与绑定快照（防「清了又复活」）。
  *  5. 失效机制：session_start 时 reconcile（派生信号，事件丢失免疫）+ session_shutdown
- *     清内存补充通道（双保险）。两者都只清内存、不清快照（快照保留供 resume）。
+ *     清内存补充通道（双保险）。两者都只清内存、不清快照（快照保留供 resume）；
+ *     但 reconcile 在会话变化时同时清 binding（仅内存）——跨会话残留的 binding 会让
+ *     新会话的无关清除动作误删旧会话快照（审查 #1）。
  */
 
 const SNAPSHOT_FILE = "session-settings.yaml";
@@ -36,15 +44,6 @@ let sessionSettings: DeepPartial<TeamSettings> = {};
 let sessionSettingsSessionId: string | null = null;
 /** 最近一次快照写入的团队会话目录（binding）。null = 未绑定（清除动作不触碰磁盘）。 */
 let bindingSessionDir: string | null = null;
-
-/** 快照文件只接受这 5 个 TeamSettings 顶层键（load 时过滤未知键）。 */
-const SESSION_SETTING_KEYS: readonly (keyof TeamSettings)[] = [
-  "memberModel",
-  "autoCompact",
-  "waitTimeoutMinutes",
-  "memberThinkingLevel",
-  "messageCoalescing",
-];
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -103,7 +102,9 @@ export function clearSessionSettingsMemory(): void {
 /**
  * 生命周期守卫（主失效通道）：session_start 时传入当前 pi sessionId。
  * 与记录值不同且 overlay 非空 → 清空内存 overlay（不删快照），返回 true。
- * 空串（会话标识不可用）→ no-op fail-open（不清除、不改写记录）。
+ * 会话变化时**无论 overlay 是否为空**都把 bindingSessionDir 置 null（仅内存、不碰磁盘）
+ * ——防止跨会话残留导致新会话的无关清除动作误删旧会话快照（审查 #1）。
+ * 空串（会话标识不可用）→ no-op fail-open（不清除、不改写记录、不清 binding）。
  */
 export function reconcileSessionSettings(sessionId: string): boolean {
   if (!sessionId) {
@@ -114,6 +115,7 @@ export function reconcileSessionSettings(sessionId: string): boolean {
   if (prev === sessionId) {
     return false;
   }
+  bindingSessionDir = null;
   if (Object.keys(sessionSettings).length === 0) {
     return false;
   }
@@ -152,23 +154,111 @@ export function resolveEffectiveSettings(
   return result as unknown as TeamSettings;
 }
 
+/** 整数区间校验（含边界）。 */
+function isIntInRange(value: unknown, min: number, max: number): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= min && value <= max;
+}
+
+/** 正整数校验。 */
+function isPositiveInt(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value > 0;
+}
+
+/**
+ * 快照内容字段级校验（镜像全局 loadSettings 的逐字段严格姿态）：
+ * 只保留已知顶层键中语义合法的字段，非法字段/非法值整体丢弃（fail-open 不变）。
+ * 未知键与 null 不进入 overlay（overlay 类型无 null 魔法；undefined = 不覆盖）。
+ */
+function sanitizeSnapshotData(data: Record<string, unknown>): DeepPartial<TeamSettings> {
+  const out: DeepPartial<TeamSettings> = {};
+
+  const mm = data.memberModel;
+  if (isPlainObject(mm)) {
+    const m: DeepPartial<MemberModelSetting> = {};
+    if (mm.mode === "follow" || mm.mode === "fixed") {
+      m.mode = mm.mode;
+    }
+    if (typeof mm.model === "string" && mm.model.length > 0) {
+      m.model = mm.model;
+    }
+    if (Object.keys(m).length > 0) {
+      out.memberModel = m;
+    }
+  }
+
+  const ac = data.autoCompact;
+  if (isPlainObject(ac)) {
+    const a: DeepPartial<AutoCompactSetting> = {};
+    if (typeof ac.enabled === "boolean") {
+      a.enabled = ac.enabled;
+    }
+    if (isIntInRange(ac.thresholdPercent, 1, 100)) {
+      a.thresholdPercent = ac.thresholdPercent;
+    }
+    if (isPositiveInt(ac.thresholdTokens)) {
+      a.thresholdTokens = ac.thresholdTokens;
+    }
+    if (isPositiveInt(ac.timeoutMinutes)) {
+      a.timeoutMinutes = ac.timeoutMinutes;
+    }
+    if (Object.keys(a).length > 0) {
+      out.autoCompact = a;
+    }
+  }
+
+  // waitTimeoutMinutes：0 = 不限（合法值），负值/非整数丢弃
+  if (isIntInRange(data.waitTimeoutMinutes, 0, Number.MAX_SAFE_INTEGER)) {
+    out.waitTimeoutMinutes = data.waitTimeoutMinutes;
+  }
+
+  const mtl = data.memberThinkingLevel;
+  if (isMemberThinkingLevel(mtl)) {
+    out.memberThinkingLevel = mtl;
+  }
+
+  const mc = data.messageCoalescing;
+  if (isPlainObject(mc)) {
+    const c: DeepPartial<MessageCoalescingSetting> = {};
+    if (typeof mc.enabled === "boolean") {
+      c.enabled = mc.enabled;
+    }
+    if (isPositiveInt(mc.maxBatchSize)) {
+      c.maxBatchSize = mc.maxBatchSize;
+    }
+    if (isPositiveInt(mc.maxBatchChars)) {
+      c.maxBatchChars = mc.maxBatchChars;
+    }
+    if (Object.keys(c).length > 0) {
+      out.messageCoalescing = c;
+    }
+  }
+
+  return out;
+}
+
 /**
  * 团队活跃期 overlay 变更后调用：把当前 overlay 原子写盘到 <sessionDir>/session-settings.yaml
- * （tmp+rename，无 .tmp 残留），成功后更新 binding。fs 失败 fail-open（内存照常生效，
- * 仅 resume 恢复能力降级），返回是否写入成功。
+ * （tmp+rename），成功后更新 binding。fs 失败 fail-open（内存照常生效，仅 resume 恢复能力
+ * 降级），返回是否写入成功。失败时清理 .tmp 残留（审查 #3）。
  */
 export function saveSessionSettingsSnapshot(sessionDir: string): boolean {
+  const filePath = getSessionSettingsSnapshotPath(sessionDir);
+  const tmpPath = `${filePath}.tmp`;
   try {
     if (!existsSync(sessionDir)) {
       mkdirSync(sessionDir, { recursive: true });
     }
-    const filePath = getSessionSettingsSnapshotPath(sessionDir);
-    const tmpPath = `${filePath}.tmp`;
     writeFileSync(tmpPath, stringifyYaml(sessionSettings, { lineWidth: 120 }), "utf-8");
     renameSync(tmpPath, filePath);
     bindingSessionDir = sessionDir;
     return true;
   } catch (err) {
+    try {
+      // rename 失败时清理已写入的 .tmp，避免残留文件堆积
+      rmSync(tmpPath, { force: true });
+    } catch {
+      // 清理失败 fail-open
+    }
     console.warn(
       `[top-notch-team] Failed to write session settings snapshot: ${
         err instanceof Error ? err.message : String(err)
@@ -183,7 +273,8 @@ export function saveSessionSettingsSnapshot(sessionDir: string): boolean {
  * 读快照并加载（本会话显式设置优先，S5）。加载成功后：
  *  - sessionSettingsSessionId 更新为当前 pi sessionId（防 reload 误清）；
  *  - binding 绑定到该会话目录（后续清除动作写回同一快照，防「清了又复活」）。
- * 文件缺失/解析失败 fail-open（忽略不报错），返回是否加载。
+ * 内容经字段级校验（sanitizeSnapshotData，非法字段丢弃）；文件缺失/解析失败/
+ * 无有效字段均 fail-open（忽略不报错），返回是否加载。
  */
 export function loadSessionSettingsSnapshot(sessionDir: string, currentSessionId: string): boolean {
   if (Object.keys(sessionSettings).length > 0) {
@@ -198,14 +289,11 @@ export function loadSessionSettingsSnapshot(sessionDir: string, currentSessionId
     if (!isPlainObject(data)) {
       return false;
     }
-    const loaded: Record<string, unknown> = {};
-    for (const key of SESSION_SETTING_KEYS) {
-      const value = data[key];
-      if (value !== undefined) {
-        loaded[key] = value;
-      }
+    const loaded = sanitizeSnapshotData(data);
+    if (Object.keys(loaded).length === 0) {
+      return false;
     }
-    sessionSettings = loaded as unknown as DeepPartial<TeamSettings>;
+    sessionSettings = loaded;
     if (currentSessionId) {
       sessionSettingsSessionId = currentSessionId;
     }

@@ -311,6 +311,17 @@ describe("snapshot primitives — save/load/clearBinding（resume 恢复通道�
     expect(getSessionSettings().waitTimeoutMinutes).toBe(5);
   });
 
+  it("save cleans up .tmp residue on rename failure (原子写失败无残留, 审查 #3)", () => {
+    // 目标路径已存在同名目录 → rename(file → dir) 必然失败（EISDIR）
+    mkdirSync(sessionDir, { recursive: true });
+    mkdirSync(getSessionSettingsSnapshotPath(sessionDir));
+    setSessionSetting("waitTimeoutMinutes", 5);
+    expect(saveSessionSettingsSnapshot(sessionDir)).toBe(false);
+    expect(existsSync(`${getSessionSettingsSnapshotPath(sessionDir)}.tmp`)).toBe(false);
+    // 内存照常生效
+    expect(getSessionSettings().waitTimeoutMinutes).toBe(5);
+  });
+
   it("load returns false without side effects when the file is missing", () => {
     setSessionSetting("waitTimeoutMinutes", 5);
     clearSessionSettingsMemory();
@@ -386,6 +397,71 @@ describe("snapshot primitives — save/load/clearBinding（resume 恢复通道�
     expect("sneakyKey" in overlay).toBe(false);
   });
 
+  it("load drops invalid field values (字段级类型校验镜像全局 loadSettings, 审查 #2)", () => {
+    mkdirSync(sessionDir, { recursive: true });
+    writeFileSync(
+      getSessionSettingsSnapshotPath(sessionDir),
+      [
+        "memberModel:",
+        "  mode: bogus",
+        "  model: 42",
+        "autoCompact:",
+        '  enabled: "yes"',
+        "  thresholdPercent: 55",
+        "  thresholdTokens: -1",
+        "  timeoutMinutes: 0",
+        "waitTimeoutMinutes: -3",
+        "memberThinkingLevel: ultra",
+        "messageCoalescing:",
+        "  enabled: false",
+        "  maxBatchSize: 0",
+        "  maxBatchChars: 4000",
+      ].join("\n"),
+      "utf-8"
+    );
+    expect(loadSessionSettingsSnapshot(sessionDir, "session-B")).toBe(true);
+    const overlay = getSessionSettings();
+    // 非法字段全部丢弃；合法字段逐个保留
+    expect(overlay.memberModel).toBeUndefined();
+    expect(overlay.autoCompact).toEqual({ thresholdPercent: 55 });
+    expect(overlay.waitTimeoutMinutes).toBeUndefined();
+    expect(overlay.memberThinkingLevel).toBeUndefined();
+    expect(overlay.messageCoalescing).toEqual({ enabled: false, maxBatchChars: 4000 });
+  });
+
+  it("load keeps valid scalars (0 = unlimited wait budget survives; all seven thinking levels accepted)", () => {
+    mkdirSync(sessionDir, { recursive: true });
+    writeFileSync(
+      getSessionSettingsSnapshotPath(sessionDir),
+      "waitTimeoutMinutes: 0\nmemberThinkingLevel: high\n",
+      "utf-8"
+    );
+    expect(loadSessionSettingsSnapshot(sessionDir, "session-B")).toBe(true);
+    expect(getSessionSettings()).toEqual({ waitTimeoutMinutes: 0, memberThinkingLevel: "high" });
+  });
+
+  it("load drops explicit null values (overlay 类型无 null 魔法)", () => {
+    mkdirSync(sessionDir, { recursive: true });
+    writeFileSync(
+      getSessionSettingsSnapshotPath(sessionDir),
+      "waitTimeoutMinutes: null\nautoCompact:\n  enabled: null\n",
+      "utf-8"
+    );
+    expect(loadSessionSettingsSnapshot(sessionDir, "session-B")).toBe(false);
+    expect(getSessionSettings()).toEqual({});
+  });
+
+  it("load returns false when no field survives validation (无可恢复内容)", () => {
+    mkdirSync(sessionDir, { recursive: true });
+    writeFileSync(
+      getSessionSettingsSnapshotPath(sessionDir),
+      "waitTimeoutMinutes: -3\nmemberThinkingLevel: ultra\n",
+      "utf-8"
+    );
+    expect(loadSessionSettingsSnapshot(sessionDir, "session-B")).toBe(false);
+    expect(getSessionSettings()).toEqual({});
+  });
+
   it("clearAllSessionSettings deletes the bound snapshot (S7: 清了不复活)", () => {
     setSessionSetting("waitTimeoutMinutes", 5);
     expect(saveSessionSettingsSnapshot(sessionDir)).toBe(true);
@@ -425,6 +501,49 @@ describe("snapshot primitives — save/load/clearBinding（resume 恢复通道�
     setSessionSetting("waitTimeoutMinutes", 5);
     clearSessionSetting("waitTimeoutMinutes");
     expect(getSessionSettings()).toEqual({});
+    expect(existsSync(getSessionSettingsSnapshotPath(sessionDir))).toBe(false);
+  });
+
+  it("session switch clears the binding — unrelated clearAll in the new session cannot delete the old snapshot (审查 #1 回归)", () => {
+    // 团队会话 A（pi session X）活跃期：set + save → binding = dirA
+    reconcileSessionSettings("session-X");
+    setSessionSetting("waitTimeoutMinutes", 5);
+    expect(saveSessionSettingsSnapshot(sessionDir)).toBe(true);
+    expect(existsSync(getSessionSettingsSnapshotPath(sessionDir))).toBe(true);
+
+    // /new → session Y：reconcile 清内存 + 清 binding（不碰磁盘）
+    expect(reconcileSessionSettings("session-Y")).toBe(true);
+    expect(getSessionSettings()).toEqual({});
+
+    // 会话 Y 中的无关清除动作不得删除旧会话快照
+    clearAllSessionSettings();
+    expect(existsSync(getSessionSettingsSnapshotPath(sessionDir))).toBe(true);
+
+    // 旧会话快照仍可被 resume 恢复
+    expect(loadSessionSettingsSnapshot(sessionDir, "session-Y")).toBe(true);
+    expect(getSessionSettings().waitTimeoutMinutes).toBe(5);
+  });
+
+  it("session switch clears the binding even when the overlay is already empty (shutdown-then-start 时序)", () => {
+    reconcileSessionSettings("session-X");
+    setSessionSetting("waitTimeoutMinutes", 5);
+    saveSessionSettingsSnapshot(sessionDir);
+    // shutdown 补充通道：只清内存、binding 保留（设计内）
+    clearSessionSettingsMemory();
+    expect(existsSync(getSessionSettingsSnapshotPath(sessionDir))).toBe(true);
+    // session_start(Y)：overlay 已空 → 不返回清除，但 binding 必须清（跨会话残留）
+    expect(reconcileSessionSettings("session-Y")).toBe(false);
+    // 无 binding → 空 overlay 的 clear 分支不触碰磁盘
+    clearSessionSetting("waitTimeoutMinutes");
+    expect(existsSync(getSessionSettingsSnapshotPath(sessionDir))).toBe(true);
+  });
+
+  it("same-session reconcile keeps the binding (clearAll still deletes the current snapshot, S7)", () => {
+    reconcileSessionSettings("session-X");
+    setSessionSetting("waitTimeoutMinutes", 5);
+    saveSessionSettingsSnapshot(sessionDir);
+    expect(reconcileSessionSettings("session-X")).toBe(false);
+    clearAllSessionSettings();
     expect(existsSync(getSessionSettingsSnapshotPath(sessionDir))).toBe(false);
   });
 
