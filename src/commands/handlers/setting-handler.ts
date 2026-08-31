@@ -94,8 +94,9 @@ function currentModelRef(ctx: ExtensionCommandContext): string | undefined {
  *   ⑦ 清除全部临时设置（仅 overlay 非空时显示）——内存 + 绑定快照双清（S7）。
  *
  * 子菜单路由：作用域=临时 → 工作对象为 effective（显示与编辑一致），每次变更
- * 经 persist 写入 overlay（setSessionSetting/clearSessionSetting，undefined =
- * 恢复全局）；作用域=全局 → 工作对象为磁盘全局，persist 直写 settings.yaml。
+ * 经 persist 做字段级 diff 写入 overlay（仅写与全局不同的字段，undefined =
+ * 跟随全局；diff 为空 → 解除该键 pin，不留幻影）；作用域=全局 → 工作对象
+ * 为磁盘全局，persist 直写 settings.yaml。
  * 复用既有 configure* 函数，仅 save 目标参数化（零重复逻辑）。
  *
  * 通知文案按场景：团队活跃期「（仅当前 pi 会话生效；/team resume 本团队会话时将
@@ -106,7 +107,6 @@ export async function handleSetting(
 ): Promise<void> {
   const rootDir = getRootDir();
   const global = loadSettings(rootDir);
-  const overlay = getSessionSettings();
   // 临时入口可用性：需要当前 pi 会话标识（fail-open：不可用则强制全局）
   const sessionId = ctx.sessionManager?.getSessionId?.() ?? "";
   const tempAvailable = sessionId !== "";
@@ -118,8 +118,10 @@ export async function handleSetting(
   let scope: SettingScope = tempAvailable ? "temp" : "global";
 
   for (;;) {
-    // 每次显示菜单时重算生效值（overlay 可能被子菜单/⑦变更）
-    const effective = resolveEffectiveSettings(global, getSessionSettings());
+    // 每轮重读 overlay：badge/⑦ 可见性绝不读过期快照（审查 #2）
+    const overlay = getSessionSettings();
+    // 每次显示菜单时重算生效值（overlay 可能被子菜单/⑦/外部通道变更）
+    const effective = resolveEffectiveSettings(global, overlay);
     const badge = (key: keyof TeamSettings) =>
       overlay[key] !== undefined ? " [临时]" : "";
 
@@ -176,11 +178,13 @@ export async function handleSetting(
     const persistFor = (key: keyof TeamSettings): (() => void) =>
       scope === "temp"
         ? () => {
-            const v = working[key];
-            if (v === undefined) {
-              clearSessionSetting(key); // 恢复全局（如「思考强度：默认」）
+            // 逐键 pin（审查 #1）：字段级 diff——仅写与 global 不同且非
+            // undefined 的字段（undefined = 跟随全局）；diff 为空 → 解除 pin。
+            const patch = diffOverlayPatch(key, working, global);
+            if (patch === undefined) {
+              clearSessionSetting(key);
             } else {
-              setSessionSetting(key, v as DeepPartial<TeamSettings[typeof key]>);
+              setSessionSetting(key, patch as DeepPartial<TeamSettings[typeof key]>);
             }
           }
         : () => saveSettings(working, rootDir);
@@ -200,8 +204,42 @@ export async function handleSetting(
   }
 }
 
-/** Parse a positive integer input; returns undefined on invalid input. */
-function parsePositiveInt(text: string): number | undefined {
+/**
+ * 字段级 diff（审查 #1 修复）：生成只含「用户实际变更字段」的 overlay 补丁。
+ * - 标量键（memberThinkingLevel / waitTimeoutMinutes）：仅当 working 值 ≠
+ *   global 值且非 undefined 时 pin；undefined（思考强度「默认」）→ 返回
+ *   undefined（调用方 clearSessionSetting 解除 pin）。
+ * - 对象键（memberModel / autoCompact / messageCoalescing）：逐子字段比较，
+ *   仅不同且非 undefined 的字段入 patch（undefined = 跟随全局，兄弟 pin
+ *   不受影响）；patch 为空 → 返回 undefined。
+ * 返回 undefined 表示「无需 pin」，调用方负责 clearSessionSetting。
+ * 效果：临时作用域只 pin 用户改动的字段——未触及字段不烘焙（全局后续变更
+ * 仍可传播）；清除操作若与全局一致则不留下幻影 pin（[临时] 徽标不常驻）。
+ */
+function diffOverlayPatch(
+  key: keyof TeamSettings,
+  working: TeamSettings,
+  global: TeamSettings,
+): DeepPartial<TeamSettings[typeof key]> | undefined {
+  const w = working[key];
+  const g = global[key];
+  if (w === undefined) return undefined;
+  if (typeof w !== "object" || w === null) {
+    return w !== g ? (w as DeepPartial<TeamSettings[typeof key]>) : undefined;
+  }
+  const patch: Record<string, unknown> = {};
+  const wObj = w as unknown as Record<string, unknown>;
+  const gObj = (g as unknown as Record<string, unknown> | undefined) ?? {};
+  for (const [f, wv] of Object.entries(wObj)) {
+    if (wv === undefined) continue; // undefined 字段不写（= 跟随全局）
+    if (wv !== gObj[f]) patch[f] = wv;
+  }
+  return Object.keys(patch).length > 0
+    ? (patch as DeepPartial<TeamSettings[typeof key]>)
+    : undefined;
+}
+
+/** Parse a positive integer input; returns undefined on invalid input. */function parsePositiveInt(text: string): number | undefined {
   const n = Number(text.trim());
   if (!Number.isInteger(n) || n < 1) return undefined;
   return n;

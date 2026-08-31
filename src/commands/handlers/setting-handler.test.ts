@@ -12,6 +12,7 @@ import {
   clearAllSessionSettings,
   setActiveSessionDir,
   resetSessionSettingsState,
+  resolveEffectiveSettings,
 } from "../../settings/session-settings";
 
 const MODEL_A = { provider: "anthropic", id: "claude-sonnet-4-5", name: "Claude Sonnet 4.5" } as any;
@@ -219,17 +220,26 @@ describe("/team setting — 临时设置作用域 (阶段 4)", () => {
   });
 
   it("default scope is 临时 — writes go to the overlay, settings.yaml untouched (文件内容断言)", async () => {
+    const { saveSettings, DEFAULT_SETTINGS } = await import("../../settings/settings");
+    // 全局已有固定模型（≠ 菜单要设置的 follow），使字段级 diff 产生 pin
+    const g = structuredClone(DEFAULT_SETTINGS);
+    g.memberModel = { mode: "fixed", model: "openai/gpt-5" };
+    saveSettings(g, tmpDir);
+
     const ctx = createCtx({
       sessionId: "session-A",
       selectImpl: pickContaining("成员默认模型", "跟随当前配置"),
     });
     await handleSetting(ctx as any);
 
-    // 内存 overlay 生效
+    // 内存 overlay 生效（字段级 pin：只写变更的 mode）
     expect(getSessionSettings().memberModel).toEqual({ mode: "follow" });
     // 全局文件零污染
-    expect(existsSync(join(tmpDir, "settings.yaml"))).toBe(false);
-    expect(loadSettings(tmpDir).memberModel.mode).toBe("follow");
+    expect(loadSettings(tmpDir).memberModel.mode).toBe("fixed");
+    // merge 生效值 = follow（字段级 pin：mode 覆盖，全局 model 字段随 merge 存活）
+    expect(
+      resolveEffectiveSettings(loadSettings(tmpDir), getSessionSettings()).memberModel
+    ).toMatchObject({ mode: "follow" });
     // 通知含临时语义（会话外：重启后失效）
     expect(ctx.ui.notify).toHaveBeenCalledWith(
       expect.stringContaining("仅当前 pi 会话生效"),
@@ -306,7 +316,7 @@ describe("/team setting — 临时设置作用域 (阶段 4)", () => {
     expect(seen2[0]?.find((o) => o.includes("等待上限"))).not.toContain("[临时]");
   });
 
-  it("temp-scope submenu edits the overlay only (global file untouched)", async () => {
+  it("temp-scope submenu edits the overlay only — 字段级 pin（global file untouched）", async () => {
     const { saveSettings, DEFAULT_SETTINGS } = await import("../../settings/settings");
     saveSettings(structuredClone(DEFAULT_SETTINGS), tmpDir);
     // 覆盖层只 pin thresholdPercent
@@ -318,11 +328,11 @@ describe("/team setting — 临时设置作用域 (阶段 4)", () => {
     });
     await handleSetting(ctx as any);
 
-    // overlay：enabled 翻转（未 pin 字段沿用全局值 10）
+    // overlay：只 pin 变更字段——enabled 翻转 + 已 pin 的 55%；全局的
+    // timeoutMinutes(10) 不烘焙进 overlay（跟随全局）
     expect(getSessionSettings().autoCompact).toEqual({
       enabled: false,
       thresholdPercent: 55,
-      timeoutMinutes: 10,
     });
     // 全局文件内容不变
     expect(loadSettings(tmpDir).autoCompact.enabled).toBe(true);
@@ -438,5 +448,130 @@ describe("/team setting — 临时作用域持久化分支 (阶段 4)", () => {
       expect.stringContaining("仅当前 pi 会话生效"),
       "info"
     );
+  });
+});
+
+describe("/team setting — 阶段 4 审查修复 (字段级 pin)", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "team-setting-review-"));
+    process.env.TOP_NOTCH_TEAM_ROOT = tmpDir;
+    resetSessionSettingsState();
+  });
+
+  afterEach(() => {
+    endSession();
+    resetSessionSettingsState();
+    delete process.env.TOP_NOTCH_TEAM_ROOT;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("复现 A：未触及字段不烘焙进 overlay，全局后续变更可传播", async () => {
+    const { saveSettings, DEFAULT_SETTINGS } = await import("../../settings/settings");
+    // 全局 autoCompact{enabled:true, 80%, 10min}
+    saveSettings(structuredClone(DEFAULT_SETTINGS), tmpDir);
+
+    // 临时作用域关掉开关
+    const ctx = createCtx({
+      sessionId: "session-A",
+      selectImpl: pickContaining("自动压缩", "开关切换"),
+    });
+    await handleSetting(ctx as any);
+
+    // 只 pin 用户变更的 enabled——80%/10min 不得烘焙
+    expect(getSessionSettings().autoCompact).toEqual({ enabled: false });
+
+    // 模拟用户随后在全局把 timeoutMinutes 改 30
+    const g = loadSettings(tmpDir);
+    g.autoCompact.timeoutMinutes = 30;
+    saveSettings(g, tmpDir);
+
+    // 本会话生效值跟随全局（未被烘焙值冻结）
+    const effective = resolveEffectiveSettings(loadSettings(tmpDir), getSessionSettings());
+    expect(effective.autoCompact).toMatchObject({
+      enabled: false,
+      thresholdPercent: 80,
+      timeoutMinutes: 30,
+    });
+  });
+
+  it("复现 B：清除阈值 → patch 为空 → 解除 pin，无幻影徽标", async () => {
+    const { saveSettings, DEFAULT_SETTINGS } = await import("../../settings/settings");
+    saveSettings(structuredClone(DEFAULT_SETTINGS), tmpDir); // 全局 80%
+
+    const ctx = createCtx({
+      sessionId: "session-A",
+      selectImpl: pickContaining("自动压缩", "清除百分比阈值"),
+    });
+    await handleSetting(ctx as any);
+
+    // 有效值与全局一致 → 不 pin（无幻影 pin）
+    expect(getSessionSettings().autoCompact).toBeUndefined();
+    // 重新打开菜单：无 [临时] 徽标、无 ⑦
+    const seen: string[][] = [];
+    const ctx2 = createCtx({
+      sessionId: "session-A",
+      selectImpl: (_title, options) => {
+        seen.push(options);
+        return Promise.resolve(undefined);
+      },
+    });
+    await handleSetting(ctx2 as any);
+    const top = seen[0] ?? [];
+    expect(top.find((o) => o.includes("自动压缩"))).not.toContain("[临时]");
+    expect(top.some((o) => o.includes("清除全部临时设置"))).toBe(false);
+  });
+
+  it("标量键：与全局不同的值才 pin；相同值 → 解除 pin", async () => {
+    const { saveSettings, DEFAULT_SETTINGS } = await import("../../settings/settings");
+    const g = structuredClone(DEFAULT_SETTINGS);
+    g.waitTimeoutMinutes = 15;
+    saveSettings(g, tmpDir);
+
+    // 临时设为 5（≠ 全局 15）→ pin
+    const ctx = createCtx({
+      sessionId: "session-A",
+      selectImpl: pickContaining("等待上限"),
+    });
+    (ctx.ui.input as any).mockResolvedValue("5");
+    await handleSetting(ctx as any);
+    expect(getSessionSettings().waitTimeoutMinutes).toBe(5);
+
+    // 临时设为与全局相同的 15 → 解除 pin
+    const ctx2 = createCtx({
+      sessionId: "session-A",
+      selectImpl: pickContaining("等待上限"),
+    });
+    (ctx2.ui.input as any).mockResolvedValue("15");
+    await handleSetting(ctx2 as any);
+    expect(getSessionSettings().waitTimeoutMinutes).toBeUndefined();
+  });
+
+  it("顶层循环每轮重读 overlay：切换作用域重显时 badge/⑦ 反映最新 overlay", async () => {
+    let pass = 0;
+    const first: string[][] = [];
+    const second: string[][] = [];
+    const ctx = createCtx({
+      sessionId: "session-A",
+      selectImpl: (_title, options) => {
+        pass++;
+        if (pass === 1) {
+          first.push(options);
+          // 菜单显示期间外部写入 overlay（模拟其他通道/未来路径）
+          setSessionSetting("waitTimeoutMinutes", 3);
+          return Promise.resolve(options.find((o) => o.includes("设置作用域")));
+        }
+        second.push(options);
+        return Promise.resolve(undefined);
+      },
+    });
+    await handleSetting(ctx as any);
+
+    // 第一轮菜单：overlay 尚空 → 无 ⑦
+    expect(first[0]?.some((o) => o.includes("清除全部临时设置"))).toBe(false);
+    // 第二轮（切换作用域后重显）：overlay 已非空 → ⑦ 出现 + [临时] 徽标
+    expect(second[0]?.some((o) => o.includes("清除全部临时设置"))).toBe(true);
+    expect(second[0]?.find((o) => o.includes("等待上限"))).toContain("[临时]");
   });
 });
