@@ -247,7 +247,7 @@ src/
 29. **自动压缩超时事件驱动出口（Phase 1 止血）** — 修复「压缩超时→成员永久 working→wait 工具卡死」根因链的止血层（根治见 Phase 2 方案，未实施）：
     - **1.1 compaction_end 消费分支**（`src/channel/event-handler.ts`）：成员端 `compaction_end` 事件（无论成败必发，F7 盲区）是压缩生命周期的**权威心跳**——TL 端 `timeoutMinutes` 只是「停止主动等待」的租约，到期 ≠ 压缩失败。收到事件 → `autoCompact.endCompaction`（compacting→idle）→ `flushPending` 派发积压消息（→working→agent_end→idle 全链路）；此前发生过 compactNow 超时的场景通知 TL「压缩已于 N 分钟后结束，积压消息已自动补发」（正常路径静默）。超时痕迹由 runtime 新原语 `markCompactionTimeout`/`takeCompactionTimeout`（per-member Map，`compactNow` 在本地租约超时错误（`timed out`）时记录，非超时失败不记录——成员端已结算）承接，消费一次即清。**审查修订（重要）——在飞租约守卫**：成员端先 emit `compaction_end`、后写 compact 响应（agent-session.js → rpc-mode.js），故每次租约内成功的压缩，事件都会在 compactNow 响应前到达。runtime 新增在飞租约跟踪（`hasInFlightCompaction`/`markCompactionEndDuringLease`，compactNow 登记、settle 后清除），分支开头 `if (hasInFlightCompaction) return`——在飞期间由持有流程（内联 finally / 批屏障）负责退出与**按序**补发（当前消息 A 先、pending FIFO 后），杜绝顺序反转（B 先于 A）与双重压缩窗口（提前复位 idle 后亚毫秒窗口重派发→第二个 compact）。仅「无在飞租约」（超时后心跳）才执行 endCompaction+flush+通知。**near-miss 陈旧 mark 抑制（建议 1）**：心跳在租约在飞期间到达（压缩实际已完成、响应延迟过租约）→ 超时 catch 不记录 mark（`compactionEndDuringLease` 按租约起始时间戳校验），防止残留 mark 误报下一次压缩的「压缩已于 N 分钟后结束」。
     - **1.2 拒收分支状态纠正（get_state 判定，beta 形态）**：prompt 拒收分支（`success===false && id===undefined`）在 resolve+通知后追加 `get_state` 查询（3s 超时 fail-open，runtime 新原语 `queryCompactionState`，复用 queryStats 模式）——`isCompacting===true` → 置 `compacting`（状态机新事件 `compaction_confirmed`：working→compacting 纠正黑洞状态；出口由 1.1 提供；新消息经 sendToMember 的 compacting 分支自动入 pending → **双重压缩循环结构上消灭**）；`false` → 置 `idle`（`task_completed` 事件，纯函数纪律）；查询失败 → `idle`+通知（保守）。通知文案诚实化：删除「已直接派发任务」假陈述，改为「消息未送达（已丢失，请稍后重试）…已按实际状态恢复」。**审查修订（建议 2）——陈旧答案不覆盖新状态**：查询窗口（≤3s）内若真实回合开始（agent_start/agent_end）或进程退出（process_exit/process_error），handler 内 per-member `stateGeneration` 递增；纠正应用前校验「状态仍为拒收快照 + 代际未变」，否则跳过（陈旧 isCompacting=false 覆盖 running turn 为假 idle、或陈旧 true 覆盖新 prompt 为假 compacting 均被杜绝；查询失败路径同守）。`compaction_end` 刻意不计入代际：单管道 FIFO 下 **true 答案恒先于事件到达**（成员查询时仍在压缩 → 响应先于 compaction_end 写出），而 false 答案可能后至（查询时压缩已结束）——计入代际会误杀后至 false 的正常闭合路径，且会让已结算租约的心跳流程（endCompaction 对 working 是 no-op）困死在 working。
-    - **1.3 waitForAllIdle deadline（防御纵深最后一道）**：`waitForAllIdle` 增加 deadline（默认 15 分钟，复用顶层 `waitTimeoutMinutes` 预算语义，0=不限保持现状；`resolveWaitIdleDeadlineMs` 解析）；到期返回**诊断结果**（`timedOut` + 疑似卡死成员清单 + 建议 stop_member / `/team stop` 后 `/team resume`）而非无限挂起——`wait_and_get_member_status` 与 `team_send_and_wait` 的 all-idle 竞速路径同时受益（后者 partial 结果追加诊断）；`setInterval` 加 `unref`（与批屏障 `waitForMembersIdle` 一致，Esc 中断后无轮询泄漏）；wait 结束后状态重读（输出反映 post-wait 现实，不再用 pre-wait 快照）。
+    - **1.3 waitForAllIdle deadline（防御纵深最后一道）**：`waitForAllIdle` 增加 deadline（默认 15 分钟，复用顶层 `waitTimeoutMinutes` 预算语义，0=不限保持现状；`resolveWaitIdleDeadlineMs` 解析）；到期返回**诊断结果**（`timedOut` + 疑似卡死成员清单 + 建议 stop_member / `/team stop` 后 `/team resume`）而非无限挂起——`wait_and_get_member_status` 与 `team_send_and_wait` 的 all-idle 等待门控（决策 #38）同时受益（后者 partial 结果追加诊断）；`setInterval` 加 `unref`（与批屏障 `waitForMembersIdle` 一致，Esc 中断后无轮询泄漏）；wait 结束后状态重读（输出反映 post-wait 现实，不再用 pre-wait 快照）。
     - **DI/接线**：`EventHandlerDeps` 新增 `autoCompact?`（共享 runtime）与 `memberHandles?`（get_state 查询 + flush 派发）；`MemberLifecycleDeps` 同步新增并转发；`index.ts` 注入。共享派发提取为模块级 `dispatchPromptToMember`（PromptDispatchDeps），内联路径与 compaction_end flush 路径同一套发送语义（working 标记 + followUp）。
     - **测试（37 个新用例，含审查修订 7 个）**：拒收分支状态恢复断言（compacting/idle/查询失败/无接线四态）、诚实文案、compaction_end 分支（正常静默/超时通知/无 runtime no-op/working 不动）、双重压缩防护（compacting 成员新消息入 pending→compaction_end flush，期间零 RPC）、状态机 `compaction_confirmed` 转换表、runtime 新原语、wait deadline 诊断/0=不限/unref 存在性、压缩超时→拒收→纠正→wait 正常返回回归；审查修订：在飞租约守卫集成用例（compaction_end 先于 compact 响应→A→B→C 顺序 + 窗口零二次压缩）、租约生命周期、near-miss 陈旧 mark 抑制、陈旧答案不覆盖（agent_start 窗口 skip×2）。
 30. **自动压缩超时根治（Phase 2：事件驱动派发，三出口闭合）** — 依赖 Phase 1（#29）；根治「超时后仍派发必被拒收 → 消息丢失」：
@@ -303,6 +303,12 @@ src/
     - **与既有机制交互**：压缩 pending 桶与合并桶**双桶正交**——compacting 期间消息走既有 `queueDuringCompaction`/`flushPending`（逐条、在飞租约/超时 mark/flush 顺序测试零触碰）；合并包触发压缩时作为单条消息入压缩 pending，压缩后整体派发（至多一次压缩检查，省 RPC）；settlement 窗口（agent_end 后 idle、pi 仍 streaming）内到达消息按「idle+桶空」立即派发（followUp 保序，方案接受）；flush 失败（拒收）→ 复用既有拒收分支（状态纠正 + 通知），通知注明合并包条数，**清桶不重试**（无等待链消息无重试契约，同时消除 idle+桶非空停滞态）。
     - **DI/接线**：`createMessageChannel` 创建共享 coalescer 实例（返回 `MessageChannel.coalescer`），`createSendToMember` 注册 flusher（合并包构建 + `dispatchWithAutoCompact`）；`EventHandlerDeps`/`MemberLifecycleDeps` 转发（agent_end flush / compaction_end 后 flush / process_exit·process_error drain）；`getCoalescing` per-dispatch 解析（设置即时生效）。
     - **测试（35 新例）**：coalescer 模块 14（前缀/上限/单条超限/原子取出/flusher 生命周期/drain）；settings 5 + resolve 6；event-handler 场景 A（忙时 3→1 回合）/B（idle 突发 2 回合）/D（corrId 保序）/E（旁路）/F（5+1 分批留桶）/G（退出 drain 通知）/I（开关）+ subject 保留 + 合并包触发一次压缩检查（9 新 + 2 更新），全量 1285 通过；压缩全链既有测试零改动。
+38. **team_send_and_wait 强制 all-idle 门控（与 wait_and_get_member_status 一致）** — 用户需求：旧语义是「全员回复 OR 全员空闲」的竞速（`Promise.race([allDone, allIdle])`），目标成员全部回复即立即返回——但回复到达时该 member 可能仍在收尾回合（settlement window），非目标 member 也可能仍在处理先前派发，TL 过早继续会与仍在运行的 member 状态错位。修复：`waitWithAllIdleCheck` 重写——
+    - **唯一返回条件 = `waitForAllIdle` 门控**（与 `wait_and_get_member_status` 同一检测：active = working/compacting，去抖 4 次连续 3s 检查）；回复仅经 fire-and-forget 的 `waitForResponse().then()` 收集进 `results`，不再参与竞速。全员回复 + 全员空闲 → 完整结果（`details: {nextSteps}`）；否则 partial（`{allIdle, partial, nextSteps}`）+ ⚠️ 标记；deadline（`waitTimeoutMinutes`，默认 15 分钟，0=不限）到期 → partial + 卡死成员诊断（两分支统一由门控结果驱动）。
+    - **corrId 清理统一**：门控结束后已回复者清 `lastPendingCorrId`、未回复者 `cancelByCorrId`（微任务语义保证结果收集先于同步清理，与旧 all-idle 分支一致）。
+    - **防御性宽容**：`Promise.resolve(waitForResponse(...))` 包裹——容忍返回裸值的 mock（waitForResponse 契约恒为 Promise，纯测试兼容）。
+    - **成本特性（语义接受）**：最后一名 member 空闲后仍需 ~12s 去抖窗口才返回（与 wait_and_get_member_status 在成员活跃时调用的行为一致）；被 channel 的 followUp 语义抵消了误判风险（settlement window 内派发会排队不丢失）。
+    - **测试**：新增核心语义用例（回复已到但非目标 member 仍 working → 推过整个去抖窗口等待不结束；转 idle 后放行）+ deadline 用例措辞更新；两处测试文件以 `runWithSettledAllIdle` / `settleAllIdleGate`（fake timers 推去抖窗口）改造成功路径用例（避免每个用例真实等待 ~12s）；压缩租约超时用例改推 15 分钟 deadline（成员保持 compacting 时门控无法去抖）。全量 1302 通过。
 
 ## Dependency Injection Pattern
 
@@ -367,8 +373,11 @@ team_send_and_wait flow:
   TL calls team_send_and_wait({tasks: [{to, content}], nextSteps}) →
     → responseWaiter.waitForResponse(corrId)
     → Message enqueued with <corr:...> tag
-    → Member replies → responseWaiter.resolveIfWaiting(corrId, ...) → TL continues
-    → All-idle detection: returns early when all members are idle
+    → Member replies → responseWaiter.resolveIfWaiting(corrId, ...) → 结果仅记录，等待继续
+    → All-idle gate（强制门控，决策 #38）：等待仅在所有 member 空闲（idle/crashed/stopped）
+      时结束——与 wait_and_get_member_status 同一检测；回复本身不结束等待
+      （回复的 member 可能仍在收尾，非目标 member 可能仍在处理先前任务）。
+      deadline（waitTimeoutMinutes，默认 15 分钟）到期 → partial 结果 + 卡死成员诊断
 ```
 
 ## Team Definition Format
@@ -477,8 +486,8 @@ printf '' | timeout 10 ./node_modules/.bin/pi --mode json --no-tools -e ./index.
 | `stop_member(name)` | Gracefully terminate a Member process |
 | `list_members()` | Show all member statuses |
 | `get_member_log(name, lines?, maxContentLength?)` | Query Member's recent session via RPC. `maxContentLength` truncates each message content (default 200 chars). Truncation uses `slice(0, max-3) + "..."` so total length = maxContentLength. |
-| `wait_and_get_member_status()` | 等待所有 member 空闲后查看所有 Member 的运行状态 (idle/working/crashed/stopped)。No parameters. 如果任何 member 仍在工作中会阻塞，和 team_send_and_wait 检测 all-idle 的方式相同。 |
-| `team_send_and_wait({tasks: [{to, content}], nextSteps})` | Send message(s) to **one or more** team members and wait for ALL responses. tasks 支持批量发送到不同 member 实现并发执行。Waits until all targeted members reply or all become idle. Returns partial results if some members fail. nextSteps 在 wait 结束后随结果返回。
+| `wait_and_get_member_status()` | 等待所有 member 空闲后查看所有 Member 的运行状态 (idle/working/crashed/stopped)。No parameters. 如果任何 member 仍在工作中会阻塞，和 team_send_and_wait 的 all-idle 门控完全一致（team_send_and_wait 同样必须等到全员空闲才结束等待，见决策 #38）。 |
+| `team_send_and_wait({tasks: [{to, content}], nextSteps})` | Send message(s) to **one or more** team members and WAIT until ALL members are idle（决策 #38：回复到达不结束等待——必须等到全员空闲，与 wait_and_get_member_status 一致；回复在等待期间陆续收集，门控结束后一并返回）. tasks 支持批量发送到不同 member 实现并发执行。Returns partial results if some members fail. nextSteps 在 wait 结束后随结果返回。
 >
 > **批屏障（统一开始）**：多 task 批次（tasks.length > 1）中若有成员需自动压缩，整批 prompt 在**最后一个需要的压缩完成后才统一派发**——一个都不先跑（压缩完成后任务间仍并发执行）。屏障对 TL **完全静默**（TL 无需感知压缩屏障，只感知更长的等待），受批预算限制（默认 15 分钟，`/team setting` 可调，0=不限）。单任务批次与 autoCompact 关闭时完全走旧路径，零预检。
 >

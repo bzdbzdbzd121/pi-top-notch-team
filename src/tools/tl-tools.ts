@@ -353,9 +353,11 @@ export function registerTlTools(deps: TlToolsDeps): void {
     name: "team_send_and_wait",
     label: "Send Message and Wait",
     description:
-      "Send message(s) to one or more team members and WAIT for their responses. "
+      "Send message(s) to one or more team members and WAIT until ALL members are idle. "
       + "Use instead of team_send_message when you need the member result.\n"
-      + "Waits until ALL targeted members reply or all members become idle.\n"
+      + "The wait does NOT end when replies arrive — it ends ONLY when every member is idle "
+      + "(same all-idle detection as wait_and_get_member_status). Replies are collected as they arrive "
+      + "and returned when the wait ends; a member that replied mid-turn may still be finishing its work.\n"
       + "Params: tasks (array of {to, content}), nextSteps (下一步计划，wait 结束后返回给 TL 以强调工作流程).\n"
       + "For a single member: tasks: [{to: \"name\", content: \"...\"}].\n"
       + "For multiple concurrent members: tasks: [{to: \"a\", content: \"...\"}, {to: \"b\", content: \"...\"}]",
@@ -382,7 +384,8 @@ export function registerTlTools(deps: TlToolsDeps): void {
       "BATCH ADVANTAGE: concurrent execution — total wall-clock time ≈ slowest single task rather than sum of all tasks.",
       "SEQUENTIAL COST: total wall-clock time = sum of all task durations; every pause between tasks adds latency.",
       "BATCH ALIGNMENT (自动压缩): in a multi-task batch, if a member needs auto-compaction, ALL prompts of the batch wait until the LAST needed compaction finishes, then dispatch together — no member starts early (unified start). The barrier is internal and fully silent — the TL only experiences a longer wait, bounded by the batch budget (default 15 min, /team setting).",
-      "team_send_and_wait waits for ALL tasks to complete. Returns PARTIAL results if some members become idle without replying — in batch mode, one member's failure does not block the other members' results from being returned.",
+      "team_send_and_wait ends ONLY when ALL members are idle — same all-idle detection as wait_and_get_member_status. Replies arriving early do NOT end the wait: a member that replied may still be finishing its turn, and other members may still be working. Do not re-dispatch to a member while a wait is running.",
+      "Returns PARTIAL results if some members went idle/crashed without replying — in batch mode, one member's failure does not block the other members' results from being returned.",
       "Always fill in nextSteps with what you plan to do after the wait ends — it will be returned to you to keep the workflow on track.",
     ],
     parameters: {
@@ -456,7 +459,7 @@ export function registerTlTools(deps: TlToolsDeps): void {
     description:
       "等待所有 member 空闲后查看所有 Member 的运行状态 (idle/working/crashed/stopped)。" +
       "No parameters. 如果任何 member 仍在工作中，该工具会阻塞直到所有 member 变为 idle。" +
-      "和 team_send_and_wait 检测 all-idle 的方式相同。",
+      "和 team_send_and_wait 的 all-idle 检测方式完全相同（team_send_and_wait 现在也必须等到全员空闲才结束等待）。",
     promptGuidelines: [
       "Use wait_and_get_member_status FIRST to quickly check if members are idle, working, or crashed.",
       "wait_and_get_member_status now WAITS until all members are idle before returning.",
@@ -888,8 +891,14 @@ function generateCorrId(): string {
 }
 
 /**
- * Wait for ALL pending tasks to complete, or all members to become idle
- * (partial completion). Returns combined results.
+ * Wait until ALL members are idle, collecting task replies as they arrive.
+ *
+ * The all-idle gate is MANDATORY (consistent with wait_and_get_member_status,
+ * per user requirement): replies alone never end the wait — a member that
+ * replied mid-turn may still be working, and non-targeted members may still
+ * be processing earlier dispatches. The wait ends only when every member is
+ * in a non-active state (idle / crashed / stopped), or when the unified wait
+ * deadline expires (partial results + stuck-member diagnostic).
  */
 async function waitWithAllIdleCheck(
   tasks: PendingTask[],
@@ -902,77 +911,57 @@ async function waitWithAllIdleCheck(
   const nextStepsFooter = "\n\n---\n下一步计划：" + nextSteps;
   const preambleBlock = preamble ? preamble + "\n\n---\n" : "";
 
-  // Collect results as they arrive
+  // Collect results as they arrive (fire-and-forget: waitForResponse never
+  // rejects; still-unresolved waits are cancelled after the gate resolves).
   const results = new Map<string, WaitResult>();
+  for (const t of tasks) {
+    // Promise.resolve wrap: tolerates waiters that return a bare value
+    // (defensive; the real ResponseWaiter always returns a Promise).
+    void Promise.resolve(responseWaiter.waitForResponse(t.corrId)).then((r) => {
+      results.set(t.to, r);
+    });
+  }
 
-  // Create individual wait promises that record results when resolved
-  const waitPromises = tasks.map(async (t) => {
-    const r = await responseWaiter.waitForResponse(t.corrId);
-    results.set(t.to, r);
-    return r;
-  });
-
-  const allDonePromise = Promise.all(waitPromises);
-  // Phase 1: the all-idle race is bounded by the same deadline (default
-  // 15 min / wait budget) — a member stuck in `working` (the compaction-
-  // timeout black hole) must not block team_send_and_wait forever. On
-  // expiry the all-idle branch returns partial results + a diagnostic.
-  const allIdlePromise = waitForAllIdle(
+  // Mandatory all-idle gate — the sole return condition. Bounded by the
+  // same deadline as wait_and_get_member_status (default 15 min / wait
+  // budget, 0 = unlimited): a member stuck in `working` (e.g. the
+  // compaction-timeout black hole) must not block team_send_and_wait
+  // forever. On expiry the gate resolves with a diagnostic instead of
+  // hanging — replies collected so far are returned as partial results.
+  const idleResult = await waitForAllIdle(
     memberOpsStates,
     resolveWaitIdleDeadlineMs(ctx.getSettings)
   );
 
-  // Race: all tasks done vs all members idle
-  const raceResult = await Promise.race([
-    allDonePromise.then(() => "all_done" as const),
-    allIdlePromise.then(() => "all_idle" as const),
-  ]);
-
-  if (raceResult === "all_done") {
-    // All tasks completed successfully
-    for (const t of tasks) {
-      lastPendingCorrId.delete(t.to);
-    }
-    const parts: string[] = [];
-    for (const t of tasks) {
-      const r = results.get(t.to);
-      if (r && r.status === "response") {
-        parts.push(`[${r.from} reply] ${r.content}`);
-      } else if (r && r.status === "cancelled") {
-        parts.push(`[${t.to}] ⚠️ 等待被取消`);
-      }
-    }
-    return {
-      details: { nextSteps },
-      content: [{ type: "text" as const, text: preambleBlock + parts.join("\n\n---\n") + nextStepsFooter }],
-    };
-  }
-
-  // all_idle — collect partial results
+  // CorrId cleanup: resolved waits clear the lastPending registry; the rest
+  // are cancelled so they don't leak in the waiter's pending map.
   for (const t of tasks) {
-    if (!results.has(t.to)) {
-      responseWaiter.cancelByCorrId(t.corrId);
-    } else {
+    if (results.has(t.to)) {
       lastPendingCorrId.delete(t.to);
+    } else {
+      responseWaiter.cancelByCorrId(t.corrId);
     }
   }
 
   const parts: string[] = [];
+  let allReplied = true;
   for (const t of tasks) {
     const r = results.get(t.to);
     if (r && r.status === "response") {
       parts.push(`[${r.from} reply] ${r.content}`);
+    } else if (r && r.status === "cancelled") {
+      allReplied = false;
+      parts.push(`[${t.to}] ⚠️ 等待被取消`);
     } else {
+      allReplied = false;
       parts.push(`[${t.to}] ⚠️ 未收到回复（成员可能已停止或崩溃）`);
     }
   }
 
   let text = preambleBlock + parts.join("\n\n---\n") + nextStepsFooter;
-  // Phase 1: deadline-expiry diagnostic — the all-idle branch won the race
-  // because the deadline fired with members still active (stuck, not busy).
-  // The TL gets the suspect list + actionable advice instead of a bare
-  // partial result.
-  const idleResult = await allIdlePromise; // already resolved (race winner)
+  // Deadline-expiry diagnostic — the gate resolved because the deadline
+  // fired with members still active (stuck, not busy). The TL gets the
+  // suspect list + actionable advice instead of a bare partial result.
   if (idleResult.timedOut) {
     text +=
       `\n\n⚠️ 等待超时：以下成员在超时后仍处于活跃状态：${idleResult.stuckMembers.join("、")}。\n` +
@@ -980,7 +969,7 @@ async function waitWithAllIdleCheck(
   }
 
   return {
-    details: { allIdle: true, partial: true, nextSteps },
+    details: allReplied ? { nextSteps } : { allIdle: true, partial: true, nextSteps },
     content: [{ type: "text" as const, text }],
   };
 }

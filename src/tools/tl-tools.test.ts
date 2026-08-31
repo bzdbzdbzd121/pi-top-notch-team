@@ -61,6 +61,26 @@ function createMockResponseWaiter(): ResponseWaiter {
  *
  * passed=false 表示参数被框架层拦截（TypeBox oneOf 硬失败）。
  */
+/**
+ * all-idle 门控 helper：team_send_and_wait 的等待现在必须等到全员空闲
+ * （4 次连续 3s 检查的去抖）才返回。在 fake timers 下启动 execute 并
+ * 推进去抖窗口后再 await 结果，避免每个成功用例真实等待 ~12s。
+ * 注意：`start` 回调内部启动 execute（waitForAllIdle 的 setInterval 必须
+ * 在 fake timers 激活后创建）。
+ */
+async function runWithSettledAllIdle<T>(start: () => Promise<T>): Promise<T> {
+  vi.useFakeTimers();
+  try {
+    const execPromise = start();
+    await vi.advanceTimersByTimeAsync(
+      WAIT_IDLE_CHECK_INTERVAL_MS * (WAIT_IDLE_REQUIRED_CONSECUTIVE + 2)
+    );
+    return await execPromise;
+  } finally {
+    vi.useRealTimers();
+  }
+}
+
 async function executeViaFramework(toolDef: any, args: unknown) {
   // 真实流程：prepareArguments → validateToolArguments（Check）→ execute
   const prepared = toolDef.prepareArguments ? toolDef.prepareArguments(args) : args;
@@ -68,7 +88,10 @@ async function executeViaFramework(toolDef: any, args: unknown) {
   if (!validator.Check(prepared)) {
     return { passed: false as const, result: undefined };
   }
-  return { passed: true as const, result: (await toolDef.execute("call-1", prepared)) as any };
+  // all-idle 门控（与 wait_and_get_member_status 一致）：成员状态在这些
+  // 用例里均为 idle，去抖一定能满足。
+  const result = await runWithSettledAllIdle(() => toolDef.execute("call-1", prepared) as Promise<any>);
+  return { passed: true as const, result };
 }
 
 function createMockMessageQueue(): MessageQueue {
@@ -650,10 +673,21 @@ describe("registerTlTools", () => {
         messageQueue,
       });
 
-      const result = await executeFn("call-1", {
-        tasks: [{ to: "worker", content: "Do the task" }],
-        nextSteps: "Check the result and assign the next task",
-      });
+      // all-idle 门控：回复到达不再结束等待——必须推过全员空闲去抖窗口
+      vi.useFakeTimers();
+      let result: any;
+      try {
+        const resultPromise = executeFn("call-1", {
+          tasks: [{ to: "worker", content: "Do the task" }],
+          nextSteps: "Check the result and assign the next task",
+        });
+        await vi.advanceTimersByTimeAsync(
+          WAIT_IDLE_CHECK_INTERVAL_MS * (WAIT_IDLE_REQUIRED_CONSECUTIVE + 2)
+        );
+        result = await resultPromise;
+      } finally {
+        vi.useRealTimers();
+      }
 
       expect(messageQueue.enqueue).toHaveBeenCalledWith(
         expect.objectContaining({ to: "worker" })
@@ -691,28 +725,30 @@ describe("registerTlTools", () => {
         messageQueue,
       });
 
-      const resultPromise = executeFn("call-1", {
-        tasks: [
-          { to: "security-reviewer", content: "审查安全" },
-          { to: "perf-reviewer", content: "审查性能" },
-        ],
-        nextSteps: "合并审查意见",
+      const result = await runWithSettledAllIdle(async () => {
+        const resultPromise = executeFn("call-1", {
+          tasks: [
+            { to: "security-reviewer", content: "审查安全" },
+            { to: "perf-reviewer", content: "审查性能" },
+          ],
+          nextSteps: "合并审查意见",
+        });
+
+        // Verify both messages were enqueued
+        expect(messageQueue.enqueue).toHaveBeenCalledTimes(2);
+        expect(messageQueue.enqueue).toHaveBeenCalledWith(
+          expect.objectContaining({ to: "security-reviewer" })
+        );
+        expect(messageQueue.enqueue).toHaveBeenCalledWith(
+          expect.objectContaining({ to: "perf-reviewer" })
+        );
+
+        // Resolve both waiters —— 回复全部到达，但 all-idle 门控下等待仍需
+        // 推到全员空闲才结束（这正是本次变更的核心语义）
+        resolveFns[0]({ status: "response", from: "security-reviewer", content: "安全无问题" });
+        resolveFns[1]({ status: "response", from: "perf-reviewer", content: "发现 O(n²) 循环" });
+        return resultPromise;
       });
-
-      // Verify both messages were enqueued
-      expect(messageQueue.enqueue).toHaveBeenCalledTimes(2);
-      expect(messageQueue.enqueue).toHaveBeenCalledWith(
-        expect.objectContaining({ to: "security-reviewer" })
-      );
-      expect(messageQueue.enqueue).toHaveBeenCalledWith(
-        expect.objectContaining({ to: "perf-reviewer" })
-      );
-
-      // Resolve both waiters
-      resolveFns[0]({ status: "response", from: "security-reviewer", content: "安全无问题" });
-      resolveFns[1]({ status: "response", from: "perf-reviewer", content: "发现 O(n²) 循环" });
-
-      const result = await resultPromise;
 
       expect(result.content[0].text).toContain("security-reviewer");
       expect(result.content[0].text).toContain("安全无问题");
@@ -722,7 +758,69 @@ describe("registerTlTools", () => {
       expect(result.details).toEqual({ nextSteps: "合并审查意见" });
     });
 
-    it("team_send_and_wait returns partial results when all members become idle", {"timeout": 15000}, async () => {
+    it("all-idle gate: 回复到达不结束等待——必须等到全员空闲（本次变更核心语义）", { timeout: 5000 }, async () => {
+      // 用户需求：member 回复不再结束等待，必须等到所有 member 空闲才结束
+      //（与 wait_and_get_member_status 一致）——即使所有目标成员都已回复，
+      // 只要还有任何成员在 working，等待就继续。
+      memberOpsStates.set("security-reviewer", "idle");
+      memberOpsStates.set("busy-reviewer", "working"); // 非目标成员仍在工作
+
+      const mockResponseWaiter = createMockResponseWaiter();
+      mockResponseWaiter.waitForResponse = vi.fn().mockResolvedValue({
+        status: "response",
+        from: "security-reviewer",
+        content: "已回复，但别人还在干活",
+      });
+
+      let executeFn: Function = () => {};
+      pi.registerTool = vi.fn((def: any) => {
+        if (def.name === "team_send_and_wait") {
+          executeFn = def.execute;
+        }
+      });
+
+      registerTlTools({
+        pi,
+        manager,
+        responseWaiter: mockResponseWaiter,
+        memberOpsStates,
+        lastPendingCorrId,
+        messageQueue,
+      });
+
+      vi.useFakeTimers();
+      try {
+        const resultPromise = executeFn("call-gate", {
+          tasks: [{ to: "security-reviewer", content: "审查安全" }],
+          nextSteps: "汇总",
+        });
+
+        // 回复已到达（waiter 同步 resolve），但 busy-reviewer 仍在 working：
+        // 推过整个去抖窗口，等待不得结束（旧语义下 all_done 会立即返回）。
+        await vi.advanceTimersByTimeAsync(
+          WAIT_IDLE_CHECK_INTERVAL_MS * (WAIT_IDLE_REQUIRED_CONSECUTIVE + 2)
+        );
+        let settled = false;
+        void resultPromise.then(() => { settled = true; });
+        await vi.advanceTimersByTimeAsync(0); // flush microtasks
+        expect(settled).toBe(false);
+
+        // busy-reviewer 转为 idle → 门控在去抖窗口后放行，回复随结果返回
+        memberOpsStates.set("busy-reviewer", "idle");
+        await vi.advanceTimersByTimeAsync(
+          WAIT_IDLE_CHECK_INTERVAL_MS * (WAIT_IDLE_REQUIRED_CONSECUTIVE + 2)
+        );
+        const result = await resultPromise;
+
+        expect(result.details).toEqual({ nextSteps: "汇总" });
+        expect(result.content[0].text).toContain("已回复，但别人还在干活");
+        expect(result.content[0].text).not.toContain("等待超时");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("team_send_and_wait returns partial results when all members become idle", async () => {
       memberOpsStates.set("security-reviewer", "idle");
       memberOpsStates.set("perf-reviewer", "idle");
 
@@ -751,13 +849,16 @@ describe("registerTlTools", () => {
 
       callRegisterTlTools();
 
-      const result = await executeFn("call-2", {
-        tasks: [
-          { to: "security-reviewer", content: "审查安全" },
-          { to: "perf-reviewer", content: "审查性能" },
-        ],
-        nextSteps: "处理检查结果",
-      });
+      // 成员均 idle 且无人回复 → 门控在去抖窗口后返回 partial 结果
+      const result = await runWithSettledAllIdle(() =>
+        executeFn("call-2", {
+          tasks: [
+            { to: "security-reviewer", content: "审查安全" },
+            { to: "perf-reviewer", content: "审查性能" },
+          ],
+          nextSteps: "处理检查结果",
+        }) as Promise<any>
+      );
 
       expect(result.details).toHaveProperty("allIdle");
       expect(result.details).toHaveProperty("partial");
@@ -769,7 +870,7 @@ describe("registerTlTools", () => {
       expect(result.content[0].text).toContain("⚠️");
     });
 
-    it("team_send_and_wait all-idle race: deadline expiry returns partial + stuck-member diagnostic (Phase 1)", {"timeout": 5000}, async () => {
+    it("team_send_and_wait all-idle gate: deadline expiry returns partial + stuck-member diagnostic (Phase 1)", {"timeout": 5000}, async () => {
       // The user scenario: a member is stuck in `working` (the compaction
       // timeout black hole). team_send_and_wait's all-idle path must not
       // wait forever — the deadline returns partial results with a
@@ -837,10 +938,12 @@ describe("registerTlTools", () => {
       callRegisterTlTools();
 
       // Simulate LLM double-encoding: tasks is a JSON string instead of raw array
-      const result = await executeFn("call-1", {
-        tasks: JSON.stringify([{ to: "planner", content: "Do the plan" }]),
-        nextSteps: "review the plan",
-      });
+      const result = await runWithSettledAllIdle(() =>
+        executeFn("call-1", {
+          tasks: JSON.stringify([{ to: "planner", content: "Do the plan" }]),
+          nextSteps: "review the plan",
+        }) as Promise<any>
+      );
 
       // Should still have sent the message
       expect(messageQueue.enqueue).toHaveBeenCalledTimes(1);
@@ -896,10 +999,12 @@ describe("registerTlTools", () => {
       const truncated =
         '[{"to": "planner", "content": "Do the plan"}, {"to": "analyst", "content": "现在kanban界面，全局视图和项目视图分成了两';
 
-      const result = await executeFn("call-1", {
-        tasks: truncated,
-        nextSteps: "continue",
-      });
+      const result = await runWithSettledAllIdle(() =>
+        executeFn("call-1", {
+          tasks: truncated,
+          nextSteps: "continue",
+        }) as Promise<any>
+      );
 
       // The complete task should still be dispatched
       expect(messageQueue.enqueue).toHaveBeenCalledTimes(1);
@@ -927,10 +1032,12 @@ describe("registerTlTools", () => {
       const withRawNewline = '[{"to": "planner", "content": "line1\nline2"}]';
       expect(() => JSON.parse(withRawNewline)).toThrow(); // confirm strict parse really fails
 
-      await executeFn("call-1", {
-        tasks: withRawNewline,
-        nextSteps: "continue",
-      });
+      await runWithSettledAllIdle(() =>
+        executeFn("call-1", {
+          tasks: withRawNewline,
+          nextSteps: "continue",
+        }) as Promise<any>
+      );
 
       expect(messageQueue.enqueue).toHaveBeenCalledTimes(1);
       const callArg = (messageQueue.enqueue as ReturnType<typeof vi.fn>).mock.calls[0][0];

@@ -596,8 +596,8 @@ team_send_and_wait({
 })
 ```
 
-- **Blocks** the tool until ALL targeted members respond or all members become idle (all-idle early return)
-- **Batch mode**: multiple `{to, content}` entries in the `tasks` array are **sent concurrently** via the message queue. The tool waits for ALL to complete before returning combined results
+- **Blocks** the tool until ALL members are idle (mandatory all-idle gate, same detection as `wait_and_get_member_status`: 4 consecutive checks, 3s interval). Replies arriving early do NOT end the wait — a member that replied may still be finishing its turn, and non-targeted members may still be processing earlier dispatches
+- **Batch mode**: multiple `{to, content}` entries in the `tasks` array are **sent concurrently** via the message queue. Replies are collected as they arrive and returned together when the gate opens
 - **Partial results**: if some members become idle without replying (e.g. crash), the tool returns results from completed members with ⚠️ markers for failures
 - **Batch vs Sequential decision rule**:
   - **Batch** when tasks are **independent** — no task's output is needed to craft another task's instruction. All members work simultaneously. Wall-clock time ≈ slowest single task.
@@ -605,7 +605,7 @@ team_send_and_wait({
   - **Mixed strategy**: batch independent discovery tasks (A+B), then use combined outputs to craft a dependent task (C). This is often the most efficient pattern.
 - **Correlation matching**: each task gets its own `<corr:...>` tag for independent matching. Supports chain workflows: Member A can forward the tag to Member B
 - **Auto-injection**: if a member's reply is directed to `"tl"` but lacks a `<corr:...>` tag, the TL extension automatically appends the most recent pending correlation ID for that member. This ensures responses are matched even if the member AI forgets to include the tag
-- **Wait budget**: by default the all-idle wait has a 15-minute diagnostic deadline (`waitTimeoutMinutes`; `0` restores unlimited waiting). On expiry it returns partial results plus suspected stuck members and recovery guidance instead of hanging forever. `/team stop` also cancels all pending waits
+- **Wait budget**: by default the all-idle gate has a 15-minute diagnostic deadline (`waitTimeoutMinutes`; `0` restores unlimited waiting). On expiry it returns partial results plus suspected stuck members and recovery guidance instead of hanging forever. `/team stop` also cancels all pending waits
 - **Cancellation**: on `/team stop`, all pending waits are cancelled
 
 **防截断协议（P3）**：promptGuidelines 内置 5 条，从源头降低截断概率（长 content 是校验失败首要诱因）。P1/P2 已保证截断形态不再以误导性框架错误出现（schema 放宽 + prepareArguments 规范化 + 截断语义提示），本协议在此基础上降低**截断发生的概率**：
@@ -623,7 +623,7 @@ team_send_and_wait({
 | tool | behavior |
 |------|----------|
 | `team_send_message` | Fire-and-forget. Message sent, tool returns immediately. |
-| `team_send_and_wait` | Messages sent, tool blocks until all responses or all idle. Combined response content returned as tool result, NOT injected into TL context via `pi.sendMessage()`. |
+| `team_send_and_wait` | Messages sent, tool blocks until ALL members are idle (replies collected as they arrive). Combined response content returned as tool result, NOT injected into TL context via `pi.sendMessage()`. |
 
 ## 7. Member Tool: `team_send_message`
 
@@ -1669,7 +1669,7 @@ tracker 生命周期随 widget install/uninstall（onSessionStart / onSessionEnd
 ### 1.3 waitForAllIdle deadline + 诊断（beta C，防御纵深）
 
 - `waitForAllIdle(memberOpsStates, deadlineMs?)` 返回 `{ timedOut, stuckMembers }`；deadline 默认 15 分钟（`DEFAULT_WAIT_TIMEOUT_MINUTES`，`src/settings/resolve-wait-timeout.ts`），`resolveWaitIdleDeadlineMs(getSettings?)` 解析顶层 `waitTimeoutMinutes`（0 = 不限保持现状），无配置时用默认（deadline 是防御纵深，与 auto-compact 开关正交）。
-- 到期返回诊断：疑似卡死成员（working/compacting）+ 建议操作（`stop_member` / `/team stop` 后 `/team resume`）。`wait_and_get_member_status` 与 `team_send_and_wait` 的 all-idle 竞速路径同时受益（后者 partial 结果追加诊断块）。
+- 到期返回诊断：疑似卡死成员（working/compacting）+ 建议操作（`stop_member` / `/team stop` 后 `/team resume`）。`wait_and_get_member_status` 与 `team_send_and_wait` 的 all-idle 等待门控同时受益（后者 partial 结果追加诊断块）。
 - `setInterval` 加 `unref`（与批屏障 `waitForMembersIdle` 一致——Esc 中断后无轮询泄漏）。
 - wait 结束后**重读状态**输出（不再用 pre-wait 快照——成员可能在等待期间完成转换，状态栏必须反映 post-wait 现实）。
 

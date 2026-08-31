@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { registerTlTools, planBatchCompaction } from "./tl-tools";
+import { registerTlTools, planBatchCompaction, WAIT_IDLE_CHECK_INTERVAL_MS, WAIT_IDLE_REQUIRED_CONSECUTIVE } from "./tl-tools";
 import type { BatchCompactionPlan } from "./tl-tools";
 import { createAutoCompactRuntime } from "../channel/auto-compact";
 import type { AutoCompactRuntime } from "../channel/auto-compact";
@@ -217,6 +217,35 @@ describe("team_send_and_wait batch barrier (phase 3)", () => {
   let autoCompact: AutoCompactRuntime;
   let setup: ReturnType<typeof setupBarrier>;
 
+  /**
+   * 推过 all-idle 门控的去抖窗口（4 次连续 3s 检查 + 余量），使等待门控
+   * 在 fake timers 下 resolve。前置 0ms advance 保证屏障的微任务链先跑完
+   * （waitForAllIdle 的 interval 已创建）再去推时间。
+   */
+  async function settleAllIdleGate() {
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(
+      WAIT_IDLE_CHECK_INTERVAL_MS * (WAIT_IDLE_REQUIRED_CONSECUTIVE + 2)
+    );
+  }
+
+  /**
+   * 在 fake timers 下运行 team_send_and_wait execute 并推过 all-idle 门控
+   * （等待现在必须等到全员空闲才结束——与 wait_and_get_member_status 一致）。
+   * 屏障阶段的 stats/compact 均为立即 resolve 的 mock，微任务链在首次
+   * advance(0) 内跑完；随后推时间去驱动门控去抖。
+   */
+  async function executeAndSettle(args: { tasks: unknown; nextSteps: string }): Promise<any> {
+    vi.useFakeTimers();
+    try {
+      const execPromise = executeFn("call-1", args);
+      await settleAllIdleGate();
+      return await execPromise;
+    } finally {
+      vi.useRealTimers();
+    }
+  }
+
   beforeEach(() => {
     vi.useRealTimers();
     setup = setupBarrier();
@@ -235,7 +264,7 @@ describe("team_send_and_wait batch barrier (phase 3)", () => {
     });
     ({ executeFn, order, pi, memberOpsStates, messageQueue, lastPendingCorrId } = setup);
 
-    await executeFn("call-1", {
+    await executeAndSettle({
       tasks: [
         { to: "a", content: "task-a" },
         { to: "b", content: "task-b" },
@@ -258,7 +287,7 @@ describe("team_send_and_wait batch barrier (phase 3)", () => {
     });
     ({ executeFn, order } = setup);
 
-    await executeFn("call-1", {
+    await executeAndSettle({
       tasks: [
         { to: "a", content: "task-a" },
         { to: "b", content: "task-b" },
@@ -272,34 +301,42 @@ describe("team_send_and_wait batch barrier (phase 3)", () => {
   });
 
   it("invariant E1: messageQueue stays empty until ALL compactions complete", async () => {
-    let resolveCompactA: (v: any) => void;
-    const compactAPromise = new Promise((r) => { resolveCompactA = r; });
-    setup = setupBarrier({
-      states: { a: "idle", b: "idle" },
-      handles: {
-        a: { stats: () => usageResponse(95, 190000), compact: () => compactAPromise },
-        b: { stats: () => usageResponse(90, 180000) },
-      },
-    });
-    ({ executeFn, order, messageQueue } = setup);
+    vi.useFakeTimers();
+    try {
+      let resolveCompactA: (v: any) => void;
+      const compactAPromise = new Promise((r) => { resolveCompactA = r; });
+      setup = setupBarrier({
+        states: { a: "idle", b: "idle" },
+        handles: {
+          a: { stats: () => usageResponse(95, 190000), compact: () => compactAPromise },
+          b: { stats: () => usageResponse(90, 180000) },
+        },
+      });
+      ({ executeFn, order, messageQueue } = setup);
 
-    const execPromise = executeFn("call-1", {
-      tasks: [
-        { to: "a", content: "task-a" },
-        { to: "b", content: "task-b" },
-      ],
-      nextSteps: "next",
-    });
-    await vi.waitFor(() => expect(order).toContain("compact:a"));
+      const execPromise = executeFn("call-1", {
+        tasks: [
+          { to: "a", content: "task-a" },
+          { to: "b", content: "task-b" },
+        ],
+        nextSteps: "next",
+      });
+      // Microtask drain: stats (parallel) → compact:a (serial) started.
+      await vi.advanceTimersByTimeAsync(0);
+      expect(order).toContain("compact:a");
 
-    // Mid-compaction: NOTHING may be enqueued yet (all-idle can never fire
-    // early — the wait logic starts only after the barrier commits).
-    expect(order.filter((e) => e.startsWith("enqueue:"))).toEqual([]);
+      // Mid-compaction: NOTHING may be enqueued yet (all-idle can never fire
+      // early — the wait logic starts only after the barrier commits).
+      expect(order.filter((e) => e.startsWith("enqueue:"))).toEqual([]);
 
-    resolveCompactA!({ type: "response", command: "compact", success: true, data: {} });
-    await execPromise;
+      resolveCompactA!({ type: "response", command: "compact", success: true, data: {} });
+      await settleAllIdleGate();
+      await execPromise;
 
-    expect(order).toEqual(["stats:a", "stats:b", "compact:a", "compact:b", "enqueue:a", "enqueue:b"]);
+      expect(order).toEqual(["stats:a", "stats:b", "compact:a", "compact:b", "enqueue:a", "enqueue:b"]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("per-member fail-open: a failed compaction still dispatches (with skip), others continue compacting", async () => {
@@ -312,7 +349,7 @@ describe("team_send_and_wait batch barrier (phase 3)", () => {
     });
     ({ executeFn, order, pi, memberOpsStates, messageQueue } = setup);
 
-    await executeFn("call-1", {
+    await executeAndSettle({
       tasks: [
         { to: "a", content: "task-a" },
         { to: "b", content: "task-b" },
@@ -341,7 +378,7 @@ describe("team_send_and_wait batch barrier (phase 3)", () => {
     });
     ({ executeFn, pi } = setup);
 
-    await executeFn("call-1", {
+    await executeAndSettle({
       tasks: [
         { to: "a", content: "task-a" },
         { to: "b", content: "task-b" },
@@ -381,7 +418,7 @@ describe("team_send_and_wait batch barrier (phase 3)", () => {
       // A's compaction eats the whole budget
       await vi.advanceTimersByTimeAsync(61_000);
       resolveCompactA!({ type: "response", command: "compact", success: true, data: {} });
-      await vi.advanceTimersByTimeAsync(0);
+      await settleAllIdleGate();
       await execPromise;
 
       // B never compacted → B's message carries NO skip (inline path gets a
@@ -423,6 +460,7 @@ describe("team_send_and_wait batch barrier (phase 3)", () => {
       // a's in-flight compaction finishes (simulated by the inline path resetting state)
       memberOpsStates.set("a", "idle");
       await vi.advanceTimersByTimeAsync(1000);
+      await settleAllIdleGate();
       await execPromise;
 
       // b compacted (over threshold); both enqueued only after a is idle;
@@ -460,6 +498,7 @@ describe("team_send_and_wait batch barrier (phase 3)", () => {
       autoCompact.markCompactionEnd("a");
       memberOpsStates.set("a", "idle");
       await vi.advanceTimersByTimeAsync(1000);
+      await settleAllIdleGate();
       await execPromise;
 
       expect(enqueuedFor(messageQueue, "a")[0].skipAutoCompact).toBe(true);
@@ -498,7 +537,9 @@ describe("team_send_and_wait batch barrier (phase 3)", () => {
 
       // a's compact lease times out (member-side compaction may still run)
       rejectCompact!(new Error('Command to "a" timed out after 600000ms'));
-      await vi.advanceTimersByTimeAsync(0);
+      // a 保持 compacting（active）→ 门控去抖永不满足；统一等待预算（15 分钟）
+      // 到期后以超时诊断结束等待（而非永久挂起）。
+      await vi.advanceTimersByTimeAsync(15 * 60_000 + WAIT_IDLE_CHECK_INTERVAL_MS);
       await execPromise;
 
       // a stays compacting (NOT reset — the flush is the waiting flow's job),
@@ -543,7 +584,7 @@ describe("team_send_and_wait batch barrier (phase 3)", () => {
       // while the lease was in flight (heartbeat recorded, state unchanged).
       autoCompact.markCompactionEnd("a");
       rejectCompact!(new Error('Command to "a" timed out after 600000ms')); // response delayed past lease
-      await vi.advanceTimersByTimeAsync(0);
+      await settleAllIdleGate();
       await execPromise;
 
       // Settled via compaction_end → attempted → a's message IS marked.
@@ -581,6 +622,7 @@ describe("team_send_and_wait batch barrier (phase 3)", () => {
       // must release: compaction is meaningless for a crashed member.
       memberOpsStates.set("a", "crashed");
       await vi.advanceTimersByTimeAsync(1000);
+      await settleAllIdleGate();
       await execPromise;
 
       expect(order).toEqual(["stats:b", "compact:b", "enqueue:a", "enqueue:b"]);
@@ -592,69 +634,77 @@ describe("team_send_and_wait batch barrier (phase 3)", () => {
   });
 
   it("member inter-sends queued during a barrier compaction are flushed after it (D2 orphan fix)", async () => {
-    let resolveCompactA: (v: any) => void;
-    const compactAPromise = new Promise((r) => { resolveCompactA = r; });
-    setup = setupBarrier({
-      states: { a: "idle", b: "idle" },
-      handles: {
-        a: { stats: () => usageResponse(95, 190000), compact: () => compactAPromise },
-        b: { stats: () => usageResponse(50, 100000) },
-      },
-    });
-    const {
-      executeFn,
-      order,
-      pi,
-      memberOpsStates,
-      messageQueue,
-      lastPendingCorrId,
-      handles,
-      autoCompact,
-      responseWaiter,
-    } = setup;
+    vi.useFakeTimers();
+    try {
+      let resolveCompactA: (v: any) => void;
+      const compactAPromise = new Promise((r) => { resolveCompactA = r; });
+      setup = setupBarrier({
+        states: { a: "idle", b: "idle" },
+        handles: {
+          a: { stats: () => usageResponse(95, 190000), compact: () => compactAPromise },
+          b: { stats: () => usageResponse(50, 100000) },
+        },
+      });
+      const {
+        executeFn,
+        order,
+        pi,
+        memberOpsStates,
+        messageQueue,
+        lastPendingCorrId,
+        handles,
+        autoCompact,
+        responseWaiter,
+      } = setup;
 
-    // Build a real sendToMember sharing the SAME runtime + states as the barrier
-    // (this is what the router does for member inter-sends / Inspector direct).
-    const { createSendToMember } = await import("../channel/event-handler");
-    const sendToMember = createSendToMember({
-      pi,
-      memberOpsStates,
-      memberHandles: handles,
-      responseWaiter,
-      lastPendingCorrId,
-      getAutoCompact: () => defaultCfg,
-      autoCompact,
-    });
+      // Build a real sendToMember sharing the SAME runtime + states as the barrier
+      // (this is what the router does for member inter-sends / Inspector direct).
+      const { createSendToMember } = await import("../channel/event-handler");
+      const sendToMember = createSendToMember({
+        pi,
+        memberOpsStates,
+        memberHandles: handles,
+        responseWaiter,
+        lastPendingCorrId,
+        getAutoCompact: () => defaultCfg,
+        autoCompact,
+      });
 
-    const execPromise = executeFn("call-1", {
-      tasks: [
-        { to: "a", content: "task-a" },
-        { to: "b", content: "task-b" },
-      ],
-      nextSteps: "next",
-    });
-    await vi.waitFor(() => expect(order).toContain("compact:a"));
+      const execPromise = executeFn("call-1", {
+        tasks: [
+          { to: "a", content: "task-a" },
+          { to: "b", content: "task-b" },
+        ],
+        nextSteps: "next",
+      });
+      // Microtask drain: stats (parallel) → compact:a (serial, held) started.
+      await vi.advanceTimersByTimeAsync(0);
+      expect(order).toContain("compact:a");
 
-    // Member b → a inter-send arrives while a is compacting inside the barrier:
-    // queued into the shared pending, NOT dispatched.
-    sendToMember("a", { id: "inter-1", from: "b", to: "a", content: "inter-send", timestamp: Date.now() });
-    expect(order.filter((e) => e.startsWith("prompt:"))).toEqual([]);
+      // Member b → a inter-send arrives while a is compacting inside the barrier:
+      // queued into the shared pending, NOT dispatched.
+      sendToMember("a", { id: "inter-1", from: "b", to: "a", content: "inter-send", timestamp: Date.now() });
+      expect(order.filter((e) => e.startsWith("prompt:"))).toEqual([]);
 
-    // Barrier compaction finishes (endCompaction resets state only) → COMMIT enqueues.
-    resolveCompactA!({ type: "response", command: "compact", success: true, data: {} });
-    await execPromise;
-    expect(enqueuedFor(messageQueue, "a")[0].skipAutoCompact).toBe(true);
+      // Barrier compaction finishes (endCompaction resets state only) → COMMIT enqueues.
+      resolveCompactA!({ type: "response", command: "compact", success: true, data: {} });
+      await settleAllIdleGate();
+      await execPromise;
+      expect(enqueuedFor(messageQueue, "a")[0].skipAutoCompact).toBe(true);
 
-    // Simulate the queue drain delivering a's marked batch message to sendToMember.
-    // The direct-dispatch path must flush the queued inter-send FIRST (FIFO),
-    // otherwise it would be silently stranded until a's next compaction cycle.
-    sendToMember("a", { id: "batch-1", from: "tl", to: "a", content: "task-a", timestamp: Date.now(), skipAutoCompact: true });
+      // Simulate the queue drain delivering a's marked batch message to sendToMember.
+      // The direct-dispatch path must flush the queued inter-send FIRST (FIFO),
+      // otherwise it would be silently stranded until a's next compaction cycle.
+      sendToMember("a", { id: "batch-1", from: "tl", to: "a", content: "task-a", timestamp: Date.now(), skipAutoCompact: true });
 
-    const prompts = (handles.get("a")!.sendCommand as ReturnType<typeof vi.fn>).mock.calls
-      .map((c: any[]) => c[0].message as string);
-    expect(prompts[0]).toContain("inter-send");
-    expect(prompts[1]).toContain("task-a");
-    expect(prompts).toHaveLength(2);
+      const prompts = (handles.get("a")!.sendCommand as ReturnType<typeof vi.fn>).mock.calls
+        .map((c: any[]) => c[0].message as string);
+      expect(prompts[0]).toContain("inter-send");
+      expect(prompts[1]).toContain("task-a");
+      expect(prompts).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("dedupes same-member multi-tasks: one stats query + one compaction for the member", async () => {
@@ -667,7 +717,7 @@ describe("team_send_and_wait batch barrier (phase 3)", () => {
     });
     ({ executeFn, order, messageQueue } = setup);
 
-    await executeFn("call-1", {
+    await executeAndSettle({
       tasks: [
         { to: "a", content: "task-a1" },
         { to: "a", content: "task-a2" },
@@ -690,7 +740,7 @@ describe("team_send_and_wait batch barrier (phase 3)", () => {
     });
     ({ executeFn, order, messageQueue } = setup);
 
-    await executeFn("call-1", {
+    await executeAndSettle({
       tasks: [{ to: "a", content: "task-a" }],
       nextSteps: "next",
     });
@@ -707,7 +757,7 @@ describe("team_send_and_wait batch barrier (phase 3)", () => {
     });
     ({ executeFn, order, messageQueue } = setup);
 
-    await executeFn("call-1", {
+    await executeAndSettle({
       tasks: [
         { to: "a", content: "task-a" },
         { to: "b", content: "task-b" },
@@ -727,7 +777,7 @@ describe("team_send_and_wait batch barrier (phase 3)", () => {
     });
     ({ executeFn, order, messageQueue } = setup);
 
-    const result = await executeFn("call-1", {
+    const result = await executeAndSettle({
       tasks: [
         { to: "all", content: "broadcast" },
         { to: "a", content: "task-a" },
@@ -751,7 +801,7 @@ describe("team_send_and_wait batch barrier (phase 3)", () => {
     });
     ({ executeFn, order, messageQueue } = setup);
 
-    await executeFn("call-1", {
+    await executeAndSettle({
       tasks: [
         { to: "a", content: "task-a" },
         { to: "b", content: "task-b" },
@@ -785,13 +835,23 @@ describe("team_send_and_wait batch barrier (phase 3)", () => {
       // NOTE: no getAutoCompact / getHandle / autoCompact
     });
 
-    await execLegacy("call-1", {
-      tasks: [
-        { to: "a", content: "task-a" },
-        { to: "b", content: "task-b" },
-      ],
-      nextSteps: "next",
-    });
+    // all-idle 门控：legacy 路径同样必须等到全员空闲才结束等待。
+    vi.useFakeTimers();
+    try {
+      const execPromise = execLegacy("call-1", {
+        tasks: [
+          { to: "a", content: "task-a" },
+          { to: "b", content: "task-b" },
+        ],
+        nextSteps: "next",
+      });
+      await vi.advanceTimersByTimeAsync(
+        WAIT_IDLE_CHECK_INTERVAL_MS * (WAIT_IDLE_REQUIRED_CONSECUTIVE + 2)
+      );
+      await execPromise;
+    } finally {
+      vi.useRealTimers();
+    }
 
     expect(orderLegacy).toEqual(["enqueue:a", "enqueue:b"]);
     expect(enqueuedFor(mqLegacy, "a")[0].skipAutoCompact).toBeUndefined();
