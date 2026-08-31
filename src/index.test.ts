@@ -1263,13 +1263,12 @@ describe("per-session settings wiring (阶段 2)", () => {
 
   it("wiring lock: index.ts reads settings ONLY through the getEffectiveSettings entry", async () => {
     const source = readFileSync(new URL("../index.ts", import.meta.url), "utf-8");
-    // 4 处注入 + buildMemberConfig 2 调用点全部替换后，index.ts 内不应再有裸 loadSettings 调用点
-    const loadSettingsCallSites = source.match(/loadSettings\(/g) ?? [];
-    expect(loadSettingsCallSites.length).toBe(1);
-    // 唯一入口形态
-    expect(source).toContain(
-      "resolveEffectiveSettings(loadSettings(getRootDir()), getSessionSettings())"
-    );
+    // 阶段 5：合并层入口收敛到 session-settings.loadEffectiveSettings——
+    // index.ts 内不得再有裸 loadSettings 调用点（静态扫描守卫覆盖全仓）
+    const loadSettingsCallSites = source.match(/\bloadSettings\(/g) ?? [];
+    expect(loadSettingsCallSites.length).toBe(0);
+    // 唯一入口形态：委托合并层
+    expect(source).toContain("loadEffectiveSettings(getRootDir())");
     // 6 个消费点全部经 getEffectiveSettings：getAutoCompact×2 / getCoalescing / getSettings
     // + buildMemberConfig 两调用点（start_member、startResumedMember）
     const effectiveCalls = source.match(/getEffectiveSettings\(\)/g) ?? [];

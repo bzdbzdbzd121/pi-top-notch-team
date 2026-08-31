@@ -4,6 +4,10 @@ import { registerTlTools, WAIT_IDLE_CHECK_INTERVAL_MS, WAIT_IDLE_REQUIRED_CONSEC
 import { createTlWaitGate } from "../channel/tl-wait-gate";
 import { startSession, endSession, markSharedContextWritten } from "../session/state";
 import { DEFAULT_SETTINGS } from "../settings/settings";
+import { resetSessionSettingsState } from "../settings/session-settings";
+import { mkdtempSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { ProcessManager } from "../process/manager";
 import type { ResponseWaiter, WaitResult } from "../channel/response-waiter";
@@ -195,6 +199,76 @@ describe("registerTlTools", () => {
     expect(buildConfig).toHaveBeenCalledWith("analyzer");
     expect(createMember).toHaveBeenCalled();
     expect(result.content[0].text).toContain("已启动");
+  });
+
+  async function executeStartMember() {
+    const createMember = vi.fn().mockReturnValue({
+      name: "analyzer",
+      start: vi.fn().mockResolvedValue(undefined),
+      getState: vi.fn().mockReturnValue({ name: "analyzer", pid: 12345, status: "running" }),
+      stop: vi.fn(),
+      onEvent: vi.fn(),
+      sendCommand: vi.fn(),
+      sendCommandAndWait: vi.fn(),
+    });
+    const buildConfig = vi.fn().mockReturnValue({
+      name: "analyzer",
+      role: "analyzer",
+      teamName: "test",
+    });
+    let executeFn: Function = () => {};
+    pi.registerTool = vi.fn((def: any) => {
+      if (def.name === "start_member") {
+        executeFn = def.execute;
+      }
+    });
+    callRegisterTlTools({ createMember, buildMemberConfig: buildConfig });
+    return await executeFn("call-1", { name: "analyzer" });
+  }
+
+  it("start_member 结果附注设置来源：无临时设置 → 无附注", async () => {
+    resetSessionSettingsState();
+    openStartMemberGate();
+    const result = await executeStartMember();
+    expect(result.content[0].text).toContain("已启动");
+    expect(result.content[0].text).not.toContain("设置来源");
+  });
+
+  it("start_member 结果附注设置来源：overlay 含成员相关键 → （设置来源：临时）", async () => {
+    resetSessionSettingsState();
+    const { setSessionSetting } = await import("../settings/session-settings");
+    setSessionSetting("memberModel", { mode: "fixed", model: "openai/gpt-5" });
+    openStartMemberGate();
+    const result = await executeStartMember();
+    expect(result.content[0].text).toContain("（设置来源：临时）");
+  });
+
+  it("start_member 结果附注设置来源：overlay 仅含 spawn 无关键 → 无附注", async () => {
+    resetSessionSettingsState();
+    const { setSessionSetting } = await import("../settings/session-settings");
+    setSessionSetting("autoCompact", { enabled: false });
+    openStartMemberGate();
+    const result = await executeStartMember();
+    expect(result.content[0].text).not.toContain("设置来源");
+  });
+
+  it("start_member 结果附注设置来源：快照恢复 → （设置来源：恢复自团队会话）", async () => {
+    resetSessionSettingsState();
+    const mod = await import("../settings/session-settings");
+    const dir = mkdtempSync(join(tmpdir(), "tl-snap-"));
+    try {
+      mod.setSessionSetting("memberModel", { mode: "fixed", model: "openai/gpt-5" });
+      expect(mod.saveSessionSettingsSnapshot(dir)).toBe(true);
+      // 清内存模拟新进程 → resume 加载快照（内存空才加载，S5）
+      mod.resetSessionSettingsState();
+      expect(mod.loadSessionSettingsSnapshot(dir, "sess-1")).toBe(true);
+      openStartMemberGate();
+      const result = await executeStartMember();
+      expect(result.content[0].text).toContain("（设置来源：恢复自团队会话）");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      resetSessionSettingsState();
+    }
   });
 
   it("start_member returns error when buildMemberConfig returns null", async () => {

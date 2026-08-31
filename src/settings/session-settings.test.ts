@@ -716,3 +716,89 @@ describe("binding 与团队会话生命周期联动（审查 #1 回归）", () =
     expect(getSessionSettings().waitTimeoutMinutes).toBe(5);
   });
 });
+
+describe("loadEffectiveSettings + isSnapshotRestored（阶段 5：合并层入口 + 恢复标记）", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "session-settings-s5-"));
+    resetSessionSettingsState();
+  });
+
+  afterEach(() => {
+    resetSessionSettingsState();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("loadEffectiveSettings：无 overlay 时等于磁盘全局（恒等）", async () => {
+    const { saveSettings, loadSettings, DEFAULT_SETTINGS } = await import("./settings");
+    const g = structuredClone(DEFAULT_SETTINGS);
+    g.waitTimeoutMinutes = 0;
+    saveSettings(g, tmpDir);
+    const { loadEffectiveSettings } = await import("./session-settings");
+    const effective = loadEffectiveSettings(tmpDir);
+    expect(effective.waitTimeoutMinutes).toBe(0);
+    expect(effective).toEqual(loadSettings(tmpDir));
+  });
+
+  it("loadEffectiveSettings：overlay 覆盖层生效（磁盘文件零改动）", async () => {
+    const { saveSettings, DEFAULT_SETTINGS } = await import("./settings");
+    saveSettings(structuredClone(DEFAULT_SETTINGS), tmpDir);
+    const { setSessionSetting, loadEffectiveSettings } = await import("./session-settings");
+    setSessionSetting("autoCompact", { thresholdPercent: 55 });
+    const effective = loadEffectiveSettings(tmpDir);
+    expect(effective.autoCompact.thresholdPercent).toBe(55);
+    // 未覆盖字段跟随全局
+    expect(effective.autoCompact.timeoutMinutes).toBe(10);
+  });
+
+  it("isSnapshotRestored：默认 false；普通 setSessionSetting 不置位", async () => {
+    const { isSnapshotRestored, setSessionSetting } = await import("./session-settings");
+    expect(isSnapshotRestored()).toBe(false);
+    setSessionSetting("waitTimeoutMinutes", 3);
+    expect(isSnapshotRestored()).toBe(false);
+  });
+
+  it("isSnapshotRestored：loadSessionSettingsSnapshot 成功应用后置位；clearAll/clearMemory/reconcile 清除", async () => {
+    const mod = await import("./session-settings");
+    // 写入快照
+    setSessionSetting("waitTimeoutMinutes", 3);
+    expect(mod.saveSessionSettingsSnapshot(tmpDir)).toBe(true);
+    // 清内存模拟新进程 → 加载快照 → 置位
+    mod.resetSessionSettingsState();
+    expect(mod.loadSessionSettingsSnapshot(tmpDir, "sess-1")).toBe(true);
+    expect(mod.isSnapshotRestored()).toBe(true);
+
+    // clearAllSessionSettings 清除标记（快照文件亦被清，S7）
+    mod.clearAllSessionSettings();
+    expect(mod.isSnapshotRestored()).toBe(false);
+
+    // 重新写快照并恢复 → 置位 → clearSessionSettingsMemory 清除标记
+    mod.setSessionSetting("waitTimeoutMinutes", 3);
+    expect(mod.saveSessionSettingsSnapshot(tmpDir)).toBe(true);
+    mod.resetSessionSettingsState();
+    expect(mod.loadSessionSettingsSnapshot(tmpDir, "sess-1")).toBe(true);
+    expect(mod.isSnapshotRestored()).toBe(true);
+    mod.clearSessionSettingsMemory();
+    expect(mod.isSnapshotRestored()).toBe(false);
+
+    // 再恢复 → reconcile 会话变化（清 overlay）清除标记
+    mod.setSessionSetting("waitTimeoutMinutes", 3);
+    expect(mod.saveSessionSettingsSnapshot(tmpDir)).toBe(true);
+    mod.resetSessionSettingsState();
+    expect(mod.loadSessionSettingsSnapshot(tmpDir, "sess-1")).toBe(true);
+    expect(mod.isSnapshotRestored()).toBe(true);
+    setSessionSetting("memberThinkingLevel", "high");
+    expect(mod.reconcileSessionSettings("sess-2")).toBe(true);
+    expect(mod.isSnapshotRestored()).toBe(false);
+  });
+
+  it("isSnapshotRestored：内存非空跳过加载（S5）→ 不置位", async () => {
+    const mod = await import("./session-settings");
+    setSessionSetting("waitTimeoutMinutes", 3);
+    expect(mod.saveSessionSettingsSnapshot(tmpDir)).toBe(true);
+    // 内存已有本会话显式设置 → 加载被跳过
+    expect(mod.loadSessionSettingsSnapshot(tmpDir, "sess-1")).toBe(false);
+    expect(mod.isSnapshotRestored()).toBe(false);
+  });
+});

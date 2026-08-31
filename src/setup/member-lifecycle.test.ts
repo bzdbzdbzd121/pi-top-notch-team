@@ -74,7 +74,10 @@ describe("buildMemberConfig", () => {
     };
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // 隔离 overlay 状态，防止用例间泄漏（阶段 5：合并感知回退测试会写 overlay）
+    const { resetSessionSettingsState } = await import("../settings/session-settings");
+    resetSessionSettingsState();
     rmSync(tmpDir, { recursive: true, force: true });
     if (originalRoot) {
       process.env.TOP_NOTCH_TEAM_ROOT = originalRoot;
@@ -721,7 +724,10 @@ describe("buildMemberConfig model resolution", () => {
     };
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // 隔离 overlay 状态，防止用例间泄漏（阶段 5：合并感知回退测试会写 overlay）
+    const { resetSessionSettingsState } = await import("../settings/session-settings");
+    resetSessionSettingsState();
     rmSync(tmpDir, { recursive: true, force: true });
     if (originalRoot) {
       process.env.TOP_NOTCH_TEAM_ROOT = originalRoot;
@@ -807,7 +813,10 @@ describe("buildMemberConfig — options.settings（临时设置覆盖层，阶�
     };
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // 隔离 overlay 状态，防止用例间泄漏（阶段 5：合并感知回退测试会写 overlay）
+    const { resetSessionSettingsState } = await import("../settings/session-settings");
+    resetSessionSettingsState();
     rmSync(tmpDir, { recursive: true, force: true });
     if (originalRoot) {
       process.env.TOP_NOTCH_TEAM_ROOT = originalRoot;
@@ -846,6 +855,28 @@ describe("buildMemberConfig — options.settings（临时设置覆盖层，阶�
     });
     expect(result!.model).toBe("openai/gpt-5");
     expect(result!.thinking).toBe("low");
+  });
+
+  it("options.settings 缺省时回退 loadEffectiveSettings——overlay 仍生效（阶段 5：合并感知回退）", async () => {
+    // 磁盘全局：fixed anthropic（会被 overlay 覆盖）
+    const { saveSettings, DEFAULT_SETTINGS } = await import("../settings/settings");
+    saveSettings(
+      {
+        ...structuredClone(DEFAULT_SETTINGS),
+        memberModel: { mode: "fixed", model: "anthropic/claude-sonnet-4-5" },
+      },
+      tmpDir
+    );
+    // overlay：fixed openai/gpt-5（未传 options.settings，回退必须经合并层）
+    const { setSessionSetting, resetSessionSettingsState } = await import("../settings/session-settings");
+    resetSessionSettingsState();
+    setSessionSetting("memberModel", { mode: "fixed", model: "openai/gpt-5" });
+
+    const { buildMemberConfig } = await loadModule();
+    const result = buildMemberConfig("analyzer", session, {
+      lookupSupportedThinkingLevels: () => ["off", "low"],
+    });
+    expect(result!.model).toBe("openai/gpt-5");
   });
 
   it("options.settings 缺省时回退磁盘全局设置（legacy 路径行为不变）", async () => {

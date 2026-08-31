@@ -130,6 +130,8 @@ src/
 │   ├── dynamic-session-bootstrap.ts ← 动态会话共享 bootstrap（/team dynamic 与 start_team_session 复用）+ ensureAddDynamicMemberTool
 ├── settings/         ← Global settings (/team setting)
 │   ├── settings.ts        ← TeamSettings type + <rootDir>/settings.yaml read/write
+│   ├── session-settings.ts ← 临时设置数据层（决策 #40）：进程内 overlay + 深合并入口 loadEffectiveSettings + 快照原语（save/load/getPath/clearBinding）+ 生命周期（reconcile/clearSessionSettingsMemory/activeSessionDir/binding）+ isSnapshotRestored 恢复标记
+│   ├── session-settings.test.ts ← 临时设置数据层测试（merge 深字段级/clone 隔离/生命周期原语/快照/审查回归）
 │   ├── resolve-model.ts   ← Pure function: member model precedence resolution
 │   ├── resolve-thinking.ts ← 纯函数：成员思考强度解析（支持集复刻 pi-ai getSupportedThinkingLevels + 支持→传 --thinking / 不支持→保持默认）
 │   ├── resolve-auto-compact.ts ← Pure functions: auto-compaction resolution + threshold check + menu label
@@ -148,6 +150,7 @@ src/
 │   └── pi-key-decode.test.ts ← 本地解码器单元测试（kitty CSI-u / modifyOtherKeys / legacy 三协议 + 修饰拒绝 + Caps Lock 掩码）
 ├── config.ts         ← getRootDir() via env var or ~/.pi/top-notch-team
 ├── config.test.ts    ← getRootDir() env var tests
+├── static-scan.test.ts ← 阶段 5 防退化守卫（R4）：静态扫描全仓 loadSettings( 调用点，除白名单（settings.ts / session-settings.ts / setting-handler.ts）外必须经合并层；负例 fixture 锁定「人为新增绕过 → 测试红」
 └── test/fixtures/    ← Test YAML files + mock-extension-api.ts
 ```
 
@@ -320,6 +323,38 @@ src/
     - **接线**：`createMessageChannel` 创建并返回 `tlWaitGate`；`index.ts` 注入 `tlToolsDeps`；`SendAndWaitCtx` 新增 `pi?`/`tlWaitGate?`。
     - **测试**：gate 单测 5 例（计数/缓冲/原子 drain）；message-channel S3 3 例（缓冲不 sendMessage、gate 关闭后 nextTurn 不变、corrId 回复优先）；tl-tools 2 例（门控打开后并入结果：`[from message]` 段落顺序/零 sendMessage/无元信息/details.bufferedMessages、无接线零变化）。全量 1312 通过。
 
+40. **临时设置（per-session settings）** — 用户要求：`/team setting` 的设置按当前 pi 会话生效，**只有 `/team resume` 恢复本团队会话时恢复**（跨 /new、跨进程）；永不写全局 settings.yaml。形态：进程内单值 overlay（`src/settings/session-settings.ts`，DeepPartial<TeamSettings>）+ 团队会话锚定的快照文件（`<sessionDir>/session-settings.yaml`，tmp+rename 原子写、fail-open）。
+    - **核心不变量**：① 内存 overlay 是唯一权威；快照只是 resume 恢复通道，从不反向污染全局。② 快照只在团队会话活跃期间写入（setSessionSetting 在 activeSessionDir 置位时即时写盘）。③ resume 仅当内存为空时加载（本会话显式设置优先，S5）。④ clear/clearAll 联动清绑定快照（防「清了又复活」，S7）；binding 与团队会话生命周期联动（start → binding=dir，stop → binding=null——stop 后清除纯内存、快照冻结为最近活跃期，S6）。⑤ 失效机制：session_start reconcile（sessionId 派生信号，事件丢失免疫）+ session_shutdown 无条件清内存（双保险）；两者都只清内存、不清快照。reconcile 在会话变化时同时清 binding/activeSessionDir（防跨会话误删，审查 #1）。
+    - **合并层**：`loadEffectiveSettings(rootDir)` = 磁盘全局 + overlay 深字段级补丁（两层：顶层 + autoCompact/messageCoalescing 内部字段；undefined = 不覆盖；structuredClone 隔离）。index.ts `getEffectiveSettings()` 是唯一生产入口（消费点 6 处）；member-lifecycle 的 options.settings 缺省回退也走 loadEffectiveSettings（合并感知，杜绝 R4）。**静态扫描守卫**（`src/static-scan.test.ts`）：全仓除白名单（settings.ts / session-settings.ts / setting-handler.ts）外禁止裸 `loadSettings(`，人为新增绕过 → 测试红。
+    - **优先级链（不变）**：成员 YAML `model` > 团队 YAML `defaults.model` > 临时/全局 `memberModel` > follow（TL 当前模型）> 不指定。
+    - **热切换说明**：memberModel/memberThinkingLevel 在成员 spawn 时解析——**仅影响之后启动的成员**（start_member 结果附注来源「（设置来源：临时）/（设置来源：恢复自团队会话）」，仅当 overlay 含 spawn 相关键）；autoCompact/messageCoalescing/waitTimeoutMinutes 每派发/屏障时解析——**即时生效**（getAutoCompact/getCoalescing per-dispatch）。
+    - **场景表 S1-S8**：
+      | 场景 | 行为 |
+      |---|---|
+      | S1 同进程：设临时 → /team stop → /team resume 同团队 | 内存保留（未 /new），快照不参与；设置生效 ✓ |
+      | S2 同进程：设临时 → /new → /team resume 同团队 | 内存被 reconcile 清 → 从快照恢复 ✓（用户要求核心） |
+      | S3 跨进程：设临时 → 退出 pi → 重启 → /team resume | 新进程内存空 → 从快照恢复 ✓（用户要求核心） |
+      | S4 /new 后 /team start 新团队（非 resume） | 不加载快照 → 临时设置不生效（其他会话不受影响） |
+      | S5 resume 前本会话已显式设过临时设置 | 内存非空 → 保留内存，不加载快照（本会话最新意图优先） |
+      | S6 活跃期改临时 → stop → /new → resume | 快照为最近活跃期状态 → 恢复该状态（stop 后改的纯内存，随 /new 失效） |
+      | S7 设临时 → ⑦清除全部 → resume | 内存+快照均已清 → 不恢复（防复活） |
+      | S8 团队 A 活跃期设临时 → 团队 B 活跃期改设置 | 各团队快照独立（按 sessionDir）→ 各自 resume 恢复各自状态 |
+    - **生命周期表（九场景）**：
+      | 场景 | 内存 overlay | 快照文件 |
+      |---|---|---|
+      | /new（reason:new） | reconcile 清空（sessionId 变化） | 保留 |
+      | /fork | 同上（新 sessionId） | 保留 |
+      | /resume（pi 会话恢复） | 同上 | 保留 |
+      | /team stop | 保留（此后变更纯内存，S6） | 保留最近活跃期（binding=null） |
+      | /team resume | 内存空 → 加载目标会话快照（S2/S3/S5），isSnapshotRestored 置位 | 读 |
+      | /team start（非 resume） | 保留（同 sessionId）或已清（异） | 不读（S4） |
+      | /team delete | 不变 | 随会话目录删除 |
+      | 进程退出（session_shutdown） | clearSessionSettingsMemory 无条件清空 | 保留（跨进程 resume，S3） |
+      | 扩展 reload | 模块状态重置（同新进程） | 保留 |
+    - **UI（阶段 4）**：/team setting 顶层作用域开关（●仅当前会话（临时）/ 全局，一次 select 往返切换重显菜单，默认临时）；五项子菜单「当前值」恒显示 merge 后生效值 + [临时] 徽标；⑦ 清除全部（仅 overlay 非空时显示）= 内存+快照双清（S7）；模型项在团队 YAML 指定 model 时附注「此设置不生效」；通知按场景附注（活跃期含 resume 恢复提示 / 会话外含重启失效提示）；sessionId 不可用 → 临时入口禁用（fail-open 强制全局）。临时作用域子菜单**字段级 pin**（审查 #1 修复）：persist 经 diffOverlayPatch 只写与全局不同的字段（undefined = 跟随全局；diff 空 → 解除 pin），未触及字段不烘焙（全局后续变更可传播），清除不留幻影 pin。
+    - **可观测性（阶段 5）**：start_member 结果附注「（设置来源：临时）」/「（设置来源：恢复自团队会话）」（仅 overlay 含 memberModel/memberThinkingLevel 时；isSnapshotRestored 由 loadSessionSettingsSnapshot 成功应用时置位，随 overlay 清空动作复位）。
+    - **测试**：全量 1410 通过（阶段 1-5，含审查回归 4 轮）；文档记录见 DESIGN.md §27。
+
 ## Dependency Injection Pattern
 
 The codebase uses an explicit Dependency Injection (DI) pattern to decouple modules and enable testability. Every subsystem receives its dependencies through a typed interface, rather than importing them directly.
@@ -476,7 +511,7 @@ printf '' | timeout 10 ./node_modules/.bin/pi --mode json --no-tools -e ./index.
 | `/team cancel`           | Alias for `/team done` (backward compatibility) |
 | `/team delete <name>` | Delete a team definition (with confirmation) |
 | `/team status` | Show active session + member process statuses |
-| `/team setting` | Interactive settings menu — member default model (follow TL current model / fixed available model) + member thinking level (成员思考强度: 模型支持则传 `--thinking`，否则保持默认) + auto-compaction (toggle / percent & token thresholds / timeout) + wait budget (等待上限, 0=永不超时 — wait 工具 all-idle deadline 与批屏障共享的顶层通用预算) + message coalescing (消息合并: 开关/批量上限/字符上限，S1 阶段 2). Also allowed during a session |
+| `/team setting` | Interactive settings menu — 顶层作用域开关（决策 #40）：默认「仅当前会话（临时）」，切换「全局」后直写 settings.yaml。临时作用域写入 overlay（不触碰 settings.yaml），「当前值」恒显示 merge 后生效值，覆盖键带 [临时] 徽标；⑦ 一键清除全部临时设置（内存+快照双清，仅 overlay 非空时显示）。五项子菜单：member default model (follow / fixed；团队 YAML 指定 model 时附注不生效) + member thinking level (成员思考强度: 模型支持则传 `--thinking`，否则保持默认) + auto-compaction (toggle / percent & token thresholds / timeout) + wait budget (等待上限, 0=永不超时 — wait 工具 all-idle deadline 与批屏障共享的顶层通用预算) + message coalescing (消息合并: 开关/批量上限/字符上限，S1 阶段 2). 通知按场景附注「（仅当前 pi 会话生效；/team resume 本团队会话时将恢复）」/「（仅当前 pi 会话生效，重启后失效）」；sessionId 不可用时临时入口禁用（fail-open）。Also allowed during a session |
 | `/team help` | Display usage help for all subcommands |
 
 ## TL Tools (session-scoped registration + activation; exception below)

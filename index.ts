@@ -10,11 +10,10 @@ import {
 } from "./src/session/manifest";
 import type { TeamContext } from "./src/session/context";
 import { getRootDir } from "./src/config";
-import { loadSettings } from "./src/settings/settings";
 import {
   getSessionSettings,
   reconcileSessionSettings,
-  resolveEffectiveSettings,
+  loadEffectiveSettings,
   clearSessionSettingsMemory,
   setActiveSessionDir,
 } from "./src/settings/session-settings";
@@ -218,9 +217,9 @@ export default function (pi: ExtensionAPI) {
   // ── Per-session settings (临时设置): 唯一读取入口 ──────────
   // 所有全局设置消费点必须经此合并层（global 打底 + 内存 overlay 深字段级补丁）。
   // 无 overlay 时 effective = 全局，行为逐位一致（阶段 2 回归口径）。
-  // 静态接线锁定测试（index.test.ts）断言 index.ts 内仅此一处 loadSettings 调用。
-  const getEffectiveSettings = () =>
-    resolveEffectiveSettings(loadSettings(getRootDir()), getSessionSettings());
+  // 合并逻辑收敛于 session-settings.loadEffectiveSettings（阶段 5）——静态扫描
+  // 守卫（src/static-scan.test.ts）强制全仓除白名单外无裸 loadSettings 调用。
+  const getEffectiveSettings = () => loadEffectiveSettings(getRootDir());
 
   // ── Message channel: queue → router (extracted to src/setup/message-channel.ts) ──
   const { router, messageQueue, responseWaiter, autoCompact, coalescer, tlWaitGate } = createMessageChannel({

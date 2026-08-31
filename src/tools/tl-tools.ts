@@ -8,6 +8,7 @@ import type { AutoCompactRuntime } from "../channel/auto-compact";
 import type { TlWaitGate } from "../channel/tl-wait-gate";
 import type { ResolvedAutoCompact } from "../settings/resolve-auto-compact";
 import type { TeamSettings } from "../settings/settings";
+import { getSessionSettings, isSnapshotRestored } from "../settings/session-settings";
 import {
   DEFAULT_WAIT_TIMEOUT_MINUTES,
   resolveWaitTimeoutMinutes,
@@ -17,6 +18,21 @@ import { getSessionState } from "../session/state";
 import { syncActiveManifest } from "../session/manifest";
 import { createMemberProcess } from "../process/member-process";
 import { spawn } from "node:child_process";
+
+/**
+ * 阶段 5 可观测性：start_member 结果附注设置来源。仅当 overlay 含成员 spawn 相关
+ * 键（memberModel / memberThinkingLevel——autoCompact/coalescing/waitTimeout 不
+ * 影响本次 spawn）时附注；来源区分「（设置来源：临时）」与快照恢复的
+ * 「（设置来源：恢复自团队会话）」（isSnapshotRestored 由 loadSessionSettingsSnapshot
+ * 成功应用时置位）。
+ */
+function tempSourceAnnotation(): string {
+  const overlay = getSessionSettings();
+  if (overlay.memberModel === undefined && overlay.memberThinkingLevel === undefined) {
+    return "";
+  }
+  return isSnapshotRestored() ? "（设置来源：恢复自团队会话）" : "（设置来源：临时）";
+}
 
 // ── Type aliases ───────────────────────────────────────────
 
@@ -176,7 +192,7 @@ export function registerTlTools(deps: TlToolsDeps): void {
               text:
                 `成员 "${params.name}" 已启动 (PID: ${handle.getState().pid})。` +
                 (config.thinking ? `思考强度：${config.thinking}（模型支持该级别，已显式指定）。` : "") +
-                `使用 list_members 查看状态，通过消息通道分配任务。`,
+                `${tempSourceAnnotation()}使用 list_members 查看状态，通过消息通道分配任务。`,
             },
           ],
         };

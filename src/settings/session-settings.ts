@@ -2,11 +2,12 @@ import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync 
 import { join } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { isMemberThinkingLevel } from "./resolve-thinking";
-import type {
-  AutoCompactSetting,
-  MemberModelSetting,
-  MessageCoalescingSetting,
-  TeamSettings,
+import {
+  loadSettings,
+  type AutoCompactSetting,
+  type MemberModelSetting,
+  type MessageCoalescingSetting,
+  type TeamSettings,
 } from "./settings";
 
 /**
@@ -53,6 +54,14 @@ let bindingSessionDir: string | null = null;
  * stop 后（置 null）变更纯内存（S6），快照保持「最近活跃期状态」。
  */
 let activeSessionDir: string | null = null;
+
+/**
+ * 快照恢复标记：loadSessionSettingsSnapshot 成功应用数据时置位（阶段 5 可观测性——
+ * start_member 结果区分「（临时）」与「（恢复自团队会话）」来源）。随 overlay 的
+ * 清空动作（clearAll/clearMemory/reconcile 会话变化）复位；普通 set/clear 不复位
+ * （恢复值仍与后续编辑共存，来源标注保持准确）。
+ */
+let snapshotRestored = false;
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -118,6 +127,7 @@ export function clearSessionSetting(key: keyof TeamSettings): void {
 /** 一键回滚：清空内存 overlay + 删除绑定快照（S7：clear 后 resume 不复活）。 */
 export function clearAllSessionSettings(): void {
   sessionSettings = {};
+  snapshotRestored = false;
   clearBindingSnapshot();
 }
 
@@ -127,6 +137,7 @@ export function clearAllSessionSettings(): void {
  */
 export function clearSessionSettingsMemory(): void {
   sessionSettings = {};
+  snapshotRestored = false;
 }
 
 /**
@@ -152,7 +163,18 @@ export function reconcileSessionSettings(sessionId: string): boolean {
     return false;
   }
   sessionSettings = {};
+  snapshotRestored = false;
   return true;
+}
+
+/**
+ * 合并层唯一入口（阶段 5 收敛）：磁盘全局 + 内存 overlay 深合并。
+ * 所有全局设置读取点必须经此函数或 index.ts 的 getEffectiveSettings（即本函数的
+ * 薄封装）——静态扫描守卫（src/static-scan.test.ts）强制除白名单模块外无裸
+ * loadSettings 调用，防止新增消费点绕过合并层导致临时设置静默失效（R4）。
+ */
+export function loadEffectiveSettings(rootDir: string): TeamSettings {
+  return resolveEffectiveSettings(loadSettings(rootDir), sessionSettings);
 }
 
 /**
@@ -326,6 +348,7 @@ export function loadSessionSettingsSnapshot(sessionDir: string, currentSessionId
       return false;
     }
     sessionSettings = loaded;
+    snapshotRestored = true;
     if (currentSessionId) {
       sessionSettingsSessionId = currentSessionId;
     }
@@ -351,14 +374,20 @@ function clearBindingSnapshot(): void {
   }
 }
 
+/** 快照恢复标记读取（阶段 5 可观测性：start_member 来源附注用）。 */
+export function isSnapshotRestored(): boolean {
+  return snapshotRestored;
+}
+
 /**
- * 测试专用：完全重置模块状态（overlay / recorded sessionId / binding / active dir），
- * 不触碰磁盘。生产路径用 clearAllSessionSettings / clearSessionSettingsMemory /
- * reconcile / setActiveSessionDir 管理状态。
+ * 测试专用：完全重置模块状态（overlay / recorded sessionId / binding / active dir /
+ * snapshotRestored），不触碰磁盘。生产路径用 clearAllSessionSettings /
+ * clearSessionSettingsMemory / reconcile / setActiveSessionDir 管理状态。
  */
 export function resetSessionSettingsState(): void {
   sessionSettings = {};
   sessionSettingsSessionId = null;
   bindingSessionDir = null;
   activeSessionDir = null;
+  snapshotRestored = false;
 }

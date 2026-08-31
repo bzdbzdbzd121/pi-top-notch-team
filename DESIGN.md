@@ -1935,3 +1935,80 @@ printf '' | timeout 10 ./node_modules/.bin/pi --mode json --no-tools -e ./index.
 ```
 
 最后一条命令必须以状态码 0 结束、stderr 为空，并输出一个 `{"type":"session", ...}` JSON 行；CLI 与高保真测试均应使用安装的 pi 0.83.0（不要用系统 PATH 中的其他 pi 版本）。静态检查只扫描 Goal reminder source/docs；Member channel 的 `followUp` 仍是有意保留的独立语义。阶段 3 不引入 outbox、完整 watchdog、Member idle gate、消息路由或新的 ADR。
+
+---
+
+## 27. Per-session Settings（临时设置，决策 #40）
+
+用户需求：`/team setting` 的设置按当前 pi 会话生效，**只有 `/team resume` 恢复本团队会话时恢复**（跨 /new、跨进程）；永不写全局 `settings.yaml`。实现分 5 阶段（数据层 → 消费点接线 → resume 恢复通道 → UI → 守卫+可观测性+文档）。
+
+### 27.1 形态与核心不变量
+
+```
+当前 pi 会话                     团队会话锚定
+┌─────────────────────┐         ┌──────────────────────────────┐
+│ 内存 overlay（权威）  │ ←写入→  │ <sessionDir>/session-settings.yaml │
+│ DeepPartial<TeamSettings>│ 活跃期即时 │ （resume 恢复通道，tmp+rename 原子写，fail-open）│
+└─────────────────────┘         └──────────────────────────────┘
+```
+
+不变量：
+1. **内存 overlay 是唯一权威**；快照只是 resume 恢复通道，从不反向污染全局（永不写 settings.yaml）。
+2. **快照只在团队会话活跃期间写入**：`setSessionSetting` 在 `activeSessionDir` 置位时即时写盘（写盘钩子在消费点层）。
+3. **resume 仅当内存为空时加载**（本会话显式设置优先，S5）；加载成功后 sessionSettingsSessionId 记录当前 pi sessionId（防 reload 误清）、binding 绑定该目录。
+4. **clear/clearAll 联动清绑定快照**（防「清了又复活」，S7）；binding 与团队会话生命周期联动（start → binding=dir；stop → binding=null——stop 后清除纯内存、快照冻结为最近活跃期，S6）。
+5. **失效机制双通道**：session_start `reconcileSessionSettings(sessionId)`（派生信号、事件丢失免疫）+ session_shutdown `clearSessionSettingsMemory()` 无条件清内存（互补）。两者只清内存、不清快照。reconcile 在会话变化时同时清 binding/activeSessionDir（仅内存）——跨会话残留 binding 会让新会话的无关清除误删旧会话快照（审查 #1 修复）。
+
+### 27.2 合并层与防退化守卫
+
+```ts
+// src/settings/session-settings.ts —— 合并层唯一入口（阶段 5 收敛）
+export function loadEffectiveSettings(rootDir: string): TeamSettings {
+  return resolveEffectiveSettings(loadSettings(rootDir), sessionSettings);
+}
+```
+
+- 深字段级 merge：顶层字段 + autoCompact/messageCoalescing 内部字段逐一覆盖；overlay 中 undefined = 不覆盖；全部 structuredClone（输入永不改动、输出无共享引用）。
+- index.ts `getEffectiveSettings()` = `loadEffectiveSettings(getRootDir())` 的薄封装，6 个消费点（getAutoCompact×2 / getCoalescing / getSettings / buildMemberConfig×2）全部经它。
+- member-lifecycle `options.settings` 缺省回退也走 `loadEffectiveSettings`（合并感知）——杜绝「忘记传 settings 静默回退全局」的 R4 漏洞。
+- **静态扫描守卫**（`src/static-scan.test.ts`）：扫描全仓生产 .ts（排除 *.test.ts / test 目录）中的 `\bloadSettings\(`，白名单仅 { settings.ts（定义层）、session-settings.ts（merge+快照，方案白名单）、setting-handler.ts（设置编辑器）}；人为新增绕过消费点 → 测试红。`loadEffectiveSettings(` 子串安全不误报。
+
+### 27.3 resume 恢复通道（用户要求核心）
+
+```
+/team resume（startResumedMember 之前）
+  → loadSessionSettingsSnapshot(<sessionDir>, currentPiSessionId)
+      ├─ 内存非空 → 跳过（S5，不置 isSnapshotRestored）
+      ├─ 文件缺失/解析失败/无有效字段 → fail-open（忽略不报错）
+      └─ 成功 → overlay = 字段级校验后的快照内容 + snapshotRestored=true + binding=dir
+  → startResumedMember → buildMemberConfig(settings: getEffectiveSettings()) → spawn 反映恢复值
+```
+
+场景表 S1-S8（与 AGENTS.md 决策 #40 一致）：S1 同进程 stop→resume 内存保留；S2 /new→resume 从快照恢复；S3 跨进程 resume 从快照恢复（S2/S3 为用户要求核心）；S4 非 resume 新团队不加载；S5 内存非空不加载；S6 快照 = 最近活跃期状态（stop 后变更纯内存）；S7 clear 后 resume 不复活（内存+快照双清）；S8 各团队快照独立（按 sessionDir）。
+
+生命周期表（九场景）：/new、/fork、/resume、/team stop、/team resume、/team start、/team delete、进程退出、扩展 reload——见 AGENTS.md 决策 #40（内存与快照两列的完整行为）。
+
+### 27.4 UI（/team setting 作用域层）
+
+- 顶层菜单：① 设置作用域（●仅当前会话（临时）/ 全局，一次 select 往返切换并重显菜单，默认临时；sessionId 不可用 → 禁用入口 fail-open 强制全局）；②-⑥ 五项设置恒显示 merge 后生效值 + [临时] 徽标（overlay 有该键时）；模型项在团队 YAML 指定 model 时附注「此设置不生效」；⑦ 清除全部临时设置（仅 overlay 非空时显示）= 内存 + 绑定快照双清（S7）。
+- 子菜单路由：临时作用域 → 工作对象 = effective，persist 经 `diffOverlayPatch` **字段级 pin**（审查 #1 修复）——标量键 working ≠ global 才 pin（undefined → 解除）；对象键逐子字段比较，仅不同且非 undefined 的字段入 patch（undefined = 跟随全局，兄弟 pin 不受影响），patch 空 → clearSessionSetting（不留幻影 pin）。未触及字段不烘焙（全局后续变更可传播）。全局作用域 → 直改磁盘对象 saveSettings。configure* 函数体零改动，仅 save 目标参数化。
+- 通知：活跃期「（仅当前 pi 会话生效；/team resume 本团队会话时将恢复）」；会话外「（仅当前 pi 会话生效，重启后失效）」；全局无后缀。
+- 顶层循环每轮重读 overlay（审查 #2）——badge/⑦ 可见性不读过期快照。
+
+### 27.5 优先级链与热切换
+
+优先级链（不变）：成员 YAML `model` > 团队 YAML `defaults.model` > 临时/全局 `memberModel` > follow（TL 当前模型）> 不指定。
+
+热切换：memberModel/memberThinkingLevel 在 spawn 时解析（**仅影响之后启动的成员**）；autoCompact/messageCoalescing/waitTimeoutMinutes 每派发/屏障时解析（**即时生效**）。
+
+### 27.6 可观测性（阶段 5）
+
+- start_member 结果附注「（设置来源：临时）」/「（设置来源：恢复自团队会话）」（仅当 overlay 含 spawn 相关键 memberModel/memberThinkingLevel；autoCompact 等无关键不附注）。
+- `isSnapshotRestored()` 由 loadSessionSettingsSnapshot 成功应用时置位；随 clearAllSessionSettings / clearSessionSettingsMemory / reconcile（会话变化清 overlay）/ resetSessionSettingsState 复位；普通 set/clear 不复位（恢复值仍与后续编辑共存，来源标注保持准确）。
+
+### 27.7 验证与发布边界
+
+- 阶段 1-5 全量 1410 通过（含 4 轮审查回归）；`npx tsc --noEmit` 干净。
+- 守卫验收：静态扫描正例（全仓零违规）+ 负例（人为新增消费点 → 红）+ 子串安全 + 测试文件豁免。
+- 快照文件格式：YAML（JSON 亦为合法 YAML）；stringify 跳过 undefined 字段；load 端字段级 sanitize（非法字段丢弃，全非法 → 视为无有效内容 fail-open）。
+- 阶段 6（可选，未实现）：实时跟随（model_select 跟踪扩展）+ 临时提升为全局（overlay → settings.yaml 后清内存+清快照）。

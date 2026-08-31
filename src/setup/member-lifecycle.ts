@@ -11,7 +11,7 @@ import type { MemberOperationalState } from "../session/context";
 import type { TeamSessionState } from "../session/state";
 import type { TeamSettings } from "../settings/settings";
 import { getRootDir } from "../config";
-import { loadSettings } from "../settings/settings";
+import { loadEffectiveSettings } from "../settings/session-settings";
 import { resolveMemberThinking } from "../settings/resolve-thinking";
 import { resolveMemberModel } from "../settings/resolve-model";
 import { createMemberEventHandler } from "../channel/event-handler";
@@ -146,7 +146,10 @@ export function buildMemberConfig(
   const sharedContextPath = ensureSharedContextFile(team, sessionId);
 
   // Resolve the effective model for this member (global settings + team YAML + TL model)
-  const settings = options?.settings ?? loadSettings(rootDir);
+  // 阶段 5：缺省回退改走合并层（loadEffectiveSettings = 磁盘全局 + 内存 overlay
+  // 深合并）——杜绝「忘记传 settings 静默回退全局」导致临时设置被绕过的 R4 漏洞。
+  // 生产调用点（index.ts）恒传 getEffectiveSettings()，此回退为防御性兜底。
+  const settings = options?.settings ?? loadEffectiveSettings(rootDir);
   const resolved = resolveMemberModel(memberDef, team, settings, options?.tlCurrentModel);
 
   // Resolve the thinking level: only pass `--thinking` when the global setting
