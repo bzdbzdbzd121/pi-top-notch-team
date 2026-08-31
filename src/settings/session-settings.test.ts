@@ -1,0 +1,436 @@
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, existsSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { parse as parseYaml } from "yaml";
+import {
+  DEFAULT_SETTINGS,
+  type TeamSettings,
+} from "./settings";
+import {
+  getSessionSettings,
+  setSessionSetting,
+  clearSessionSetting,
+  clearAllSessionSettings,
+  clearSessionSettingsMemory,
+  reconcileSessionSettings,
+  resolveEffectiveSettings,
+  saveSessionSettingsSnapshot,
+  loadSessionSettingsSnapshot,
+  getSessionSettingsSnapshotPath,
+  resetSessionSettingsState,
+  type DeepPartial,
+} from "./session-settings";
+
+/** Fresh full settings (a deep clone of DEFAULT_SETTINGS with a few custom values). */
+function makeGlobal(): TeamSettings {
+  return {
+    memberModel: { mode: "follow", model: undefined },
+    autoCompact: { enabled: true, thresholdPercent: 80, thresholdTokens: undefined, timeoutMinutes: 10 },
+    waitTimeoutMinutes: 15,
+    memberThinkingLevel: undefined,
+    messageCoalescing: { enabled: true, maxBatchSize: 5, maxBatchChars: 4000 },
+  };
+}
+
+describe("resolveEffectiveSettings — 深字段级 merge（纯函数）", () => {
+  it("empty overlay is the identity: deep-equal to global, no shared references", () => {
+    const global = makeGlobal();
+    const result = resolveEffectiveSettings(global, {});
+    expect(result).toEqual(global);
+    expect(result).not.toBe(global);
+    // 修改结果不得影响 global（clone 隔离）
+    result.autoCompact.thresholdPercent = 99;
+    result.memberModel.mode = "fixed";
+    expect(global.autoCompact.thresholdPercent).toBe(80);
+    expect(global.memberModel.mode).toBe("follow");
+  });
+
+  it("overrides top-level scalar fields (waitTimeoutMinutes, memberThinkingLevel)", () => {
+    const result = resolveEffectiveSettings(makeGlobal(), {
+      waitTimeoutMinutes: 0,
+      memberThinkingLevel: "high",
+    });
+    expect(result.waitTimeoutMinutes).toBe(0);
+    expect(result.memberThinkingLevel).toBe("high");
+    // 未覆盖字段保持 global
+    expect(result.autoCompact.enabled).toBe(true);
+  });
+
+  it("merges autoCompact field-by-field (only thresholdPercent overridden)", () => {
+    const global = makeGlobal();
+    const result = resolveEffectiveSettings(global, {
+      autoCompact: { enabled: false, thresholdPercent: 55, timeoutMinutes: 30 },
+    });
+    expect(result.autoCompact.enabled).toBe(false);
+    expect(result.autoCompact.thresholdPercent).toBe(55);
+    expect(result.autoCompact.timeoutMinutes).toBe(30);
+    // overlay 未提及的字段保持 global
+    expect(result.autoCompact.thresholdTokens).toBeUndefined();
+    // 内部字段深合并：enabled 来自 overlay、thresholdTokens 来自 global
+    expect(result.autoCompact).toEqual({
+      enabled: false,
+      thresholdPercent: 55,
+      thresholdTokens: undefined,
+      timeoutMinutes: 30,
+    });
+  });
+
+  it("merges messageCoalescing field-by-field", () => {
+    const result = resolveEffectiveSettings(makeGlobal(), {
+      messageCoalescing: { enabled: false },
+    });
+    expect(result.messageCoalescing?.enabled).toBe(false);
+    expect(result.messageCoalescing?.maxBatchSize).toBe(5);
+    expect(result.messageCoalescing?.maxBatchChars).toBe(4000);
+  });
+
+  it("merges memberModel field-by-field", () => {
+    const global = makeGlobal();
+    const result = resolveEffectiveSettings(global, { memberModel: { mode: "fixed", model: "openai/gpt-5" } });
+    expect(result.memberModel).toEqual({ mode: "fixed", model: "openai/gpt-5" });
+
+    // 只覆盖 mode：model 保持 global 的 undefined（不引入幽灵 model）
+    const result2 = resolveEffectiveSettings(global, { memberModel: { mode: "fixed" } });
+    expect(result2.memberModel.mode).toBe("fixed");
+    expect(result2.memberModel.model).toBeUndefined();
+  });
+
+  it("treats top-level undefined overlay fields as 'not overridden'", () => {
+    const global = makeGlobal();
+    const result = resolveEffectiveSettings(global, {
+      waitTimeoutMinutes: undefined,
+      memberThinkingLevel: undefined,
+    });
+    expect(result.waitTimeoutMinutes).toBe(15);
+    expect(result.memberThinkingLevel).toBeUndefined();
+    expect(result).toEqual(global);
+  });
+
+  it("treats undefined nested overlay fields as 'not overridden'", () => {
+    const global = makeGlobal();
+    const result = resolveEffectiveSettings(global, {
+      autoCompact: { thresholdPercent: undefined, enabled: false },
+      messageCoalescing: { maxBatchChars: undefined },
+    });
+    // undefined 字段不覆盖：thresholdPercent / maxBatchChars 保持 global
+    expect(result.autoCompact.enabled).toBe(false);
+    expect(result.autoCompact.thresholdPercent).toBe(80);
+    expect(result.messageCoalescing?.maxBatchChars).toBe(4000);
+  });
+
+  it("does not mutate either input", () => {
+    const global = makeGlobal();
+    const overlay: DeepPartial<TeamSettings> = {
+      autoCompact: { enabled: false, thresholdPercent: 30 },
+      memberModel: { mode: "fixed", model: "openai/gpt-5" },
+    };
+    resolveEffectiveSettings(global, overlay);
+    expect(global).toEqual(makeGlobal());
+    expect(overlay).toEqual({
+      autoCompact: { enabled: false, thresholdPercent: 30 },
+      memberModel: { mode: "fixed", model: "openai/gpt-5" },
+    });
+  });
+
+  it("clones nested values — mutating the result never leaks back to global or overlay", () => {
+    const global = makeGlobal();
+    const overlay: DeepPartial<TeamSettings> = { autoCompact: { thresholdPercent: 30 } };
+    const result = resolveEffectiveSettings(global, overlay);
+    result.autoCompact.thresholdPercent = 70;
+    result.messageCoalescing!.maxBatchSize = 2;
+    expect(global.autoCompact.thresholdPercent).toBe(80);
+    expect(overlay.autoCompact?.thresholdPercent).toBe(30);
+    expect(global.messageCoalescing?.maxBatchSize).toBe(5);
+  });
+});
+
+describe("session settings overlay — set/clear/clearAll", () => {
+  beforeEach(() => {
+    resetSessionSettingsState();
+  });
+
+  it("starts empty", () => {
+    expect(getSessionSettings()).toEqual({});
+  });
+
+  it("set then get reflects the value (structuredClone isolation)", () => {
+    setSessionSetting("waitTimeoutMinutes", 5);
+    expect(getSessionSettings().waitTimeoutMinutes).toBe(5);
+
+    // 返回副本：修改返回值不影响内部状态
+    const copy = getSessionSettings() as DeepPartial<TeamSettings>;
+    copy.waitTimeoutMinutes = 99;
+    expect(getSessionSettings().waitTimeoutMinutes).toBe(5);
+  });
+
+  it("set stores a clone — later mutation of the input does not leak into state", () => {
+    const patch: DeepPartial<TeamSettings> = { autoCompact: { enabled: false, thresholdPercent: 30 } };
+    setSessionSetting("autoCompact", patch.autoCompact!);
+    patch.autoCompact!.thresholdPercent = 99;
+    expect(getSessionSettings().autoCompact).toEqual({
+      enabled: false,
+      thresholdPercent: 30,
+    });
+  });
+
+  it("set with undefined value is a no-op (undefined = 不覆盖)", () => {
+    setSessionSetting("waitTimeoutMinutes", undefined);
+    expect(getSessionSettings()).toEqual({});
+  });
+
+  it("clearSessionSetting removes a single key", () => {
+    setSessionSetting("waitTimeoutMinutes", 5);
+    setSessionSetting("memberThinkingLevel", "low");
+    clearSessionSetting("waitTimeoutMinutes");
+    expect(getSessionSettings()).toEqual({ memberThinkingLevel: "low" });
+  });
+
+  it("clearAllSessionSettings empties everything", () => {
+    setSessionSetting("waitTimeoutMinutes", 5);
+    setSessionSetting("memberThinkingLevel", "low");
+    clearAllSessionSettings();
+    expect(getSessionSettings()).toEqual({});
+  });
+
+  it("clearSessionSettingsMemory empties memory only (session_shutdown 补充通道)", () => {
+    setSessionSetting("waitTimeoutMinutes", 5);
+    clearSessionSettingsMemory();
+    expect(getSessionSettings()).toEqual({});
+  });
+});
+
+describe("reconcileSessionSettings — pi 会话切换失效守卫", () => {
+  beforeEach(() => {
+    resetSessionSettingsState();
+  });
+
+  it("keeps the overlay when the recorded sessionId matches (same pi session)", () => {
+    // 真实时序：session_start 先于任何用户设置（reconcile 记录当前会话）
+    expect(reconcileSessionSettings("session-A")).toBe(false);
+    setSessionSetting("waitTimeoutMinutes", 5);
+    // 同 ID 重复 reconcile：保留，返回 false
+    expect(reconcileSessionSettings("session-A")).toBe(false);
+    expect(getSessionSettings().waitTimeoutMinutes).toBe(5);
+  });
+
+  it("clears on the first reconcile when the overlay predates any recorded session (session_start 未先行)", () => {
+    // 极端时序（如扩展热重载后）：设置先于首次 reconcile → 无证据表明属于当前会话 → 清除
+    setSessionSetting("waitTimeoutMinutes", 5);
+    expect(reconcileSessionSettings("session-A")).toBe(true);
+    expect(getSessionSettings()).toEqual({});
+  });
+
+  it("clears the overlay when the sessionId changes (session_start 对比变化则清除)", () => {
+    reconcileSessionSettings("session-A"); // 记录当前会话
+    setSessionSetting("waitTimeoutMinutes", 5);
+    expect(reconcileSessionSettings("session-B")).toBe(true);
+    expect(getSessionSettings()).toEqual({});
+  });
+
+  it("returns false and keeps state when the overlay is empty (nothing to clear)", () => {
+    reconcileSessionSettings("session-A");
+    expect(reconcileSessionSettings("session-B")).toBe(false);
+  });
+
+  it("does not clear when the sessionId is an empty string (fail-open, 会话标识不可用)", () => {
+    reconcileSessionSettings("session-A");
+    setSessionSetting("waitTimeoutMinutes", 5);
+    // 空串：不清除、不改写记录 —— 之后同 ID reconcile 仍视为同一会话
+    expect(reconcileSessionSettings("")).toBe(false);
+    expect(getSessionSettings().waitTimeoutMinutes).toBe(5);
+    expect(reconcileSessionSettings("session-A")).toBe(false);
+    expect(getSessionSettings().waitTimeoutMinutes).toBe(5);
+  });
+
+  it("updates the recorded sessionId after a clear (later same-id reconcile keeps)", () => {
+    reconcileSessionSettings("session-A");
+    setSessionSetting("waitTimeoutMinutes", 5);
+    expect(reconcileSessionSettings("session-B")).toBe(true);
+    // 已清除 + 记录更新为 B：再 reconcile(B) 无事发生
+    expect(reconcileSessionSettings("session-B")).toBe(false);
+    setSessionSetting("memberThinkingLevel", "high");
+    expect(reconcileSessionSettings("session-B")).toBe(false);
+    expect(getSessionSettings().memberThinkingLevel).toBe("high");
+  });
+});
+
+describe("snapshot primitives — save/load/clearBinding（resume 恢复通道）", () => {
+  let tmpDir: string;
+  let sessionDir: string;
+
+  beforeEach(() => {
+    resetSessionSettingsState();
+    tmpDir = mkdtempSync(join(tmpdir(), "team-session-settings-test-"));
+    sessionDir = join(tmpDir, "sessions", "team-a", "sid-1");
+  });
+
+  afterEach(() => {
+    resetSessionSettingsState();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("save writes the overlay as YAML to <sessionDir>/session-settings.yaml and returns true", () => {
+    setSessionSetting("waitTimeoutMinutes", 5);
+    setSessionSetting("memberThinkingLevel", "high");
+    expect(saveSessionSettingsSnapshot(sessionDir)).toBe(true);
+    const path = getSessionSettingsSnapshotPath(sessionDir);
+    expect(existsSync(path)).toBe(true);
+    const parsed = parseYaml(readFileSync(path, "utf-8")) as Record<string, unknown>;
+    expect(parsed.waitTimeoutMinutes).toBe(5);
+    expect(parsed.memberThinkingLevel).toBe("high");
+  });
+
+  it("round-trips: save → memory cleared → load restores the same overlay", () => {
+    setSessionSetting("autoCompact", { enabled: false, thresholdPercent: 30 });
+    saveSessionSettingsSnapshot(sessionDir);
+    // 模拟 /new 清内存（快照保留）
+    clearSessionSettingsMemory();
+    expect(getSessionSettings()).toEqual({});
+    expect(loadSessionSettingsSnapshot(sessionDir, "session-B")).toBe(true);
+    expect(getSessionSettings()).toEqual({
+      autoCompact: { enabled: false, thresholdPercent: 30 },
+    });
+  });
+
+  it("save leaves no .tmp residue (atomic tmp+rename)", () => {
+    setSessionSetting("waitTimeoutMinutes", 5);
+    saveSessionSettingsSnapshot(sessionDir);
+    const tmpPath = `${getSessionSettingsSnapshotPath(sessionDir)}.tmp`;
+    expect(existsSync(tmpPath)).toBe(false);
+  });
+
+  it("save is fail-open when the target directory cannot be created (fs failure)", () => {
+    // 父路径是一个文件 → mkdirSync 必然失败
+    const fileAsParent = join(tmpDir, "not-a-dir");
+    writeFileSync(fileAsParent, "x", "utf-8");
+    setSessionSetting("waitTimeoutMinutes", 5);
+    expect(() => saveSessionSettingsSnapshot(join(fileAsParent, "sub"))).not.toThrow();
+    expect(saveSessionSettingsSnapshot(join(fileAsParent, "sub"))).toBe(false);
+    // 内存照常生效（fail-open：仅 resume 恢复能力降级）
+    expect(getSessionSettings().waitTimeoutMinutes).toBe(5);
+  });
+
+  it("load returns false without side effects when the file is missing", () => {
+    setSessionSetting("waitTimeoutMinutes", 5);
+    clearSessionSettingsMemory();
+    expect(loadSessionSettingsSnapshot(sessionDir, "session-B")).toBe(false);
+    expect(getSessionSettings()).toEqual({});
+    // recorded 未被改写：reconcile("session-B") 仍按旧记录对比（此处无记录 → 异 ID 亦无事）
+    expect(reconcileSessionSettings("session-B")).toBe(false);
+  });
+
+  it("load returns false without side effects when the file is corrupted (parse failure, fail-open)", () => {
+    mkdirSync(sessionDir, { recursive: true });
+    writeFileSync(getSessionSettingsSnapshotPath(sessionDir), "waitTimeoutMinutes: [broken: {", "utf-8");
+    expect(loadSessionSettingsSnapshot(sessionDir, "session-B")).toBe(false);
+    expect(getSessionSettings()).toEqual({});
+  });
+
+  it("load returns false when the file is not an object (fail-open)", () => {
+    mkdirSync(sessionDir, { recursive: true });
+    writeFileSync(getSessionSettingsSnapshotPath(sessionDir), "- just\n- a\n- list\n", "utf-8");
+    expect(loadSessionSettingsSnapshot(sessionDir, "session-B")).toBe(false);
+    expect(getSessionSettings()).toEqual({});
+  });
+
+  it("load keeps memory when the overlay is non-empty (本会话显式设置优先, S5)", () => {
+    setSessionSetting("waitTimeoutMinutes", 30);
+    saveSessionSettingsSnapshot(sessionDir);
+    // 内存非空 → 不加载快照
+    expect(loadSessionSettingsSnapshot(sessionDir, "session-B")).toBe(false);
+    expect(getSessionSettings().waitTimeoutMinutes).toBe(30);
+  });
+
+  it("load records the current pi sessionId (防 reload 误清)", () => {
+    setSessionSetting("waitTimeoutMinutes", 5);
+    saveSessionSettingsSnapshot(sessionDir);
+    clearSessionSettingsMemory();
+    expect(loadSessionSettingsSnapshot(sessionDir, "session-B")).toBe(true);
+    // 同会话后续 reconcile 不清除
+    expect(reconcileSessionSettings("session-B")).toBe(false);
+    expect(getSessionSettings().waitTimeoutMinutes).toBe(5);
+    // 会话切换 → 清除
+    expect(reconcileSessionSettings("session-C")).toBe(true);
+  });
+
+  it("load binds to the sessionDir — later clears write back to the same snapshot (防复活)", () => {
+    setSessionSetting("waitTimeoutMinutes", 5);
+    setSessionSetting("memberThinkingLevel", "low");
+    saveSessionSettingsSnapshot(sessionDir);
+    clearSessionSettingsMemory();
+    loadSessionSettingsSnapshot(sessionDir, "session-B");
+
+    // 恢复后清除一个字段 → 快照同步移除该字段
+    clearSessionSetting("memberThinkingLevel");
+    const parsed = parseYaml(readFileSync(getSessionSettingsSnapshotPath(sessionDir), "utf-8")) as Record<string, unknown>;
+    expect(parsed.memberThinkingLevel).toBeUndefined();
+    expect(parsed.waitTimeoutMinutes).toBe(5);
+
+    // 清除最后一个字段 → 快照文件删除（不复活）
+    clearSessionSetting("waitTimeoutMinutes");
+    expect(existsSync(getSessionSettingsSnapshotPath(sessionDir))).toBe(false);
+  });
+
+  it("load drops unknown top-level keys (only TeamSettings keys enter the overlay)", () => {
+    mkdirSync(sessionDir, { recursive: true });
+    writeFileSync(
+      getSessionSettingsSnapshotPath(sessionDir),
+      "waitTimeoutMinutes: 5\nsneakyKey: 42\nmemberModel:\n  mode: fixed\n",
+      "utf-8"
+    );
+    expect(loadSessionSettingsSnapshot(sessionDir, "session-B")).toBe(true);
+    const overlay = getSessionSettings() as Record<string, unknown>;
+    expect(overlay.waitTimeoutMinutes).toBe(5);
+    expect(overlay.memberModel).toEqual({ mode: "fixed" });
+    expect("sneakyKey" in overlay).toBe(false);
+  });
+
+  it("clearAllSessionSettings deletes the bound snapshot (S7: 清了不复活)", () => {
+    setSessionSetting("waitTimeoutMinutes", 5);
+    expect(saveSessionSettingsSnapshot(sessionDir)).toBe(true);
+    expect(existsSync(getSessionSettingsSnapshotPath(sessionDir))).toBe(true);
+
+    clearAllSessionSettings();
+    expect(getSessionSettings()).toEqual({});
+    expect(existsSync(getSessionSettingsSnapshotPath(sessionDir))).toBe(false);
+
+    // 快照已删 → resume 无法恢复
+    expect(loadSessionSettingsSnapshot(sessionDir, "session-B")).toBe(false);
+  });
+
+  it("clearSessionSettingsMemory keeps the snapshot (session_shutdown 只清内存)", () => {
+    setSessionSetting("waitTimeoutMinutes", 5);
+    saveSessionSettingsSnapshot(sessionDir);
+    clearSessionSettingsMemory();
+    expect(getSessionSettings()).toEqual({});
+    expect(existsSync(getSessionSettingsSnapshotPath(sessionDir))).toBe(true);
+    // 快照保留 → 跨进程 /team resume 可恢复
+    expect(loadSessionSettingsSnapshot(sessionDir, "session-B")).toBe(true);
+    expect(getSessionSettings().waitTimeoutMinutes).toBe(5);
+  });
+
+  it("clearSessionSetting rewrites the snapshot without the cleared field while bound", () => {
+    setSessionSetting("waitTimeoutMinutes", 5);
+    setSessionSetting("memberThinkingLevel", "low");
+    saveSessionSettingsSnapshot(sessionDir);
+
+    clearSessionSetting("memberThinkingLevel");
+    const parsed = parseYaml(readFileSync(getSessionSettingsSnapshotPath(sessionDir), "utf-8")) as Record<string, unknown>;
+    expect(parsed.waitTimeoutMinutes).toBe(5);
+    expect(parsed.memberThinkingLevel).toBeUndefined();
+  });
+
+  it("unbound clearSessionSetting only touches memory (no snapshot side effects)", () => {
+    setSessionSetting("waitTimeoutMinutes", 5);
+    clearSessionSetting("waitTimeoutMinutes");
+    expect(getSessionSettings()).toEqual({});
+    expect(existsSync(getSessionSettingsSnapshotPath(sessionDir))).toBe(false);
+  });
+
+  it("DEFAULT_SETTINGS is untouched by the overlay layer", () => {
+    setSessionSetting("waitTimeoutMinutes", 0);
+    clearAllSessionSettings();
+    expect(DEFAULT_SETTINGS.waitTimeoutMinutes).toBe(15);
+  });
+});
