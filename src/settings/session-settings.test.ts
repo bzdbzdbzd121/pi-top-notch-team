@@ -653,3 +653,66 @@ describe("active-period snapshot write (阶段 3: 团队活跃期即时写盘)",
     expect(getSessionSettings()).toEqual({ memberThinkingLevel: "low" });
   });
 });
+
+describe("binding 与团队会话生命周期联动（审查 #1 回归）", () => {
+  let tmpDir: string;
+  let sessionDir: string;
+
+  beforeEach(() => {
+    resetSessionSettingsState();
+    tmpDir = mkdtempSync(join(tmpdir(), "team-session-settings-binding-"));
+    sessionDir = join(tmpDir, "sessions", "team-a", "sid-1");
+  });
+
+  afterEach(() => {
+    resetSessionSettingsState();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("stop 后 clear 冻结快照（S6: clear 也纯内存，快照保持最近活跃期状态）", () => {
+    setActiveSessionDir(sessionDir);
+    setSessionSetting("waitTimeoutMinutes", 5);
+    setSessionSetting("memberThinkingLevel", "low");
+    // /team stop → onSessionEnd → active 与 binding 均置空
+    setActiveSessionDir(null);
+
+    clearSessionSetting("waitTimeoutMinutes");
+    clearAllSessionSettings();
+    expect(getSessionSettings()).toEqual({});
+
+    // 快照冻结为最近活跃期状态（两字段都未被 stop 后的 clear 触及）
+    const parsed = parseYaml(readFileSync(getSessionSettingsSnapshotPath(sessionDir), "utf-8")) as Record<string, unknown>;
+    expect(parsed.waitTimeoutMinutes).toBe(5);
+    expect(parsed.memberThinkingLevel).toBe("low");
+    // stop→clear→resume 同一会话恢复 clear 前的值（S7 只约束活跃期 clear）
+    expect(loadSessionSettingsSnapshot(sessionDir, "session-A")).toBe(true);
+    expect(getSessionSettings().waitTimeoutMinutes).toBe(5);
+  });
+
+  it("跨会话 clear 不动旧会话快照（S8: binding 随 onSessionStart 更新）", () => {
+    const dirB = join(tmpDir, "sessions", "team-b", "sid-9");
+    // 会话 A 活跃：set → 快照 A 落盘
+    setActiveSessionDir(sessionDir);
+    setSessionSetting("waitTimeoutMinutes", 5);
+    expect(existsSync(getSessionSettingsSnapshotPath(sessionDir))).toBe(true);
+
+    // stop A → start B：binding 联动到 B
+    setActiveSessionDir(dirB);
+    setSessionSetting("memberThinkingLevel", "low");
+    expect(existsSync(getSessionSettingsSnapshotPath(dirB))).toBe(true);
+
+    // B 中 clear 只作用于 B 的快照（清空 overlay → 删 B 快照），A 的快照不受影响
+    clearSessionSetting("memberThinkingLevel");
+    clearSessionSetting("waitTimeoutMinutes");
+    expect(existsSync(getSessionSettingsSnapshotPath(dirB))).toBe(false);
+    expect(existsSync(getSessionSettingsSnapshotPath(sessionDir))).toBe(true);
+
+    // B 中 clearAll 同样不动 A
+    setSessionSetting("memberThinkingLevel", "high");
+    clearAllSessionSettings();
+    expect(existsSync(getSessionSettingsSnapshotPath(sessionDir))).toBe(true);
+    // A 的快照仍可被 A 的 resume 恢复
+    expect(loadSessionSettingsSnapshot(sessionDir, "session-A")).toBe(true);
+    expect(getSessionSettings().waitTimeoutMinutes).toBe(5);
+  });
+});

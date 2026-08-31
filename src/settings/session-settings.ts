@@ -20,6 +20,9 @@ import type {
  *  2. 快照只在团队会话活跃期间写入（写盘接线在消费点层，见阶段 3）。
  *  3. /team resume 仅在内存 overlay 为空时从目标会话目录加载。
  *  4. 清除动作（clear/clearAll）同时清除内存与绑定快照（防「清了又复活」）。
+ *     binding 与团队会话生命周期联动（setActiveSessionDir）：start → binding=dir
+ *     （本会话 clear 只作用于本会话快照，S8）；stop → binding=null（clear 纯内存，
+ *     快照冻结为最近活跃期状态，S6）。S7「clear 不复活」只约束活跃期 clear。
  *  5. 失效机制：session_start 时 reconcile（派生信号，事件丢失免疫）+ session_shutdown
  *     清内存补充通道（双保险）。两者都只清内存、不清快照（快照保留供 resume）；
  *     但 reconcile 在会话变化时同时清 binding（仅内存）——跨会话残留的 binding 会让
@@ -65,9 +68,14 @@ export function getSessionSettingsSnapshotPath(sessionDir: string): string {
  * 团队会话启动（/team start、/team dynamic、/team resume）→ 传入会话目录；
  * 会话结束（/team stop、stop_team_session、pi 会话切换 teardown）→ 传入 null。
  * 仅影响 set 的即时写盘；clear/clearAll 仍走 binding 语义（不变量 4）。
+ *
+ * binding 与团队会话生命周期联动（审查 #1）：start → binding=dir（本会话的
+ * clear/clearAll 只作用于本会话快照，S8）；stop → binding=null（clear 纯内存，
+ * 快照冻结为最近活跃期状态，S6）。S7「clear 不复活」只约束活跃期 clear。
  */
 export function setActiveSessionDir(sessionDir: string | null): void {
   activeSessionDir = sessionDir;
+  bindingSessionDir = sessionDir;
 }
 
 /** 返回当前 overlay 的深拷贝（外部修改不影响内部状态）。 */
