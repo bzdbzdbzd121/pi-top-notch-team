@@ -787,3 +787,98 @@ describe("buildMemberConfig model resolution", () => {
     expect(config?.model).toBe("anthropic/claude-opus-4");
   });
 });
+
+describe("buildMemberConfig — options.settings（临时设置覆盖层，阶段 2）", () => {
+  let tmpDir: string;
+  let session: TeamSessionState;
+  const originalRoot = process.env.TOP_NOTCH_TEAM_ROOT;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "member-lifecycle-settings-test-"));
+    mkdirSync(join(tmpDir, "sessions", "test-team"), { recursive: true });
+    process.env.TOP_NOTCH_TEAM_ROOT = tmpDir;
+    session = {
+      active: true,
+      teamDefinition: createMockTeamDefinition(),
+      startedAt: Date.now(),
+      sessionId: "abc123",
+      sharedContextWritten: true,
+      origin: "user",
+    };
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+    if (originalRoot) {
+      process.env.TOP_NOTCH_TEAM_ROOT = originalRoot;
+    } else {
+      delete process.env.TOP_NOTCH_TEAM_ROOT;
+    }
+  });
+
+  async function loadModule() {
+    return await import("./member-lifecycle");
+  }
+
+  it("spawn 参数反映临时 model/thinking（overlay 合并后传入 options.settings）", async () => {
+    // 磁盘全局：fixed anthropic + thinking high（会被 overlay 覆盖）
+    const { saveSettings, DEFAULT_SETTINGS } = await import("../settings/settings");
+    saveSettings(
+      {
+        ...structuredClone(DEFAULT_SETTINGS),
+        memberModel: { mode: "fixed", model: "anthropic/claude-sonnet-4-5" },
+        memberThinkingLevel: "high",
+      },
+      tmpDir
+    );
+    // 临时覆盖层：fixed openai/gpt-5 + thinking low
+    const { setSessionSetting, getSessionSettings, resolveEffectiveSettings, resetSessionSettingsState } = await import("../settings/session-settings");
+    resetSessionSettingsState();
+    const { loadSettings } = await import("../settings/settings");
+    setSessionSetting("memberModel", { mode: "fixed", model: "openai/gpt-5" });
+    setSessionSetting("memberThinkingLevel", "low");
+    const effective = resolveEffectiveSettings(loadSettings(tmpDir), getSessionSettings());
+
+    const { buildMemberConfig } = await loadModule();
+    const result = buildMemberConfig("analyzer", session, {
+      settings: effective,
+      lookupSupportedThinkingLevels: () => ["off", "low"],
+    });
+    expect(result!.model).toBe("openai/gpt-5");
+    expect(result!.thinking).toBe("low");
+  });
+
+  it("options.settings 缺省时回退磁盘全局设置（legacy 路径行为不变）", async () => {
+    const { saveSettings, DEFAULT_SETTINGS } = await import("../settings/settings");
+    saveSettings(
+      {
+        ...structuredClone(DEFAULT_SETTINGS),
+        memberModel: { mode: "fixed", model: "anthropic/claude-sonnet-4-5" },
+        memberThinkingLevel: "high",
+      },
+      tmpDir
+    );
+    const { buildMemberConfig } = await loadModule();
+    const result = buildMemberConfig("analyzer", session, {
+      lookupSupportedThinkingLevels: () => ["off", "high"],
+    });
+    expect(result!.model).toBe("anthropic/claude-sonnet-4-5");
+    expect(result!.thinking).toBe("high");
+  });
+
+  it("overlay 只替换全局层、不压团队 YAML（优先级链不变）", async () => {
+    // 团队 YAML defaults.model 高于临时/全局设置
+    session.teamDefinition = createMockTeamDefinition({
+      defaults: { model: "anthropic/claude-sonnet-4-5" },
+    });
+    const { setSessionSetting, getSessionSettings, resolveEffectiveSettings, resetSessionSettingsState } = await import("../settings/session-settings");
+    const { loadSettings } = await import("../settings/settings");
+    resetSessionSettingsState();
+    setSessionSetting("memberModel", { mode: "fixed", model: "openai/gpt-5" });
+    const effective = resolveEffectiveSettings(loadSettings(tmpDir), getSessionSettings());
+
+    const { buildMemberConfig } = await loadModule();
+    const result = buildMemberConfig("analyzer", session, { settings: effective });
+    expect(result!.model).toBe("anthropic/claude-sonnet-4-5");
+  });
+});

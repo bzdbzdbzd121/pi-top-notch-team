@@ -10,6 +10,12 @@ import {
 import type { TeamContext } from "./src/session/context";
 import { getRootDir } from "./src/config";
 import { loadSettings } from "./src/settings/settings";
+import {
+  getSessionSettings,
+  reconcileSessionSettings,
+  resolveEffectiveSettings,
+  clearSessionSettingsMemory,
+} from "./src/settings/session-settings";
 import { resolveAutoCompact } from "./src/settings/resolve-auto-compact";
 import { resolveMessageCoalescing } from "./src/settings/resolve-message-coalescing";
 import { getSupportedThinkingLevelsFor } from "./src/settings/resolve-thinking";
@@ -207,6 +213,13 @@ export default function (pi: ExtensionAPI) {
   // Capture ctx.ui.notify for UI-only routing notifications
   let uiNotify: ((msg: string, type?: "info" | "warning" | "error") => void) | null = null;
 
+  // ── Per-session settings (临时设置): 唯一读取入口 ──────────
+  // 所有全局设置消费点必须经此合并层（global 打底 + 内存 overlay 深字段级补丁）。
+  // 无 overlay 时 effective = 全局，行为逐位一致（阶段 2 回归口径）。
+  // 静态接线锁定测试（index.test.ts）断言 index.ts 内仅此一处 loadSettings 调用。
+  const getEffectiveSettings = () =>
+    resolveEffectiveSettings(loadSettings(getRootDir()), getSessionSettings());
+
   // ── Message channel: queue → router (extracted to src/setup/message-channel.ts) ──
   const { router, messageQueue, responseWaiter, autoCompact, coalescer, tlWaitGate } = createMessageChannel({
     pi,
@@ -217,9 +230,9 @@ export default function (pi: ExtensionAPI) {
       uiNotify?.(`[消息已路由给 ${target}]`, "info");
     },
     // Resolve per dispatch so /team setting changes take effect immediately.
-    getAutoCompact: () => resolveAutoCompact(loadSettings(getRootDir())),
+    getAutoCompact: () => resolveAutoCompact(getEffectiveSettings()),
     // S1 (阶段 2): 消息合并设置 per-dispatch 解析（开关/上限即时生效）。
-    getCoalescing: () => resolveMessageCoalescing(loadSettings(getRootDir())),
+    getCoalescing: () => resolveMessageCoalescing(getEffectiveSettings()),
   });
 
   teamCtx.router = router;
@@ -341,6 +354,8 @@ export default function (pi: ExtensionAPI) {
       buildMemberConfig(memberName, getSessionState(), {
         tlCurrentModel,
         lookupSupportedThinkingLevels,
+        // 临时设置覆盖层：spawn 时读取 merge 后的生效设置（模型/思考强度）
+        settings: getEffectiveSettings(),
       }),
     getMemberLog: async (memberName, maxLines, maxContentLength) => {
       const handle = teamCtx.getHandle(memberName);
@@ -366,8 +381,8 @@ export default function (pi: ExtensionAPI) {
     // runtime + per-call config + handle resolution power the pre-check that
     // aligns batch prompts behind member compactions.
     autoCompact,
-    getAutoCompact: () => resolveAutoCompact(loadSettings(getRootDir())),
-    getSettings: () => loadSettings(getRootDir()),
+    getAutoCompact: () => resolveAutoCompact(getEffectiveSettings()),
+    getSettings: () => getEffectiveSettings(),
     getHandle: (name: string) => teamCtx.getHandle(name),
   };
 
@@ -642,6 +657,10 @@ export default function (pi: ExtensionAPI) {
   // processes are stopped best-effort so no orphan keeps appending to a
   // session file a later resume would reopen.
   pi.on("session_shutdown", () => {
+    // Per-session settings (临时设置) 补充失效通道：无条件清内存（不清快照，快照
+    // 保留供 /team resume）。必须无条件执行——不得包进下方 if (_session.active)
+    // 团队会话条件内（无团队会话时同样要清，防止跨 /new 泄漏）。
+    clearSessionSettingsMemory();
     const _session = getSessionState();
     if (_session.active) {
       const isDynamic = teamCtx.isDynamicSession;
@@ -670,6 +689,11 @@ export default function (pi: ExtensionAPI) {
 
   // ── session_start: reset stale team state + register autocomplete/editor ──
   pi.on("session_start", (event, ctx) => {
+    // Per-session settings (临时设置) 主失效通道：sessionId 对比变化则清内存 overlay
+    // （派生信号，事件丢失免疫；session_shutdown 为补充通道）。空串（sessionManager
+    // 不可用）→ fail-open no-op。仅清内存、不清快照。
+    reconcileSessionSettings(ctx.sessionManager?.getSessionId?.() ?? "");
+
     // Track TL current model for /team setting "follow" mode
     tlCurrentModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
     // Cache the model registry for member thinking-level support lookups
@@ -749,6 +773,8 @@ export default function (pi: ExtensionAPI) {
           tlCurrentModel,
           resume: true,
           lookupSupportedThinkingLevels,
+          // 临时设置覆盖层：resume 重启成员同样读取 merge 后的生效设置
+          settings: getEffectiveSettings(),
         });
         if (!config) {
           throw new Error(`无法为成员 "${name}" 构建配置`);

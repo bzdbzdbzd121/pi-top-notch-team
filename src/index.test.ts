@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -1174,5 +1174,105 @@ describe("session-ended banner in before_agent_start", () => {
     };
     const result = await runBeforeAgentStart(undefined, tracedCtx);
     expect(result.systemPrompt).toContain("团队会话已结束");
+  });
+});
+
+describe("per-session settings wiring (阶段 2)", () => {
+  let pi: ExtensionAPI;
+  let sessionSettingsMod: typeof import("./settings/session-settings");
+
+  beforeEach(async () => {
+    vi.resetModules();
+    delete process.env.TEAM_ROLE;
+    pi = createMockPi();
+    const mod = await import("../index");
+    mod.default(pi);
+    sessionSettingsMod = await import("./settings/session-settings");
+  });
+
+  afterEach(() => {
+    sessionSettingsMod.resetSessionSettingsState();
+  });
+
+  function getHandler(name: string): Function {
+    const onCalls = (pi.on as ReturnType<typeof vi.fn>).mock.calls;
+    return onCalls.find((c: any) => c[0] === name)![1];
+  }
+
+  function ctxWithSessionId(sessionId?: string) {
+    return createMockContext({
+      sessionManager: {
+        getEntries: vi.fn().mockReturnValue([]),
+        getSessionId: sessionId ? vi.fn().mockReturnValue(sessionId) : undefined,
+      } as any,
+    });
+  }
+
+  it("session_start records the sessionId — a later session change clears the overlay (reconcile 兜底, shutdown 缺失时也清除)", async () => {
+    const sessionStart = getHandler("session_start");
+    await sessionStart({ type: "session_start" }, ctxWithSessionId("session-A"));
+    sessionSettingsMod.setSessionSetting("waitTimeoutMinutes", 5);
+    expect(sessionSettingsMod.getSessionSettings().waitTimeoutMinutes).toBe(5);
+    // 会话切换（例如 /new 后 shutdown 事件丢失）：session_start 的 reconcile 兜底清除
+    await sessionStart({ type: "session_start" }, ctxWithSessionId("session-B"));
+    expect(sessionSettingsMod.getSessionSettings()).toEqual({});
+  });
+
+  it("same-session session_start keeps the overlay (reconcile 同 ID 保留)", async () => {
+    const sessionStart = getHandler("session_start");
+    await sessionStart({ type: "session_start" }, ctxWithSessionId("session-A"));
+    sessionSettingsMod.setSessionSetting("waitTimeoutMinutes", 5);
+    await sessionStart({ type: "session_start" }, ctxWithSessionId("session-A"));
+    expect(sessionSettingsMod.getSessionSettings().waitTimeoutMinutes).toBe(5);
+  });
+
+  it("session_start with an unavailable session id is fail-open (overlay kept)", async () => {
+    const sessionStart = getHandler("session_start");
+    await sessionStart({ type: "session_start" }, ctxWithSessionId());
+    sessionSettingsMod.setSessionSetting("waitTimeoutMinutes", 5);
+    await sessionStart({ type: "session_start" }, ctxWithSessionId());
+    expect(sessionSettingsMod.getSessionSettings().waitTimeoutMinutes).toBe(5);
+  });
+
+  it("session_shutdown clears the overlay unconditionally (no active team session)", async () => {
+    // 无任何团队会话活跃（fresh load 默认状态）：清除逻辑必须无条件执行
+    const shutdown = getHandler("session_shutdown");
+    sessionSettingsMod.setSessionSetting("waitTimeoutMinutes", 5);
+    await shutdown({ type: "session_shutdown" });
+    expect(sessionSettingsMod.getSessionSettings()).toEqual({});
+  });
+
+  it("session_shutdown keeps the snapshot (只清内存, resume 恢复通道保留)", async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), "index-session-settings-"));
+    try {
+      const sessionDir = join(tmpDir, "sessions", "team-a", "sid-1");
+      sessionSettingsMod.setSessionSetting("waitTimeoutMinutes", 5);
+      expect(sessionSettingsMod.saveSessionSettingsSnapshot(sessionDir)).toBe(true);
+
+      const shutdown = getHandler("session_shutdown");
+      await shutdown({ type: "session_shutdown" });
+
+      expect(sessionSettingsMod.getSessionSettings()).toEqual({});
+      expect(existsSync(sessionSettingsMod.getSessionSettingsSnapshotPath(sessionDir))).toBe(true);
+      // 跨进程 resume 语义：快照仍可恢复
+      expect(sessionSettingsMod.loadSessionSettingsSnapshot(sessionDir, "session-B")).toBe(true);
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("wiring lock: index.ts reads settings ONLY through the getEffectiveSettings entry", async () => {
+    const source = readFileSync(new URL("../index.ts", import.meta.url), "utf-8");
+    // 4 处注入 + buildMemberConfig 2 调用点全部替换后，index.ts 内不应再有裸 loadSettings 调用点
+    const loadSettingsCallSites = source.match(/loadSettings\(/g) ?? [];
+    expect(loadSettingsCallSites.length).toBe(1);
+    // 唯一入口形态
+    expect(source).toContain(
+      "resolveEffectiveSettings(loadSettings(getRootDir()), getSessionSettings())"
+    );
+    // 6 个消费点全部经 getEffectiveSettings：getAutoCompact×2 / getCoalescing / getSettings
+    // + buildMemberConfig 两调用点（start_member、startResumedMember）
+    const effectiveCalls = source.match(/getEffectiveSettings\(\)/g) ?? [];
+    expect(effectiveCalls.length).toBe(6);
   });
 });

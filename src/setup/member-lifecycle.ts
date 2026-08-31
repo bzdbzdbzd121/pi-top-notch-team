@@ -9,6 +9,7 @@ import type { MessageQueue } from "../channel/message-queue";
 import type { ResponseWaiter } from "../channel/response-waiter";
 import type { MemberOperationalState } from "../session/context";
 import type { TeamSessionState } from "../session/state";
+import type { TeamSettings } from "../settings/settings";
 import { getRootDir } from "../config";
 import { loadSettings } from "../settings/settings";
 import { resolveMemberThinking } from "../settings/resolve-thinking";
@@ -105,6 +106,13 @@ export interface BuildMemberConfigOptions {
    * Only consulted when the global `memberThinkingLevel` setting is set.
    */
   lookupSupportedThinkingLevels?: (modelRef: string) => readonly string[] | undefined;
+  /**
+   * Pre-resolved effective settings (global settings + per-session overlay merged,
+   * 阶段 2 临时设置). When omitted, plain global settings are loaded from disk
+   * (legacy path — keeps existing call sites/tests intact). index.ts always passes
+   * getEffectiveSettings() so per-session temporary settings reach the member spawn.
+   */
+  settings?: TeamSettings;
 }
 
 export function buildMemberConfig(
@@ -138,7 +146,7 @@ export function buildMemberConfig(
   const sharedContextPath = ensureSharedContextFile(team, sessionId);
 
   // Resolve the effective model for this member (global settings + team YAML + TL model)
-  const settings = loadSettings(rootDir);
+  const settings = options?.settings ?? loadSettings(rootDir);
   const resolved = resolveMemberModel(memberDef, team, settings, options?.tlCurrentModel);
 
   // Resolve the thinking level: only pass `--thinking` when the global setting
