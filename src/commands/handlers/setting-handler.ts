@@ -15,7 +15,6 @@ import {
   resolveMessageCoalescing,
 } from "../../settings/resolve-message-coalescing";
 import {
-  DEFAULT_WAIT_TIMEOUT_MINUTES,
   describeWaitTimeoutSetting,
   resolveWaitTimeoutMinutes,
 } from "../../settings/resolve-wait-timeout";
@@ -23,14 +22,25 @@ import {
   MEMBER_THINKING_LEVELS,
   describeMemberThinkingSetting,
 } from "../../settings/resolve-thinking";
+import {
+  getSessionSettings,
+  setSessionSetting,
+  clearSessionSetting,
+  clearAllSessionSettings,
+  resolveEffectiveSettings,
+  type DeepPartial,
+} from "../../settings/session-settings";
+import { getSessionState } from "../../session/state";
 import { scrollSelect } from "../../ui/scroll-select";
 
 /** Menu option identifiers (suffix after the emoji prefix is matched loosely). */
+const OPT_SCOPE = "设置作用域";
 const OPT_MEMBER_MODEL = "成员默认模型";
 const OPT_MEMBER_THINKING = "成员思考强度";
 const OPT_AUTO_COMPACT = "自动压缩";
 const OPT_WAIT_TIMEOUT = "等待上限";
 const OPT_COALESCE = "消息合并";
+const OPT_CLEAR_ALL = "清除全部临时设置";
 const OPT_FOLLOW = "跟随当前配置";
 const OPT_FIXED = "指定模型";
 
@@ -47,6 +57,24 @@ const COALESCE_TOGGLE = "开关切换";
 const COALESCE_SET_SIZE = "设置批量上限（条数）";
 const COALESCE_SET_CHARS = "设置总字符上限";
 
+/** 设置作用域：仅当前会话（临时 overlay）/ 全局（settings.yaml）。 */
+type SettingScope = "temp" | "global";
+const SCOPE_LABEL: Record<SettingScope, string> = {
+  temp: "仅当前会话（临时）",
+  global: "全局",
+};
+
+/**
+ * 团队 YAML 指定 model 时（成员 model 或 defaults.model），全局/临时模型设置对
+ * 这些成员不生效——菜单项透明附注（阶段 4）。
+ */
+function teamYamlSpecifiesModel(): boolean {
+  const s = getSessionState();
+  if (!s.active || !s.teamDefinition) return false;
+  if (s.teamDefinition.defaults?.model) return true;
+  return s.teamDefinition.members.some((m) => !!m.model);
+}
+
 function formatModel(m: { provider: string; id: string; name?: string }): string {
   return `${m.provider}/${m.id}`;
 }
@@ -56,47 +84,119 @@ function currentModelRef(ctx: ExtensionCommandContext): string | undefined {
 }
 
 /**
- * /team setting — Interactive settings menu for team sessions.
+ * /team setting — 团队设置交互菜单（阶段 4：作用域改造）。
  *
- * Currently supports:
- *   - 成员默认模型: "follow" (member uses TL's current model at spawn time)
- *                   or "fixed" (one of pi's available/logged-in models)
- *   - 成员思考强度: a thinking level applied to members when their resolved
- *                   model supports it (otherwise the model's default is kept)
+ * 顶层菜单：
+ *   ① 设置作用域（●仅当前会话（临时）/ 全局）——一次 select 往返切换，切换后
+ *      重新显示菜单；临时入口在 sessionManager 不可用/空 sessionId 时禁用（fail-open）。
+ *   ②-⑥ 五项设置——「当前值」恒显示 merge 后生效值（global + overlay 深合并），
+ *      有覆盖的键带 [临时] 徽标；模型项在团队 YAML 指定 model 时附注「此设置不生效」。
+ *   ⑦ 清除全部临时设置（仅 overlay 非空时显示）——内存 + 绑定快照双清（S7）。
  *
- * The setting only affects members started AFTER the change; already-running
- * member processes keep the model they were spawned with.
+ * 子菜单路由：作用域=临时 → 工作对象为 effective（显示与编辑一致），每次变更
+ * 经 persist 写入 overlay（setSessionSetting/clearSessionSetting，undefined =
+ * 恢复全局）；作用域=全局 → 工作对象为磁盘全局，persist 直写 settings.yaml。
+ * 复用既有 configure* 函数，仅 save 目标参数化（零重复逻辑）。
+ *
+ * 通知文案按场景：团队活跃期「（仅当前 pi 会话生效；/team resume 本团队会话时将
+ * 恢复）」；会话外「（仅当前 pi 会话生效，重启后失效）」；全局作用域无后缀。
  */
 export async function handleSetting(
   ctx: ExtensionCommandContext,
 ): Promise<void> {
   const rootDir = getRootDir();
-  const settings = loadSettings(rootDir);
+  const global = loadSettings(rootDir);
+  const overlay = getSessionSettings();
+  // 临时入口可用性：需要当前 pi 会话标识（fail-open：不可用则强制全局）
+  const sessionId = ctx.sessionManager?.getSessionId?.() ?? "";
+  const tempAvailable = sessionId !== "";
+  const activeTeamSession = getSessionState().active;
+  const teamYamlNote = teamYamlSpecifiesModel()
+    ? "团队 YAML 指定了 model，此设置不生效"
+    : "";
 
-  // ── Top-level menu ──────────────────────────────────────
-  const topChoice = await ctx.ui.select(
-    "团队设置（Esc 退出）",
-    [
-      `${OPT_MEMBER_MODEL}（当前：${describeMemberModelSetting(settings, currentModelRef(ctx))}` +
-        `${settings.memberThinkingLevel ? `，思考：${settings.memberThinkingLevel}` : ""}）`,
-      `${OPT_MEMBER_THINKING}（当前：${describeMemberThinkingSetting(settings)}）`,
-      `${OPT_AUTO_COMPACT}（当前：${describeAutoCompactSetting(settings)}）`,
-      `${OPT_WAIT_TIMEOUT}（当前：${describeWaitTimeoutSetting(settings)}）`,
-      `${OPT_COALESCE}（当前：${describeMessageCoalescingSetting(settings)}）`,
-    ]
-  );
-  if (topChoice === undefined) return; // Esc
+  let scope: SettingScope = tempAvailable ? "temp" : "global";
 
-  if (topChoice.startsWith(OPT_MEMBER_MODEL)) {
-    await configureMemberModel(ctx, settings, rootDir);
-  } else if (topChoice.startsWith(OPT_MEMBER_THINKING)) {
-    await configureMemberThinking(ctx, settings, rootDir);
-  } else if (topChoice.startsWith(OPT_AUTO_COMPACT)) {
-    await configureAutoCompact(ctx, settings, rootDir);
-  } else if (topChoice.startsWith(OPT_WAIT_TIMEOUT)) {
-    await configureWaitTimeout(ctx, settings, rootDir);
-  } else if (topChoice.startsWith(OPT_COALESCE)) {
-    await configureMessageCoalescing(ctx, settings, rootDir);
+  for (;;) {
+    // 每次显示菜单时重算生效值（overlay 可能被子菜单/⑦变更）
+    const effective = resolveEffectiveSettings(global, getSessionSettings());
+    const badge = (key: keyof TeamSettings) =>
+      overlay[key] !== undefined ? " [临时]" : "";
+
+    const scopeItem = tempAvailable
+      ? `${OPT_SCOPE}：${scope === "temp" ? "●" : ""}${SCOPE_LABEL.temp} / ${
+          scope === "global" ? "●" : ""
+        }${SCOPE_LABEL.global}`
+      : `${OPT_SCOPE}：全局（临时设置不可用：无法获取当前 pi 会话）`;
+
+    const items = [
+      scopeItem,
+      `${OPT_MEMBER_MODEL}（当前：${describeMemberModelSetting(effective, currentModelRef(ctx))}）${badge("memberModel")}${teamYamlNote ? `（${teamYamlNote}）` : ""}`,
+      `${OPT_MEMBER_THINKING}（当前：${describeMemberThinkingSetting(effective)}）${badge("memberThinkingLevel")}`,
+      `${OPT_AUTO_COMPACT}（当前：${describeAutoCompactSetting(effective)}）${badge("autoCompact")}`,
+      `${OPT_WAIT_TIMEOUT}（当前：${describeWaitTimeoutSetting(effective)}）${badge("waitTimeoutMinutes")}`,
+      `${OPT_COALESCE}（当前：${describeMessageCoalescingSetting(effective)}）${badge("messageCoalescing")}`,
+      ...(Object.keys(overlay).length > 0 ? [`${OPT_CLEAR_ALL}（恢复全局）`] : []),
+    ];
+
+    const topChoice = await ctx.ui.select("团队设置（Esc 退出）", items);
+    if (topChoice === undefined) return; // Esc
+
+    if (topChoice.startsWith(OPT_SCOPE)) {
+      if (!tempAvailable) {
+        ctx.ui.notify(
+          "临时设置不可用：无法获取当前 pi 会话（sessionManager 缺失或会话标识为空）。已使用全局设置。",
+          "warning"
+        );
+        continue;
+      }
+      // 一次 select 往返切换，重新显示菜单
+      scope = scope === "temp" ? "global" : "temp";
+      ctx.ui.notify(`设置作用域已切换为「${SCOPE_LABEL[scope]}」。`, "info");
+      continue;
+    }
+
+    if (topChoice.startsWith(OPT_CLEAR_ALL)) {
+      // 内存 + 绑定快照双清（防「清了又复活」；活跃期快照随 clearAll 删除）
+      clearAllSessionSettings();
+      ctx.ui.notify("已清除全部临时设置，恢复全局设置生效。", "info");
+      return;
+    }
+
+    // ── 子菜单：工作对象 + persist 按作用域分流 ──
+    // 临时 → working = effective（显示 merge 后生效值，变更写 overlay，逐键 pin）；
+    // 全局 → working = 磁盘全局对象（直改，persist 落盘）。仅 save 目标参数化。
+    const working = scope === "temp" ? effective : global;
+    const noticeSuffix =
+      scope === "temp"
+        ? activeTeamSession
+          ? "（仅当前 pi 会话生效；/team resume 本团队会话时将恢复）"
+          : "（仅当前 pi 会话生效，重启后失效）"
+        : "";
+    const persistFor = (key: keyof TeamSettings): (() => void) =>
+      scope === "temp"
+        ? () => {
+            const v = working[key];
+            if (v === undefined) {
+              clearSessionSetting(key); // 恢复全局（如「思考强度：默认」）
+            } else {
+              setSessionSetting(key, v as DeepPartial<TeamSettings[typeof key]>);
+            }
+          }
+        : () => saveSettings(working, rootDir);
+
+    if (topChoice.startsWith(OPT_MEMBER_MODEL)) {
+      await configureMemberModel(ctx, working, persistFor("memberModel"), noticeSuffix, teamYamlNote);
+    } else if (topChoice.startsWith(OPT_MEMBER_THINKING)) {
+      await configureMemberThinking(ctx, working, persistFor("memberThinkingLevel"), noticeSuffix);
+    } else if (topChoice.startsWith(OPT_AUTO_COMPACT)) {
+      await configureAutoCompact(ctx, working, persistFor("autoCompact"), noticeSuffix);
+    } else if (topChoice.startsWith(OPT_WAIT_TIMEOUT)) {
+      await configureWaitTimeout(ctx, working, persistFor("waitTimeoutMinutes"), noticeSuffix);
+    } else if (topChoice.startsWith(OPT_COALESCE)) {
+      await configureMessageCoalescing(ctx, working, persistFor("messageCoalescing"), noticeSuffix);
+    }
+    return;
   }
 }
 
@@ -116,20 +216,22 @@ function parseNonNegativeInt(text: string): number | undefined {
 
 /**
  * Auto-compaction submenu. Loops until Esc so multiple items can be
- * configured in one visit. Saves after every change and surfaces the
- * effective configuration (including the default-fallback state).
+ * configured in one visit. Persists (overlay or disk, per scope) after every
+ * change and surfaces the effective configuration (including the
+ * default-fallback state).
  */
 async function configureAutoCompact(
   ctx: ExtensionCommandContext,
   settings: TeamSettings,
-  rootDir: string,
+  persist: () => void,
+  noticeSuffix: string,
 ): Promise<void> {
   // Track whether the user has been told about the default fallback,
   // so the notice appears at most once per menu visit.
   let fallbackNotified = false;
 
   const saveAndMaybeNotifyFallback = (): void => {
-    saveSettings(settings, rootDir);
+    persist();
     const ac = settings.autoCompact;
     if (
       ac.enabled &&
@@ -139,7 +241,7 @@ async function configureAutoCompact(
     ) {
       fallbackNotified = true;
       ctx.ui.notify(
-        `未配置任何阈值，自动压缩将使用默认阈值 ${DEFAULT_THRESHOLD_PERCENT}% 生效。`,
+        `未配置任何阈值，自动压缩将使用默认阈值 ${DEFAULT_THRESHOLD_PERCENT}% 生效。${noticeSuffix}`,
         "info"
       );
     }
@@ -206,12 +308,13 @@ async function configureAutoCompact(
 
 /**
  * 消息合并子菜单（S1，阶段 2）：开关 + 批量上限 + 总字符上限。
- * 循环直至 Esc；每次变更即保存。关闭时派发层完全走原逐条路径（fail-open）。
+ * 循环直至 Esc；每次变更即持久化（按作用域）。关闭时派发层完全走原逐条路径（fail-open）。
  */
 async function configureMessageCoalescing(
   ctx: ExtensionCommandContext,
   settings: TeamSettings,
-  rootDir: string,
+  persist: () => void,
+  noticeSuffix: string,
 ): Promise<void> {
   for (;;) {
     const mc = resolveMessageCoalescing(settings);
@@ -231,11 +334,11 @@ async function configureMessageCoalescing(
         ...(settings.messageCoalescing ?? { enabled: true }),
         enabled: !mc.enabled,
       };
-      saveSettings(settings, rootDir);
+      persist();
       ctx.ui.notify(
-        mc.enabled
+        (mc.enabled
           ? "消息合并已关闭：成员消息恢复逐条立即派发。"
-          : "消息合并已开启：接收方回合结束时积压消息合并为单条派发。",
+          : "消息合并已开启：接收方回合结束时积压消息合并为单条派发。") + noticeSuffix,
         "info"
       );
     } else if (choice.startsWith(COALESCE_SET_SIZE)) {
@@ -250,7 +353,7 @@ async function configureMessageCoalescing(
         ...(settings.messageCoalescing ?? { enabled: true }),
         maxBatchSize: n,
       };
-      saveSettings(settings, rootDir);
+      persist();
     } else if (choice.startsWith(COALESCE_SET_CHARS)) {
       const text = await ctx.ui.input("合并包总字符软上限（≥1 的整数）", String(mc.maxBatchChars));
       if (text === undefined) continue;
@@ -263,17 +366,11 @@ async function configureMessageCoalescing(
         ...(settings.messageCoalescing ?? { enabled: true }),
         maxBatchChars: n,
       };
-      saveSettings(settings, rootDir);
+      persist();
     }
   }
 }
 
-/**
- * Wait budget (top-level, independent of auto-compaction): unified budget
- * for team wait operations — the all-idle deadline of
- * wait_and_get_member_status / team_send_and_wait and the batch barrier
- * (maxWait). 0 = never time out (the original wait-tool semantics).
- */
 /**
  * 成员思考强度子菜单：选择一个思考级别（或「默认」不指定）。
  *
@@ -286,7 +383,8 @@ const THINKING_DEFAULT_LABEL = "默认（不指定 — 使用 pi 对该模型的
 async function configureMemberThinking(
   ctx: ExtensionCommandContext,
   settings: TeamSettings,
-  rootDir: string,
+  persist: () => void,
+  noticeSuffix: string,
 ): Promise<void> {
   const items = [
     THINKING_DEFAULT_LABEL,
@@ -302,8 +400,11 @@ async function configureMemberThinking(
 
   if (choice === THINKING_DEFAULT_LABEL) {
     settings.memberThinkingLevel = undefined;
-    saveSettings(settings, rootDir);
-    ctx.ui.notify("成员思考强度已设为「默认（不指定）」。\n仅对之后启动的成员生效。", "info");
+    persist();
+    ctx.ui.notify(
+      `成员思考强度已设为「默认（不指定）」。\n仅对之后启动的成员生效。${noticeSuffix}`,
+      "info"
+    );
     return;
   }
 
@@ -311,9 +412,9 @@ async function configureMemberThinking(
   const level = choice.replace(/^● /, "");
   if (!(MEMBER_THINKING_LEVELS as readonly string[]).includes(level)) return;
   settings.memberThinkingLevel = level as (typeof MEMBER_THINKING_LEVELS)[number];
-  saveSettings(settings, rootDir);
+  persist();
   ctx.ui.notify(
-    `成员思考强度已设为「${level}」。\n模型不支持该级别的成员保持默认；仅对之后启动的成员生效。`,
+    `成员思考强度已设为「${level}」。\n模型不支持该级别的成员保持默认；仅对之后启动的成员生效。${noticeSuffix}`,
     "info"
   );
 }
@@ -321,7 +422,8 @@ async function configureMemberThinking(
 async function configureWaitTimeout(
   ctx: ExtensionCommandContext,
   settings: TeamSettings,
-  rootDir: string,
+  persist: () => void,
+  noticeSuffix: string,
 ): Promise<void> {
   const current = resolveWaitTimeoutMinutes(settings);
   const text = await ctx.ui.input(
@@ -335,11 +437,11 @@ async function configureWaitTimeout(
     return;
   }
   settings.waitTimeoutMinutes = n;
-  saveSettings(settings, rootDir);
+  persist();
   ctx.ui.notify(
-    n === 0
+    (n === 0
       ? "等待上限已设为「不限」：wait 工具与批屏障永不超时（恢复原始语义）。"
-      : `等待上限已设为 ${n} 分钟：wait 工具在超时后返回诊断，批屏障在超预算后直接派发。`,
+      : `等待上限已设为 ${n} 分钟：wait 工具在超时后返回诊断，批屏障在超预算后直接派发。`) + noticeSuffix,
     "info"
   );
 }
@@ -347,7 +449,9 @@ async function configureWaitTimeout(
 async function configureMemberModel(
   ctx: ExtensionCommandContext,
   settings: TeamSettings,
-  rootDir: string,
+  persist: () => void,
+  noticeSuffix: string,
+  teamYamlNote: string,
 ): Promise<void> {
   const tlModel = currentModelRef(ctx);
 
@@ -361,7 +465,7 @@ async function configureMemberModel(
     : `${OPT_FIXED}…`;
 
   const modeChoice = await ctx.ui.select(
-    "成员默认模型 — 仅对之后启动的成员生效（Esc 返回）",
+    `成员默认模型 — 仅对之后启动的成员生效${teamYamlNote ? `（${teamYamlNote}）` : ""}（Esc 返回）`,
     [followLabel, fixedLabel]
   );
   if (modeChoice === undefined) return; // Esc
@@ -369,9 +473,9 @@ async function configureMemberModel(
   // ── Follow mode ─────────────────────────────────────────
   if (modeChoice.includes(OPT_FOLLOW)) {
     settings.memberModel = { mode: "follow" };
-    saveSettings(settings, rootDir);
+    persist();
     ctx.ui.notify(
-      `成员默认模型已设为「跟随当前配置」${tlSuffix}。\n仅对之后启动的成员生效。`,
+      `成员默认模型已设为「跟随当前配置」${tlSuffix}。\n仅对之后启动的成员生效。${noticeSuffix}`,
       "info"
     );
     return;
@@ -411,9 +515,9 @@ async function configureMemberModel(
   if (!picked) return;
 
   settings.memberModel = { mode: "fixed", model: formatModel(picked) };
-  saveSettings(settings, rootDir);
+  persist();
   ctx.ui.notify(
-    `成员默认模型已设为「${formatModel(picked)}」。\n仅对之后启动的成员生效；团队成员 YAML 中的 model/defaults.model 优先级更高。`,
+    `成员默认模型已设为「${formatModel(picked)}」。\n仅对之后启动的成员生效；团队成员 YAML 中的 model/defaults.model 优先级更高。${noticeSuffix}`,
     "info"
   );
 }

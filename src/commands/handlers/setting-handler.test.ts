@@ -1,10 +1,18 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createMockContext } from "../../test/fixtures/mock-extension-api";
 import { handleSetting } from "./setting-handler";
 import { loadSettings } from "../../settings/settings";
+import { endSession } from "../../session/state";
+import {
+  getSessionSettings,
+  setSessionSetting,
+  clearAllSessionSettings,
+  setActiveSessionDir,
+  resetSessionSettingsState,
+} from "../../settings/session-settings";
 
 const MODEL_A = { provider: "anthropic", id: "claude-sonnet-4-5", name: "Claude Sonnet 4.5" } as any;
 const MODEL_B = { provider: "openai", id: "gpt-5", name: "GPT-5" } as any;
@@ -16,12 +24,22 @@ function createCtx(options?: {
   customImpl?: (factory: any, opts?: any) => Promise<any>;
   availableModels?: Array<typeof MODEL_A>;
   currentModel?: typeof MODEL_A;
+  /** Current pi sessionId. Absent → sessionManager 不可用（临时入口禁用，fail-open）。 */
+  sessionId?: string;
 }) {
   return createMockContext({
     modelRegistry: {
       getAvailable: vi.fn().mockReturnValue(options?.availableModels ?? [MODEL_A, MODEL_B]),
     } as any,
     model: options?.currentModel ?? MODEL_A,
+    ...(options?.sessionId !== undefined
+      ? {
+          sessionManager: {
+            getEntries: vi.fn().mockReturnValue([]),
+            getSessionId: vi.fn().mockReturnValue(options.sessionId),
+          } as any,
+        }
+      : {}),
     ui: {
       ...createMockContext().ui,
       select: vi.fn(options?.selectImpl ?? (() => Promise.resolve(undefined))),
@@ -47,9 +65,12 @@ describe("/team setting", () => {
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), "team-setting-test-"));
     process.env.TOP_NOTCH_TEAM_ROOT = tmpDir;
+    resetSessionSettingsState();
   });
 
   afterEach(() => {
+    endSession();
+    resetSessionSettingsState();
     delete process.env.TOP_NOTCH_TEAM_ROOT;
     rmSync(tmpDir, { recursive: true, force: true });
   });
@@ -62,9 +83,9 @@ describe("/team setting", () => {
     expect(ctx.ui.notify).not.toHaveBeenCalled();
   });
 
-  it("sets follow mode via the menu", async () => {
+  it("sets follow mode via the menu (global scope)", async () => {
     const ctx = createCtx({
-      selectImpl: pickContaining("成员默认模型", "跟随当前配置"),
+      selectImpl: pickContaining("设置作用域", "成员默认模型", "跟随当前配置"),
     });
     await handleSetting(ctx as any);
 
@@ -75,9 +96,9 @@ describe("/team setting", () => {
     );
   });
 
-  it("sets a fixed model picked from available models", async () => {
+  it("sets a fixed model picked from available models (global scope)", async () => {
     const ctx = createCtx({
-      selectImpl: pickContaining("成员默认模型", "指定模型"),
+      selectImpl: pickContaining("设置作用域", "成员默认模型", "指定模型"),
       // scrollSelect resolves with the picked model ref
       customImpl: () => Promise.resolve("openai/gpt-5"),
     });
@@ -106,9 +127,9 @@ describe("/team setting", () => {
     expect(loadSettings(tmpDir).memberModel.mode).toBe("follow");
   });
 
-  it("keeps settings unchanged when the user cancels the model picker", async () => {
+  it("keeps settings unchanged when the user cancels the model picker (global scope)", async () => {
     const ctx = createCtx({
-      selectImpl: pickContaining("成员默认模型", "指定模型"),
+      selectImpl: pickContaining("设置作用域", "成员默认模型", "指定模型"),
       customImpl: () => Promise.resolve(undefined), // Esc in scroll picker
     });
     await handleSetting(ctx as any);
@@ -178,5 +199,244 @@ describe("/team setting", () => {
     const selectMock = ctx.ui.select as ReturnType<typeof vi.fn>;
     const modePickerOptions = selectMock.mock.calls[1]?.[1] as string[];
     expect(modePickerOptions?.some((o) => o.includes("openai/gpt-5"))).toBe(true);
+  });
+});
+
+describe("/team setting — 临时设置作用域 (阶段 4)", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "team-setting-temp-"));
+    process.env.TOP_NOTCH_TEAM_ROOT = tmpDir;
+    resetSessionSettingsState();
+  });
+
+  afterEach(() => {
+    endSession();
+    resetSessionSettingsState();
+    delete process.env.TOP_NOTCH_TEAM_ROOT;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("default scope is 临时 — writes go to the overlay, settings.yaml untouched (文件内容断言)", async () => {
+    const ctx = createCtx({
+      sessionId: "session-A",
+      selectImpl: pickContaining("成员默认模型", "跟随当前配置"),
+    });
+    await handleSetting(ctx as any);
+
+    // 内存 overlay 生效
+    expect(getSessionSettings().memberModel).toEqual({ mode: "follow" });
+    // 全局文件零污染
+    expect(existsSync(join(tmpDir, "settings.yaml"))).toBe(false);
+    expect(loadSettings(tmpDir).memberModel.mode).toBe("follow");
+    // 通知含临时语义（会话外：重启后失效）
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("仅当前 pi 会话生效"),
+      "info"
+    );
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("重启后失效"),
+      "info"
+    );
+  });
+
+  it("scope switch flips to 全局 — subsequent writes go to settings.yaml", async () => {
+    const seen: string[][] = [];
+    let pass = 0;
+    const ctx = createCtx({
+      sessionId: "session-A",
+      selectImpl: (_title, options) => {
+        seen.push(options);
+        pass++;
+        if (pass === 1) return Promise.resolve(options.find((o) => o.includes("设置作用域")));
+        if (pass === 2) return Promise.resolve(options.find((o) => o.includes("成员默认模型")));
+        return Promise.resolve(options.find((o) => o.includes("跟随当前配置")));
+      },
+    });
+    await handleSetting(ctx as any);
+
+    // 第一次菜单：默认临时作用域（● 在临时侧）
+    expect(seen[0]?.[0]).toContain("●仅当前会话（临时）");
+    // 切换后重新显示：● 移到全局侧
+    expect(seen[1]?.[0]).toContain("●全局");
+    // 写入全局文件，overlay 保持为空
+    expect(existsSync(join(tmpDir, "settings.yaml"))).toBe(true);
+    expect(loadSettings(tmpDir).memberModel).toEqual({ mode: "follow" });
+    expect(getSessionSettings()).toEqual({});
+  });
+
+  it("[临时] badges appear only on covered keys; ⑦ appears only when overlay non-empty", async () => {
+    setSessionSetting("autoCompact", { enabled: true, thresholdPercent: 55 });
+    setSessionSetting("waitTimeoutMinutes", 3);
+    const seen: string[][] = [];
+    const ctx = createCtx({
+      selectImpl: (_title, options) => {
+        seen.push(options);
+        return Promise.resolve(undefined); // Esc
+      },
+    });
+    await handleSetting(ctx as any);
+
+    const top = seen[0] ?? [];
+    const waitItem = top.find((o) => o.includes("等待上限"))!;
+    expect(waitItem).toContain("[临时]");
+    const acItem = top.find((o) => o.includes("自动压缩"))!;
+    expect(acItem).toContain("[临时]");
+    // 未覆盖的键无徽标
+    const modelItem = top.find((o) => o.includes("成员默认模型"))!;
+    expect(modelItem).not.toContain("[临时]");
+    // 生效值显示 = merge 后（overlay 的 55% / 3 分钟）
+    expect(acItem).toContain("55%");
+    expect(waitItem).toContain("3 分钟");
+    // ⑦ 存在
+    expect(top.some((o) => o.includes("清除全部临时设置"))).toBe(true);
+
+    // 清空后 ⑦ 消失
+    clearAllSessionSettings();
+    const seen2: string[][] = [];
+    const ctx2 = createCtx({
+      selectImpl: (_title, options) => {
+        seen2.push(options);
+        return Promise.resolve(undefined);
+      },
+    });
+    await handleSetting(ctx2 as any);
+    expect(seen2[0]?.some((o) => o.includes("清除全部临时设置"))).toBe(false);
+    expect(seen2[0]?.find((o) => o.includes("等待上限"))).not.toContain("[临时]");
+  });
+
+  it("temp-scope submenu edits the overlay only (global file untouched)", async () => {
+    const { saveSettings, DEFAULT_SETTINGS } = await import("../../settings/settings");
+    saveSettings(structuredClone(DEFAULT_SETTINGS), tmpDir);
+    // 覆盖层只 pin thresholdPercent
+    setSessionSetting("autoCompact", { thresholdPercent: 55 });
+
+    const ctx = createCtx({
+      sessionId: "session-A",
+      selectImpl: pickContaining("自动压缩", "开关切换"),
+    });
+    await handleSetting(ctx as any);
+
+    // overlay：enabled 翻转（未 pin 字段沿用全局值 10）
+    expect(getSessionSettings().autoCompact).toEqual({
+      enabled: false,
+      thresholdPercent: 55,
+      timeoutMinutes: 10,
+    });
+    // 全局文件内容不变
+    expect(loadSettings(tmpDir).autoCompact.enabled).toBe(true);
+  });
+
+  it("⑦ clears the overlay AND the bound snapshot (S7); settings.yaml untouched", async () => {
+    const sessionDir = join(tmpDir, "sessions", "team-a", "sid-1");
+    setActiveSessionDir(sessionDir);
+    setSessionSetting("waitTimeoutMinutes", 5);
+    expect(existsSync(join(sessionDir, "session-settings.yaml"))).toBe(true);
+
+    const ctx = createCtx({
+      selectImpl: pickContaining("清除全部临时设置"),
+    });
+    await handleSetting(ctx as any);
+
+    expect(getSessionSettings()).toEqual({});
+    expect(existsSync(join(sessionDir, "session-settings.yaml"))).toBe(false);
+    expect(existsSync(join(tmpDir, "settings.yaml"))).toBe(false);
+  });
+
+  it("fail-open: sessionId unavailable → temp entry disabled with notify, writes go to global", async () => {
+    // 默认 mock context 的 sessionManager 无 getSessionId → 临时不可用
+    const seen: string[][] = [];
+    let pass = 0;
+    const ctx = createCtx({
+      selectImpl: (_title, options) => {
+        seen.push(options);
+        pass++;
+        if (pass === 1) return Promise.resolve(options.find((o) => o.includes("设置作用域")));
+        if (pass === 2) return Promise.resolve(options.find((o) => o.includes("成员默认模型")));
+        return Promise.resolve(options.find((o) => o.includes("跟随当前配置")));
+      },
+    });
+    await handleSetting(ctx as any);
+
+    expect(seen[0]?.[0]).toContain("临时设置不可用");
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("临时设置不可用"),
+      "warning"
+    );
+    // 写入全局，overlay 为空
+    expect(existsSync(join(tmpDir, "settings.yaml"))).toBe(true);
+    expect(loadSettings(tmpDir).memberModel.mode).toBe("follow");
+    expect(getSessionSettings()).toEqual({});
+  });
+
+  it("model item notes when the team YAML specifies a model (此设置不生效)", async () => {
+    const { startSession } = await import("../../session/state");
+    startSession({
+      name: "team-a",
+      description: "",
+      defaults: { model: "anthropic/claude-sonnet-4-5" },
+      members: [],
+    } as any);
+    const seen: string[][] = [];
+    const ctx = createCtx({
+      selectImpl: (_title, options) => {
+        seen.push(options);
+        return Promise.resolve(undefined);
+      },
+    });
+    await handleSetting(ctx as any);
+
+    const modelItem = seen[0]?.find((o) => o.includes("成员默认模型"))!;
+    expect(modelItem).toContain("团队 YAML 指定了 model");
+  });
+
+  it("active team session → notify mentions resume recovery", async () => {
+    const { startSession } = await import("../../session/state");
+    startSession({ name: "team-a", description: "", members: [] } as any);
+    const ctx = createCtx({
+      sessionId: "session-A",
+      selectImpl: pickContaining("成员默认模型", "跟随当前配置"),
+    });
+    await handleSetting(ctx as any);
+
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("/team resume 本团队会话时将恢复"),
+      "info"
+    );
+  });
+});
+
+describe("/team setting — 临时作用域持久化分支 (阶段 4)", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "team-setting-temp-persist-"));
+    process.env.TOP_NOTCH_TEAM_ROOT = tmpDir;
+    resetSessionSettingsState();
+  });
+
+  afterEach(() => {
+    endSession();
+    resetSessionSettingsState();
+    delete process.env.TOP_NOTCH_TEAM_ROOT;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("temp scope「思考强度：默认（不指定）」removes the pin (undefined → clearSessionSetting, 恢复全局)", async () => {
+    setSessionSetting("memberThinkingLevel", "high");
+    const ctx = createCtx({
+      sessionId: "session-A",
+      selectImpl: pickContaining("成员思考强度", "默认（不指定"),
+    });
+    await handleSetting(ctx as any);
+
+    expect(getSessionSettings().memberThinkingLevel).toBeUndefined();
+    expect(existsSync(join(tmpDir, "settings.yaml"))).toBe(false);
+    // 通知含临时语义后缀
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("仅当前 pi 会话生效"),
+      "info"
+    );
   });
 });
