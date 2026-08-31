@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { handleResume, type ResumeHandlerDeps } from "./resume-handler";
@@ -217,5 +217,110 @@ describe("/team resume", () => {
     await handleResume(pi as any, makeTeamCtx(), ctx as any, "", { startResumedMember: vi.fn() });
     expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("--all"), "info");
     expect(getSessionState().active).toBe(false);
+  });
+});
+
+describe("临时设置恢复通道 (阶段 3)", () => {
+  let sessionSettingsMod: typeof import("../../settings/session-settings");
+
+  beforeEach(async () => {
+    sessionSettingsMod = await import("../../settings/session-settings");
+    sessionSettingsMod.resetSessionSettingsState();
+  });
+
+  afterEach(() => {
+    sessionSettingsMod.resetSessionSettingsState();
+  });
+
+  function writeSnapshot(teamName: string, sessionId: string, overlay: Record<string, unknown>) {
+    const dir = join(rootDir, "sessions", teamName, sessionId);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "session-settings.yaml"), JSON.stringify(overlay), "utf-8");
+  }
+
+  it("S2/S3: /new 后及跨进程 resume 恢复临时设置，且在 startResumedMember 之前加载", async () => {
+    writeManifest(rootDir, { teamName: "team-a", sessionId: "sid-1" });
+    writeSnapshot("team-a", "sid-1", { waitTimeoutMinutes: 5, memberThinkingLevel: "high" });
+    // 模拟 /new 或跨进程重启：内存 overlay 为空
+    expect(sessionSettingsMod.getSessionSettings()).toEqual({});
+
+    let overlayAtSpawn: Record<string, unknown> = {};
+    const startResumedMember = vi.fn(async () => {
+      overlayAtSpawn = { ...sessionSettingsMod.getSessionSettings() };
+      return 111;
+    });
+    const deps: ResumeHandlerDeps = { startResumedMember };
+    await handleResume(createMockExtensionAPI(), makeTeamCtx(), createMockContext() as any, "team-a", deps);
+
+    // 快照已恢复进内存
+    expect(sessionSettingsMod.getSessionSettings().waitTimeoutMinutes).toBe(5);
+    expect(sessionSettingsMod.getSessionSettings().memberThinkingLevel).toBe("high");
+    // 加载先于成员重启（spawn 时 overlay 已就位 → buildMemberConfig 读到恢复值）
+    expect(overlayAtSpawn.waitTimeoutMinutes).toBe(5);
+    expect(overlayAtSpawn.memberThinkingLevel).toBe("high");
+    expect(startResumedMember).toHaveBeenCalledWith("analyst");
+  });
+
+  it("S5: 本会话已显式设置时 resume 不加载快照（内存优先）", async () => {
+    writeManifest(rootDir, { teamName: "team-a", sessionId: "sid-1" });
+    writeSnapshot("team-a", "sid-1", { waitTimeoutMinutes: 5 });
+    sessionSettingsMod.setSessionSetting("waitTimeoutMinutes", 30);
+
+    await handleResume(
+      createMockExtensionAPI(),
+      makeTeamCtx(),
+      createMockContext() as any,
+      "team-a",
+      { startResumedMember: vi.fn(async () => 111) }
+    );
+
+    expect(sessionSettingsMod.getSessionSettings().waitTimeoutMinutes).toBe(30);
+  });
+
+  it("恢复后成员 spawn 反映恢复的 model/thinking（S2/S3 验收口径）", async () => {
+    writeManifest(rootDir, { teamName: "team-a", sessionId: "sid-1" });
+    writeSnapshot("team-a", "sid-1", {
+      memberModel: { mode: "fixed", model: "openai/gpt-5" },
+      memberThinkingLevel: "low",
+    });
+    await handleResume(
+      createMockExtensionAPI(),
+      makeTeamCtx(),
+      createMockContext() as any,
+      "team-a",
+      { startResumedMember: vi.fn(async () => 111) }
+    );
+
+    // 与 index.ts 相同的 effective-settings 组合 → buildMemberConfig
+    const { loadSettings } = await import("../../settings/settings");
+    const effective = sessionSettingsMod.resolveEffectiveSettings(
+      loadSettings(rootDir),
+      sessionSettingsMod.getSessionSettings()
+    );
+    const { buildMemberConfig } = await import("../../setup/member-lifecycle");
+    const config = buildMemberConfig("analyst", getSessionState(), {
+      settings: effective,
+      lookupSupportedThinkingLevels: () => ["off", "low"],
+    });
+    expect(config?.model).toBe("openai/gpt-5");
+    expect(config?.thinking).toBe("low");
+  });
+
+  it("S7: 活跃期 clear 后快照已删 → resume 不复活", async () => {
+    writeManifest(rootDir, { teamName: "team-a", sessionId: "sid-1" });
+    // 活跃期：set + clearAll → 快照删除
+    sessionSettingsMod.setActiveSessionDir(join(rootDir, "sessions", "team-a", "sid-1"));
+    sessionSettingsMod.setSessionSetting("waitTimeoutMinutes", 5);
+    sessionSettingsMod.clearAllSessionSettings();
+    expect(existsSync(join(rootDir, "sessions", "team-a", "sid-1", "session-settings.yaml"))).toBe(false);
+
+    await handleResume(
+      createMockExtensionAPI(),
+      makeTeamCtx(),
+      createMockContext() as any,
+      "team-a",
+      { startResumedMember: vi.fn(async () => 111) }
+    );
+    expect(sessionSettingsMod.getSessionSettings()).toEqual({});
   });
 });

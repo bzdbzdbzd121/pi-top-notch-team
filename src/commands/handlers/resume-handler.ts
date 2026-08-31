@@ -10,6 +10,7 @@ import {
 } from "../../session/manifest";
 import { readTeam } from "../../team/store";
 import { getRootDir } from "../../config";
+import { loadSessionSettingsSnapshot } from "../../settings/session-settings";
 import { ensureAddDynamicMemberTool } from "../../setup/dynamic-session-bootstrap";
 import { STOP_TEAM_SESSION_TOOL_NAME } from "../../tools/agent-session-tool-names";
 import { scrollSelect } from "../../ui/scroll-select";
@@ -203,6 +204,17 @@ export async function handleResume(
 
   // Widget + session-tool registration (onSessionStart also syncs the manifest)
   teamCtx.onSessionStart?.(ctx.ui as unknown as SessionUI);
+
+  // ── 临时设置恢复通道（阶段 3，用户需求核心）──
+  // /team resume 恢复团队会话时保留临时设置：内存 overlay 为空则从目标会话目录
+  // 读快照恢复（S2/S3 跨 /new、跨进程保留；S5 内存非空不加载；S7 clear 后快照已删
+  // 不复活）。必须在 startResumedMember 之前——成员 spawn 的 buildMemberConfig
+  // 走 effective settings（恢复的 model/thinking 直接作用于重启的成员进程）。
+  // 文件缺失/解析失败 fail-open（忽略不报错）。非 resume 的新团队会话不经过这里。
+  loadSessionSettingsSnapshot(
+    join(rootDir, "sessions", manifest.teamName, manifest.sessionId),
+    ctx.sessionManager?.getSessionId?.() ?? ""
+  );
 
   // Activate session tools (+ dynamic / agent-session extras)
   const extras = [

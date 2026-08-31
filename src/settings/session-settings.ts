@@ -44,6 +44,12 @@ let sessionSettings: DeepPartial<TeamSettings> = {};
 let sessionSettingsSessionId: string | null = null;
 /** 最近一次快照写入的团队会话目录（binding）。null = 未绑定（清除动作不触碰磁盘）。 */
 let bindingSessionDir: string | null = null;
+/**
+ * 当前活跃团队会话的会话目录（阶段 3 注入，index.ts 在 onSessionStart/onSessionEnd 维护）。
+ * 不变量 2：快照只在团队会话活跃期间写入——set 仅在 activeSessionDir 非空时写盘；
+ * stop 后（置 null）变更纯内存（S6），快照保持「最近活跃期状态」。
+ */
+let activeSessionDir: string | null = null;
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -54,12 +60,25 @@ export function getSessionSettingsSnapshotPath(sessionDir: string): string {
   return join(sessionDir, SNAPSHOT_FILE);
 }
 
+/**
+ * 注入/清除当前活跃团队会话目录（阶段 3 写盘钩子）。
+ * 团队会话启动（/team start、/team dynamic、/team resume）→ 传入会话目录；
+ * 会话结束（/team stop、stop_team_session、pi 会话切换 teardown）→ 传入 null。
+ * 仅影响 set 的即时写盘；clear/clearAll 仍走 binding 语义（不变量 4）。
+ */
+export function setActiveSessionDir(sessionDir: string | null): void {
+  activeSessionDir = sessionDir;
+}
+
 /** 返回当前 overlay 的深拷贝（外部修改不影响内部状态）。 */
 export function getSessionSettings(): Readonly<DeepPartial<TeamSettings>> {
   return structuredClone(sessionSettings);
 }
 
-/** 写入一个临时设置字段（深拷贝入内存）。undefined 视为无效调用（no-op，符合 undefined=不覆盖约定）。 */
+/**
+ * 写入一个临时设置字段（深拷贝入内存）。undefined 视为无效调用（no-op，符合 undefined=不覆盖约定）。
+ * 团队会话活跃期间（activeSessionDir 非空）即时写快照（不变量 2，resume 恢复通道）。
+ */
 export function setSessionSetting<K extends keyof TeamSettings>(
   key: K,
   value: DeepPartial<TeamSettings[K]>
@@ -68,6 +87,9 @@ export function setSessionSetting<K extends keyof TeamSettings>(
     return;
   }
   sessionSettings[key] = structuredClone(value) as DeepPartial<TeamSettings>[K];
+  if (activeSessionDir) {
+    saveSessionSettingsSnapshot(activeSessionDir);
+  }
 }
 
 /**
@@ -116,6 +138,8 @@ export function reconcileSessionSettings(sessionId: string): boolean {
     return false;
   }
   bindingSessionDir = null;
+  // 防御层：跨 pi 会话残留的活跃目录一并清除（正常路径由 onSessionEnd 置空）
+  activeSessionDir = null;
   if (Object.keys(sessionSettings).length === 0) {
     return false;
   }
@@ -320,11 +344,13 @@ function clearBindingSnapshot(): void {
 }
 
 /**
- * 测试专用：完全重置模块状态（overlay / recorded sessionId / binding），不触碰磁盘。
- * 生产路径用 clearAllSessionSettings / clearSessionSettingsMemory / reconcile 管理状态。
+ * 测试专用：完全重置模块状态（overlay / recorded sessionId / binding / active dir），
+ * 不触碰磁盘。生产路径用 clearAllSessionSettings / clearSessionSettingsMemory /
+ * reconcile / setActiveSessionDir 管理状态。
  */
 export function resetSessionSettingsState(): void {
   sessionSettings = {};
   sessionSettingsSessionId = null;
   bindingSessionDir = null;
+  activeSessionDir = null;
 }

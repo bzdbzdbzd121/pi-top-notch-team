@@ -1,4 +1,5 @@
 import type { ExtensionAPI, ModelRegistry } from "@earendil-works/pi-coding-agent";
+import { join } from "node:path";
 import { registerTeamCommand } from "./src/commands/team";
 import { TeamModeEditor } from "./src/ui/team-mode-editor";
 import { getSessionState, endSession } from "./src/session/state";
@@ -15,6 +16,7 @@ import {
   reconcileSessionSettings,
   resolveEffectiveSettings,
   clearSessionSettingsMemory,
+  setActiveSessionDir,
 } from "./src/settings/session-settings";
 import { resolveAutoCompact } from "./src/settings/resolve-auto-compact";
 import { resolveMessageCoalescing } from "./src/settings/resolve-message-coalescing";
@@ -794,6 +796,16 @@ export default function (pi: ExtensionAPI) {
 
   // Wire UI lifecycle hooks so commands/team.ts can install/uninstall immediately
   teamCtx.onSessionStart = (ui) => {
+    // Per-session settings (临时设置) 写盘钩子（阶段 3）：团队会话活跃期间 overlay 变更
+    // 即时写快照到当前会话目录（resume 恢复通道）。覆盖 /team start、/team dynamic、
+    // /team resume（都经此钩子）；onSessionEnd 置 null（stop 后变更纯内存，S6）。
+    const s = getSessionState();
+    setActiveSessionDir(
+      s.teamDefinition && s.sessionId
+        ? join(getRootDir(), "sessions", s.teamDefinition.name, s.sessionId)
+        : null
+    );
+
     // Register ALL session-only tools on-demand when a team session starts
     // (/team start or /team dynamic). Runs BEFORE the widget guard below —
     // registration must not depend on widget state (the widget may already be
@@ -842,6 +854,9 @@ export default function (pi: ExtensionAPI) {
     }
   };
   teamCtx.onSessionEnd = () => {
+    // Per-session settings (临时设置)：会话结束 → 活跃目录置空（stop 后变更纯内存）
+    setActiveSessionDir(null);
+
     if (teamStatusWidget) {
       teamStatusWidget.uninstall();
       teamStatusWidget = null;

@@ -1276,3 +1276,59 @@ describe("per-session settings wiring (阶段 2)", () => {
     expect(effectiveCalls.length).toBe(6);
   });
 });
+
+describe("per-session settings active-period wiring (阶段 3)", () => {
+  let pi: ExtensionAPI;
+  let sessionSettingsMod: typeof import("./settings/session-settings");
+
+  beforeEach(async () => {
+    vi.resetModules();
+    delete process.env.TEAM_ROLE;
+    pi = createMockPi();
+    const mod = await import("../index");
+    mod.default(pi);
+    sessionSettingsMod = await import("./settings/session-settings");
+  });
+
+  afterEach(() => {
+    sessionSettingsMod.resetSessionSettingsState();
+  });
+
+  function getTeamCommandHandler() {
+    return (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
+  }
+
+  it("onSessionStart sets the active session dir — team-active sets write snapshots immediately; onSessionEnd clears it", async () => {
+    const setActiveSpy = vi.spyOn(sessionSettingsMod, "setActiveSessionDir");
+    const cmdDef = getTeamCommandHandler();
+
+    // /team dynamic → onSessionStart → activeSessionDir = 会话目录
+    await cmdDef.handler("dynamic", createMockContext());
+    expect(setActiveSpy).toHaveBeenCalled();
+    const lastArg = setActiveSpy.mock.calls.at(-1)![0] as string;
+    expect(lastArg).toContain(join("sessions", "_dynamic_"));
+
+    // 团队活跃期 set → 即时写盘（文件内容断言）
+    sessionSettingsMod.setSessionSetting("waitTimeoutMinutes", 5);
+    const snapshotPath = join(lastArg, "session-settings.yaml");
+    expect(existsSync(snapshotPath)).toBe(true);
+    expect(readFileSync(snapshotPath, "utf-8")).toContain("waitTimeoutMinutes: 5");
+
+    // /team stop → onSessionEnd → 清除活跃目录（此后变更纯内存）
+    await cmdDef.handler("stop", createMockContext());
+    expect(setActiveSpy).toHaveBeenLastCalledWith(null);
+    sessionSettingsMod.setSessionSetting("memberThinkingLevel", "low");
+    expect(readFileSync(snapshotPath, "utf-8")).not.toContain("memberThinkingLevel");
+  });
+
+  it("wiring lock: snapshot load exists ONLY in the resume path (S4: 非 resume 新团队结构性拿不到快照)", async () => {
+    const indexSource = readFileSync(new URL("../index.ts", import.meta.url), "utf-8");
+    expect(indexSource.includes("loadSessionSettingsSnapshot")).toBe(false);
+    const resumeSource = readFileSync(
+      new URL("./commands/handlers/resume-handler.ts", import.meta.url),
+      "utf-8"
+    );
+    // handleResume 内唯一加载点（startResumedMember 之前）
+    expect((resumeSource.match(/loadSessionSettingsSnapshot\(/g) ?? []).length).toBe(1);
+  });
+});

@@ -19,6 +19,7 @@ import {
   loadSessionSettingsSnapshot,
   getSessionSettingsSnapshotPath,
   resetSessionSettingsState,
+  setActiveSessionDir,
   type DeepPartial,
 } from "./session-settings";
 
@@ -551,5 +552,104 @@ describe("snapshot primitives — save/load/clearBinding（resume 恢复通道�
     setSessionSetting("waitTimeoutMinutes", 0);
     clearAllSessionSettings();
     expect(DEFAULT_SETTINGS.waitTimeoutMinutes).toBe(15);
+  });
+});
+
+describe("active-period snapshot write (阶段 3: 团队活跃期即时写盘)", () => {
+  let tmpDir: string;
+  let sessionDir: string;
+
+  beforeEach(() => {
+    resetSessionSettingsState();
+    tmpDir = mkdtempSync(join(tmpdir(), "team-session-settings-active-"));
+    sessionDir = join(tmpDir, "sessions", "team-a", "sid-1");
+  });
+
+  afterEach(() => {
+    resetSessionSettingsState();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("set during an active team session writes the snapshot immediately (文件内容断言)", () => {
+    setActiveSessionDir(sessionDir);
+    setSessionSetting("waitTimeoutMinutes", 5);
+    setSessionSetting("memberThinkingLevel", "high");
+    const parsed = parseYaml(readFileSync(getSessionSettingsSnapshotPath(sessionDir), "utf-8")) as Record<string, unknown>;
+    expect(parsed.waitTimeoutMinutes).toBe(5);
+    expect(parsed.memberThinkingLevel).toBe("high");
+  });
+
+  it("set outside an active session is memory-only (不变量 2: 快照只在团队活跃期间写入)", () => {
+    setSessionSetting("waitTimeoutMinutes", 5);
+    expect(existsSync(getSessionSettingsSnapshotPath(sessionDir))).toBe(false);
+    expect(getSessionSettings().waitTimeoutMinutes).toBe(5);
+  });
+
+  it("setActiveSessionDir(null) stops snapshot writes (S6: stop 后变更纯内存, 已有快照不被改写)", () => {
+    setActiveSessionDir(sessionDir);
+    setSessionSetting("waitTimeoutMinutes", 5);
+    expect(existsSync(getSessionSettingsSnapshotPath(sessionDir))).toBe(true);
+
+    // /team stop → onSessionEnd → 活跃目录置空
+    setActiveSessionDir(null);
+    setSessionSetting("memberThinkingLevel", "low");
+    const parsed = parseYaml(readFileSync(getSessionSettingsSnapshotPath(sessionDir), "utf-8")) as Record<string, unknown>;
+    // 快照仍为「最近活跃期状态」：waitTimeout=5，无 thinking
+    expect(parsed.waitTimeoutMinutes).toBe(5);
+    expect(parsed.memberThinkingLevel).toBeUndefined();
+    expect(getSessionSettings().memberThinkingLevel).toBe("low");
+  });
+
+  it("set during an active session is fail-open when the snapshot cannot be written (fs 失败不阻塞设置)", () => {
+    const fileAsParent = join(tmpDir, "not-a-dir");
+    writeFileSync(fileAsParent, "x", "utf-8");
+    setActiveSessionDir(join(fileAsParent, "sub"));
+    expect(() => setSessionSetting("waitTimeoutMinutes", 5)).not.toThrow();
+    expect(getSessionSettings().waitTimeoutMinutes).toBe(5);
+  });
+
+  it("clear during an active session rewrites the snapshot; clearing the last key deletes it", () => {
+    setActiveSessionDir(sessionDir);
+    setSessionSetting("waitTimeoutMinutes", 5);
+    setSessionSetting("memberThinkingLevel", "low");
+    clearSessionSetting("memberThinkingLevel");
+    let parsed = parseYaml(readFileSync(getSessionSettingsSnapshotPath(sessionDir), "utf-8")) as Record<string, unknown>;
+    expect(parsed.waitTimeoutMinutes).toBe(5);
+    expect(parsed.memberThinkingLevel).toBeUndefined();
+
+    clearSessionSetting("waitTimeoutMinutes");
+    expect(existsSync(getSessionSettingsSnapshotPath(sessionDir))).toBe(false);
+  });
+
+  it("reconcile session change clears the active dir (跨会话残留防线)", () => {
+    reconcileSessionSettings("session-X");
+    setActiveSessionDir(sessionDir);
+    setSessionSetting("waitTimeoutMinutes", 5);
+    expect(existsSync(getSessionSettingsSnapshotPath(sessionDir))).toBe(true);
+
+    // /new → session Y：reconcile 清内存 + 清 active dir（防御层，正常由 onSessionEnd 处理）
+    reconcileSessionSettings("session-Y");
+    setSessionSetting("memberThinkingLevel", "low");
+    // 无活跃目录 → 新 set 不写盘
+    expect(existsSync(getSessionSettingsSnapshotPath(sessionDir))).toBe(true);
+    const parsed = parseYaml(readFileSync(getSessionSettingsSnapshotPath(sessionDir), "utf-8")) as Record<string, unknown>;
+    expect(parsed.memberThinkingLevel).toBeUndefined();
+  });
+
+  it("S8: multi-team snapshots are independent (按 sessionDir 隔离)", () => {
+    const dirB = join(tmpDir, "sessions", "team-b", "sid-9");
+    setActiveSessionDir(sessionDir);
+    setSessionSetting("waitTimeoutMinutes", 5);
+    clearSessionSettingsMemory();
+    setActiveSessionDir(dirB);
+    setSessionSetting("memberThinkingLevel", "low");
+
+    // 各自 resume 恢复各自状态
+    resetSessionSettingsState();
+    expect(loadSessionSettingsSnapshot(sessionDir, "session-A")).toBe(true);
+    expect(getSessionSettings()).toEqual({ waitTimeoutMinutes: 5 });
+    clearSessionSettingsMemory();
+    expect(loadSessionSettingsSnapshot(dirB, "session-A")).toBe(true);
+    expect(getSessionSettings()).toEqual({ memberThinkingLevel: "low" });
   });
 });
