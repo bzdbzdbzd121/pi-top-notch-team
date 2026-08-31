@@ -364,7 +364,8 @@ export function registerTlTools(deps: TlToolsDeps): void {
       + "Use instead of team_send_message when you need the member result.\n"
       + "The wait does NOT end when replies arrive — it ends ONLY when every member is idle "
       + "(same all-idle detection as wait_and_get_member_status). Replies are collected as they arrive "
-      + "and returned when the wait ends; a member that replied mid-turn may still be finishing its work.\n"
+      + "and returned when the wait ends; a member that replied mid-turn may still be finishing its work. "
+      + "Non-reply messages members sent to you during the wait are included in the same result.\n"
       + "Params: tasks (array of {to, content}), nextSteps (下一步计划，wait 结束后返回给 TL 以强调工作流程).\n"
       + "For a single member: tasks: [{to: \"name\", content: \"...\"}].\n"
       + "For multiple concurrent members: tasks: [{to: \"a\", content: \"...\"}, {to: \"b\", content: \"...\"}]",
@@ -391,7 +392,7 @@ export function registerTlTools(deps: TlToolsDeps): void {
       "BATCH ADVANTAGE: concurrent execution — total wall-clock time ≈ slowest single task rather than sum of all tasks.",
       "SEQUENTIAL COST: total wall-clock time = sum of all task durations; every pause between tasks adds latency.",
       "BATCH ALIGNMENT (自动压缩): in a multi-task batch, if a member needs auto-compaction, ALL prompts of the batch wait until the LAST needed compaction finishes, then dispatch together — no member starts early (unified start). The barrier is internal and fully silent — the TL only experiences a longer wait, bounded by the batch budget (default 15 min, /team setting).",
-      "team_send_and_wait ends ONLY when ALL members are idle — same all-idle detection as wait_and_get_member_status. Replies arriving early do NOT end the wait: a member that replied may still be finishing its turn, and other members may still be working. Do not re-dispatch to a member while a wait is running.",
+      "team_send_and_wait ends ONLY when ALL members are idle — same all-idle detection as wait_and_get_member_status. Replies arriving early do NOT end the wait: a member that replied may still be finishing its turn, and other members may still be working. Do not re-dispatch to a member while a wait is running. Non-reply messages members sent you during the wait come back inside the same result ([from message] sections).",
       "Returns PARTIAL results if some members went idle/crashed without replying — in batch mode, one member's failure does not block the other members' results from being returned.",
       "Always fill in nextSteps with what you plan to do after the wait ends — it will be returned to you to keep the workflow on track.",
     ],
@@ -451,7 +452,6 @@ export function registerTlTools(deps: TlToolsDeps): void {
         memberOpsStates,
         lastPendingCorrId,
         messageQueue,
-        pi: deps.pi,
         autoCompact: deps.autoCompact,
         tlWaitGate: deps.tlWaitGate,
         getAutoCompact: deps.getAutoCompact,
@@ -631,8 +631,6 @@ interface SendAndWaitCtx {
   memberOpsStates: Map<string, MemberOperationalState>;
   lastPendingCorrId: Map<string, string>;
   messageQueue: MessageQueue;
-  /** TL extension API — used by the S3 wait-gate flush (steer delivery). */
-  pi?: ExtensionAPI;
   /** Shared auto-compaction runtime — required for the batch barrier. Absent = legacy path. */
   autoCompact?: AutoCompactRuntime;
   /** Resolve the effective auto-compaction config. Absent = feature disabled. */
@@ -907,52 +905,6 @@ function generateCorrId(): string {
 }
 
 /**
- * S3: deliver messages buffered during the wait (member→TL, non-reply) the
- * moment the all-idle gate opens — no waiting for the TL's turn to end.
- *
- * Delivery: plain pi.sendMessage WITHOUT deliverAs — during tool execution
- * the agent run is active (_isAgentRunActive covers tool execution), so pi
- * takes the steer branch: the agent loop drains the steering queue AFTER
- * tool results are appended and BEFORE the next assistant completion
- * (pi 0.83.0 pi-agent-core agent-loop.js runLoop). The TL sees these
- * messages in the SAME turn, immediately after the team_send_and_wait tool
- * result; nothing is streaming during tool execution, so no interruption.
- * If the run was aborted just before the flush, pi's not-streaming +
- * no-triggerTurn branch appends the message to history without a turn —
- * the message still lands in context, never lost.
- *
- * Fire-and-forget: delivery failure must not fail the tool result (the TL
- * can still recover content via get_member_log).
- */
-function flushTlWaitBuffer(ctx: SendAndWaitCtx): void {
-  const gate = ctx.tlWaitGate;
-  const pi = ctx.pi;
-  if (!gate || !pi) return;
-  const buffered = gate.drain();
-  if (buffered.length === 0) return;
-  // 注入格式（用户裁决：保持 TL 上下文干净）：每条缓冲消息以 S2 原格式
-  // 逐条独立注入——与 nextTurn 路径的消息外观完全一致，不加合并包头、
-  // 编号标注等元信息。多条 = 多个独立 custom message，全部落在同一个
-  // steering batch（下一 completion 前一次性注入，时序上仍紧随工具结果）。
-  for (const m of buffered) {
-    try {
-      void Promise.resolve(
-        pi.sendMessage({
-          customType: "team-message",
-          content: `[消息通道 - 来自 ${m.from}]\n${m.subject ? `主题：${m.subject}\n` : ""}${m.content}`,
-          display: true,
-          details: { msg: m },
-        })
-      ).catch(() => {
-        // Async delivery failure — fail-open (tool result unaffected).
-      });
-    } catch {
-      // Synchronous throw — fail-open.
-    }
-  }
-}
-
-/**
  * Wait until ALL members are idle, collecting task replies as they arrive.
  *
  * The all-idle gate is MANDATORY (consistent with wait_and_get_member_status,
@@ -1006,11 +958,14 @@ async function waitWithAllIdleCheck(
     ctx.tlWaitGate?.endWait();
   }
 
-  // S3 flush: all members idle (or deadline expired) — deliver the buffered
-  // member→TL messages NOW via steer, in the same turn right after this
-  // tool result. Not waiting for the TL's turn to end is the whole point of
-  // the all-idle gate (decision #38) + S3 flush (decision #39).
-  flushTlWaitBuffer(ctx);
+  // S3（修订 v2，用户裁决）：等待期到达的 member→TL 非回复消息并入本工具
+  // 结果。理由：强制 all-idle 门控（决策 #38）覆盖成员的整个工作窗口，
+  // 非回复消息只可能在门控激活期间到达——无需独立注入（v1 曾以 steer
+  // 在工具结果之后单独注入 custom message，v2 并入结果更干净：少 N 条
+  // 独立历史消息、零额外投递路径）。Esc 中断也安全：agent loop 在
+  // abort-break 之前就已 push 已完成的工具结果（agent-loop.js
+  // executeToolCallsSequential 实读），含缓冲消息的结果照常落上下文。
+  const buffered = ctx.tlWaitGate?.drain() ?? [];
 
   // CorrId cleanup: resolved waits clear the lastPending registry; the rest
   // are cancelled so they don't leak in the waiter's pending map.
@@ -1036,6 +991,11 @@ async function waitWithAllIdleCheck(
       parts.push(`[${t.to}] ⚠️ 未收到回复（成员可能已停止或崩溃）`);
     }
   }
+  // 等待期到达的非回复消息：追加在回复之后、下一步计划之前，与
+  // `[from reply]` 同风格（`[from message]`），无任何元信息包头。
+  for (const m of buffered) {
+    parts.push(`[${m.from} message] ${m.subject ? `主题：${m.subject}\n` : ""}${m.content}`);
+  }
 
   let text = preambleBlock + parts.join("\n\n---\n") + nextStepsFooter;
   // Deadline-expiry diagnostic — the gate resolved because the deadline
@@ -1047,8 +1007,15 @@ async function waitWithAllIdleCheck(
       `建议：对该成员执行 stop_member，或 /team stop 后 /team resume 恢复会话。`;
   }
 
+  const details: Record<string, unknown> = allReplied
+    ? { nextSteps }
+    : { allIdle: true, partial: true, nextSteps };
+  if (buffered.length > 0) {
+    details.bufferedMessages = buffered.length;
+  }
+
   return {
-    details: allReplied ? { nextSteps } : { allIdle: true, partial: true, nextSteps },
+    details,
     content: [{ type: "text" as const, text }],
   };
 }

@@ -81,7 +81,7 @@ src/
 │   ├── message-queue.ts  ← Serial FIFO queue (event-driven drain, no polling)
 │   ├── router.ts     ← Routes to member / tl / all / self-skip
 │   ├── response-waiter.ts  ← team_send_and_wait correlation matching + response buffer
-│   ├── tl-wait-gate.ts     ← S3 等待期缓冲门控（决策 #39）：team_send_and_wait 在飞时 member→TL 非回复消息入缓冲，all-idle 门控打开时经 steer 即时注入（纯状态）
+│   ├── tl-wait-gate.ts     ← S3 等待期缓冲门控（决策 #39）：team_send_and_wait 在飞时 member→TL 非回复消息入缓冲，门控打开后并入工具结果一并返回（纯状态）
 │   ├── auto-compact.ts    ← Shared Auto-Compaction runtime (primitives + pending/flush)
 │   ├── message-coalescer.ts ← S1 合并运行时（决策 #37）：per-receiver 桶 + 前缀上限 + flusher 钩子（纯状态，派发由 createSendToMember 注入）
 │   ├── message-coalescer.test.ts ← 前缀选择/上限降级/drain/flusher 生命周期（14 例）
@@ -126,7 +126,7 @@ src/
 │   └── dynamic-mode.test.ts  ← 动态模式提示词测试
 ├── setup/            ← Modular extracted setup modules
 │   ├── member-lifecycle.ts  ← createAndRegisterMember, buildMemberConfig, getMemberLog
-│   ├── message-channel.ts   ← createMessageChannel factory (queue+router+waiter wiring)；sendToTl 以 deliverAs:"nextTurn" 注入成员→TL 消息（S2 阶段 1，决策 #36；S3 修正：team_send_and_wait 等待期间改入 tlWaitGate 缓冲，门控打开时 steer 即时注入，决策 #39）；创建共享 coalescer 实例（S1 阶段 2，决策 #37）
+│   ├── message-channel.ts   ← createMessageChannel factory (queue+router+waiter wiring)；sendToTl 以 deliverAs:"nextTurn" 注入成员→TL 消息（S2 阶段 1，决策 #36；S3 修正：team_send_and_wait 等待期间改入 tlWaitGate 缓冲、门控打开后并入工具结果返回，决策 #39）；创建共享 coalescer 实例（S1 阶段 2，决策 #37）
 │   ├── dynamic-session-bootstrap.ts ← 动态会话共享 bootstrap（/team dynamic 与 start_team_session 复用）+ ensureAddDynamicMemberTool
 ├── settings/         ← Global settings (/team setting)
 │   ├── settings.ts        ← TeamSettings type + <rootDir>/settings.yaml read/write
@@ -312,13 +312,13 @@ src/
     - **测试**：新增核心语义用例（回复已到但非目标 member 仍 working → 推过整个去抖窗口等待不结束；转 idle 后放行）+ deadline 用例措辞更新；两处测试文件以 `runWithSettledAllIdle` / `settleAllIdleGate`（fake timers 推去抖窗口）改造成功路径用例（避免每个用例真实等待 ~12s）；压缩租约超时用例改推 15 分钟 deadline（成员保持 compacting 时门控无法去抖）。全量 1302 通过。
 39. **S3：等待期 member→TL 消息缓冲 + all-idle 即时注入（消息合并阶段 3，依决策 #38）** — S2（决策 #36）的遗留盲区：`team_send_and_wait` 等待期间到达的**非回复** member→TL 消息（无 corrId / corrId 不匹配）进 pi 的 `_pendingNextTurnMessages`，要等 TL 回合结束才可见——而 TL 正阻塞在工具调用里，工具结果返回后继续当前回合时这些消息仍不可见，TL 只能下回合才看到，与 #38 的「全员空闲即返回」形成信息时差。修复：
     - **缓冲层**（`src/channel/tl-wait-gate.ts` 纯状态）：`waitWithAllIdleCheck` 在飞期间 `sendToTl` 的非回复消息改入 `tlWaitGate` 扩展侧缓冲（不进 pi 的 nextTurn 队列——该队列无公开 drain API，缓冲决策必须在消息到达时做出）；corrId 回复仍由 waiter 消费进工具结果（优先级不变）；无等待在飞时 S2 nextTurn 语义零变化。
-    - **注入时机（核心）**：all-idle 门控打开（或 deadline 到期）的瞬间，`flushTlWaitBuffer` 以**无 deliverAs 的 `pi.sendMessage`** 投递缓冲消息——工具执行期 agent run 恒 active（`_isAgentRunActive` 覆盖整个 run 含工具执行）→ pi 走 **steer 分支** → agent loop 在工具结果 append 之后、下一次 assistant completion 之前排空 steering 队列（pi-agent-core agent-loop.js runLoop 每轮末 `getSteeringMessages()`）：**同一回合、紧随工具结果、零 streaming 打断**（工具执行期无 token 在流）。**真实 AgentSession E2E 锁定**（`src/tools/tl-wait-gate.agent-session.test.ts`）：工具执行中 sendMessage 的 custom 消息落在 toolResult 之后、final assistant 之前。若 flush 前回合刚被 Esc 中止：pi 的 not-streaming + 无 triggerTurn 分支把消息直接 append 进 history（不触发回合）——不丢失。
-    - **注入格式（用户裁决：保持 TL 上下文干净）**：每条缓冲消息以 S2 原格式（`[消息通道 - 来自 X]` + 主题 + 内容）**逐条独立注入**——与 nextTurn 路径的消息外观完全一致，不加合并包头、编号标注等元信息；多条 = 多个独立 custom message，全部落在同一 steering batch（时序上仍紧随工具结果）。
+    - **并入工具结果（v2，用户裁决，替代 v1 的 steer 注入）**：门控打开（或 deadline 到期）后，`waitWithAllIdleCheck` drain 缓冲并把每条消息以 `[from message] 主题…\n内容` 段落拼进工具返回值（位于回复之后、下一步计划之前，无任何元信息包头）。依据：强制 all-idle 门控覆盖成员的整个工作窗口，非回复消息只可能在门控激活期间到达——无需独立注入，随结果一并返回更干净（少 N 条独立历史消息、零额外投递路径）。**Esc 中断安全**（agent-loop.js `executeToolCallsSequential` 实读）：已完成的工具结果在 abort-break **之前**就已 push 进上下文——含缓冲消息的结果照常落历史，下回合可见。
+    - **v1 机制留档（已废弃）**：曾以无 deliverAs 的 `pi.sendMessage`（工具执行期 agent run 恒 active → steer 分支）在工具结果之后同一回合注入独立 custom message——真实 AgentSession E2E 验证过注入位置（toolResult 之后、final assistant 之前），v2 简化后移除该路径与测试，机制知识留档于此（若未来需要工具执行期主动向 TL 递送消息可复用）。
     - **生命周期泄漏防护**：beginWait/endWait 的 try/finally 完全在 `waitWithAllIdleCheck` 内（endWait 先于 flush，两者间无 await——同步块内无 interleaved 入桶）；gate 在飞期间到达的最后一批消息（如成员 idle 前最后一报）恰好在门控打开时被 flush 携带。无 `tlWaitGate` 接线的 legacy 路径零行为变化（flush 直接跳过，测试锁定）。并发等待（并行 tool call）容忍：计数器不归零不算结束，首个打开的门控 drain 全部缓冲。
     - **fire-and-forget**：flush 投递失败（异步 reject / 同步 throw）fail-open，不影响工具结果返回（TL 可经 get_member_log 兜底）。
     - **范围**：仅 `sendToTl` 的 team-message 路径；系统通知（崩溃/拒收/压缩/清理）与 team-route 错误保持即时；批屏障期间（beginWait 之前）到达的消息仍走 S2 nextTurn（屏障静默且短暂）。
     - **接线**：`createMessageChannel` 创建并返回 `tlWaitGate`；`index.ts` 注入 `tlToolsDeps`；`SendAndWaitCtx` 新增 `pi?`/`tlWaitGate?`。
-    - **测试**：gate 单测 5 例（计数/缓冲/原子 drain）；message-channel S3 3 例（缓冲不 sendMessage、gate 关闭后 nextTurn 不变、corrId 回复优先）；tl-tools 2 例（门控打开时单次 steer 注入含合并格式与单参数调用断言、无接线零变化）；真实 AgentSession E2E 1 例。全量 1313 通过。
+    - **测试**：gate 单测 5 例（计数/缓冲/原子 drain）；message-channel S3 3 例（缓冲不 sendMessage、gate 关闭后 nextTurn 不变、corrId 回复优先）；tl-tools 2 例（门控打开后并入结果：`[from message]` 段落顺序/零 sendMessage/无元信息/details.bufferedMessages、无接线零变化）。全量 1312 通过。
 
 ## Dependency Injection Pattern
 
@@ -351,8 +351,7 @@ Member A calls team_send_message({to: "mover", content: "..."})
       ├── to="mover"  → handle.sendCommand({type:"prompt", streamingBehavior:"followUp", ...}) on Member B's stdin
       ├── to="tl"     → responseWaiter.resolveIfWaiting(corrId, ...) OR buffer
                           → team_send_and_wait 等待在飞（S3，决策 #39）：入 tlWaitGate 扩展侧缓冲，
-                            all-idle 门控打开时由 waitWithAllIdleCheck 经 pi.sendMessage（无 deliverAs
-                            → 工具执行期 = steer 分支）注入——工具结果之后、同一回合内，不等 TL 回合结束
+                            门控打开后并入 team_send_and_wait 工具结果一并返回（[from message] 段落）
                           → 否则 pi.sendMessage({customType:"team-message", ...}, {deliverAs:"nextTurn"})  ← S2：下一次任意回合统一注入，零 steer（决策 #36）
       ├── to="all"    → broadcast to all (skip self)
       └── unknown     → pi.sendMessage ("无法路由消息到未知成员")
@@ -500,7 +499,7 @@ printf '' | timeout 10 ./node_modules/.bin/pi --mode json --no-tools -e ./index.
 | `list_members()` | Show all member statuses |
 | `get_member_log(name, lines?, maxContentLength?)` | Query Member's recent session via RPC. `maxContentLength` truncates each message content (default 200 chars). Truncation uses `slice(0, max-3) + "..."` so total length = maxContentLength. |
 | `wait_and_get_member_status()` | 等待所有 member 空闲后查看所有 Member 的运行状态 (idle/working/crashed/stopped)。No parameters. 如果任何 member 仍在工作中会阻塞，和 team_send_and_wait 的 all-idle 门控完全一致（team_send_and_wait 同样必须等到全员空闲才结束等待，见决策 #38）。 |
-| `team_send_and_wait({tasks: [{to, content}], nextSteps})` | Send message(s) to **one or more** team members and WAIT until ALL members are idle（决策 #38：回复到达不结束等待——必须等到全员空闲，与 wait_and_get_member_status 一致；回复在等待期间陆续收集，门控结束后一并返回；等待期间到达的非回复 member→TL 消息随门控打开经 steer 即时注入——决策 #39，不等 TL 回合结束）. tasks 支持批量发送到不同 member 实现并发执行。Returns partial results if some members fail. nextSteps 在 wait 结束后随结果返回。
+| `team_send_and_wait({tasks: [{to, content}], nextSteps})` | Send message(s) to **one or more** team members and WAIT until ALL members are idle（决策 #38：回复到达不结束等待——必须等到全员空闲，与 wait_and_get_member_status 一致）；等待期间到达的非回复 member→TL 消息并入工具结果一并返回（`[from message]` 段落，决策 #39 v2）. tasks 支持批量发送到不同 member 实现并发执行。Returns partial results if some members fail. nextSteps 在 wait 结束后随结果返回。
 >
 > **批屏障（统一开始）**：多 task 批次（tasks.length > 1）中若有成员需自动压缩，整批 prompt 在**最后一个需要的压缩完成后才统一派发**——一个都不先跑（压缩完成后任务间仍并发执行）。屏障对 TL **完全静默**（TL 无需感知压缩屏障，只感知更长的等待），受批预算限制（默认 15 分钟，`/team setting` 可调，0=不限）。单任务批次与 autoCompact 关闭时完全走旧路径，零预检。
 >

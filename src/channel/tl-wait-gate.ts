@@ -2,31 +2,22 @@ import type { TeamMessage } from "./types";
 
 /**
  * TL wait gate (S3) — buffers member→TL messages while a team_send_and_wait
- * wait is in flight, so they can be delivered the moment ALL members go idle
- * (the all-idle gate, decision #38) instead of sitting in pi's
- * `_pendingNextTurnMessages` until the TL's turn ends.
+ * wait is in flight, so they can be returned INSIDE the tool result the
+ * moment ALL members go idle (the all-idle gate, decision #38) — instead of
+ * sitting in pi's `_pendingNextTurnMessages` until the TL's turn ends.
  *
  * Why buffering instead of pi's nextTurn queue: `_pendingNextTurnMessages`
  * has no public read/drain API (pi 0.83.0 agent-session.js — only push at
  * sendCustomMessage and inject+clear inside prompt()). The delivery decision
  * must therefore happen at message-arrival time: while a wait gate is active,
  * `sendToTl` buffers here; when the gate opens, `waitWithAllIdleCheck`
- * drains and re-delivers via a plain `pi.sendMessage` (steer — see below).
+ * drains the gate and appends the messages to the team_send_and_wait tool
+ * result as `[from message]` sections (after the replies, before nextSteps).
  *
- * Delivery timing (pi 0.83.0 verified): during a tool execution the agent
- * run is active (`_isAgentRunActive` covers the whole run, including tool
- * execution), so `sendCustomMessage` without `deliverAs` takes the steer
- * branch → the agent loop's steering queue is drained AFTER tool results
- * are appended and BEFORE the next assistant completion (agent-loop.js
- * runLoop: `pendingMessages = await config.getSteeringMessages()` at each
- * iteration end) — the TL sees the messages in the SAME turn, right after
- * the team_send_and_wait tool result, with zero streaming interruption.
- * Nothing is streaming during tool execution, so steer cannot interrupt.
- *
- * Robustness: if the TL run was aborted just before the flush, sendCustom-
- * Message falls to the not-streaming/no-triggerTurn branch and appends the
- * message to history without a turn — the message still lands in context
- * for the next completion instead of being lost.
+ * Esc-abort safety (pi 0.83.0 verified, agent-loop.js executeToolCalls-
+ * Sequential): a completed tool result is pushed into the conversation BEFORE
+ * the abort-break — so the result (buffered messages included) lands in
+ * history even when the user aborts mid-wait; the next turn sees it.
  *
  * Counting semantics: `beginWait`/`endWait` are balanced by the single
  * `waitWithAllIdleCheck` caller (try/finally). Concurrent waits (parallel

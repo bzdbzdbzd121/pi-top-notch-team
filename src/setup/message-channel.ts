@@ -116,10 +116,10 @@ export function createMessageChannel(deps: MessageChannelDeps): MessageChannel {
           return; // consumed by waiter, skip sendMessage
         }
       }
-      // S3（等待期缓冲，阶段 3）：team_send_and_wait 等待期间到达的非回复消息
-      // 改入 tlWaitGate 缓冲——等待的门控（全员空闲，决策 #38）一打开就由
-      // waitWithAllIdleCheck 经 steer 即时注入（工具结果之后、同一回合内），
-      // 不再等到 TL 回合结束。pi 的 nextTurn 队列无公开 drain API，故缓冲
+      // S3（等待期缓冲，阶段 3 v2）：team_send_and_wait 等待期间到达的非回复消息
+      // 改入 tlWaitGate 缓冲——门控（全员空闲，决策 #38）打开后由
+      // waitWithAllIdleCheck drain 并**并入工具结果**一并返回（[from message]
+      // 段落，位于回复之后）。pi 的 nextTurn 队列无公开 drain API，故缓冲
       // 决策必须在消息到达时做出。无等待在飞时保持 S2 nextTurn 语义不变。
       if (tlWaitGate.isWaitActive()) {
         tlWaitGate.buffer(msg);

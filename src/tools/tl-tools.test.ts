@@ -821,11 +821,11 @@ describe("registerTlTools", () => {
       }
     });
 
-    it("S3: 等待期间到达的 member→TL 消息在门控打开时经 steer 即时注入（不等 TL 回合结束）", { timeout: 5000 }, async () => {
-      // 阶段 3：gate 活跃时 sendToTl 会把非回复消息缓冲到 tlWaitGate；
-      // all-idle 门控打开的瞬间，waitWithAllIdleCheck 把缓冲消息经
-      // pi.sendMessage（无 deliverAs → 工具执行期 = steer 分支，注入在
-      // 工具结果之后、同一回合内）投递给 TL。
+    it("S3: 等待期间到达的 member→TL 非回复消息并入工具结果返回（v2，不独立注入）", { timeout: 5000 }, async () => {
+      // 阶段 3 v2（用户裁决）：gate 活跃时 sendToTl 把非回复消息缓冲到
+      // tlWaitGate；门控打开后缓冲消息直接拼进 team_send_and_wait 的
+      // 返回值（[from message] 段落，位于回复之后、下一步计划之前）——
+      // 不两发独立 custom message（v1 的 steer 注入已废弃）。
       memberOpsStates.set("worker", "idle");
 
       const gate = createTlWaitGate();
@@ -866,7 +866,7 @@ describe("registerTlTools", () => {
 
         // 等待期间（去抖窗口内）模拟通道投递：成员的非回复消息进缓冲。
         // sendToTl 的缓冲分支已在 message-channel.test.ts 锁定；此处直接
-        // 向 gate 注入以驱动 flush 路径。
+        // 向 gate 注入以驱动并入路径。
         gate.buffer({ id: "m1", from: "worker", to: "tl", content: "等待期间的补充汇报", timestamp: Date.now() });
         gate.buffer({ id: "m2", from: "analyst", to: "tl", content: "顺手发现的问题", subject: "侧线发现", timestamp: Date.now() });
 
@@ -875,24 +875,20 @@ describe("registerTlTools", () => {
         );
         const result = await resultPromise;
 
-        // 门控打开：缓冲消息逐条以 S2 原格式 steer 投递（单参数调用——无 nextTurn/followUp）
-        expect(piFlush.sendMessage).toHaveBeenCalledTimes(2);
-        const calls = (piFlush.sendMessage as ReturnType<typeof vi.fn>).mock.calls;
-        for (const [m, opt] of calls) {
-          expect(m.customType).toBe("team-message");
-          expect(m.display).toBe(true);
-          expect(opt).toBeUndefined(); // steer：注入在工具结果之后、同一回合
-        }
-        // 逐条 S2 原格式、精确匹配：无合并包头 / 编号标注等元信息
-        //（用户裁决：保持 TL 上下文干净，与 nextTurn 路径消息外观完全一致）
-        expect(calls[0][0].content).toBe("[消息通道 - 来自 worker]\n等待期间的补充汇报");
-        expect(calls[1][0].content).toBe("[消息通道 - 来自 analyst]\n主题：侧线发现\n顺手发现的问题");
-        expect(calls[0][0].content).not.toContain("条消息");
-        expect(calls[0][0].content).not.toContain("【消息");
-        // 缓冲已清空；工具结果本身不受影响
+        // 不再有任何独立注入：零 pi.sendMessage 调用
+        expect(piFlush.sendMessage).not.toHaveBeenCalled();
+        const text = result.content[0].text;
+        // 回复在前、非回复消息在后（[from message] 段落、含 subject、无元信息包头）
+        expect(text).toContain("[worker reply] Task done");
+        expect(text).toContain("[worker message] 等待期间的补充汇报");
+        expect(text).toContain("[analyst message] 主题：侧线发现\n顺手发现的问题");
+        expect(text.indexOf("[worker reply]")).toBeLessThan(text.indexOf("[worker message]"));
+        expect(text.indexOf("[worker message]")).toBeLessThan(text.indexOf("下一步计划"));
+        expect(text).not.toContain("条消息");
+        expect(text).not.toContain("【消息");
+        // 缓冲已清空；details 带条数（不进 LLM 上下文）
         expect(gate.drain()).toEqual([]);
-        expect(result.content[0].text).toContain("Task done");
-        expect(result.content[0].text).toContain("下一步计划");
+        expect(result.details.bufferedMessages).toBe(2);
       } finally {
         vi.useRealTimers();
       }
