@@ -36,14 +36,14 @@ export interface ScanViolation {
   count: number;
 }
 
-/** 扫描 root 下所有生产 .ts 文件（排除 *.test.ts 与 test 目录），返回裸 loadSettings 违规。 */
+/** 扫描 root 下所有生产 .ts 文件（排除 *.test.ts、test 目录、node_modules 与 dist 构建产物），返回裸 loadSettings 违规。 */
 export function scanLoadSettingsConsumers(root: string): ScanViolation[] {
   const violations: ScanViolation[] = [];
   const walk = (dir: string, relDir: string): void => {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
       const rel = relDir ? `${relDir}/${entry.name}` : entry.name;
       if (entry.isDirectory()) {
-        if (entry.name === "test" || entry.name === "node_modules") continue;
+        if (entry.name === "test" || entry.name === "node_modules" || entry.name === "dist") continue;
         walk(join(dir, entry.name), rel);
       } else if (entry.name.endsWith(".ts") && !entry.name.endsWith(".test.ts")) {
         const source = readFileSync(join(dir, entry.name), "utf-8");
@@ -105,6 +105,23 @@ describe("静态扫描守卫（阶段 5）：所有 loadSettings 消费点必须
     try {
       writeFileSync(join(tmp, "foo.test.ts"), "const s = loadSettings(root);\n");
       expect(scanLoadSettingsConsumers(tmp)).toEqual([]);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("构建产物目录被排除（dist 内 .d.ts 的 loadSettings 字样不误报）", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "scan-guard-"));
+    try {
+      mkdirSync(join(tmp, "dist", "src", "settings"), { recursive: true });
+      writeFileSync(
+        join(tmp, "dist", "src", "settings", "settings.d.ts"),
+        "export declare function loadSettings(root: string): TeamSettings;\n"
+      );
+      // 真正的源码仍受守卫约束（dist 排除不豁免 src）
+      mkdirSync(join(tmp, "src"), { recursive: true });
+      writeFileSync(join(tmp, "src", "consumer.ts"), "const s = loadSettings(root);\n");
+      expect(scanLoadSettingsConsumers(tmp)).toEqual([{ file: "src/consumer.ts", count: 1 }]);
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }
