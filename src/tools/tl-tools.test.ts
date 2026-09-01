@@ -234,6 +234,51 @@ describe("registerTlTools", () => {
     expect(result.content[0].text).not.toContain("设置来源");
   });
 
+  it("start_member 结果无条件显示模型与思考强度（无显式配置 → 默认）", async () => {
+    resetSessionSettingsState();
+    openStartMemberGate();
+    const result = await executeStartMember();
+    const text = result.content[0].text;
+    expect(text).toContain("模型：默认；思考强度：默认");
+    // 冗余语已删除：不出现「模型支持该级别，已显式指定」
+    expect(text).not.toContain("已显式指定");
+  });
+
+  it("start_member 结果显示实际解析出的模型与思考强度（不受设置来源影响）", async () => {
+    resetSessionSettingsState();
+    openStartMemberGate();
+    const createMember = vi.fn().mockReturnValue({
+      name: "analyzer",
+      start: vi.fn().mockResolvedValue(undefined),
+      getState: vi.fn().mockReturnValue({ name: "analyzer", pid: 12345, status: "running" }),
+      stop: vi.fn(),
+      onEvent: vi.fn(),
+      sendCommand: vi.fn(),
+      sendCommandAndWait: vi.fn(),
+    });
+    const buildConfig = vi.fn().mockReturnValue({
+      name: "analyzer",
+      role: "analyzer",
+      teamName: "test",
+      model: "anthropic/claude-sonnet-4-5",
+      thinking: "low",
+    });
+    let executeFn: Function = () => {};
+    pi.registerTool = vi.fn((def: any) => {
+      if (def.name === "start_member") {
+        executeFn = def.execute;
+      }
+    });
+    callRegisterTlTools({ createMember, buildMemberConfig: buildConfig });
+    const result = await executeFn("call-1", { name: "analyzer" });
+    const text = result.content[0].text;
+    expect(text).toContain("模型：anthropic/claude-sonnet-4-5");
+    expect(text).toContain("思考强度：low");
+    expect(text).not.toContain("已显式指定");
+    // 无临时设置 → 仍显示模型与思考强度，但无来源附注
+    expect(text).not.toContain("设置来源");
+  });
+
   it("start_member 结果附注设置来源：overlay 含成员相关键 → （设置来源：临时）", async () => {
     resetSessionSettingsState();
     const { setSessionSetting } = await import("../settings/session-settings");
