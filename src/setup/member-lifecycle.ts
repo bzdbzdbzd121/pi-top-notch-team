@@ -159,7 +159,10 @@ export function buildMemberConfig(
   let thinking: string | undefined;
   if (requestedLevel && resolved.model) {
     const supported = options?.lookupSupportedThinkingLevels?.(resolved.model);
-    thinking = resolveMemberThinking(requestedLevel, supported);
+    // P1：follow 模式尚未接线（P2 引入 tlThinkingLevel 快照注入）——TL 级别传
+    // undefined，resolveMemberThinking fail-open 不传 flag（与 tlCurrentModel
+    // undefined 行为一致）。fixed 路径行为与 P1 前完全一致。
+    thinking = resolveMemberThinking(requestedLevel, undefined, supported);
   }
 
   return {

@@ -1,7 +1,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
-import { isMemberThinkingLevel, type MemberThinkingLevel } from "./resolve-thinking";
+import { parseMemberThinkingSetting, type MemberThinkingSetting } from "./resolve-thinking";
 
 /** How the default model for team members is chosen. */
 export type MemberModelMode = "follow" | "fixed";
@@ -59,8 +59,12 @@ export interface TeamSettings {
    * 配置后：若成员生效模型支持该级别 → 以 `--thinking <level>` 传给 member 进程；
    * 不支持（或无法判定支持集）→ 不传 flag，保持现状。
    * 仅影响之后启动的成员。支持集语义见 src/settings/resolve-thinking.ts。
+   *
+   * 形态：对象两态 {mode:"follow"|"fixed", level?}（与 memberModel 同构）。
+   * follow = 成员 spawn 时使用 TL 当前思考强度（快照）；fixed = 固定 level；
+   * fixed 缺 level 视为默认。旧字符串形态（7 级别）在 loadSettings 迁移。
    */
-  memberThinkingLevel?: MemberThinkingLevel;
+  memberThinkingLevel?: MemberThinkingSetting;
   /** 消息合并（S1，阶段 2）。缺省 = 开启（默认 5 条 / 4000 字符）。 */
   messageCoalescing?: MessageCoalescingSetting;
 }
@@ -161,10 +165,13 @@ export function loadSettings(rootDir: string): TeamSettings {
     }
 
     // memberThinkingLevel (top-level): members' preferred thinking level.
-    // Invalid values are dropped (undefined = use each model's pi default).
+    // 迁移守卫用**原始 YAML 值**（settings 克隆恒带新形态缺省，用克隆判断永不迁移
+    // ——决策 #34 教训）；旧字符串形态（7 级别）→ fixed 对象，"follow" 字符串 →
+    // follow 对象，新对象形态幂等通过；非法值丢弃（undefined = 用模型 pi 默认）。
     const mtl = rawData.memberThinkingLevel;
-    if (isMemberThinkingLevel(mtl)) {
-      settings.memberThinkingLevel = mtl;
+    const parsedMtl = parseMemberThinkingSetting(mtl);
+    if (parsedMtl) {
+      settings.memberThinkingLevel = parsedMtl;
     }
 
     // messageCoalescing (top-level): member→member message batching. Invalid

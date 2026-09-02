@@ -424,10 +424,11 @@ async function configureMemberThinking(
   persist: () => void,
   noticeSuffix: string,
 ): Promise<void> {
+  const current = settings.memberThinkingLevel;
   const items = [
     THINKING_DEFAULT_LABEL,
     ...MEMBER_THINKING_LEVELS.map(
-      (l) => (settings.memberThinkingLevel === l ? "● " : "") + l
+      (l) => (current?.mode === "fixed" && current.level === l ? "● " : "") + l
     ),
   ];
   const choice = await ctx.ui.select(
@@ -449,7 +450,12 @@ async function configureMemberThinking(
   // Strip the "● " current-marker prefix before matching
   const level = choice.replace(/^● /, "");
   if (!(MEMBER_THINKING_LEVELS as readonly string[]).includes(level)) return;
-  settings.memberThinkingLevel = level as (typeof MEMBER_THINKING_LEVELS)[number];
+  // P1 对象形态：菜单仍为两态（默认/指定级别），固定级别以 fixed 对象存储；
+  // 三态菜单（含「跟随 TL」）属 P3 范围。
+  settings.memberThinkingLevel = {
+    mode: "fixed",
+    level: level as (typeof MEMBER_THINKING_LEVELS)[number],
+  };
   persist();
   ctx.ui.notify(
     `成员思考强度已设为「${level}」。\n模型不支持该级别的成员保持默认；仅对之后启动的成员生效。${noticeSuffix}`,

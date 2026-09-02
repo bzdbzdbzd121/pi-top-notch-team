@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
-import { isMemberThinkingLevel } from "./resolve-thinking";
+import { parseMemberThinkingSetting } from "./resolve-thinking";
 import {
   loadSettings,
   type AutoCompactSetting,
@@ -265,9 +265,13 @@ function sanitizeSnapshotData(data: Record<string, unknown>): DeepPartial<TeamSe
     out.waitTimeoutMinutes = data.waitTimeoutMinutes;
   }
 
+  // memberThinkingLevel：与全局 loadSettings 同守卫（原始 YAML 值）——旧字符串
+  // 形态（7 级别）→ fixed 对象、"follow" 字符串 → follow 对象（R3 快照兼容），
+  // 新对象幂等通过；非法值丢弃（undefined = 不覆盖，跟随全局）。
   const mtl = data.memberThinkingLevel;
-  if (isMemberThinkingLevel(mtl)) {
-    out.memberThinkingLevel = mtl;
+  const parsedMtl = parseMemberThinkingSetting(mtl);
+  if (parsedMtl) {
+    out.memberThinkingLevel = parsedMtl;
   }
 
   const mc = data.messageCoalescing;

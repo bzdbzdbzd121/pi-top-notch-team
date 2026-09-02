@@ -830,13 +830,15 @@ describe("buildMemberConfig — options.settings（临时设置覆盖层，阶�
   }
 
   it("spawn 参数反映临时 model/thinking（overlay 合并后传入 options.settings）", async () => {
-    // 磁盘全局：fixed anthropic + thinking high（会被 overlay 覆盖）
+    // 磁盘全局：fixed anthropic + thinking high（旧字符串形态，经 loadSettings 迁移守卫转对象；会被 overlay 覆盖）
     const { saveSettings, DEFAULT_SETTINGS } = await import("../settings/settings");
     saveSettings(
       {
         ...structuredClone(DEFAULT_SETTINGS),
         memberModel: { mode: "fixed", model: "anthropic/claude-sonnet-4-5" },
-        memberThinkingLevel: "high",
+        // 旧字符串形态（P1 迁移前的存量 settings.yaml 形态）——经 loadSettings
+        // 迁移守卫转 fixed 对象（as never：TeamSettings 已对象化，此处刻意写旧形态）
+        memberThinkingLevel: "high" as never,
       },
       tmpDir
     );
@@ -845,7 +847,7 @@ describe("buildMemberConfig — options.settings（临时设置覆盖层，阶�
     resetSessionSettingsState();
     const { loadSettings } = await import("../settings/settings");
     setSessionSetting("memberModel", { mode: "fixed", model: "openai/gpt-5" });
-    setSessionSetting("memberThinkingLevel", "low");
+    setSessionSetting("memberThinkingLevel", { mode: "fixed", level: "low" });
     const effective = resolveEffectiveSettings(loadSettings(tmpDir), getSessionSettings());
 
     const { buildMemberConfig } = await loadModule();
@@ -885,7 +887,8 @@ describe("buildMemberConfig — options.settings（临时设置覆盖层，阶�
       {
         ...structuredClone(DEFAULT_SETTINGS),
         memberModel: { mode: "fixed", model: "anthropic/claude-sonnet-4-5" },
-        memberThinkingLevel: "high",
+        // 旧字符串形态（迁移守卫经 loadEffectiveSettings→loadSettings 生效）
+        memberThinkingLevel: "high" as never,
       },
       tmpDir
     );

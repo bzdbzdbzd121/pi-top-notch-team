@@ -434,7 +434,7 @@ describe("/team setting — 临时作用域持久化分支 (阶段 4)", () => {
   });
 
   it("temp scope「思考强度：默认（不指定）」removes the pin (undefined → clearSessionSetting, 恢复全局)", async () => {
-    setSessionSetting("memberThinkingLevel", "high");
+    setSessionSetting("memberThinkingLevel", { mode: "fixed", level: "high" });
     const ctx = createCtx({
       sessionId: "session-A",
       selectImpl: pickContaining("成员思考强度", "默认（不指定"),

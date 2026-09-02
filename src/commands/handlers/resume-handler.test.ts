@@ -254,10 +254,13 @@ describe("临时设置恢复通道 (阶段 3)", () => {
 
     // 快照已恢复进内存
     expect(sessionSettingsMod.getSessionSettings().waitTimeoutMinutes).toBe(5);
-    expect(sessionSettingsMod.getSessionSettings().memberThinkingLevel).toBe("high");
+    expect(sessionSettingsMod.getSessionSettings().memberThinkingLevel).toEqual({
+      mode: "fixed",
+      level: "high",
+    });
     // 加载先于成员重启（spawn 时 overlay 已就位 → buildMemberConfig 读到恢复值）
     expect(overlayAtSpawn.waitTimeoutMinutes).toBe(5);
-    expect(overlayAtSpawn.memberThinkingLevel).toBe("high");
+    expect(overlayAtSpawn.memberThinkingLevel).toEqual({ mode: "fixed", level: "high" });
     expect(startResumedMember).toHaveBeenCalledWith("analyst");
   });
 

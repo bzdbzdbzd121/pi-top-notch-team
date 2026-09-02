@@ -50,10 +50,10 @@ describe("resolveEffectiveSettings — 深字段级 merge（纯函数）", () =>
   it("overrides top-level scalar fields (waitTimeoutMinutes, memberThinkingLevel)", () => {
     const result = resolveEffectiveSettings(makeGlobal(), {
       waitTimeoutMinutes: 0,
-      memberThinkingLevel: "high",
+      memberThinkingLevel: { mode: "fixed", level: "high" },
     });
     expect(result.waitTimeoutMinutes).toBe(0);
-    expect(result.memberThinkingLevel).toBe("high");
+    expect(result.memberThinkingLevel).toEqual({ mode: "fixed", level: "high" });
     // 未覆盖字段保持 global
     expect(result.autoCompact.enabled).toBe(true);
   });
@@ -95,6 +95,21 @@ describe("resolveEffectiveSettings — 深字段级 merge（纯函数）", () =>
     const result2 = resolveEffectiveSettings(global, { memberModel: { mode: "fixed" } });
     expect(result2.memberModel.mode).toBe("fixed");
     expect(result2.memberModel.model).toBeUndefined();
+  });
+
+  it("merges memberThinkingLevel field-by-field (diffOverlayPatch 零适配)", () => {
+    const global = makeGlobal();
+    // 只覆盖 mode：level 保持 global 的 undefined（不引入幽灵 level）
+    const result = resolveEffectiveSettings(global, {
+      memberThinkingLevel: { mode: "fixed" },
+    });
+    expect(result.memberThinkingLevel).toEqual({ mode: "fixed" });
+
+    // 全量覆盖
+    const result2 = resolveEffectiveSettings(global, {
+      memberThinkingLevel: { mode: "fixed", level: "low" },
+    });
+    expect(result2.memberThinkingLevel).toEqual({ mode: "fixed", level: "low" });
   });
 
   it("treats top-level undefined overlay fields as 'not overridden'", () => {
@@ -182,14 +197,14 @@ describe("session settings overlay — set/clear/clearAll", () => {
 
   it("clearSessionSetting removes a single key", () => {
     setSessionSetting("waitTimeoutMinutes", 5);
-    setSessionSetting("memberThinkingLevel", "low");
+    setSessionSetting("memberThinkingLevel", { mode: "fixed", level: "low" });
     clearSessionSetting("waitTimeoutMinutes");
-    expect(getSessionSettings()).toEqual({ memberThinkingLevel: "low" });
+    expect(getSessionSettings()).toEqual({ memberThinkingLevel: { mode: "fixed", level: "low" } });
   });
 
   it("clearAllSessionSettings empties everything", () => {
     setSessionSetting("waitTimeoutMinutes", 5);
-    setSessionSetting("memberThinkingLevel", "low");
+    setSessionSetting("memberThinkingLevel", { mode: "fixed", level: "low" });
     clearAllSessionSettings();
     expect(getSessionSettings()).toEqual({});
   });
@@ -250,9 +265,9 @@ describe("reconcileSessionSettings — pi 会话切换失效守卫", () => {
     expect(reconcileSessionSettings("session-B")).toBe(true);
     // 已清除 + 记录更新为 B：再 reconcile(B) 无事发生
     expect(reconcileSessionSettings("session-B")).toBe(false);
-    setSessionSetting("memberThinkingLevel", "high");
+    setSessionSetting("memberThinkingLevel", { mode: "fixed", level: "high" });
     expect(reconcileSessionSettings("session-B")).toBe(false);
-    expect(getSessionSettings().memberThinkingLevel).toBe("high");
+    expect(getSessionSettings().memberThinkingLevel).toEqual({ mode: "fixed", level: "high" });
   });
 });
 
@@ -273,13 +288,13 @@ describe("snapshot primitives — save/load/clearBinding（resume 恢复通道�
 
   it("save writes the overlay as YAML to <sessionDir>/session-settings.yaml and returns true", () => {
     setSessionSetting("waitTimeoutMinutes", 5);
-    setSessionSetting("memberThinkingLevel", "high");
+    setSessionSetting("memberThinkingLevel", { mode: "fixed", level: "high" });
     expect(saveSessionSettingsSnapshot(sessionDir)).toBe(true);
     const path = getSessionSettingsSnapshotPath(sessionDir);
     expect(existsSync(path)).toBe(true);
     const parsed = parseYaml(readFileSync(path, "utf-8")) as Record<string, unknown>;
     expect(parsed.waitTimeoutMinutes).toBe(5);
-    expect(parsed.memberThinkingLevel).toBe("high");
+    expect(parsed.memberThinkingLevel).toEqual({ mode: "fixed", level: "high" });
   });
 
   it("round-trips: save → memory cleared → load restores the same overlay", () => {
@@ -368,7 +383,7 @@ describe("snapshot primitives — save/load/clearBinding（resume 恢复通道�
 
   it("load binds to the sessionDir — later clears write back to the same snapshot (防复活)", () => {
     setSessionSetting("waitTimeoutMinutes", 5);
-    setSessionSetting("memberThinkingLevel", "low");
+    setSessionSetting("memberThinkingLevel", { mode: "fixed", level: "low" });
     saveSessionSettingsSnapshot(sessionDir);
     clearSessionSettingsMemory();
     loadSessionSettingsSnapshot(sessionDir, "session-B");
@@ -430,7 +445,7 @@ describe("snapshot primitives — save/load/clearBinding（resume 恢复通道�
     expect(overlay.messageCoalescing).toEqual({ enabled: false, maxBatchChars: 4000 });
   });
 
-  it("load keeps valid scalars (0 = unlimited wait budget survives; all seven thinking levels accepted)", () => {
+  it("load keeps valid scalars (0 = unlimited wait budget survives; legacy thinking string migrates)", () => {
     mkdirSync(sessionDir, { recursive: true });
     writeFileSync(
       getSessionSettingsSnapshotPath(sessionDir),
@@ -438,7 +453,30 @@ describe("snapshot primitives — save/load/clearBinding（resume 恢复通道�
       "utf-8"
     );
     expect(loadSessionSettingsSnapshot(sessionDir, "session-B")).toBe(true);
-    expect(getSessionSettings()).toEqual({ waitTimeoutMinutes: 0, memberThinkingLevel: "high" });
+    expect(getSessionSettings()).toEqual({
+      waitTimeoutMinutes: 0,
+      memberThinkingLevel: { mode: "fixed", level: "high" },
+    });
+  });
+
+  it("migrates legacy string-form thinking from snapshots (R3 快照兼容, 原始 YAML 值守卫)", () => {
+    mkdirSync(sessionDir, { recursive: true });
+    // 旧快照：字符串级别 → fixed 对象（与全局 loadSettings 同守卫）
+    writeFileSync(getSessionSettingsSnapshotPath(sessionDir), "memberThinkingLevel: high\n", "utf-8");
+    expect(loadSessionSettingsSnapshot(sessionDir, "session-B")).toBe(true);
+    expect(getSessionSettings()).toEqual({
+      memberThinkingLevel: { mode: "fixed", level: "high" },
+    });
+
+    // 新形态快照幂等往返
+    resetSessionSettingsState();
+    writeFileSync(
+      getSessionSettingsSnapshotPath(sessionDir),
+      "memberThinkingLevel:\n  mode: follow\n",
+      "utf-8"
+    );
+    expect(loadSessionSettingsSnapshot(sessionDir, "session-B")).toBe(true);
+    expect(getSessionSettings()).toEqual({ memberThinkingLevel: { mode: "follow" } });
   });
 
   it("load drops explicit null values (overlay 类型无 null 魔法)", () => {
@@ -489,7 +527,7 @@ describe("snapshot primitives — save/load/clearBinding（resume 恢复通道�
 
   it("clearSessionSetting rewrites the snapshot without the cleared field while bound", () => {
     setSessionSetting("waitTimeoutMinutes", 5);
-    setSessionSetting("memberThinkingLevel", "low");
+    setSessionSetting("memberThinkingLevel", { mode: "fixed", level: "low" });
     saveSessionSettingsSnapshot(sessionDir);
 
     clearSessionSetting("memberThinkingLevel");
@@ -573,10 +611,10 @@ describe("active-period snapshot write (阶段 3: 团队活跃期即时写盘)",
   it("set during an active team session writes the snapshot immediately (文件内容断言)", () => {
     setActiveSessionDir(sessionDir);
     setSessionSetting("waitTimeoutMinutes", 5);
-    setSessionSetting("memberThinkingLevel", "high");
+    setSessionSetting("memberThinkingLevel", { mode: "fixed", level: "high" });
     const parsed = parseYaml(readFileSync(getSessionSettingsSnapshotPath(sessionDir), "utf-8")) as Record<string, unknown>;
     expect(parsed.waitTimeoutMinutes).toBe(5);
-    expect(parsed.memberThinkingLevel).toBe("high");
+    expect(parsed.memberThinkingLevel).toEqual({ mode: "fixed", level: "high" });
   });
 
   it("set outside an active session is memory-only (不变量 2: 快照只在团队活跃期间写入)", () => {
@@ -592,12 +630,12 @@ describe("active-period snapshot write (阶段 3: 团队活跃期即时写盘)",
 
     // /team stop → onSessionEnd → 活跃目录置空
     setActiveSessionDir(null);
-    setSessionSetting("memberThinkingLevel", "low");
+    setSessionSetting("memberThinkingLevel", { mode: "fixed", level: "low" });
     const parsed = parseYaml(readFileSync(getSessionSettingsSnapshotPath(sessionDir), "utf-8")) as Record<string, unknown>;
     // 快照仍为「最近活跃期状态」：waitTimeout=5，无 thinking
     expect(parsed.waitTimeoutMinutes).toBe(5);
     expect(parsed.memberThinkingLevel).toBeUndefined();
-    expect(getSessionSettings().memberThinkingLevel).toBe("low");
+    expect(getSessionSettings().memberThinkingLevel).toEqual({ mode: "fixed", level: "low" });
   });
 
   it("set during an active session is fail-open when the snapshot cannot be written (fs 失败不阻塞设置)", () => {
@@ -611,7 +649,7 @@ describe("active-period snapshot write (阶段 3: 团队活跃期即时写盘)",
   it("clear during an active session rewrites the snapshot; clearing the last key deletes it", () => {
     setActiveSessionDir(sessionDir);
     setSessionSetting("waitTimeoutMinutes", 5);
-    setSessionSetting("memberThinkingLevel", "low");
+    setSessionSetting("memberThinkingLevel", { mode: "fixed", level: "low" });
     clearSessionSetting("memberThinkingLevel");
     let parsed = parseYaml(readFileSync(getSessionSettingsSnapshotPath(sessionDir), "utf-8")) as Record<string, unknown>;
     expect(parsed.waitTimeoutMinutes).toBe(5);
@@ -629,7 +667,7 @@ describe("active-period snapshot write (阶段 3: 团队活跃期即时写盘)",
 
     // /new → session Y：reconcile 清内存 + 清 active dir（防御层，正常由 onSessionEnd 处理）
     reconcileSessionSettings("session-Y");
-    setSessionSetting("memberThinkingLevel", "low");
+    setSessionSetting("memberThinkingLevel", { mode: "fixed", level: "low" });
     // 无活跃目录 → 新 set 不写盘
     expect(existsSync(getSessionSettingsSnapshotPath(sessionDir))).toBe(true);
     const parsed = parseYaml(readFileSync(getSessionSettingsSnapshotPath(sessionDir), "utf-8")) as Record<string, unknown>;
@@ -642,7 +680,7 @@ describe("active-period snapshot write (阶段 3: 团队活跃期即时写盘)",
     setSessionSetting("waitTimeoutMinutes", 5);
     clearSessionSettingsMemory();
     setActiveSessionDir(dirB);
-    setSessionSetting("memberThinkingLevel", "low");
+    setSessionSetting("memberThinkingLevel", { mode: "fixed", level: "low" });
 
     // 各自 resume 恢复各自状态
     resetSessionSettingsState();
@@ -650,7 +688,7 @@ describe("active-period snapshot write (阶段 3: 团队活跃期即时写盘)",
     expect(getSessionSettings()).toEqual({ waitTimeoutMinutes: 5 });
     clearSessionSettingsMemory();
     expect(loadSessionSettingsSnapshot(dirB, "session-A")).toBe(true);
-    expect(getSessionSettings()).toEqual({ memberThinkingLevel: "low" });
+    expect(getSessionSettings()).toEqual({ memberThinkingLevel: { mode: "fixed", level: "low" } });
   });
 });
 
@@ -672,7 +710,7 @@ describe("binding 与团队会话生命周期联动（审查 #1 回归）", () =
   it("stop 后 clear 冻结快照（S6: clear 也纯内存，快照保持最近活跃期状态）", () => {
     setActiveSessionDir(sessionDir);
     setSessionSetting("waitTimeoutMinutes", 5);
-    setSessionSetting("memberThinkingLevel", "low");
+    setSessionSetting("memberThinkingLevel", { mode: "fixed", level: "low" });
     // /team stop → onSessionEnd → active 与 binding 均置空
     setActiveSessionDir(null);
 
@@ -683,7 +721,7 @@ describe("binding 与团队会话生命周期联动（审查 #1 回归）", () =
     // 快照冻结为最近活跃期状态（两字段都未被 stop 后的 clear 触及）
     const parsed = parseYaml(readFileSync(getSessionSettingsSnapshotPath(sessionDir), "utf-8")) as Record<string, unknown>;
     expect(parsed.waitTimeoutMinutes).toBe(5);
-    expect(parsed.memberThinkingLevel).toBe("low");
+    expect(parsed.memberThinkingLevel).toEqual({ mode: "fixed", level: "low" });
     // stop→clear→resume 同一会话恢复 clear 前的值（S7 只约束活跃期 clear）
     expect(loadSessionSettingsSnapshot(sessionDir, "session-A")).toBe(true);
     expect(getSessionSettings().waitTimeoutMinutes).toBe(5);
@@ -698,7 +736,7 @@ describe("binding 与团队会话生命周期联动（审查 #1 回归）", () =
 
     // stop A → start B：binding 联动到 B
     setActiveSessionDir(dirB);
-    setSessionSetting("memberThinkingLevel", "low");
+    setSessionSetting("memberThinkingLevel", { mode: "fixed", level: "low" });
     expect(existsSync(getSessionSettingsSnapshotPath(dirB))).toBe(true);
 
     // B 中 clear 只作用于 B 的快照（清空 overlay → 删 B 快照），A 的快照不受影响
@@ -708,7 +746,7 @@ describe("binding 与团队会话生命周期联动（审查 #1 回归）", () =
     expect(existsSync(getSessionSettingsSnapshotPath(sessionDir))).toBe(true);
 
     // B 中 clearAll 同样不动 A
-    setSessionSetting("memberThinkingLevel", "high");
+    setSessionSetting("memberThinkingLevel", { mode: "fixed", level: "high" });
     clearAllSessionSettings();
     expect(existsSync(getSessionSettingsSnapshotPath(sessionDir))).toBe(true);
     // A 的快照仍可被 A 的 resume 恢复
@@ -788,7 +826,7 @@ describe("loadEffectiveSettings + isSnapshotRestored（阶段 5：合并层入�
     mod.resetSessionSettingsState();
     expect(mod.loadSessionSettingsSnapshot(tmpDir, "sess-1")).toBe(true);
     expect(mod.isSnapshotRestored()).toBe(true);
-    setSessionSetting("memberThinkingLevel", "high");
+    setSessionSetting("memberThinkingLevel", { mode: "fixed", level: "high" });
     expect(mod.reconcileSessionSettings("sess-2")).toBe(true);
     expect(mod.isSnapshotRestored()).toBe(false);
   });

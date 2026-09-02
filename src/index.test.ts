@@ -1316,7 +1316,7 @@ describe("per-session settings active-period wiring (阶段 3)", () => {
     // /team stop → onSessionEnd → 清除活跃目录（此后变更纯内存）
     await cmdDef.handler("stop", createMockContext());
     expect(setActiveSpy).toHaveBeenLastCalledWith(null);
-    sessionSettingsMod.setSessionSetting("memberThinkingLevel", "low");
+    sessionSettingsMod.setSessionSetting("memberThinkingLevel", { mode: "fixed", level: "low" });
     expect(readFileSync(snapshotPath, "utf-8")).not.toContain("memberThinkingLevel");
   });
 

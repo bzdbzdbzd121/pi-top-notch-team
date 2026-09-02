@@ -10,6 +10,7 @@ import {
   getSettingsPath,
 } from "./settings";
 import { resolveMessageCoalescing } from "./resolve-message-coalescing";
+import { MEMBER_THINKING_LEVELS } from "./resolve-thinking";
 
 describe("settings store", () => {
   let tmpDir: string;
@@ -225,33 +226,74 @@ describe("memberThinkingLevel (成员思考强度)", () => {
     expect(settings.memberThinkingLevel).toBeUndefined();
   });
 
-  it("round-trips a configured level through save/load", () => {
+  it("round-trips a fixed object through save/load (幂等)", () => {
     saveSettings(
-      { ...structuredClone(DEFAULT_SETTINGS), memberThinkingLevel: "high" },
+      {
+        ...structuredClone(DEFAULT_SETTINGS),
+        memberThinkingLevel: { mode: "fixed", level: "high" },
+      },
       tmpDir
     );
     const loaded = loadSettings(tmpDir);
-    expect(loaded.memberThinkingLevel).toBe("high");
+    expect(loaded.memberThinkingLevel).toEqual({ mode: "fixed", level: "high" });
   });
 
-  it("drops invalid levels from the settings file (fall back to undefined)", () => {
-    writeFileSync(
-      getSettingsPath(tmpDir),
-      "memberModel:\n  mode: follow\nmemberThinkingLevel: ultra\n",
-      "utf-8"
+  it("round-trips a follow object through save/load (幂等)", () => {
+    saveSettings(
+      {
+        ...structuredClone(DEFAULT_SETTINGS),
+        memberThinkingLevel: { mode: "follow" },
+      },
+      tmpDir
     );
     const loaded = loadSettings(tmpDir);
-    expect(loaded.memberThinkingLevel).toBeUndefined();
+    expect(loaded.memberThinkingLevel).toEqual({ mode: "follow" });
   });
 
-  it("accepts all seven valid levels on load", () => {
-    for (const level of ["off", "minimal", "low", "medium", "high", "xhigh", "max"]) {
-      writeFileSync(
-        getSettingsPath(tmpDir),
-        `memberThinkingLevel: ${level}\n`,
-        "utf-8"
-      );
-      expect(loadSettings(tmpDir).memberThinkingLevel).toBe(level);
+  it("migrates the legacy string form to a fixed object (原始 YAML 值守卫)", () => {
+    // 守卫必须读原始 YAML 值：settings 克隆恒带新形态缺省（undefined），若用克隆值
+    // 判断（isMemberThinkingLevel(undefined) = false）则永不迁移 → 本测试红
+    // （决策 #34 batchMaxWaitMinutes 教训）。
+    writeFileSync(getSettingsPath(tmpDir), "memberThinkingLevel: high\n", "utf-8");
+    expect(loadSettings(tmpDir).memberThinkingLevel).toEqual({
+      mode: "fixed",
+      level: "high",
+    });
+  });
+
+  it("migrates all seven legacy levels on load", () => {
+    for (const level of MEMBER_THINKING_LEVELS) {
+      writeFileSync(getSettingsPath(tmpDir), `memberThinkingLevel: ${level}\n`, "utf-8");
+      expect(loadSettings(tmpDir).memberThinkingLevel).toEqual({ mode: "fixed", level });
+    }
+  });
+
+  it("accepts a legacy 'follow' string (defensive) → follow object", () => {
+    writeFileSync(getSettingsPath(tmpDir), "memberThinkingLevel: follow\n", "utf-8");
+    expect(loadSettings(tmpDir).memberThinkingLevel).toEqual({ mode: "follow" });
+  });
+
+  it("accepts the new object form on load (idempotent)", () => {
+    writeFileSync(
+      getSettingsPath(tmpDir),
+      "memberThinkingLevel:\n  mode: fixed\n  level: xhigh\n",
+      "utf-8"
+    );
+    expect(loadSettings(tmpDir).memberThinkingLevel).toEqual({
+      mode: "fixed",
+      level: "xhigh",
+    });
+  });
+
+  it("drops invalid values from the settings file (fall back to undefined)", () => {
+    for (const raw of [
+      "memberModel:\n  mode: follow\nmemberThinkingLevel: ultra\n",
+      "memberThinkingLevel: 3\n",
+      "memberThinkingLevel:\n  mode: bogus\n",
+      "memberThinkingLevel:\n  mode: fixed\n  level: ultra\n",
+    ]) {
+      writeFileSync(getSettingsPath(tmpDir), raw, "utf-8");
+      expect(loadSettings(tmpDir).memberThinkingLevel).toBeUndefined();
     }
   });
 });
