@@ -8,6 +8,7 @@ import type { AutoCompactRuntime } from "../channel/auto-compact";
 import type { TlWaitGate } from "../channel/tl-wait-gate";
 import type { ResolvedAutoCompact } from "../settings/resolve-auto-compact";
 import type { TeamSettings } from "../settings/settings";
+import type { MemberThinkingSetting } from "../settings/resolve-thinking";
 import { getSessionSettings, isSnapshotRestored } from "../settings/session-settings";
 import {
   DEFAULT_WAIT_TIMEOUT_MINUTES,
@@ -32,6 +33,27 @@ function tempSourceAnnotation(): string {
     return "";
   }
   return isSnapshotRestored() ? "（设置来源：恢复自团队会话）" : "（设置来源：临时）";
+}
+
+/**
+ * start_member 结果「思考强度」附注（三态，P2）：
+ *   - follow + TL 级别 + 模型支持 → `思考强度：<level>（跟随 TL，模型支持该级别）`
+ *   - follow + TL 级别 + 模型不支持 → `思考强度：跟随 TL，但模型不支持该级别，保持默认`
+ *   - follow + TL 级别未知 → `思考强度：跟随 TL（TL 级别未知，保持默认）`
+ *   - 非 follow（默认/fixed）→ 既有格式 `思考强度：<resolved ?? 默认>`（向后兼容）
+ */
+export function describeSpawnThinkingAnnotation(
+  setting: MemberThinkingSetting | undefined,
+  tlLevel: string | undefined,
+  resolved: string | undefined
+): string {
+  if (setting?.mode === "follow") {
+    if (!tlLevel) return "思考强度：跟随 TL（TL 级别未知，保持默认）";
+    return resolved
+      ? `思考强度：${resolved}（跟随 TL，模型支持该级别）`
+      : "思考强度：跟随 TL，但模型不支持该级别，保持默认";
+  }
+  return `思考强度：${resolved ?? "默认"}`;
 }
 
 // ── Type aliases ───────────────────────────────────────────
@@ -64,6 +86,11 @@ export interface TlToolsDeps {
    * shared by the all-idle deadline and the batch barrier. Absent = default.
    */
   getSettings?: () => TeamSettings;
+  /**
+   * TL's current thinking level snapshot (P2 follow 附注用)。
+   * Absent = TL 级别未知（follow 附注显示「未知，保持默认」）。
+   */
+  getTlThinkingLevel?: () => string | undefined;
   /** Resolve a member's process handle by name (batch barrier compact RPC). */
   getHandle?: (name: string) => MemberProcessHandle | undefined;
   /**
@@ -184,6 +211,11 @@ export function registerTlTools(deps: TlToolsDeps): void {
         syncActiveManifest({ startedMember: { name: params.name, pid: handle.getState().pid } });
         // Notify the host about phase transition (e.g. dynamic mode design → execution)
         deps.onDynamicPhaseTransition?.();
+        const thinkingNote = describeSpawnThinkingAnnotation(
+          deps.getSettings?.()?.memberThinkingLevel,
+          deps.getTlThinkingLevel?.(),
+          config.thinking
+        );
         return {
           details: {},
           content: [
@@ -191,7 +223,7 @@ export function registerTlTools(deps: TlToolsDeps): void {
               type: "text" as const,
               text:
                 `成员 "${params.name}" 已启动 (PID: ${handle.getState().pid})。` +
-                `模型：${config.model ?? "默认"}；思考强度：${config.thinking ?? "默认"}。` +
+                `模型：${config.model ?? "默认"}；${thinkingNote}。` +
                 `${tempSourceAnnotation()}使用 list_members 查看状态，通过消息通道分配任务。`,
             },
           ],

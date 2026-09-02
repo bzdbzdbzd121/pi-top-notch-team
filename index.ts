@@ -302,6 +302,15 @@ export default function (pi: ExtensionAPI) {
   // the TL's current model to members spawned in "follow" mode.
   let tlCurrentModel: string | undefined;
 
+  // ── TL thinking level tracking (for /team setting "follow" mode) ──────
+  // Updated on session_start (ctx.thinkingLevel 快照) and thinking_level_select
+  // so buildMemberConfig can pass the TL's current thinking level to members
+  // spawned in follow mode. Mirrors tlCurrentModel. 信号源完备性（D4）：
+  // thinking_level_select 仅在级别实际变化时 emit（setThinkingLevel 的
+  // isChanging 判断），模型切换路径也走 setThinkingLevel（clamp 后变化则
+  // emit、不变则缓存值本就正确）——单事件监听已完备，无盲区。
+  let tlThinkingLevel: string | undefined;
+
   // TL process's model registry (cached on session_start) — used to look up
   // whether a member's resolved model supports the configured thinking level
   // (memberThinkingLevel setting). Fail-open when unavailable.
@@ -354,6 +363,7 @@ export default function (pi: ExtensionAPI) {
     buildMemberConfig: (memberName) =>
       buildMemberConfig(memberName, getSessionState(), {
         tlCurrentModel,
+        tlThinkingLevel,
         lookupSupportedThinkingLevels,
         // 临时设置覆盖层：spawn 时读取 merge 后的生效设置（模型/思考强度）
         settings: getEffectiveSettings(),
@@ -384,6 +394,8 @@ export default function (pi: ExtensionAPI) {
     autoCompact,
     getAutoCompact: () => resolveAutoCompact(getEffectiveSettings()),
     getSettings: () => getEffectiveSettings(),
+    // P2：start_member 附注三态（跟随 TL）需要 TL 当前思考级别快照
+    getTlThinkingLevel: () => tlThinkingLevel,
     getHandle: (name: string) => teamCtx.getHandle(name),
   };
 
@@ -697,6 +709,9 @@ export default function (pi: ExtensionAPI) {
 
     // Track TL current model for /team setting "follow" mode
     tlCurrentModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+    // Track TL thinking level (ExtensionContext 顶层字段；getThinkingLevel() 仅
+    // 命令 ctx 可用，不作设计依赖——仅此处快照即覆盖「启动后未切级别」绝大多数场景)
+    tlThinkingLevel = ctx.thinkingLevel;
     // Cache the model registry for member thinking-level support lookups
     tlModelRegistry = ctx.modelRegistry;
 
@@ -760,6 +775,13 @@ export default function (pi: ExtensionAPI) {
     tlCurrentModel = `${event.model.provider}/${event.model.id}`;
   });
 
+  // ── thinking_level_select: keep TL thinking level up to date ──
+  // 主通道（D4）：用户手动切级别 emit；模型切换联动走 setThinkingLevel 路径
+  //（clamp 后变化则 emit、不变则缓存值本就正确）——单监听已完备。
+  pi.on("thinking_level_select", (event) => {
+    tlThinkingLevel = event.level;
+  });
+
   // ── Register the /team command ────────────────────────────
   registerTeamCommand(pi, teamCtx, () =>
     (teamCtx.processManager?.listStatus().map((s) => ({
@@ -772,6 +794,7 @@ export default function (pi: ExtensionAPI) {
       startResumedMember: async (name: string) => {
         const config = buildMemberConfig(name, getSessionState(), {
           tlCurrentModel,
+          tlThinkingLevel,
           resume: true,
           lookupSupportedThinkingLevels,
           // 临时设置覆盖层：resume 重启成员同样读取 merge 后的生效设置

@@ -12,7 +12,7 @@ import type { TeamSessionState } from "../session/state";
 import type { TeamSettings } from "../settings/settings";
 import { getRootDir } from "../config";
 import { loadEffectiveSettings } from "../settings/session-settings";
-import { resolveMemberThinking } from "../settings/resolve-thinking";
+import { resolveMemberThinking, isMemberThinkingLevel } from "../settings/resolve-thinking";
 import { resolveMemberModel } from "../settings/resolve-model";
 import { createMemberEventHandler } from "../channel/event-handler";
 import type { AutoCompactRuntime } from "../channel/auto-compact";
@@ -94,6 +94,13 @@ export interface BuildMemberConfigOptions {
   /** TL's current model as "provider/id" — used when the global setting is "follow". */
   tlCurrentModel?: string;
   /**
+   * TL's current thinking level — used when the global `memberThinkingLevel`
+   * setting is "follow" (P2 事件接线快照，与 tlCurrentModel 对称)。
+   * 取值为 TL 实际生效级别（agent.state.thinkingLevel，clamp 后）；非合法级别
+   * 字符串（运行时防御）→ 视为未知 fail-open 不传 flag。
+   */
+  tlThinkingLevel?: string;
+  /**
    * Force session resume (`--continue`). When omitted, resume is auto-detected:
    * a member whose session dir already contains persisted pi session files is
    * always resumed (context continuity on restart), a fresh dir starts fresh.
@@ -162,7 +169,12 @@ export function buildMemberConfig(
     // P1：follow 模式尚未接线（P2 引入 tlThinkingLevel 快照注入）——TL 级别传
     // undefined，resolveMemberThinking fail-open 不传 flag（与 tlCurrentModel
     // undefined 行为一致）。fixed 路径行为与 P1 前完全一致。
-    thinking = resolveMemberThinking(requestedLevel, undefined, supported);
+    // P2：follow 模式注入 TL 级别快照（非法级别字符串运行时防御 → fail-open）。
+    const tlLevel =
+      options?.tlThinkingLevel !== undefined && isMemberThinkingLevel(options.tlThinkingLevel)
+        ? options.tlThinkingLevel
+        : undefined;
+    thinking = resolveMemberThinking(requestedLevel, tlLevel, supported);
   }
 
   return {

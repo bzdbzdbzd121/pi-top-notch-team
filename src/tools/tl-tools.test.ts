@@ -131,6 +131,7 @@ describe("registerTlTools", () => {
     buildMemberConfig?: any;
     getMemberLog?: any;
     getSettings?: any;
+    getTlThinkingLevel?: any;
   }) {
     registerTlTools({
       pi,
@@ -143,6 +144,7 @@ describe("registerTlTools", () => {
       buildMemberConfig: overrides?.buildMemberConfig,
       getMemberLog: overrides?.getMemberLog,
       getSettings: overrides?.getSettings,
+      getTlThinkingLevel: overrides?.getTlThinkingLevel,
     });
   }
 
@@ -277,6 +279,163 @@ describe("registerTlTools", () => {
     expect(text).not.toContain("已显式指定");
     // 无临时设置 → 仍显示模型与思考强度，但无来源附注
     expect(text).not.toContain("设置来源");
+  });
+
+  it("start_member 附注：follow + TL 级别 + 模型支持 → （跟随 TL，模型支持该级别）", async () => {
+    resetSessionSettingsState();
+    openStartMemberGate();
+    const createMember = vi.fn().mockReturnValue({
+      name: "analyzer",
+      start: vi.fn().mockResolvedValue(undefined),
+      getState: vi.fn().mockReturnValue({ name: "analyzer", pid: 12345, status: "running" }),
+      stop: vi.fn(),
+      onEvent: vi.fn(),
+      sendCommand: vi.fn(),
+      sendCommandAndWait: vi.fn(),
+    });
+    const buildConfig = vi.fn().mockReturnValue({
+      name: "analyzer",
+      role: "analyzer",
+      teamName: "test",
+      model: "anthropic/claude-sonnet-4-5",
+      thinking: "high",
+    });
+    let executeFn: Function = () => {};
+    pi.registerTool = vi.fn((def: any) => {
+      if (def.name === "start_member") {
+        executeFn = def.execute;
+      }
+    });
+    callRegisterTlTools({
+      createMember,
+      buildMemberConfig: buildConfig,
+      getSettings: () => ({
+        ...structuredClone(DEFAULT_SETTINGS),
+        memberThinkingLevel: { mode: "follow" },
+      }),
+      getTlThinkingLevel: () => "high",
+    });
+    const result = await executeFn("call-1", { name: "analyzer" });
+    const text = result.content[0].text;
+    expect(text).toContain("思考强度：high（跟随 TL，模型支持该级别）");
+  });
+
+  it("start_member 附注：follow + 模型不支持 TL 级别 → 降级文案（保持默认）", async () => {
+    resetSessionSettingsState();
+    openStartMemberGate();
+    const createMember = vi.fn().mockReturnValue({
+      name: "analyzer",
+      start: vi.fn().mockResolvedValue(undefined),
+      getState: vi.fn().mockReturnValue({ name: "analyzer", pid: 12345, status: "running" }),
+      stop: vi.fn(),
+      onEvent: vi.fn(),
+      sendCommand: vi.fn(),
+      sendCommandAndWait: vi.fn(),
+    });
+    const buildConfig = vi.fn().mockReturnValue({
+      name: "analyzer",
+      role: "analyzer",
+      teamName: "test",
+      model: "anthropic/claude-sonnet-4-5",
+      thinking: undefined,
+    });
+    let executeFn: Function = () => {};
+    pi.registerTool = vi.fn((def: any) => {
+      if (def.name === "start_member") {
+        executeFn = def.execute;
+      }
+    });
+    callRegisterTlTools({
+      createMember,
+      buildMemberConfig: buildConfig,
+      getSettings: () => ({
+        ...structuredClone(DEFAULT_SETTINGS),
+        memberThinkingLevel: { mode: "follow" },
+      }),
+      getTlThinkingLevel: () => "xhigh",
+    });
+    const result = await executeFn("call-1", { name: "analyzer" });
+    const text = result.content[0].text;
+    expect(text).toContain("思考强度：跟随 TL，但模型不支持该级别，保持默认");
+  });
+
+  it("start_member 附注：follow + TL 级别未知 → 未知文案（保持默认）", async () => {
+    resetSessionSettingsState();
+    openStartMemberGate();
+    const createMember = vi.fn().mockReturnValue({
+      name: "analyzer",
+      start: vi.fn().mockResolvedValue(undefined),
+      getState: vi.fn().mockReturnValue({ name: "analyzer", pid: 12345, status: "running" }),
+      stop: vi.fn(),
+      onEvent: vi.fn(),
+      sendCommand: vi.fn(),
+      sendCommandAndWait: vi.fn(),
+    });
+    const buildConfig = vi.fn().mockReturnValue({
+      name: "analyzer",
+      role: "analyzer",
+      teamName: "test",
+      model: "anthropic/claude-sonnet-4-5",
+      thinking: undefined,
+    });
+    let executeFn: Function = () => {};
+    pi.registerTool = vi.fn((def: any) => {
+      if (def.name === "start_member") {
+        executeFn = def.execute;
+      }
+    });
+    callRegisterTlTools({
+      createMember,
+      buildMemberConfig: buildConfig,
+      getSettings: () => ({
+        ...structuredClone(DEFAULT_SETTINGS),
+        memberThinkingLevel: { mode: "follow" },
+      }),
+      getTlThinkingLevel: () => undefined,
+    });
+    const result = await executeFn("call-1", { name: "analyzer" });
+    const text = result.content[0].text;
+    expect(text).toContain("思考强度：跟随 TL（TL 级别未知，保持默认）");
+  });
+
+  it("start_member 附注：非 follow（默认/fixed）→ 既有格式不变（不受 getTlThinkingLevel 影响）", async () => {
+    resetSessionSettingsState();
+    openStartMemberGate();
+    const createMember = vi.fn().mockReturnValue({
+      name: "analyzer",
+      start: vi.fn().mockResolvedValue(undefined),
+      getState: vi.fn().mockReturnValue({ name: "analyzer", pid: 12345, status: "running" }),
+      stop: vi.fn(),
+      onEvent: vi.fn(),
+      sendCommand: vi.fn(),
+      sendCommandAndWait: vi.fn(),
+    });
+    const buildConfig = vi.fn().mockReturnValue({
+      name: "analyzer",
+      role: "analyzer",
+      teamName: "test",
+      model: "anthropic/claude-sonnet-4-5",
+      thinking: "low",
+    });
+    let executeFn: Function = () => {};
+    pi.registerTool = vi.fn((def: any) => {
+      if (def.name === "start_member") {
+        executeFn = def.execute;
+      }
+    });
+    callRegisterTlTools({
+      createMember,
+      buildMemberConfig: buildConfig,
+      getSettings: () => ({
+        ...structuredClone(DEFAULT_SETTINGS),
+        memberThinkingLevel: { mode: "fixed", level: "low" },
+      }),
+      getTlThinkingLevel: () => "high",
+    });
+    const result = await executeFn("call-1", { name: "analyzer" });
+    const text = result.content[0].text;
+    expect(text).toContain("思考强度：low");
+    expect(text).not.toContain("跟随 TL");
   });
 
   it("start_member 结果附注设置来源：overlay 含成员相关键 → （设置来源：临时）", async () => {

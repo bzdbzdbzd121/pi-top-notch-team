@@ -7,6 +7,16 @@ import { transitionState } from "./session/state-machine";
 import type { MemberOperationalState } from "./session/context";
 import { createMockContext } from "./test/fixtures/mock-extension-api";
 
+// P2 集成测试：start_member 完整链路需要 mock 成员子进程 spawn（避免真实启动
+// pi 子进程）。其余既有测试不触发 spawn，mock 工厂零副作用。
+const { mockCreateMemberProcess } = vi.hoisted(() => ({
+  mockCreateMemberProcess: vi.fn(),
+}));
+vi.mock("./process/member-process", () => ({
+  createMemberProcess: (...args: any[]) => mockCreateMemberProcess(...args),
+  hasSessionFiles: () => false,
+}));
+
 // ── Helpers ────────────────────────────────────────────────
 
 function createMockUi() {
@@ -1273,6 +1283,160 @@ describe("per-session settings wiring (阶段 2)", () => {
     // + buildMemberConfig 两调用点（start_member、startResumedMember）
     const effectiveCalls = source.match(/getEffectiveSettings\(\)/g) ?? [];
     expect(effectiveCalls.length).toBe(6);
+  });
+});
+
+describe("P2: TL thinking-level tracking（memberThinkingLevel follow 事件接线）", () => {
+  let pi: ExtensionAPI;
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    delete process.env.TEAM_ROLE;
+    mockCreateMemberProcess.mockReset();
+    tmpDir = mkdtempSync(join(tmpdir(), "index-tl-thinking-"));
+    process.env.TOP_NOTCH_TEAM_ROOT = tmpDir;
+    pi = createMockPi();
+    const mod = await import("../index");
+    mod.default(pi);
+  });
+
+  afterEach(() => {
+    delete process.env.TOP_NOTCH_TEAM_ROOT;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function getHandler(name: string): Function {
+    const onCalls = (pi.on as ReturnType<typeof vi.fn>).mock.calls;
+    return onCalls.find((c: any) => c[0] === name)![1];
+  }
+
+  function getToolDef(name: string): any {
+    const toolCalls = (pi.registerTool as ReturnType<typeof vi.fn>).mock.calls;
+    return toolCalls.find((c: any) => c[0].name === name)![0];
+  }
+
+  function mockHandle() {
+    return {
+      name: "coder",
+      start: vi.fn().mockResolvedValue(undefined),
+      getState: vi.fn().mockReturnValue({ name: "coder", pid: 12345, status: "running" }),
+      stop: vi.fn(),
+      onEvent: vi.fn(),
+      sendCommand: vi.fn(),
+      sendCommandAndWait: vi.fn(),
+    };
+  }
+
+  /** 进入动态会话 + 注册成员 + 写共享上下文（start_member 前置） */
+  async function setupDynamicSession() {
+    const cmdDef = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    await cmdDef.handler("dynamic", createMockContext());
+    const addMember = getToolDef("add_dynamic_member");
+    await addMember.execute("id-1", {
+      name: "coder",
+      label: "编码员",
+      systemPrompt: "你是一个编码员",
+    });
+    const writeCtx = getToolDef("write_shared_context");
+    await writeCtx.execute("id-2", { content: "# 团队上下文\n成员：coder" });
+  }
+
+  function reasoningRegistry(
+    extra: Record<string, unknown> = {}
+  ): { getAvailable: () => any[] } {
+    return {
+      getAvailable: () => [
+        {
+          provider: "anthropic",
+          id: "claude-sonnet-4-5",
+          reasoning: true,
+          thinkingLevelMap: undefined,
+          ...extra,
+        },
+      ],
+    };
+  }
+
+  it("session_start 快照 ctx.thinkingLevel + thinking_level_select 更新 → start_member follow 附注与 spawn 参数（快照语义）", async () => {
+    const { setSessionSetting } = await import("./settings/session-settings");
+    setSessionSetting("memberThinkingLevel", { mode: "follow" });
+    // session_start 必须先于团队会话（真实 pi 时序）：TL 级别 = high +
+    // 模型 = anthropic/claude-sonnet-4-5（registry 缓存）
+    const sessionStart = getHandler("session_start");
+    await sessionStart(
+      { type: "session_start" },
+      createMockContext({
+        model: { provider: "anthropic", id: "claude-sonnet-4-5" } as any,
+        thinkingLevel: "high" as any,
+        modelRegistry: reasoningRegistry() as any,
+      })
+    );
+    await setupDynamicSession();
+
+    // start_member：follow + TL=high + 成员模型支持 high → spawn 参数含 --thinking high
+    mockCreateMemberProcess.mockReturnValue(mockHandle());
+    const startMember = getToolDef("start_member");
+    const r1 = await startMember.execute("id-3", { name: "coder" });
+    expect(r1.content[0].text).toContain("思考强度：high（跟随 TL，模型支持该级别）");
+    expect(mockCreateMemberProcess.mock.calls[0][0].thinking).toBe("high");
+    expect(mockCreateMemberProcess.mock.calls[0][0].model).toBe("anthropic/claude-sonnet-4-5");
+
+    // thinking_level_select：TL 切到 low → 新 spawn 用新级别（快照语义）
+    const tls = getHandler("thinking_level_select");
+    tls({ type: "thinking_level_select", level: "low", previousLevel: "high" });
+    const addMember2 = getToolDef("add_dynamic_member");
+    await addMember2.execute("id-4", {
+      name: "coder2",
+      label: "编码员2",
+      systemPrompt: "你是一个编码员",
+    });
+    const r2 = await startMember.execute("id-5", { name: "coder2" });
+    expect(r2.content[0].text).toContain("思考强度：low（跟随 TL，模型支持该级别）");
+    expect(mockCreateMemberProcess.mock.calls[1][0].thinking).toBe("low");
+  });
+
+  it("follow + 成员模型不支持 TL 级别 → spawn 无 flag + 降级附注（fail-open 不 clamp）", async () => {
+    const { setSessionSetting } = await import("./settings/session-settings");
+    setSessionSetting("memberThinkingLevel", { mode: "follow" });
+    // 成员模型 thinkingLevelMap 将 high 映射为 null → 支持集不含 high
+    const sessionStart = getHandler("session_start");
+    await sessionStart(
+      { type: "session_start" },
+      createMockContext({
+        model: { provider: "anthropic", id: "claude-sonnet-4-5" } as any,
+        thinkingLevel: "high" as any,
+        modelRegistry: reasoningRegistry({ thinkingLevelMap: { high: null } }) as any,
+      })
+    );
+    await setupDynamicSession();
+
+    mockCreateMemberProcess.mockReturnValue(mockHandle());
+    const startMember = getToolDef("start_member");
+    const r1 = await startMember.execute("id-3", { name: "coder" });
+    expect(r1.content[0].text).toContain("思考强度：跟随 TL，但模型不支持该级别，保持默认");
+    expect(mockCreateMemberProcess.mock.calls[0][0].thinking).toBeUndefined();
+  });
+
+  it("follow + TL 级别未知（session runtime 未提供）→ spawn 无 flag + 未知附注（fail-open）", async () => {
+    const { setSessionSetting } = await import("./settings/session-settings");
+    setSessionSetting("memberThinkingLevel", { mode: "follow" });
+    // session_start 不提供 thinkingLevel（事件也未到）→ 快照保持 undefined
+    const sessionStart = getHandler("session_start");
+    await sessionStart(
+      { type: "session_start" },
+      createMockContext({
+        model: { provider: "anthropic", id: "claude-sonnet-4-5" } as any,
+        modelRegistry: reasoningRegistry() as any,
+      })
+    );
+    await setupDynamicSession();
+
+    mockCreateMemberProcess.mockReturnValue(mockHandle());
+    const startMember = getToolDef("start_member");
+    const r1 = await startMember.execute("id-3", { name: "coder" });
+    expect(r1.content[0].text).toContain("思考强度：跟随 TL（TL 级别未知，保持默认）");
+    expect(mockCreateMemberProcess.mock.calls[0][0].thinking).toBeUndefined();
   });
 });
 

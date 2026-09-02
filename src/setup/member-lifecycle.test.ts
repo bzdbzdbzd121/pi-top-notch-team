@@ -238,6 +238,99 @@ describe("buildMemberConfig", () => {
     expect(result!.thinking).toBeUndefined();
   });
 
+  // ── follow 模式（P2：tlThinkingLevel 快照注入 resolveMemberThinking）──
+
+  async function writeThinkingObjectSetting(setting: {
+    mode: "follow" | "fixed";
+    level?: string;
+  }): Promise<void> {
+    const { saveSettings, DEFAULT_SETTINGS } = await import("../settings/settings");
+    saveSettings(
+      {
+        ...structuredClone(DEFAULT_SETTINGS),
+        memberThinkingLevel: setting as never,
+      },
+      tmpDir
+    );
+  }
+
+  it("follow + TL 级别 + 模型支持 → spawn 使用 TL 级别（跟随成功）", async () => {
+    const { buildMemberConfig } = await loadModule();
+    await writeThinkingObjectSetting({ mode: "follow" });
+    session.teamDefinition = createMockTeamDefinition({
+      defaults: { model: "anthropic/claude-sonnet-4-5" },
+    });
+    const result = buildMemberConfig("analyzer", session, {
+      tlThinkingLevel: "high",
+      lookupSupportedThinkingLevels: () => ["off", "low", "high"],
+    });
+    expect(result!.thinking).toBe("high");
+  });
+
+  it("follow + TL 级别 + 模型不支持 → 无 flag（fail-open 不 clamp）", async () => {
+    const { buildMemberConfig } = await loadModule();
+    await writeThinkingObjectSetting({ mode: "follow" });
+    session.teamDefinition = createMockTeamDefinition({
+      defaults: { model: "anthropic/claude-sonnet-4-5" },
+    });
+    const result = buildMemberConfig("analyzer", session, {
+      tlThinkingLevel: "xhigh",
+      lookupSupportedThinkingLevels: () => ["off", "low", "medium", "high"],
+    });
+    expect(result!.thinking).toBeUndefined();
+  });
+
+  it("follow + TL 级别未知 → 无 flag（fail-open，spawn 早期竞态）", async () => {
+    const { buildMemberConfig } = await loadModule();
+    await writeThinkingObjectSetting({ mode: "follow" });
+    session.teamDefinition = createMockTeamDefinition({
+      defaults: { model: "anthropic/claude-sonnet-4-5" },
+    });
+    const result = buildMemberConfig("analyzer", session, {
+      lookupSupportedThinkingLevels: () => ["off", "low", "high"],
+    });
+    expect(result!.thinking).toBeUndefined();
+  });
+
+  it("follow + 支持集未知 → 无 flag（fail-open）", async () => {
+    const { buildMemberConfig } = await loadModule();
+    await writeThinkingObjectSetting({ mode: "follow" });
+    session.teamDefinition = createMockTeamDefinition({
+      defaults: { model: "anthropic/claude-sonnet-4-5" },
+    });
+    const result = buildMemberConfig("analyzer", session, {
+      tlThinkingLevel: "high",
+      lookupSupportedThinkingLevels: () => undefined,
+    });
+    expect(result!.thinking).toBeUndefined();
+  });
+
+  it("follow + 非法 TL 级别字符串 → 无 flag（fail-open）", async () => {
+    const { buildMemberConfig } = await loadModule();
+    await writeThinkingObjectSetting({ mode: "follow" });
+    session.teamDefinition = createMockTeamDefinition({
+      defaults: { model: "anthropic/claude-sonnet-4-5" },
+    });
+    const result = buildMemberConfig("analyzer", session, {
+      tlThinkingLevel: "ultra",
+      lookupSupportedThinkingLevels: () => ["off", "low", "high"],
+    });
+    expect(result!.thinking).toBeUndefined();
+  });
+
+  it("fixed 不受 tlThinkingLevel 影响（固定级别优先）", async () => {
+    const { buildMemberConfig } = await loadModule();
+    await writeThinkingObjectSetting({ mode: "fixed", level: "high" });
+    session.teamDefinition = createMockTeamDefinition({
+      defaults: { model: "anthropic/claude-sonnet-4-5" },
+    });
+    const result = buildMemberConfig("analyzer", session, {
+      tlThinkingLevel: "low",
+      lookupSupportedThinkingLevels: () => ["off", "low", "high"],
+    });
+    expect(result!.thinking).toBe("high");
+  });
+
   it("omits thinking when no setting is configured (lookup never consulted)", async () => {
     const { buildMemberConfig } = await loadModule();
     session.teamDefinition = createMockTeamDefinition({
