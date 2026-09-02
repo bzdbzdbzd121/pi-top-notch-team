@@ -27,12 +27,17 @@ function createCtx(options?: {
   currentModel?: typeof MODEL_A;
   /** Current pi sessionId. Absent → sessionManager 不可用（临时入口禁用，fail-open）。 */
   sessionId?: string;
+  /** TL 当前思考级别（ExtensionContext 顶层字段，命令 ctx 实时值）。 */
+  thinkingLevel?: string;
 }) {
   return createMockContext({
     modelRegistry: {
       getAvailable: vi.fn().mockReturnValue(options?.availableModels ?? [MODEL_A, MODEL_B]),
     } as any,
     model: options?.currentModel ?? MODEL_A,
+    ...(options?.thinkingLevel !== undefined
+      ? { thinkingLevel: options.thinkingLevel as any }
+      : {}),
     ...(options?.sessionId !== undefined
       ? {
           sessionManager: {
@@ -448,6 +453,169 @@ describe("/team setting — 临时作用域持久化分支 (阶段 4)", () => {
       expect.stringContaining("仅当前 pi 会话生效"),
       "info"
     );
+  });
+
+  // ── P3：三段式菜单（默认 / 跟随 TL（当前：X）/ 指定级别…二级）──
+
+  it("三段式：选「跟随 TL（当前：high）」→ 全局写 {mode: follow}（顶层当前值带 TL 级别）", async () => {
+    const ctx = createCtx({
+      selectImpl: pickContaining("成员思考强度", "跟随 TL（当前：high）"),
+      thinkingLevel: "high",
+    });
+    await handleSetting(ctx as any);
+
+    expect(loadSettings(tmpDir).memberThinkingLevel).toEqual({ mode: "follow" });
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("跟随 TL（当前：high）"),
+      "info"
+    );
+  });
+
+  it("三段式：TL 级别未知时菜单显示「跟随 TL（TL 级别未知）」，仍可选中写 follow", async () => {
+    const ctx = createCtx({
+      // 不传 thinkingLevel → ctx.thinkingLevel 为 undefined
+      selectImpl: pickContaining("成员思考强度", "跟随 TL（TL 级别未知）"),
+    });
+    await handleSetting(ctx as any);
+
+    expect(loadSettings(tmpDir).memberThinkingLevel).toEqual({ mode: "follow" });
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("跟随 TL（当前：未知）"),
+      "info"
+    );
+  });
+
+  it("三段式：选「指定级别…」进二级 7 级别菜单 → {mode: fixed, level}（全局落盘）", async () => {
+    const ctx = createCtx({
+      selectImpl: pickContaining("成员思考强度", "指定级别…", "high"),
+    });
+    await handleSetting(ctx as any);
+
+    expect(loadSettings(tmpDir).memberThinkingLevel).toEqual({
+      mode: "fixed",
+      level: "high",
+    });
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("已设为「high」"),
+      "info"
+    );
+  });
+
+  it("三段式：二级菜单 Esc → 设置不变（fail-open）", async () => {
+    const ctx = createCtx({
+      selectImpl: pickContaining("成员思考强度", "指定级别…"),
+    });
+    await handleSetting(ctx as any);
+
+    expect(loadSettings(tmpDir).memberThinkingLevel).toBeUndefined();
+  });
+
+  it("三段式：二级菜单以 ● 标记当前 fixed 级别", async () => {
+    const { saveSettings, DEFAULT_SETTINGS } = await import("../../settings/settings");
+    saveSettings(
+      {
+        ...structuredClone(DEFAULT_SETTINGS),
+        memberThinkingLevel: { mode: "fixed", level: "low" },
+      },
+      tmpDir
+    );
+    const selectCalls: string[][] = [];
+    const ctx = createCtx({
+      selectImpl: (_t, opts) => {
+        selectCalls.push(opts);
+        if (selectCalls.length === 1) {
+          // 顶层：选「成员思考强度」项（自定义返回，须为顶层项文本）
+          return Promise.resolve(opts.find((o) => o.includes("成员思考强度"))!);
+        }
+        if (selectCalls.length === 2) {
+          // 三段式子菜单：选「指定级别…」进二级
+          return Promise.resolve(opts.find((o) => o.includes("指定级别…"))!);
+        }
+        return Promise.resolve(undefined); // 二级菜单 Esc
+      },
+    });
+    await handleSetting(ctx as any);
+    const levelOptions = selectCalls[2]; // 0=顶层 1=子菜单 2=二级 7 级别
+    expect(levelOptions).toBeDefined();
+    expect(levelOptions.find((o) => o.includes("low"))).toBe("● low");
+  });
+
+  it("三段式：临时作用域选「跟随 TL」→ overlay pin {mode: follow}（磁盘全局零改动 + 临时后缀）", async () => {
+    // 默认作用域即 temp（sessionId 可用）；无需先选「设置作用域」项
+    const ctx = createCtx({
+      sessionId: "session-A",
+      selectImpl: pickContaining("成员思考强度", "跟随 TL"),
+    });
+    await handleSetting(ctx as any);
+
+    expect(getSessionSettings().memberThinkingLevel).toEqual({ mode: "follow" });
+    expect(loadSettings(tmpDir).memberThinkingLevel).toBeUndefined();
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("仅当前 pi 会话生效"),
+      "info"
+    );
+  });
+
+  it("三段式：顶层菜单当前值显示 follow + TL 级别（describe 第二参接线）", async () => {
+    const { saveSettings, DEFAULT_SETTINGS } = await import("../../settings/settings");
+    saveSettings(
+      {
+        ...structuredClone(DEFAULT_SETTINGS),
+        memberThinkingLevel: { mode: "follow" },
+      },
+      tmpDir
+    );
+    let topOptions: string[] = [];
+    const ctx = createCtx({
+      thinkingLevel: "high",
+      selectImpl: (_t, opts) => {
+        topOptions = [...opts];
+        return Promise.resolve(undefined);
+      },
+    });
+    await handleSetting(ctx as any);
+    const thinkingItem = topOptions.find((o) => o.includes("成员思考强度"))!;
+    expect(thinkingItem).toContain("跟随 TL（当前：high）");
+    expect(thinkingItem).not.toContain("TL 级别未知");
+  });
+
+  it("三段式：顶层菜单 follow + TL 未知 → 「跟随 TL（TL 级别未知）」", async () => {
+    const { saveSettings, DEFAULT_SETTINGS } = await import("../../settings/settings");
+    saveSettings(
+      {
+        ...structuredClone(DEFAULT_SETTINGS),
+        memberThinkingLevel: { mode: "follow" },
+      },
+      tmpDir
+    );
+    let topOptions: string[] = [];
+    const ctx = createCtx({
+      selectImpl: (_t, opts) => {
+        topOptions = [...opts];
+        return Promise.resolve(undefined);
+      },
+    });
+    await handleSetting(ctx as any);
+    const thinkingItem = topOptions.find((o) => o.includes("成员思考强度"))!;
+    expect(thinkingItem).toContain("跟随 TL（TL 级别未知）");
+  });
+
+  it("三段式：既有 fixed 全局在顶层显示「指定级别：X」，子菜单仍可选默认/跟随/指定", async () => {
+    const { saveSettings, DEFAULT_SETTINGS } = await import("../../settings/settings");
+    saveSettings(
+      {
+        ...structuredClone(DEFAULT_SETTINGS),
+        memberThinkingLevel: { mode: "fixed", level: "xhigh" },
+      },
+      tmpDir
+    );
+    // 选「跟随 TL」覆盖既有 fixed（xhigh 不可选为二级入口的当前标记不影响）
+    const ctx = createCtx({
+      thinkingLevel: "low",
+      selectImpl: pickContaining("成员思考强度", "跟随 TL（当前：low）"),
+    });
+    await handleSetting(ctx as any);
+    expect(loadSettings(tmpDir).memberThinkingLevel).toEqual({ mode: "follow" });
   });
 });
 

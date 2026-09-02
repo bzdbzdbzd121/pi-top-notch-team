@@ -134,7 +134,7 @@ export async function handleSetting(
     const items = [
       scopeItem,
       `${OPT_MEMBER_MODEL}（当前：${describeMemberModelSetting(effective, currentModelRef(ctx))}）${badge("memberModel")}${teamYamlNote ? `（${teamYamlNote}）` : ""}`,
-      `${OPT_MEMBER_THINKING}（当前：${describeMemberThinkingSetting(effective)}）${badge("memberThinkingLevel")}`,
+      `${OPT_MEMBER_THINKING}（当前：${describeMemberThinkingSetting(effective, ctx.thinkingLevel)}）${badge("memberThinkingLevel")}`,
       `${OPT_AUTO_COMPACT}（当前：${describeAutoCompactSetting(effective)}）${badge("autoCompact")}`,
       `${OPT_WAIT_TIMEOUT}（当前：${describeWaitTimeoutSetting(effective)}）${badge("waitTimeoutMinutes")}`,
       `${OPT_COALESCE}（当前：${describeMessageCoalescingSetting(effective)}）${badge("messageCoalescing")}`,
@@ -410,13 +410,19 @@ async function configureMessageCoalescing(
 }
 
 /**
- * 成员思考强度子菜单：选择一个思考级别（或「默认」不指定）。
+ * 成员思考强度子菜单（三段式，P3）：
+ *   1. 默认（不指定）——首项必须保留（两态对象无 default 态，R8：勿照抄
+ *      memberModel 的两段式而漏掉默认入口）
+ *   2. 跟随 TL（当前：<ctx.thinkingLevel>；未知时显示「TL 级别未知」）
+ *   3. 指定级别…（二级进 7 级别选择）
  *
  * 语义：配置后，成员启动时若其生效模型支持该级别 → 以 `--thinking` 传给
  * member 进程；不支持（或无法判定支持集）→ 不传 flag，保持 pi 默认。
- * 仅影响之后启动的成员。
+ * 仅影响之后启动的成员。保存后 settings.yaml / overlay 为新对象形态
+ * （{mode:"follow"|"fixed", level?}）。
  */
 const THINKING_DEFAULT_LABEL = "默认（不指定 — 使用 pi 对该模型的默认思考级别）";
+const THINKING_SPECIFY_LABEL = "指定级别…";
 
 async function configureMemberThinking(
   ctx: ExtensionCommandContext,
@@ -424,15 +430,16 @@ async function configureMemberThinking(
   persist: () => void,
   noticeSuffix: string,
 ): Promise<void> {
-  const current = settings.memberThinkingLevel;
+  // TL 当前思考级别：ExtensionContext 顶层字段（命令 ctx 实时值，0.83.0 types 确认）
+  const tlLevel = ctx.thinkingLevel;
+  const followLabel = tlLevel ? `跟随 TL（当前：${tlLevel}）` : "跟随 TL（TL 级别未知）";
   const items = [
     THINKING_DEFAULT_LABEL,
-    ...MEMBER_THINKING_LEVELS.map(
-      (l) => (current?.mode === "fixed" && current.level === l ? "● " : "") + l
-    ),
+    `${followLabel}${settings.memberThinkingLevel?.mode === "follow" ? "（当前选中）" : ""}`,
+    THINKING_SPECIFY_LABEL,
   ];
   const choice = await ctx.ui.select(
-    `成员思考强度（当前：${describeMemberThinkingSetting(settings)}）— 仅对之后启动的成员生效（Esc 返回）`,
+    `成员思考强度（当前：${describeMemberThinkingSetting(settings, tlLevel)}）— 仅对之后启动的成员生效（Esc 返回）`,
     items
   );
   if (choice === undefined) return; // Esc
@@ -447,11 +454,28 @@ async function configureMemberThinking(
     return;
   }
 
+  if (choice === items[1]) {
+    settings.memberThinkingLevel = { mode: "follow" };
+    persist();
+    ctx.ui.notify(
+      `成员思考强度已设为「跟随 TL（当前：${tlLevel ?? "未知"}）」。\n模型不支持该级别的成员保持默认；仅对之后启动的成员生效。${noticeSuffix}`,
+      "info"
+    );
+    return;
+  }
+
+  // 指定级别…：二级 7 级别选择（当前 fixed 级别带 ● 标记）
+  const levelItems = MEMBER_THINKING_LEVELS.map((l) =>
+    settings.memberThinkingLevel?.mode === "fixed" && settings.memberThinkingLevel.level === l
+      ? `● ${l}`
+      : l
+  );
+  const levelChoice = await ctx.ui.select("指定思考级别（Esc 返回）", levelItems);
+  if (levelChoice === undefined) return; // Esc
+
   // Strip the "● " current-marker prefix before matching
-  const level = choice.replace(/^● /, "");
+  const level = levelChoice.replace(/^● /, "");
   if (!(MEMBER_THINKING_LEVELS as readonly string[]).includes(level)) return;
-  // P1 对象形态：菜单仍为两态（默认/指定级别），固定级别以 fixed 对象存储；
-  // 三态菜单（含「跟随 TL」）属 P3 范围。
   settings.memberThinkingLevel = {
     mode: "fixed",
     level: level as (typeof MEMBER_THINKING_LEVELS)[number],

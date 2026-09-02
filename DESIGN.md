@@ -455,11 +455,13 @@ The TL follows the **Orchestration Playbook** (`src/prompts/orchestration-playbo
 - The resolved model is passed to the member process as the `--model provider/id` CLI flag at spawn (`MemberProcessConfig.model` in `member-process.ts`). This also wires up the previously inert team-YAML `defaults.model` / `member.model` fields. Already-running members keep the model they were spawned with.
 - The model picker uses `src/ui/scroll-select.ts` — a reusable `ctx.ui.custom` component with a `maxVisible` scroll window (default 10, same as pi's `/model` selector), `(n/total)` scroll indicator, PgUp/PgDn support, and a fuzzy-search input (`fuzzyFilter` from pi-tui). pi's built-in `ctx.ui.select` renders ALL options without scrolling, which is unusable for 100+ available models. Small menus (top-level, mode picker) still use `ctx.ui.select`. The `/team resume` session picker also uses `scrollSelect` for the same reason (many resumable sessions would overflow the screen).
 - Also supports: **成员思考强度** (`memberThinkingLevel?` in settings.yaml; `src/settings/resolve-thinking.ts`)
-  - Second-level menu: `默认（不指定）` + `off` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`; current level marked with `●`
-  - **Semantics (支持则用，不支持保持现状)**：配置后，成员启动时若其生效模型支持该级别 → spawn 参数加 `--thinking <level>`；不支持（或无法判定支持集）→ 不传 flag，member pi 使用自己的默认思考级别链（per-model 覆盖 > 全局默认 > 模型自身默认）。**刻意不做就近 clamp**——pi 自身的 `setThinkingLevel` 会 clamp 到最近支持级别，与「保持现状」语义不符，因此支持性检测在 TL 侧完成，不支持时根本不传 flag。
-  - **Support-set semantics**（逐字复刻 pi-ai `getSupportedThinkingLevels`，版本锚定 pi 0.83.x dist bundle；不 import pi-ai——非本包依赖且 jiti alias 深导入有拼坏前科，见 §17）：非 reasoning 模型仅 `off`；reasoning 模型 `off/minimal/low/medium/high` 默认支持（`thinkingLevelMap` 映射为 `null` 者除外），`xhigh/max` 仅当 `thinkingLevelMap` 存在对应条目。
-  - **Wiring**: `index.ts` 在 `session_start` 缓存 `ctx.modelRegistry`；`buildMemberConfig` 新增 `lookupSupportedThinkingLevels?(modelRef)` 选项——按 `provider/modelId` 在 `getAvailable()` 查模型后返回支持集（查不到/注册表不可用 fail-open）。两个调用点均传入：`start_member` 工具与 `/team resume` 的 `startResumedMember`；崩溃 auto-restart 复用已存 config，flag 自然保留。无生效模型覆盖（source=none）时不检测；团队 YAML `model: "provider/id:high"` 后缀逃生口不受影响（含后缀的 id 匹配不到注册表 → fail-open）。
-  - `start_member` 结果文本在指定成功时附「思考强度：<level>（模型支持该级别，已显式指定）」便于观测；仅影响之后启动的成员。
+  - **设置形态对象化两态**（与 memberModel 同构，键名保留）：`{mode:"follow"|"fixed", level?}`——`undefined`/`{mode:"fixed"}` 缺 level = 默认（不指定）；`{mode:"fixed", level}` = 固定级别；`{mode:"follow"}` = 跟随 TL（spawn 时快照 TL 实际生效级别）。旧字符串形态（P1 迁移前存量 settings.yaml / resume 快照）由 `parseMemberThinkingSetting` 迁移守卫转对象（原始 YAML 值判断，决策 #34 教训），内存态迁移不主动回写磁盘。
+  - **三段式菜单**（P3，R8：首项必须保留「默认」）：① `默认（不指定 — 使用 pi 对该模型的默认思考级别）` ② `跟随 TL（当前：<ctx.thinkingLevel 实时值>；未知时显示「TL 级别未知」）` ③ `指定级别…`（二级进 `off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max` 选择，当前 fixed 级别带 `●`）。顶层菜单「当前：」经 `describeMemberThinkingSetting(setting, tlLevel)` 显示 merge 后生效值（follow 带当前级别）；子菜单标题同。保存后 settings.yaml / overlay 为新对象形态。
+  - **Semantics (支持则用，不支持保持现状)**：配置后，成员启动时若其生效模型支持该级别 → spawn 参数加 `--thinking <level>`；不支持（或无法判定支持集）→ 不传 flag，member pi 使用自己的默认思考级别链（per-model 覆盖 > 全局默认 > 模型自身默认）。**刻意不做就近 clamp**——pi 自身的 `setThinkingLevel` 会 clamp 到最近支持级别，与「保持现状」语义不符；且成员侧 pi 也会 clamp，预检 fail-open 保证「传了什么、生效什么」完全可预测，因此支持性检测在 TL 侧完成，不支持时根本不传 flag。follow 模式下 TL 级别未知（session runtime 未提供/事件未到）同样 fail-open 不传。
+  - **TL 级别跟踪（follow 信号源，D4）**：`index.ts` 模块级 `tlThinkingLevel`（与 `tlCurrentModel` 逐行同构）——`session_start` 从 `ctx.thinkingLevel`（ExtensionContext 顶层字段）初始化 + `thinking_level_select` 单监听增量更新（仅实际变化时 emit；模型切换联动走 setThinkingLevel 路径，clamp 后变化则 emit、不变则缓存值本就正确——单事件已完备）。`getThinkingLevel()` 仅命令 ctx 可用，不作设计依赖。buildMemberConfig 两调用点（`start_member` 工具 + `/team resume` 的 `startResumedMember`）均传 `tlThinkingLevel`；菜单显示用命令 ctx 实时值。**实时跟随（向运行中成员广播 `set_thinking_level` RPC）为文档化未来增强**——rpc-mode.js 已存在命令、`get_state` 已返回 thinkingLevel。
+  - **Support-set semantics**（逐字复刻 pi-ai `getSupportedThinkingLevels`，版本锚定 pi 0.83.x dist bundle；不 import pi-ai——非本包依赖且 jiti alias 深导入有拼坏前科，见 §17）：非 reasoning 模型仅 `off`；reasoning 模型 `off/minimal/low/medium/high` 默认支持（`thinkingLevelMap` 映射为 `null` 者除外），`xhigh/max` 仅当 `thinkingLevelMap` 存在对应条目。`isMemberThinkingLevel` 校验保持严格不变——`follow` 是模式不是级别，绝不混入级别值域。
+  - **Wiring**: `index.ts` 在 `session_start` 缓存 `ctx.modelRegistry`；`buildMemberConfig` 新增 `lookupSupportedThinkingLevels?(modelRef)` 选项——按 `provider/modelId` 在 `getAvailable()` 查模型后返回支持集（查不到/注册表不可用 fail-open）。两个调用点均传入：`start_member` 工具与 `/team resume` 的 `startResumedMember`；崩溃 auto-restart 复用已存 config，flag 自然保留。无生效模型覆盖（source=none）时不检测；团队 YAML `model: "provider/id:high"` 后缀逃生口不受影响（含后缀的 id 匹配不到注册表 → fail-open）。仅影响之后启动的成员。
+  - `start_member` 结果附注三态（`describeSpawnThinkingAnnotation`，P2）：跟随成功「思考强度：<level>（跟随 TL，模型支持该级别）」/ 跟随降级「思考强度：跟随 TL，但模型不支持该级别，保持默认」/ TL 级别未知「思考强度：跟随 TL（TL 级别未知，保持默认）」；非 follow 保持既有格式「思考强度：<level|默认>」。
 
 ## 6. TL Process Management Tools
 
@@ -1999,7 +2001,7 @@ export function loadEffectiveSettings(rootDir: string): TeamSettings {
 
 优先级链（不变）：成员 YAML `model` > 团队 YAML `defaults.model` > 临时/全局 `memberModel` > follow（TL 当前模型）> 不指定。
 
-热切换：memberModel/memberThinkingLevel 在 spawn 时解析（**仅影响之后启动的成员**）；autoCompact/messageCoalescing/waitTimeoutMinutes 每派发/屏障时解析（**即时生效**）。
+热切换：memberModel/memberThinkingLevel 在 spawn 时解析（**仅影响之后启动的成员**；memberThinkingLevel follow 模式另取 TL 思考强度快照——`index.ts` `tlThinkingLevel`，见 §5 成员思考强度）；autoCompact/messageCoalescing/waitTimeoutMinutes 每派发/屏障时解析（**即时生效**）。
 
 ### 27.6 可观测性（阶段 5）
 
