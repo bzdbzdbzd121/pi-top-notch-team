@@ -898,3 +898,62 @@ describe("loadEffectiveSettings + isSnapshotRestored（阶段 5：合并层入�
     expect(mod.isSnapshotRestored()).toBe(false);
   });
 });
+
+describe("allowAgentInitiatedSessions 快照登记 (S3 场景: 写快照 → 清内存 → resume 恢复 → 生效)", () => {
+  let sessionDir: string;
+
+  beforeEach(() => {
+    resetSessionSettingsState();
+    sessionDir = mkdtempSync(join(tmpdir(), "team-settings-agent-snap-test-"));
+  });
+
+  afterEach(() => {
+    resetSessionSettingsState();
+    rmSync(sessionDir, { recursive: true, force: true });
+  });
+
+  it("round-trips the scalar through the snapshot (登记后 resume 不丢键)", () => {
+    setSessionSetting("allowAgentInitiatedSessions", false);
+    expect(saveSessionSettingsSnapshot(sessionDir)).toBe(true);
+    const parsed = parseYaml(
+      readFileSync(getSessionSettingsSnapshotPath(sessionDir), "utf-8")
+    ) as Record<string, unknown>;
+    expect(parsed.allowAgentInitiatedSessions).toBe(false);
+
+    // 模拟跨进程 resume：清内存 → 加载快照 → 新键进入 overlay 且 resolver 判定生效
+    clearSessionSettingsMemory();
+    expect(getSessionSettings()).toEqual({});
+    expect(loadSessionSettingsSnapshot(sessionDir, "session-B")).toBe(true);
+    expect(getSessionSettings()).toEqual({ allowAgentInitiatedSessions: false });
+    expect(
+      resolveEffectiveSettings(makeGlobal(), getSessionSettings()).allowAgentInitiatedSessions
+    ).toBe(false);
+  });
+
+  it("drops non-boolean values from snapshots (字段级校验负例: 未登记直接红)", () => {
+    mkdirSync(sessionDir, { recursive: true });
+    for (const raw of [
+      'allowAgentInitiatedSessions: "false"\nwaitTimeoutMinutes: 5\n', // string
+      "allowAgentInitiatedSessions: 0\nwaitTimeoutMinutes: 5\n", // number
+      "allowAgentInitiatedSessions: null\nwaitTimeoutMinutes: 5\n", // null
+    ]) {
+      resetSessionSettingsState();
+      writeFileSync(getSessionSettingsSnapshotPath(sessionDir), raw, "utf-8");
+      expect(loadSessionSettingsSnapshot(sessionDir, "session-B")).toBe(true);
+      const overlay = getSessionSettings() as Record<string, unknown>;
+      expect("allowAgentInitiatedSessions" in overlay).toBe(false);
+      expect(overlay.waitTimeoutMinutes).toBe(5);
+    }
+  });
+
+  it("load returns false when only an invalid value exists (无可恢复内容)", () => {
+    mkdirSync(sessionDir, { recursive: true });
+    writeFileSync(
+      getSessionSettingsSnapshotPath(sessionDir),
+      "allowAgentInitiatedSessions: 0\n",
+      "utf-8"
+    );
+    expect(loadSessionSettingsSnapshot(sessionDir, "session-B")).toBe(false);
+    expect(getSessionSettings()).toEqual({});
+  });
+});

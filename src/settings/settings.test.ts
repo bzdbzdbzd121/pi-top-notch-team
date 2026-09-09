@@ -12,6 +12,7 @@ import {
 import { resolveMessageCoalescing } from "./resolve-message-coalescing";
 import { MEMBER_THINKING_LEVELS } from "./resolve-thinking";
 import { resolvePeerMessaging } from "./resolve-peer-messaging";
+import { resolveAgentSessionAllowed } from "./resolve-agent-session";
 
 describe("settings store", () => {
   let tmpDir: string;
@@ -455,5 +456,93 @@ describe("allowPeerMessaging (成员互发开关)", () => {
     } finally {
       warnSpy.mockRestore();
     }
+  });
+});
+
+describe("allowAgentInitiatedSessions (agent 自主会话开关)", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "team-settings-agent-session-test-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("defaults to true (allow) when unset — DEFAULT_SETTINGS 显式入列", () => {
+    expect(DEFAULT_SETTINGS.allowAgentInitiatedSessions).toBe(true);
+    const settings = loadSettings(tmpDir);
+    expect(settings.allowAgentInitiatedSessions).toBe(true);
+    // resolver 联动：缺省即允许（现状行为，向后兼容）
+    expect(resolveAgentSessionAllowed(settings)).toBe(true);
+  });
+
+  it("round-trips explicit false and true through save/load", () => {
+    saveSettings(
+      { ...structuredClone(DEFAULT_SETTINGS), allowAgentInitiatedSessions: false },
+      tmpDir
+    );
+    expect(loadSettings(tmpDir).allowAgentInitiatedSessions).toBe(false);
+
+    saveSettings(
+      { ...structuredClone(DEFAULT_SETTINGS), allowAgentInitiatedSessions: true },
+      tmpDir
+    );
+    expect(loadSettings(tmpDir).allowAgentInitiatedSessions).toBe(true);
+  });
+
+  it("drops non-boolean values (严格姿态，丢弃回退默认 true)", () => {
+    for (const raw of [
+      'allowAgentInitiatedSessions: "false"\n', // string
+      "allowAgentInitiatedSessions: 0\n", // number
+      "allowAgentInitiatedSessions: null\n", // null
+    ]) {
+      writeFileSync(getSettingsPath(tmpDir), raw, "utf-8");
+      expect(loadSettings(tmpDir).allowAgentInitiatedSessions).toBe(true);
+    }
+  });
+
+  it("近似意图非法值 console.warn 一次 per 文件路径（防禁用意图被静默吞掉）", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      writeFileSync(getSettingsPath(tmpDir), 'allowAgentInitiatedSessions: "false"\n', "utf-8");
+      // 严格姿态不变：仍回退默认 true（warn 只补信号，不改行为）
+      expect(loadSettings(tmpDir).allowAgentInitiatedSessions).toBe(true);
+      const warns = () =>
+        warnSpy.mock.calls.filter(
+          (c) => String(c[0]).includes(tmpDir) && String(c[0]).includes("allowAgentInitiatedSessions")
+        );
+      expect(warns()).toHaveLength(1);
+      expect(String(warns()[0][0])).toContain("allowAgentInitiatedSessions");
+      // loadSettings 每 dispatch 高频调用 → 同文件路径只 warn 一次，防刷屏
+      loadSettings(tmpDir);
+      loadSettings(tmpDir);
+      expect(warns()).toHaveLength(1);
+
+      // 键缺失（旧文件）不 warn —— 只有显式写了非法值才有信号
+      const tmpDir2 = mkdtempSync(join(tmpdir(), "team-settings-agent-session-test-2-"));
+      try {
+        writeFileSync(getSettingsPath(tmpDir2), "memberModel:\n  mode: follow\n", "utf-8");
+        loadSettings(tmpDir2);
+        expect(
+          warnSpy.mock.calls.filter(
+            (c) => String(c[0]).includes(tmpDir2) && String(c[0]).includes("allowAgentInitiatedSessions")
+          )
+        ).toHaveLength(0);
+      } finally {
+        rmSync(tmpDir2, { recursive: true, force: true });
+      }
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("explicit false resolves to disallowed (resolver 联动)", () => {
+    saveSettings(
+      { ...structuredClone(DEFAULT_SETTINGS), allowAgentInitiatedSessions: false },
+      tmpDir
+    );
+    expect(resolveAgentSessionAllowed(loadSettings(tmpDir))).toBe(false);
   });
 });

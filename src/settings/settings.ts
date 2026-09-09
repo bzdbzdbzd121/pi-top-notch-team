@@ -75,6 +75,14 @@ export interface TeamSettings {
    * 演进空间：per-member/team 粒度（hub-spoke 语义），以注释/文档承载。
    */
   allowPeerMessaging?: boolean;
+  /**
+   * 是否允许 agent 自主启动团队会话（start_team_session，ADR-0003）。仅影响启动，
+   * 不影响运行中会话的收尾与恢复。缺省/非法值回退为 true（允许 = 现状，向后兼容）。
+   * 解析语义见 src/settings/resolve-agent-session.ts（fail-open → 允许）。
+   * 演进空间：三态（"confirm" 确认门）见 DESIGN.md 注记——真到三态时新增键 + 迁移
+   * （waitTimeoutMinutes 先例），本键不焊死语义。
+   */
+  allowAgentInitiatedSessions?: boolean;
 }
 
 export const DEFAULT_SETTINGS: TeamSettings = {
@@ -83,12 +91,14 @@ export const DEFAULT_SETTINGS: TeamSettings = {
   waitTimeoutMinutes: 15,
   messageCoalescing: { enabled: true, maxBatchSize: 5, maxBatchChars: 4000 },
   allowPeerMessaging: true,
+  allowAgentInitiatedSessions: true,
 };
 
 const SETTINGS_FILE = "settings.yaml";
 
 /** 近似意图非法值 warn 去重（每文件路径一次；loadSettings 每 dispatch 高频调用，防刷屏）。 */
 const warnedApproximatePeerMessaging = new Set<string>();
+const warnedApproximateAgentSession = new Set<string>();
 
 export function getSettingsPath(rootDir: string): string {
   return join(rootDir, SETTINGS_FILE);
@@ -231,6 +241,22 @@ export function loadSettings(rootDir: string): TeamSettings {
       warnedApproximatePeerMessaging.add(filePath);
       console.warn(
         `[top-notch-team] settings: allowPeerMessaging 值 ${JSON.stringify(apm)} 非法（需要 true/false），已忽略并按「允许成员互发」处理——请经 /team setting 或编辑 ${filePath} 修正。`
+      );
+    }
+
+    // allowAgentInitiatedSessions (top-level): agent-initiated session toggle
+    // (start_team_session, ADR-0003). 严格姿态与 allowPeerMessaging 一致：仅接受
+    // boolean，其余丢弃回退默认（DEFAULT true = 允许，现状行为）。
+    const aais = rawData.allowAgentInitiatedSessions;
+    if (typeof aais === "boolean") {
+      settings.allowAgentInitiatedSessions = aais;
+    } else if (aais !== undefined && !warnedApproximateAgentSession.has(filePath)) {
+      // 近似意图非法值（如 YAML 引号包裹的 "false"、数字 0）被严格丢弃后，
+      // 用户的「禁用」意图会静默变回允许——补一次性 console.warn 让意图不被
+      // 吞掉（复刻 allowPeerMessaging 的 warn-once 模式）。
+      warnedApproximateAgentSession.add(filePath);
+      console.warn(
+        `[top-notch-team] settings: allowAgentInitiatedSessions 值 ${JSON.stringify(aais)} 非法（需要 true/false），已忽略并按「允许」处理——请经 /team setting 或编辑 ${filePath} 修正。`
       );
     }
 
