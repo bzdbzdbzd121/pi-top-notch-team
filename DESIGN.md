@@ -1387,6 +1387,9 @@ The agent can start a team session **itself** — without the user typing `/team
 TL calls start_team_session(task)          ← registered at extension LOAD (the single
   │                                           deliberate exception to session-scoped
   │                                           registration, decision #21)
+  ├─ guard: allowAgentInitiatedSessions=false → policy rejection, ZERO side
+  │          effects (决策 #42 L2 execute gate — checked FIRST, before task
+  │          validation and re-entry guard; see §29)
   ├─ guard: session already active → error (re-entry)
   ├─ bootstrapDynamicSession(origin "agent")   src/setup/dynamic-session-bootstrap.ts
   │    ├─ mkdir sessions/_dynamic_<ts>/
@@ -1426,6 +1429,7 @@ Rationale (the core design philosophy): in a user-initiated session the user's e
 
 - **Nesting is structurally impossible** — `index.ts` returns early when `TEAM_ROLE` is set, so member processes never see `start_team_session`.
 - **Re-entry** returns an error while any session is active.
+- **Policy-gated entry (决策 #42, since 阶段①-④)** — the entry is controlled by the `allowAgentInitiatedSessions` setting (default `true` = unchanged behavior): disabled ⇒ the tool is removed from the active set at every turn boundary (prompt surface vanishes with it, L1) and its execute rejects with zero side effects (L2); disabling only blocks NEW starts — running sessions are not terminated, `stop_team_session`/`/team resume` and in-session guards are unchanged. Full design, boundaries and the bootstrap third-layer evolution note: §29.
 - **Visibility** — bootstrap fires a `🤖` notify with the task summary, and the team status widget carries a persistent origin marker (🤖 agent / 👤 user) in its title.
 - **User oversight is unchanged** — widget, Member Inspector (`alt+t`), Esc, `/team stop` all work regardless of origin.
 
@@ -1433,13 +1437,13 @@ Rationale (the core design philosophy): in a user-initiated session the user's e
 
 | File | Role |
 |------|------|
-| `src/tools/agent-session-tools.ts` | `start_team_session` (load-time) + `stop_team_session` (session-scoped, agent-only activation) |
+| `src/tools/agent-session-tools.ts` | `start_team_session` (load-time) + `stop_team_session` (session-scoped, agent-only activation); `getSettings` dep + first-step policy gate (§29.2, L2) |
 | `src/tools/agent-session-tool-names.ts` | Tool name constants (leaf module — avoids import cycles) |
-| `src/setup/dynamic-session-bootstrap.ts` | Shared bootstrap behind `/team dynamic` and `start_team_session` (+ `ensureAddDynamicMemberTool`) |
+| `src/setup/dynamic-session-bootstrap.ts` | Shared bootstrap behind `/team dynamic` and `start_team_session` (+ `ensureAddDynamicMemberTool`) — kept settings-free by red line (§29.6) |
 | `src/session/teardown.ts` | Shared teardown behind `/team stop` and `stop_team_session` |
 | `src/prompts/agent-initiated-mode.ts` | Autonomous design/execution phase prompts (mission-anchored) |
 | `src/session/state.ts` | `SessionOrigin` + `origin` field on `TeamSessionState` |
-| `src/session/session-tool-visibility.ts` | `AGENT_SESSION_TOOL_NAMES` + `agentInitiated` dep — origin-conditional activation |
+| `src/session/session-tool-visibility.ts` | `AGENT_SESSION_TOOL_NAMES` + `agentInitiated` dep — origin-conditional activation; `startTeamSessionVisible` policy gate (§29.3, L1) |
 | `index.ts` | Load-time registration, origin-branched guards/prompt, whitelist additions |
 
 ## 19. 细粒度活动状态显示层（Activity Tracker + 事件驱动渲染）
@@ -2071,3 +2075,68 @@ export function loadEffectiveSettings(rootDir: string): TeamSettings {
 - **allow 态 `to:"all"` 既有语义澄清**：`route()` 的 all 分支广播给**全部其他成员、不含 TL**（成员的 all 广播到不了 TL；TL 需单独 `to:"tl"`，或由 TL 主动向成员派发）——防后续需求误读。
 - members 命名 "tl" 的病态边界：router from/to 的既有歧义（如成员名恰为 "tl" 时 all 分支 skip-self 语义），与本需求无关，仅记录既有事实。
 - **演进空间**：拓扑词汇（`"allowed" | "tl-only"` 枚举）可承载 proxy 子模式；团队 YAML defaults 覆盖（与 model 解析链同构）为二期；per-member 能力矩阵出现时标量升级对象零成本。TL 审批制代理转（TL 代转发成员间消息）留档未采纳（TL 上下文成本最大、与「TL 只调度」纪律冲突，如确需可审计通道可为特定团队显式配置开启）。
+
+## 29. Agent 自主会话开关（决策 #42，阶段①-⑤）
+
+**需求**：设置控制 agent 是否可自主启动团队会话（`start_team_session`，ADR-0003）。用户已确认的管辖范围：仅禁用 agent 自主启动；手动入口（`/team start`、`/team dynamic`）不受影响；默认开启 = 现状。最终方案（三分析员并行分析 + 互审 + 汇总裁决）：**双层门控单次交付**——L2 execute 门控（正确性硬闸门）先行、L1 activeTools 可见性门控（禁用语义完备性层）叠加；设置层五件套完整复刻决策 #41 模板，命名 `allowAgentInitiatedSessions`（与 ADR-0003 术语 agent-initiated sessions 逐字对齐）。
+
+### 29.1 设置数据层（阶段①）
+
+- `TeamSettings.allowAgentInitiatedSessions?: boolean`，`DEFAULT_SETTINGS` 显式 `true`（默认允许 = 现状，向后兼容）。字段注释载明：仅影响启动相，不影响运行中会话的收尾与恢复；三态（"confirm" 确认门）演进空间以注释/ADR 留档——真到三态时新增键 + 迁移（waitTimeoutMinutes 先例），本键不焊死语义。
+- `loadSettings` 严格 boolean 解析；近似意图非法值（`"false"`/`0`/`null`）丢弃回退默认 + 每文件路径一次性 console.warn（复刻 #41 warn-once 模式，防禁用意图被静默吞掉）。新键无迁移需求。
+- `src/settings/resolve-agent-session.ts`：`resolveAgentSessionAllowed(settings)` = `!== false → true`（`=== false` → 禁止；undefined/true/访问异常/null settings → 允许，fail-open）。**不对称论证**（写入 resolver 注释）：误允许可经 /team setting 修正，误禁止静默剥夺 agent 委派能力更难察觉。`describeAgentSessionSetting`：「允许」/「禁止」。resolver 只收 settings 参数，零裸 loadSettings（R4 天然合规）。
+- `sanitizeSnapshotData` 登记该键 boolean 校验（紧跟 allowPeerMessaging 登记点）——**未登记则 /team resume 静默丢失**（验收 checklist 第一项）；标量 diff-pin 走 `diffOverlayPatch` 现成泛型分支（零改动）。
+
+### 29.2 L2 execute 门控（阶段②，正确性硬闸门）
+
+- `AgentSessionToolsDeps` 新增 `getSettings?: () => TeamSettings`（D5 裁决：与 TlToolsDeps.getSettings 同构；per-call 动态求值——late-evaluation 纪律，绝不在注册点缓存；缺省/异常 = 允许 fail-open，现有测试与 embedder 零破坏）。
+- `execute()` **首步**策略检查（D6 裁决：先于 task 空校验、先于活跃会话校验、先于 bootstrap/setGoalInternal——disabled 对任何参数成立，判定确定性最好；禁用+空 task 场景返回策略错误而非参数错误，避免信息错位）。检查与拒绝同函数体内同步完成，无 TOCTOU 窗口。
+- `entryAllowed()` 在 resolver 自身 fail-open 之上再兜 getSettings 闭包本身抛错（防御纵深，测试锁定）。
+- 拒绝文案（信息一次给足）：「请勿再次调用」抑制重试 + 建设性出路（告知用户该功能已被禁用 → /team start、/team dynamic 手动启动，或 /team setting 重开；否则直接自行完成任务）。prose 建议不受拦截（A5）——拒绝文案利用此点给出路。details 带 `disabledBySettings: true`。
+- **零副作用**（最锋利测试设计）：拒绝时不 bootstrap、不置 Goal、不建 sessions 目录、不动 activeTools、不 notify。
+- `stop_team_session` 完全不动（与开关正交——收尾是安全方向；其 active 性由会话 origin 决定）。
+- index.ts 接线：`registerStartTeamSessionTool({ pi, teamCtx, getSettings: () => getEffectiveSettings() })`（合并层唯一入口，R4 合规；index.test.ts 接线锁消费点计数同步）。
+
+### 29.3 L1 可见性门控（阶段③，禁用语义完备性层）
+
+- **F2 证据（D1 裁决依据）**：pi 0.83.0 dist 实读——`_rebuildSystemPrompt` 仅按 activeTools 收集 promptSnippet/promptGuidelines。execute-only（无 L1）下禁用态系统提示每回合仍注入「Delegate complex multi-part tasks…」邀请函与 5 条委派 guidelines——系统提示教 LLM 委派而调用被拒，是禁用语义的完备性缺陷。L1 使 disabled 时工具与 prompt 表面**同步消失，无残渣**。
+- `SessionToolVisibilityDeps` 新增 `startTeamSessionVisible?: boolean`（D8 裁决：具体入参非泛型——无第二个 policy-gated 工具时泛型是负资产，YAGNI 一致性；缺省/undefined/true = 可见 fail-open）。index.ts 调用点传 `resolveAgentSessionAllowed(getEffectiveSettings())`（before_agent_start 每回合实时求值，字面 boolean）。
+- **D3 统一不变式**：可见性 ⇔ 开关值、与会话状态无关——
+  - disabled ⇒ 两个分支（session-active / no-session）结束时该工具均不在 activeTools（发现即移除，与 SESSION_TOOL_NAMES leaked 处理同路；陈旧列表重注入 → 下回合边界再移除）；
+  - enabled（true/undefined）⇒ 结束时在 activeTools（E8：disabled→enabled 往返后补回，**无会话分支同样补回**——「禁用→启用往返下一回合边界即恢复」承诺的结构前提；既有 13 例测试按统一契约更新而非破坏覆盖）。
+- **实现约束**：补回/移除只经 setActiveTools，**registerTools 永不为它触发**——该工具是加载时注册的既成事实（F1），注册缺失属加载层缺陷，静默补注册会掩盖问题（未注册场景仅名单进入活跃列表，pi setActiveTools 对未知名 no-op；与 session tools 的 required→registerTools 逻辑隔离）。`changed` 标志正确反映实际变更，正确状态幂等 no-op。
+- **E9 已知窗口**（记录，无需代码）：进程启动时已禁用 → 加载期 registerTool 自动激活 → 首个 before_agent_start 之前工具短暂 active。实际暴露面为零（首回合前 LLM 无调用机会、回合边界即纠正），L2 兜底使其结构性无害。写入模块注释与测试注释。
+- **已知残差**：禁用期间 LLM 幻觉调用非活跃工具 → pi agent-loop 短路报晦涩 `Tool not found`（决策 #24 记录的行为）——低概率、无害、到达不了 execute；F2 消除诱导源后概率进一步下降。接受。
+- 模块注释语义改写：session tools 不变式（Invariant 1）之外新增 Invariant 2——「start_team_session（加载时注册例外）受策略门控可见性约束，disabled ⇒ 不可见（含活跃会话期间）」。
+
+### 29.4 UI（阶段④）
+
+- `/team setting` 顶层新增「Agent 自主团队会话（当前：允许/禁止 [临时]）」插在「成员互发消息」之后（同为标量布尔分组相邻，位置测试锁定）；顶层项显示 merge 后生效值 + 临时徽标（既有 badge 管线自动覆盖）。
+- `configureAgentSession`：标量两段式子菜单（● 允许 / ● 禁止标记当前值），经 `persistFor("allowAgentInitiatedSessions")` 作用域分流——临时（overlay 字段级 pin，diff 空 → 解除 pin，无幻影徽标）/全局（settings.yaml）+ 场景附注管线（决策 #40：活跃期「/team resume 将恢复」/ 会话外「重启后失效」）全部复用零新发明。写入值为布尔字面量（审查员留档提示遵守）。
+- 语义边界在子菜单标题与通知中明示：仅影响启动相；运行中会话不终止；手动入口不受影响；下一回合边界即生效，无需重启。
+- ⑦ 清除全部经 overlay 通用机制覆盖该键（无特判，测试锁定）。
+- **promptGuidelines 不补禁用态说明**（阶段③审查建议评估结论）：F2 实证 disabled 时 guidelines 根本不进 LLM 上下文——补写两面皆无价值（enabled 时该文案对现状用户无意义且占输出预算；disabled 时无人读到）；E9 窗口由 L2 兜底。
+- **可观测性结论**：无用户侧 UI 变化——方案语义边界表将「禁用态 LLM 幻觉调用非活跃工具」接受为已知残差；用户侧指引由 L2 拒绝文案承载。
+
+### 29.5 语义边界总表（守护测试锁定）
+
+| 面 | 行为 | 锁定方式 |
+|----|------|----------|
+| `/team start` / `/team dynamic` | 零影响 | 守护测试：禁用态（settings.yaml + L2 deps 双禁用）/team dynamic 正常 bootstrap（origin user、design 阶段）+ add_dynamic_member 实际注册成员 + 对照组 start_team_session 仍被 L2 拒绝且不扰动 user 会话 |
+| 运行中的 agent 会话（开关切换） | 会话继续运行直至收尾（E4） | 文档 + L1 测试（agent 会话禁用后 stop_team_session 仍可见） |
+| `stop_team_session` | 永不受影响 | 测试锁定（禁用态 stop 照常报无活跃会话错误；其 active 性由 origin 决定） |
+| `/team resume` | 不受影响（含 agent-origin 会话） | resume 路径不经 start_team_session 工具（E5） |
+| 成员进程 | 结构性无关（TEAM_ROLE 早退） | 零改动（改动面小于决策 #41，无 env、无成员侧两态） |
+| prose 建议 | 不受拦截（A5） | 拒绝文案引导 agent 建议用户手动入口 |
+| 临时设置跨 resume | 快照恢复该键 | sanitize 登记 + S3 往返测试 |
+| 手工编辑 settings.yaml | 下一回合边界生效 | per-call resolver（late-evaluation） |
+
+### 29.6 红线与 bootstrap 第三层演进空间
+
+- **红线**：开关逻辑绝不进入共享 `bootstrapDynamicSession`/`startSession` 无差别拦截——两者同时服务用户路径（origin "user"）与 agent 路径（origin "agent"），无差别门控会误伤手动入口。守护测试锁定（§29.5 第一行）。
+- **bootstrap 第三层加固不做**（D4 裁决，2:1）：agent 可达路径已被 L1+L2 闭合；第三层防的「第三个 agent-origin 调用方」（MCP 暴露等）是假想场景（YAGNI）；向共享 bootstrap 塞设置检查的失败模式（origin 守卫写错 → 误伤 /team dynamic）恰是红线要防的事故类别。**概念留档**：gate 跟随 **origin** 而非调用方——若未来出现第三个 agent-origin 调用方，在其调用点套用 `resolveAgentSessionAllowed` 检查（概念自洽：origin==="agent" 分支内检查），并重估守护测试面。
+- **未采纳留档**：三态 confirm 模式（用户裁决二元范围；confirm 有阻塞等待语义 + RPC 无 UI 降级路径）——演进空间：真到三态时新增键 + 迁移（waitTimeoutMinutes 先例），boolean 命名不焊死语义；方案 A/E（加载时条件注册/注册点读设置）被 pi 无 unregisterTool API + late-evaluation 纪律双重否决（「关了再开」需重启违反即时生效）；方案 H（纯提示词抑制）被决策 #17 自身教训否决。
+
+### 29.7 测试面（38 新例，TDD 先红后绿）
+
+resolver 矩阵 8（undefined/true/false/getter 异常/null·undefined settings + describe 三态）+ settings 解析矩阵 5（DEFAULT 锁定/往返/非法值丢弃/warn-once per 文件路径/resolver 联动）+ 快照 3（S3 往返/非 boolean 丢弃/仅非法值 load false）+ L2 门控 6（禁用拒绝零副作用/启用回归/未注入放行/闭包抛错放行/D6 顺序×2/stop 正交）+ L1 门控 7（两分支移除/E8 补回×2/registerTools 隔离/未注册场景/幂等三态/user 会话双 forbidden）+ 红线守护 1 + 菜单 8。既有 session-tool-visibility 13 例按统一契约更新。

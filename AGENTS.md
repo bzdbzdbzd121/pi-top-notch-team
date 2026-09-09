@@ -98,9 +98,9 @@ src/
 │   ├── goal-tools.ts  ← Goal system: set_goal/finish_goal + settled-boundary reminder delivery
 │   ├── goal-tools.test.ts  ← Lifecycle, rollover, abort, cooldown, failure, and marker unit tests
 │   ├── goal-tools.agent-session.test.ts  ← Real pi 0.83.0 AgentSession lifecycle/void-wrapper integration tests
-│   ├── agent-session-tools.ts ← start_team_session（加载时注册，ADR-0003 例外）+ stop_team_session（会话作用域，仅自主会话激活）
+│   ├── agent-session-tools.ts ← start_team_session（加载时注册，ADR-0003 例外）+ stop_team_session（会话作用域，仅自主会话激活）；阶段② L2 execute 门控：getSettings 注入 + 首步策略检查（禁用→拒绝零副作用，决策 #42）
 │   ├── agent-session-tool-names.ts ← 工具名常量（叶子模块，防循环依赖）
-│   ├── session-tool-visibility.ts ← 会话工具可见性强制（纯函数）：9 个团队会话工具首次会话按需注册、会话期间激活，teardown 后 registry 保留、会话外从 activeTools 移除；before_agent_start 回合边界强制执行；AGENT_SESSION_TOOL_NAMES 按 origin 条件激活
+│   ├── session-tool-visibility.ts ← 会话工具可见性强制（纯函数）：9 个团队会话工具首次会话按需注册、会话期间激活，teardown 后 registry 保留、会话外从 activeTools 移除；before_agent_start 回合边界强制执行；AGENT_SESSION_TOOL_NAMES 按 origin 条件激活；阶段③ L1 策略门控：startTeamSessionVisible 统一不变式（决策 #42/D3，与会话状态无关），补回/移除只经 setActiveTools
 │   ├── shared-context-tool.ts ← write_shared_context 工具：唯一合法的共享上下文写入入口，成功后标记会话状态（start_member 门控依赖）
 │   └── tl-tools-add-dynamic.test.ts  ← add_dynamic_member tool tests
 ├── team/
@@ -142,7 +142,9 @@ src/
 │   ├── resolve-message-coalescing.ts ← 纯函数：消息合并设置解析（enabled + 上限回退默认）与菜单标签
 │   ├── resolve-wait-timeout.ts ← Pure functions: 顶层通用等待预算 waitTimeoutMinutes（wait 工具 all-idle deadline + 批屏障共享，独立于自动压缩）
 │   ├── resolve-peer-messaging.ts ← 纯函数：成员互发策略解析（决策 #41：===false→tl-only，fail-open 异常→allowed）+ PeerMessagingMode 共享词汇 + 菜单标签；DEFAULT 显式 true
-│   └── resolve-peer-messaging.test.ts ← resolver fail-open 矩阵（undefined/true/false/异常/null settings）+ 菜单标签用例
+│   ├── resolve-peer-messaging.test.ts ← resolver fail-open 矩阵（undefined/true/false/异常/null settings）+ 菜单标签用例
+│   ├── resolve-agent-session.ts ← 纯函数：agent 自主会话开关解析（决策 #42：===false→禁止，fail-open 异常→允许；不对称论证入注释）+ 菜单标签；DEFAULT 显式 true；late-evaluation 纪律（消费点 per-call 求值）
+│   └── resolve-agent-session.test.ts ← resolver fail-open 矩阵（undefined/true/false/异常/null settings）+ describe 两态用例
 ├── ui/               ← TUI components for team mode
 │   ├── team-status-widget.ts  ← Bordered widget: live member status + context %；阶段 2 实时化 + v2 简化：细粒度阶段渲染（💭×2/🔧×2/✏️/✅——working 与 thinking 同 💭 靠颜色区分（默认 vs accent），无耗时无工具名）+ N1 双层渲染去重（调度侧签名 logical|phase + 渲染侧 styled 行比较闸门）+ N2 轮询完成保留 refresh + N3 轮询并行化 + 合并节流（120ms + nextStreamFlushDelay 自适应退避，上限 1s）
 │   ├── team-status-widget.test.ts ← widget 单测：徽标/截断/overlay 优先级/时长格式/N1 双闸门（颜色盲区 B1）/S1 进程死亡强制调度/定时器清理
@@ -370,6 +372,15 @@ src/
     - **P4 UI/文档**：`/team setting` 顶层「成员互发消息（当前：…）」+ 标量两段式子菜单（● 标记当前值）；消息合并子菜单在互发禁用态附 no-op 退化注记（beta F7：合并输入源枯竭）。
     - **边界声明**：本机制管消息通道拓扑，不封文件通道信息流（共享上下文/成员日志，R5）；团队 YAML 角色描述含「与 X 讨论」字样时宜同步改写（R7）；allow 态 `to:"all"` 不含 TL 的既有语义澄清见 DESIGN.md §28.5。
 
+42. **Agent 自主会话开关（allowAgentInitiatedSessions，阶段①-⑤）** — 需求：设置控制 agent 是否可自主启动团队会话（`start_team_session`，ADR-0003）；仅禁用启动相，手动入口（`/team start`、`/team dynamic`）与运行中会话不受影响，默认开启 = 现状。双层门控单次交付（详见 DESIGN.md §29）：
+    - **设置数据层（阶段①）**：`TeamSettings.allowAgentInitiatedSessions?: boolean`（DEFAULT 显式 `true` = 允许，现状向后兼容）；`src/settings/resolve-agent-session.ts` 纯函数 resolver（`=== false → 禁止`，fail-open 异常→允许——不对称论证：误允许可经菜单修正，误禁止静默剥夺 agent 委派能力更难察觉）；`sanitizeSnapshotData` 登记该键（未登记则 `/team resume` 静默丢失，验收第一项）；近似意图非法值（如引号包裹字符串）console.warn 一次/文件路径（复刻 #41 warn-once 模式）。
+    - **L2 execute 门控（阶段②，正确性硬闸门）**：`src/tools/agent-session-tools.ts` 的 `execute()` **首步**检查（D6：先于 task 空校验与活跃校验，同函数体内同步完成无 TOCTOU）；禁用 → 拒绝文案（「请勿再次调用」抑制重试 + 手动入口/菜单重开的建设性出路）+ **零副作用**（不 bootstrap、不置 Goal、不建目录、不动 activeTools）；deps 注入 `getSettings?: () => TeamSettings`（D5：与 TlToolsDeps 同构，per-call 动态求值 late-evaluation，缺省/异常 fail-open）；`stop_team_session` 完全不动（与开关正交）。
+    - **L1 可见性门控（阶段③，禁用语义完备性层）**：`enforceSessionToolVisibility` 新增 `startTeamSessionVisible?: boolean`（D8 具体入参非泛型，调用点字面 boolean 经合并层每回合求值）——统一不变式（D3）：可见性 ⇔ 开关值、与会话状态无关；disabled ⇒ 两分支（会话活跃/无会话）结束均不在 activeTools（发现即移除，陈旧列表重注入再移除），enabled ⇒ 补回（E8 往返下一回合边界即恢复，含无会话分支）；补回/移除只经 setActiveTools，registerTools 永不为它触发（F1 加载时注册既成事实，注册缺失属加载层缺陷不静默补注册）；E9 已知窗口（启动即禁用 → 首回合前短暂 active，暴露面为零，L2 兜底结构性无害）记录于模块注释。F2 效果：disabled 时工具与 promptSnippet/promptGuidelines 同步从系统提示消失（pi 按 activeTools 收集 prompt 表面）——**不补 promptGuidelines 禁用态说明**（两面皆无价值）。
+    - **UI（阶段④）**：`/team setting` 顶层「Agent 自主团队会话（当前：…）」插在成员互发消息之后 + 标量两段式子菜单（● 标记当前值），经 `persistFor` 作用域分流（临时字段级 pin / 全局 settings.yaml，决策 #40 机制）；⑦ 清除全部经通用机制覆盖该键。
+    - **语义边界**：仅影响启动相——运行中的 agent 会话不终止（E4）、`stop_team_session` 不受影响（收尾是安全方向，正交）、`/team resume` 不受影响（E5）、prose 建议不受拦截（agent 可建议用户手动入口）；成员进程结构性无关（TEAM_ROLE 早退，零改动）；白名单正交（start_team_session 在白名单中的存在意义是活跃会话内重入友好错误）；禁用态 LLM 幻觉调用非活跃工具 → pi 短路报晦涩 Tool not found——接受为已知残差（F2 消除诱导源后概率进一步下降）。
+    - **红线与演进空间**：开关逻辑绝不进入共享 `bootstrapDynamicSession`/`startSession` 无差别拦截（守护测试锁定：禁用态 /team dynamic 正常开会 + 对照组 L2 仍拒绝）——两者同时服务用户路径与 agent 路径；bootstrap 第三层加固（origin==="agent" 分支内检查）不做（YAGNI，假想调用方 + 塞检查进共享 bootstrap 的失败模式恰是红线防的事故类别），概念留档「gate 跟随 origin 而非调用方」（DESIGN.md §29.6），未来出现第三个 agent-origin 调用方时再评估；三态 confirm 演进空间以注释/ADR 留档（真到三态时新增键 + 迁移，waitTimeoutMinutes 先例）。
+    - **测试**：新增 38 例（resolver 8 + settings 5 + 快照 3 + L2 6 + L1 7 + 红线守护 1 + 菜单 8，TDD 先红后绿）；文档记录见 DESIGN.md §29。
+
 ## Dependency Injection Pattern
 
 The codebase uses an explicit Dependency Injection (DI) pattern to decouple modules and enable testability. Every subsystem receives its dependencies through a typed interface, rather than importing them directly.
@@ -531,7 +542,7 @@ printf '' | timeout 10 ./node_modules/.bin/pi --mode json --no-tools -e ./index.
 | `/team cancel`           | Alias for `/team done` (backward compatibility) |
 | `/team delete <name>` | Delete a team definition (with confirmation) |
 | `/team status` | Show active session + member process statuses |
-| `/team setting` | Interactive settings menu — 顶层作用域开关（决策 #40）：默认「仅当前会话（临时）」，切换「全局」后直写 settings.yaml。临时作用域写入 overlay（不触碰 settings.yaml），「当前值」恒显示 merge 后生效值，覆盖键带 [临时] 徽标；⑦ 一键清除全部临时设置（内存+快照双清，仅 overlay 非空时显示）。六项子菜单：member default model (follow / fixed；团队 YAML 指定 model 时附注不生效) + member thinking level (成员思考强度三段式：默认 / 跟随 TL（当前：TL 级别，未知时显示「TL 级别未知」）/ 指定级别…二级 7 级别；对象形态 {mode:follow|fixed, level?}，follow = spawn 时快照 TL 思考强度) + auto-compaction (toggle / percent & token thresholds / timeout) + wait budget (等待上限, 0=永不超时 — wait 工具 all-idle deadline 与批屏障共享的顶层通用预算) + message coalescing (消息合并: 开关/批量上限/字符上限，S1 阶段 2；互发禁用态子菜单附 no-op 退化注记) + 成员互发消息 (P4 决策 #41: 「允许 / 仅限回复 TL」标量两段式，● 标记当前值；TL 侧即时生效，成员侧仅影响之后启动的成员). 通知按场景附注「（仅当前 pi 会话生效；/team resume 本团队会话时将恢复）」/「（仅当前 pi 会话生效，重启后失效）」；sessionId 不可用时临时入口禁用（fail-open）。Also allowed during a session |
+| `/team setting` | Interactive settings menu — 顶层作用域开关（决策 #40）：默认「仅当前会话（临时）」，切换「全局」后直写 settings.yaml。临时作用域写入 overlay（不触碰 settings.yaml），「当前值」恒显示 merge 后生效值，覆盖键带 [临时] 徽标；⑦ 一键清除全部临时设置（内存+快照双清，仅 overlay 非空时显示）。七项子菜单：member default model (follow / fixed；团队 YAML 指定 model 时附注不生效) + member thinking level (成员思考强度三段式：默认 / 跟随 TL（当前：TL 级别，未知时显示「TL 级别未知」）/ 指定级别…二级 7 级别；对象形态 {mode:follow|fixed, level?}，follow = spawn 时快照 TL 思考强度) + auto-compaction (toggle / percent & token thresholds / timeout) + wait budget (等待上限, 0=永不超时 — wait 工具 all-idle deadline 与批屏障共享的顶层通用预算) + message coalescing (消息合并: 开关/批量上限/字符上限，S1 阶段 2；互发禁用态子菜单附 no-op 退化注记) + 成员互发消息 (P4 决策 #41: 「允许 / 仅限回复 TL」标量两段式，● 标记当前值；TL 侧即时生效，成员侧仅影响之后启动的成员) + Agent 自主团队会话 (决策 #42: 「允许 / 禁止」标量两段式，● 标记当前值；仅影响 agent 自主启动相，运行中会话不终止，手动 /team start、/team dynamic 不受影响；下一回合边界即生效，无需重启). 通知按场景附注「（仅当前 pi 会话生效；/team resume 本团队会话时将恢复）」/「（仅当前 pi 会话生效，重启后失效）」；sessionId 不可用时临时入口禁用（fail-open）。Also allowed during a session |
 | `/team help` | Display usage help for all subcommands |
 
 ## TL Tools (session-scoped registration + activation; exception below)
@@ -540,7 +551,7 @@ printf '' | timeout 10 ./node_modules/.bin/pi --mode json --no-tools -e ./index.
 
 | Tool | Description |
 |------|-------------|
-| `start_team_session(task)` | **加载时注册**（决策 #21 唯一例外）。agent 自主启动动态团队会话（`origin: "agent"`）：`task` 必填——自动置 Goal + 注入自主版设计阶段提示词。全程无确认门；读/分析自由（无派发管制守卫），**可自由 read 与编辑文件（任意扩展名，写纪律见系统提示词；ADR-0003 修订）**，`.shared-context.md` 仍须经 `write_shared_context` 写入。已有活跃会话时返回错误。成员进程结构性无法调用（`TEAM_ROLE` 早退）。 |
+| `start_team_session(task)` | **加载时注册**（决策 #21 唯一例外）。agent 自主启动动态团队会话（`origin: "agent"`）：`task` 必填——自动置 Goal + 注入自主版设计阶段提示词。全程无确认门；读/分析自由（无派发管制守卫），**可自由 read 与编辑文件（任意扩展名，写纪律见系统提示词；ADR-0003 修订）**，`.shared-context.md` 仍须经 `write_shared_context` 写入。已有活跃会话时返回错误。成员进程结构性无法调用（`TEAM_ROLE` 早退）。**受设置门控（决策 #42，双层）**：`allowAgentInitiatedSessions=false` 时 execute 首步拒绝且零副作用（L2 正确性硬闸门），且每回合边界从 activeTools 移除、promptSnippet/promptGuidelines 同步消失（L1 完备性层）；切换下一回合边界即生效；运行中会话不终止、stop_team_session 与 /team resume 不受影响。 |
 | `stop_team_session()` | 结束 agent 自主会话（停成员、摘 widget、保留会话目录供 `/team resume`；磁盘清理由 `/team delete` 负责）。会话作用域注册，**仅自主会话出现在活跃工具集**；对 `origin: "user"` 的会话拒绝执行（手动会话归用户 `/team stop`）。与 `/team stop` 共享 `teardownTeamSession()`。 |
 
 | Tool | Description |
