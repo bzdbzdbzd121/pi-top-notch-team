@@ -27,6 +27,10 @@ import {
   resolvePeerMessaging,
 } from "../../settings/resolve-peer-messaging";
 import {
+  describeAgentSessionSetting,
+  resolveAgentSessionAllowed,
+} from "../../settings/resolve-agent-session";
+import {
   getSessionSettings,
   setSessionSetting,
   clearSessionSetting,
@@ -45,6 +49,7 @@ const OPT_AUTO_COMPACT = "自动压缩";
 const OPT_WAIT_TIMEOUT = "等待上限";
 const OPT_COALESCE = "消息合并";
 const OPT_PEER = "成员互发消息";
+const OPT_AGENT_SESSION = "Agent 自主团队会话";
 const OPT_CLEAR_ALL = "清除全部临时设置";
 const OPT_FOLLOW = "跟随当前配置";
 const OPT_FIXED = "指定模型";
@@ -52,6 +57,8 @@ const OPT_FIXED = "指定模型";
 // Peer-messaging submenu options（P4 标量两段式：DEFAULT 显式 true，「当前值」恒有值）
 const PEER_ALLOW_LABEL = "允许（成员间可互发消息）";
 const PEER_TL_ONLY_LABEL = "仅限回复 TL（互发禁用，消息在 TL 路由层被拦截）";
+const AGENT_ALLOW_LABEL = "允许（agent 可自主启动团队会话）";
+const AGENT_DISABLE_LABEL = "禁止（agent 不可自主启动；可经 /team start、/team dynamic 手动开会）";
 
 // Auto-compaction submenu options
 const AC_TOGGLE = "开关切换";
@@ -148,6 +155,7 @@ export async function handleSetting(
       `${OPT_WAIT_TIMEOUT}（当前：${describeWaitTimeoutSetting(effective)}）${badge("waitTimeoutMinutes")}`,
       `${OPT_COALESCE}（当前：${describeMessageCoalescingSetting(effective)}）${badge("messageCoalescing")}`,
       `${OPT_PEER}（当前：${describePeerMessagingSetting(effective)}）${badge("allowPeerMessaging")}`,
+      `${OPT_AGENT_SESSION}（当前：${describeAgentSessionSetting(effective)}）${badge("allowAgentInitiatedSessions")}`,
       ...(Object.keys(overlay).length > 0 ? [`${OPT_CLEAR_ALL}（恢复全局）`] : []),
     ];
 
@@ -211,6 +219,8 @@ export async function handleSetting(
       await configureMessageCoalescing(ctx, working, persistFor("messageCoalescing"), noticeSuffix);
     } else if (topChoice.startsWith(OPT_PEER)) {
       await configurePeerMessaging(ctx, working, persistFor("allowPeerMessaging"), noticeSuffix);
+    } else if (topChoice.startsWith(OPT_AGENT_SESSION)) {
+      await configureAgentSession(ctx, working, persistFor("allowAgentInitiatedSessions"), noticeSuffix);
     }
     return;
   }
@@ -457,6 +467,45 @@ async function configurePeerMessaging(
   persist();
   ctx.ui.notify(
     `成员互发消息已设为「仅限回复 TL」：成员→成员 / →all 消息将在 TL 路由层被拦截（成员收到改道回执）。TL 侧立即生效（per-route）；仅影响之后启动的成员的提示词与工具面。${noticeSuffix}`,
+    "info"
+  );
+}
+
+/**
+ * Agent 自主团队会话子菜单（阶段④，标量两段式，复刻 configurePeerMessaging）：
+ * DEFAULT 显式 true，「当前值」恒有值，标量 diff-pin 走现成泛型分支。
+ * 语义边界（子菜单标题与通知明示）：仅影响 agent 自主启动相（start_team_session）——
+ * 运行中的团队会话不终止（收尾/恢复不受影响）；手动入口 /team start、
+ * /team dynamic 不受影响。消费点 per-call 动态读 → 下一回合边界即时生效，无需重启。
+ */
+async function configureAgentSession(
+  ctx: ExtensionCommandContext,
+  settings: TeamSettings,
+  persist: () => void,
+  noticeSuffix: string,
+): Promise<void> {
+  const allowed = resolveAgentSessionAllowed(settings);
+  const allowItem = `${allowed ? "●" : "  "}${AGENT_ALLOW_LABEL}`;
+  const disableItem = `${allowed ? "  " : "●"}${AGENT_DISABLE_LABEL}`;
+  const choice = await ctx.ui.select(
+    `Agent 自主团队会话（当前：${describeAgentSessionSetting(settings)}）— 仅影响 agent 自主启动；运行中的团队会话不终止，手动 /team start、/team dynamic 不受影响（Esc 返回）`,
+    [allowItem, disableItem]
+  );
+  if (choice === undefined) return; // Esc
+
+  if (choice.includes(AGENT_ALLOW_LABEL)) {
+    settings.allowAgentInitiatedSessions = true;
+    persist();
+    ctx.ui.notify(
+      `Agent 自主团队会话已设为「允许」：agent 可经 start_team_session 自主启动团队会话。下一回合边界即生效，无需重启。${noticeSuffix}`,
+      "info"
+    );
+    return;
+  }
+  settings.allowAgentInitiatedSessions = false;
+  persist();
+  ctx.ui.notify(
+    `Agent 自主团队会话已设为「禁止」：agent 调用 start_team_session 将被拒绝（下一回合边界即生效）。仅影响启动——运行中的团队会话不终止；手动 /team start、/team dynamic 不受影响。${noticeSuffix}`,
     "info"
   );
 }

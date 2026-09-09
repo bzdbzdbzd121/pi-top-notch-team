@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { createMockContext } from "../../test/fixtures/mock-extension-api";
 import { handleSetting } from "./setting-handler";
 import { loadSettings, getSettingsPath } from "../../settings/settings";
-import { endSession } from "../../session/state";
+import { endSession, startSession } from "../../session/state";
 import {
   getSessionSettings,
   setSessionSetting,
@@ -877,5 +877,182 @@ describe("/team setting — 成员互发消息 (P4)", () => {
 
     // ④ 注记消失
     expect(await captureCoalesceTitle()).not.toContain("no-op");
+  });
+});
+
+describe("/team setting — Agent 自主团队会话 (阶段④)", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "team-setting-agent-session-test-"));
+    process.env.TOP_NOTCH_TEAM_ROOT = tmpDir;
+    resetSessionSettingsState();
+  });
+
+  afterEach(() => {
+    endSession();
+    resetSessionSettingsState();
+    delete process.env.TOP_NOTCH_TEAM_ROOT;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("顶层菜单显示「Agent 自主团队会话（当前：允许）」+ 子菜单两选项与 ● 标记（插在成员互发消息之后）", async () => {
+    const selectCalls: Array<{ title: string; options: string[] }> = [];
+    const ctx = createCtx({
+      sessionId: "session-A",
+      selectImpl: (title, options) => {
+        selectCalls.push({ title, options });
+        if (selectCalls.length === 1) {
+          return Promise.resolve(options.find((o) => o.includes("Agent 自主团队会话")));
+        }
+        return Promise.resolve(undefined); // 子菜单 Esc
+      },
+    });
+    await handleSetting(ctx as any);
+
+    // 顶层项：merge 后生效值恒显（describe 函数），位置在「成员互发消息」之后（同为标量布尔分组相邻）
+    const topOptions = selectCalls[0]!.options;
+    const peerIdx = topOptions.findIndex((o) => o.includes("成员互发消息"));
+    const agentIdx = topOptions.findIndex((o) => o.startsWith("Agent 自主团队会话（当前：允许）"));
+    expect(agentIdx).toBeGreaterThanOrEqual(0);
+    expect(agentIdx).toBe(peerIdx + 1);
+    // 子菜单：两选项，● 标记在「允许」上；标题含语义边界
+    expect(selectCalls[1]!.title).toContain("Agent 自主团队会话");
+    expect(selectCalls[1]!.title).toContain("当前：允许");
+    expect(selectCalls[1]!.title).toContain("仅影响 agent 自主启动");
+    expect(selectCalls[1]!.options.some((o) => o.startsWith("●") && o.includes("允许（agent 可自主启动"))).toBe(true);
+    expect(selectCalls[1]!.options.some((o) => o.startsWith("●禁止") === false && o.includes("禁止（agent 不可自主启动"))).toBe(true);
+  });
+
+  it("子菜单切「禁止」→ settings.yaml allowAgentInitiatedSessions=false + 通知含语义边界（全局作用域）", async () => {
+    const ctx = createCtx({
+      sessionId: "session-A",
+      selectImpl: pickContaining("设置作用域", "Agent 自主团队会话", "禁止"),
+    });
+    await handleSetting(ctx as any);
+
+    expect(loadSettings(tmpDir).allowAgentInitiatedSessions).toBe(false);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("仅影响启动"),
+      "info"
+    );
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("运行中的团队会话不终止"),
+      "info"
+    );
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("下一回合边界即生效"),
+      "info"
+    );
+    // 手动入口不受影响写进通知（建设性出路）
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("/team start"),
+      "info"
+    );
+  });
+
+  it("子菜单切回「允许」→ settings.yaml=true（可逆，两轮 handleSetting）", async () => {
+    const first = createCtx({
+      sessionId: "session-A",
+      selectImpl: pickContaining("设置作用域", "Agent 自主团队会话", "禁止"),
+    });
+    await handleSetting(first as any);
+    expect(loadSettings(tmpDir).allowAgentInitiatedSessions).toBe(false);
+
+    const second = createCtx({
+      sessionId: "session-A",
+      selectImpl: pickContaining("设置作用域", "Agent 自主团队会话", "允许（"),
+    });
+    await handleSetting(second as any);
+    expect(loadSettings(tmpDir).allowAgentInitiatedSessions).toBe(true);
+  });
+
+  it("临时作用域：禁止 → overlay pin（磁盘全局零改动）+ 场景通知后缀（会话外=重启后失效）", async () => {
+    const ctx = createCtx({
+      sessionId: "session-A",
+      selectImpl: pickContaining("Agent 自主团队会话", "禁止"),
+    });
+    await handleSetting(ctx as any);
+
+    expect(getSessionSettings().allowAgentInitiatedSessions).toBe(false);
+    expect(loadSettings(tmpDir).allowAgentInitiatedSessions).toBe(true); // DEFAULT 兜底
+    expect(existsSync(getSettingsPath(tmpDir))).toBe(false);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("仅当前 pi 会话生效，重启后失效"),
+      "info"
+    );
+  });
+
+  it("活跃团队会话场景：临时作用域通知带 resume 恢复后缀（同 noticeSuffix 管线）", async () => {
+    startSession({ name: "team-x", description: "", members: [] });
+    const ctx = createCtx({
+      sessionId: "session-A",
+      selectImpl: pickContaining("Agent 自主团队会话", "禁止"),
+    });
+    await handleSetting(ctx as any);
+
+    expect(getSessionSettings().allowAgentInitiatedSessions).toBe(false);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("仅当前 pi 会话生效；/team resume 本团队会话时将恢复"),
+      "info"
+    );
+  });
+
+  it("临时作用域 [临时] 徽标：overlay 含该键时顶层项带徽标", async () => {
+    setSessionSetting("allowAgentInitiatedSessions", false);
+    const selectCalls: Array<{ title: string; options: string[] }> = [];
+    const ctx = createCtx({
+      sessionId: "session-A",
+      selectImpl: (title, options) => {
+        selectCalls.push({ title, options });
+        return Promise.resolve(undefined); // 顶层即 Esc
+      },
+    });
+    await handleSetting(ctx as any);
+    const item = selectCalls[0]!.options.find((o) => o.startsWith("Agent 自主团队会话"));
+    expect(item).toBeDefined();
+    expect(item).toContain("当前：禁止");
+    expect(item).toContain("[临时]");
+  });
+
+  it("字段级 pin 标量语义：临时作用域改回与全局相同的值 → pin 解除（无幻影徽标）", async () => {
+    // 第一轮：临时 pin 禁止
+    const first = createCtx({
+      sessionId: "session-A",
+      selectImpl: pickContaining("Agent 自主团队会话", "禁止"),
+    });
+    await handleSetting(first as any);
+    expect(getSessionSettings().allowAgentInitiatedSessions).toBe(false);
+
+    // 第二轮：临时改回允许（= 全局值）→ diff 空 → 解除 pin
+    const second = createCtx({
+      sessionId: "session-A",
+      selectImpl: pickContaining("Agent 自主团队会话", "允许（"),
+    });
+    await handleSetting(second as any);
+    const overlay = getSessionSettings() as Record<string, unknown>;
+    expect("allowAgentInitiatedSessions" in overlay).toBe(false);
+  });
+
+  it("⑦ 清除全部临时设置覆盖该键：overlay 双清后生效值回「允许」", async () => {
+    // 先临时 pin 禁止
+    const setup = createCtx({
+      sessionId: "session-A",
+      selectImpl: pickContaining("Agent 自主团队会话", "禁止"),
+    });
+    await handleSetting(setup as any);
+    expect(getSessionSettings().allowAgentInitiatedSessions).toBe(false);
+
+    // 重开菜单 → ⑦ 出现 → 选 ⑦
+    const ctx = createCtx({
+      sessionId: "session-A",
+      selectImpl: pickContaining("清除全部"),
+    });
+    await handleSetting(ctx as any);
+    expect(getSessionSettings()).toEqual({});
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("已清除全部临时设置"),
+      "info"
+    );
   });
 });
