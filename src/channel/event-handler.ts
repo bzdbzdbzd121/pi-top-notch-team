@@ -415,8 +415,14 @@ export function createMemberEventHandler(
       const teamMsg = event.result?.details?.teamMessage;
       if (!teamMsg) return;
 
+      // D6 防绕过加固（P2，防御纵深）：from 交叉校验。member.ts 硬绑定
+      // `const from = role`，现状 LLM 无法谎报（teamMsg.from === memberName）
+      // ——但 event-handler 曾直接信任工具回传的 teamMsg.from（dedup/corr/入队
+      // 三处），字段来源未来演化可能出现裂口。统一以真实成员名为准。
+      const trueFrom = memberName;
+
       // Record fingerprint for de-duplication (Map-based, auto-pruning)
-      const dedupKey = `${teamMsg.from}:${teamMsg.content?.slice(0, 80) ?? ""}`;
+      const dedupKey = `${trueFrom}:${teamMsg.content?.slice(0, 80) ?? ""}`;
       markDedupProcessed(rpm, dedupKey);
 
       // Auto-populate correlation ID (only for TL-directed messages).
@@ -426,7 +432,7 @@ export function createMemberEventHandler(
       let content = teamMsg.content;
       let correlationId: string | undefined;
       if (teamMsg.to === "tl") {
-        const stored = lpc.get(teamMsg.from);
+        const stored = lpc.get(trueFrom);
         if (stored) {
           correlationId = stored;
           // Strip any existing wrong corr tag and use the stored one instead
@@ -435,13 +441,13 @@ export function createMemberEventHandler(
         }
 
         // Mark this member as having replied — prevents auto-reply at agent_end
-        deps.perTurnReplied?.add(teamMsg.from);
+        deps.perTurnReplied?.add(trueFrom);
         // Cancel any pending auto-reply — member replied properly via tool
-        cancelPendingAutoReply(teamMsg.from, deps);
+        cancelPendingAutoReply(trueFrom, deps);
       }
       mq.enqueue({
         id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        from: teamMsg.from,
+        from: trueFrom,
         to: teamMsg.to,
         subject: teamMsg.subject,
         content,
@@ -747,6 +753,20 @@ export function dispatchPromptToMember(
   memberName: string,
   msg: TeamMessage
 ): void {
+  dispatchPromptTextToMember(deps, memberName, buildPromptMessage(msg));
+}
+
+/**
+ * Direct text-dispatch variant of dispatchPromptToMember (P2): same working
+ * mark + followUp queueing + fail-open failure notification semantics, but
+ * the caller owns the prompt text (peer-blocked ack notices use their own
+ * anchored wording rather than the `[消息通道 - 来自 …]` channel prefix).
+ */
+export function dispatchPromptTextToMember(
+  deps: PromptDispatchDeps,
+  memberName: string,
+  promptText: string
+): void {
   const handle = deps.memberHandles.get(memberName);
   if (!handle) return;
   // Mark member as working when we send a prompt
@@ -757,7 +777,7 @@ export function dispatchPromptToMember(
   try {
     handle.sendCommand({
       type: "prompt",
-      message: buildPromptMessage(msg),
+      message: promptText,
       // If the member's agent is still streaming (working, or inside its
       // post-agent_end settlement window — auto-retry / auto-compaction /
       // listener drain), pi queues this prompt as a followUp instead of

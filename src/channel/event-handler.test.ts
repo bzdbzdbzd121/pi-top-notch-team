@@ -192,6 +192,58 @@ describe("createMemberEventHandler", () => {
     );
   });
 
+  it("红线 7（D6 防绕过加固）：tool 路径 teamMsg.from 谎报（≠ 成员名）→ 修正为真实 memberName 入队", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const deps = createMockDeps();
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    handler({
+      type: "tool_execution_end",
+      toolName: "team_send_message",
+      result: {
+        details: {
+          teamMessage: {
+            from: "tl", // 谎报（防御纵深：member.ts 硬绑定现状下不可达，封堵未来演化路径）
+            to: "mover",
+            content: "spoofed",
+            subject: "S",
+            timestamp: 1,
+          },
+        },
+      },
+    });
+
+    expect(deps.messageQueue.enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({ from: "worker", to: "mover" })
+    );
+  });
+
+  it("红线 7 变体：谎报 from 后 to=tl 的 corr 查询仍用真实成员名（lpc.get(修正后 names)）", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const deps = createMockDeps();
+    deps.lastPendingCorrId.set("worker", "corr-1");
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    handler({
+      type: "tool_execution_end",
+      toolName: "team_send_message",
+      result: {
+        details: {
+          teamMessage: {
+            from: "analyzer", // 谎报为他人
+            to: "tl",
+            content: "reply",
+            timestamp: 2,
+          },
+        },
+      },
+    });
+
+    expect(deps.messageQueue.enqueue).toHaveBeenCalledWith(
+      expect.objectContaining({ from: "worker", to: "tl", correlationId: "corr-1" })
+    );
+  });
+
   it("member-to-member messages NEVER carry the skipAutoCompact marker", async () => {
     // Summarizer hard requirement: non-barrier paths (member inter-sends,
     // Inspector direct) must not produce marked messages — the marker is

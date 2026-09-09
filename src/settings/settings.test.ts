@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, writeFileSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -425,6 +425,35 @@ describe("allowPeerMessaging (成员互发开关)", () => {
     ]) {
       writeFileSync(getSettingsPath(tmpDir), raw, "utf-8");
       expect(loadSettings(tmpDir).allowPeerMessaging).toBe(true);
+    }
+  });
+
+  it("P2 建议采纳：近似意图非法值 console.warn 一次（防禁用意图被静默吞掉）", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      writeFileSync(getSettingsPath(tmpDir), 'allowPeerMessaging: "false"\n', "utf-8");
+      // 严格姿态不变：仍回退默认 true（warn 只补信号，不改行为）
+      expect(loadSettings(tmpDir).allowPeerMessaging).toBe(true);
+      const warns = () =>
+        warnSpy.mock.calls.filter((c) => String(c[0]).includes(tmpDir));
+      expect(warns()).toHaveLength(1);
+      expect(String(warns()[0][0])).toContain("allowPeerMessaging");
+      // loadSettings 每 dispatch 高频调用 → 同文件路径只 warn 一次，防刷屏
+      loadSettings(tmpDir);
+      loadSettings(tmpDir);
+      expect(warns()).toHaveLength(1);
+
+      // 键缺失（旧文件）不 warn —— 只有显式写了非法值才有信号
+      const tmpDir2 = mkdtempSync(join(tmpdir(), "team-settings-peer-test-2-"));
+      try {
+        writeFileSync(getSettingsPath(tmpDir2), "memberModel:\n  mode: follow\n", "utf-8");
+        loadSettings(tmpDir2);
+        expect(warnSpy.mock.calls.filter((c) => String(c[0]).includes(tmpDir2))).toHaveLength(0);
+      } finally {
+        rmSync(tmpDir2, { recursive: true, force: true });
+      }
+    } finally {
+      warnSpy.mockRestore();
     }
   });
 });

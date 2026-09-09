@@ -8,7 +8,7 @@ import type { MessageQueue } from "../channel/message-queue";
 import { createResponseWaiter, extractCorrelationId } from "../channel/response-waiter";
 import type { ResponseWaiter } from "../channel/response-waiter";
 import type { TeamMessage } from "../channel/types";
-import { createSendToMember } from "../channel/event-handler";
+import { createSendToMember, dispatchPromptTextToMember } from "../channel/event-handler";
 import { createAutoCompactRuntime } from "../channel/auto-compact";
 import type { AutoCompactRuntime } from "../channel/auto-compact";
 import { createMessageCoalescer } from "../channel/message-coalescer";
@@ -31,6 +31,13 @@ export interface MessageChannelDeps {
   getAutoCompact?: () => ResolvedAutoCompact;
   /** Resolve the effective message-coalescing config (per dispatch). Absent = defaults (enabled). */
   getCoalescing?: () => ResolvedMessageCoalescing;
+  /**
+   * Resolve the peer-messaging policy (P2, per-route 即时生效，与 getAutoCompact /
+   * getCoalescing 同构）。false = 该团队已禁用成员互发。Absent = 恒允许
+   * （router 侧 fail-open 缺省路径；resolver 自身异常的 fail-open 在设置层
+   * resolvePeerMessaging 内闭合）。
+   */
+  getPeerMessagingAllowed?: () => boolean;
 }
 
 export interface MessageChannel {
@@ -90,6 +97,15 @@ export function createMessageChannel(deps: MessageChannelDeps): MessageChannel {
   // them at all-idle gate open (see tl-wait-gate.ts for the delivery timing).
   const tlWaitGate = createTlWaitGate();
 
+  // P2（peer-messaging 强制层，D1 裁决）：sender 回执计数。回执是唯一让成员
+  // LLM 立即改道的闭环（否则成员工具恒返回「[消息已发送]」假成功，旧成员在
+  // 窗口期会基于「对方已收到」继续推理）；per-from 计数上限去抖（丙路径）
+  // 防循环重试刷屏。与 channel 同生命周期，超过成员数上限整体清零（参照
+  // recentlyProcessedMessages 的剪枝姿态，数量级防御）。
+  const PEER_ACK_LIMIT_PER_MEMBER = 3;
+  const PEER_ACK_COUNT_MAX_MEMBERS = 100;
+  const peerAckCounts = new Map<string, number>();
+
   // 2. Create router (callbacks capture responseWaiter + other deps)
   const router = createRouter({
     sendToMember: createSendToMember({
@@ -146,12 +162,42 @@ export function createMessageChannel(deps: MessageChannelDeps): MessageChannel {
     },
 
     memberNames: [],
+    isPeerMessagingAllowed: deps.getPeerMessagingAllowed,
     onUnknownTarget: (from, to) => {
       pi.sendMessage({
         customType: "team-route",
         content: `消息目标 "${to}" 不存在（来自 ${from}）。有效目标：tl、all、团队成员名称。`,
         display: true,
       });
+    },
+    onPeerBlocked: (from, to) => {
+      // TL 通知（即时 team-route，onUnknownTarget 同构）。MVP 恒发（频繁互发
+      // 禁用团队会刷屏为已知噪音，方案已记录；输入端由回执上限收口）。
+      pi.sendMessage({
+        customType: "team-route",
+        content: `⚠️ 成员 ${from}→${to} 的消息被拦截（该团队已禁用成员互发）；成员需改为回复 TL 或经 stop_member+start_member 刷新策略`,
+        display: true,
+      });
+      // sender 回执（D1）：拒绝闭环。crashed/stopped 的成员不再派发（进程已
+      // 死，通知无法处理；TL 通知已覆盖可观测性）。
+      const state = memberOpsStates.get(from) ?? "idle";
+      if (state === "crashed" || state === "stopped") return;
+      // per-from 上限：达上限后静默（仅 TL 通知），防成员循环重试刷屏。
+      const count = peerAckCounts.get(from) ?? 0;
+      if (count >= PEER_ACK_LIMIT_PER_MEMBER) return;
+      peerAckCounts.set(from, count + 1);
+      if (peerAckCounts.size > PEER_ACK_COUNT_MAX_MEMBERS) {
+        peerAckCounts.clear();
+      }
+      // 回执不计 corrId、不进 messageQueue（非互发性质的 TL→member 派发）
+      // ——直接走派发语义（working 标记 + followUp 保序）。不传 coalescer：
+      // 回执失败通知不应误带「合并包含 N 条」注记（takeMergedCount 是他人
+      // 消息的遗留状态）。
+      dispatchPromptTextToMember(
+        { pi, memberOpsStates, memberHandles, lastPendingCorrId, responseWaiter },
+        from,
+        `[系统通知（消息通道）] 你发送给 ${to} 的消息未送达——该团队已禁用成员互发（只能回复 TL）。后续请直接回复 TL 说明协作需求。`
+      );
     },
   });
 

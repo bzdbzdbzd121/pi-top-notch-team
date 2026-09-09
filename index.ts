@@ -19,6 +19,7 @@ import {
 } from "./src/settings/session-settings";
 import { resolveAutoCompact } from "./src/settings/resolve-auto-compact";
 import { resolveMessageCoalescing } from "./src/settings/resolve-message-coalescing";
+import { resolvePeerMessaging } from "./src/settings/resolve-peer-messaging";
 import { getSupportedThinkingLevelsFor } from "./src/settings/resolve-thinking";
 import { registerTlTools, type TlToolsDeps } from "./src/tools/tl-tools";
 import { registerGoalTools, registerGoalAgentHandler, resetGoal, GOAL_TOOL_NAMES } from "./src/tools/goal-tools";
@@ -234,6 +235,9 @@ export default function (pi: ExtensionAPI) {
     getAutoCompact: () => resolveAutoCompact(getEffectiveSettings()),
     // S1 (阶段 2): 消息合并设置 per-dispatch 解析（开关/上限即时生效）。
     getCoalescing: () => resolveMessageCoalescing(getEffectiveSettings()),
+    // P2 (peer-messaging 强制层): per-route 即时生效（与 getCoalescing 同构）。
+    // resolvePeerMessaging 内部 fail-open（异常/缺省 → allowed），resolver 不会 throw。
+    getPeerMessagingAllowed: () => resolvePeerMessaging(getEffectiveSettings()) === "allowed",
   });
 
   teamCtx.router = router;

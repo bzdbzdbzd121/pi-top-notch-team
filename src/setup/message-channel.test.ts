@@ -611,4 +611,175 @@ describe("createMessageChannel", () => {
       })
     );
   });
+
+  // ── P2：peer-messaging 强制层接线（方案 L2）──────────────
+
+  it("P2 接线：deps.getPeerMessagingAllowed 原样传递为 router config.isPeerMessagingAllowed（per-route 实时查询）", async () => {
+    const { createMessageChannel } = await loadModule();
+    const getPeerMessagingAllowed = vi.fn(() => true);
+    const deps = {
+      pi: pi as any,
+      memberOpsStates,
+      lastPendingCorrId,
+      memberHandles,
+      getPeerMessagingAllowed,
+    };
+
+    createMessageChannel(deps as any);
+    const routerConfig = mockCreateRouter.mock.calls[0][0];
+    expect(routerConfig.isPeerMessagingAllowed).toBe(getPeerMessagingAllowed);
+    expect(routerConfig.isPeerMessagingAllowed!()).toBe(true);
+  });
+
+  it("P2 接线 fail-open：getPeerMessagingAllowed 缺省 → isPeerMessagingAllowed 为 undefined（router 恒允许）", async () => {
+    const { createMessageChannel } = await loadModule();
+    const deps = {
+      pi: pi as any,
+      memberOpsStates,
+      lastPendingCorrId,
+      memberHandles,
+    };
+
+    createMessageChannel(deps as any);
+    const routerConfig = mockCreateRouter.mock.calls[0][0];
+    expect(routerConfig.isPeerMessagingAllowed).toBeUndefined();
+  });
+
+  it("P2 onPeerBlocked：TL 收 team-route 拦截通知（即时，含发送方/目标/指引；与 onUnknownTarget 同构）", async () => {
+    const { createMessageChannel } = await loadModule();
+    const deps = {
+      pi: pi as any,
+      memberOpsStates,
+      lastPendingCorrId,
+      memberHandles,
+      getPeerMessagingAllowed: vi.fn(() => false),
+    };
+
+    createMessageChannel(deps as any);
+    const routerConfig = mockCreateRouter.mock.calls[0][0];
+    routerConfig.onPeerBlocked!("analyzer", "mover");
+
+    const call = pi.sendMessage.mock.calls[0];
+    expect(call[0]).toEqual(
+      expect.objectContaining({ customType: "team-route", display: true })
+    );
+    expect(call[0].content).toContain("analyzer");
+    expect(call[0].content).toContain("mover");
+    expect(call[0].content).toContain("成员互发");
+    // 即时通知（操作性，不走 nextTurn/steer）
+    expect(call[1]).toBeUndefined();
+  });
+
+  it("P2 onPeerBlocked：sender 回执直接派发（followUp 保序，不进 messageQueue；复用 dispatch 语义标 working）", async () => {
+    const { createMessageChannel } = await loadModule();
+    const deps = {
+      pi: pi as any,
+      memberOpsStates,
+      lastPendingCorrId,
+      memberHandles,
+      getPeerMessagingAllowed: vi.fn(() => false),
+    };
+
+    createMessageChannel(deps as any);
+    const routerConfig = mockCreateRouter.mock.calls[0][0];
+    routerConfig.onPeerBlocked!("analyzer", "mover");
+
+    // 红线 3（结构上）：拦截发生在路由层，回执不经 messageQueue/coalescer——
+    // 直接向发送方 handle 派发。mock 队列的 enqueue从未被调用。
+    expect(mockCreateMessageQueue.mock.results[0].value.enqueue).not.toHaveBeenCalled();
+    expect(memberHandles.get("analyzer")!.sendCommand).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "prompt",
+        streamingBehavior: "followUp",
+        message: expect.stringContaining("[系统通知（消息通道）]"),
+      })
+    );
+    const ackText = (
+      (memberHandles.get("analyzer")! as any).sendCommand as ReturnType<typeof vi.fn>
+    ).mock.calls[0][0].message as string;
+    expect(ackText).toContain("你发送给 mover 的消息未送达");
+    expect(ackText).toContain("该团队已禁用成员互发");
+    expect(ackText).toContain("直接回复 TL");
+    // 回执按 TL→member 派发语义标 working（成员处理完通知后自然回 idle）
+    expect(memberOpsStates.get("analyzer")).toBe("working");
+  });
+
+  it("P2 红线 10：per-from 回执上限 3 次——第 4 次起回执停发，TL 通知恒发", async () => {
+    const { createMessageChannel } = await loadModule();
+    const deps = {
+      pi: pi as any,
+      memberOpsStates,
+      lastPendingCorrId,
+      memberHandles,
+      getPeerMessagingAllowed: vi.fn(() => false),
+    };
+
+    createMessageChannel(deps as any);
+    const routerConfig = mockCreateRouter.mock.calls[0][0];
+    for (let i = 0; i < 4; i++) {
+      routerConfig.onPeerBlocked!("analyzer", "mover");
+    }
+    expect(memberHandles.get("analyzer")!.sendCommand).toHaveBeenCalledTimes(3);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(4);
+    expect(pi.sendMessage.mock.calls.every((c) => c[0].customType === "team-route")).toBe(true);
+  });
+
+  it("P2 红线 10 变体：上限内不同成员独立计数（mover 仍有完整额度）", async () => {
+    const { createMessageChannel } = await loadModule();
+    const deps = {
+      pi: pi as any,
+      memberOpsStates,
+      lastPendingCorrId,
+      memberHandles,
+      getPeerMessagingAllowed: vi.fn(() => false),
+    };
+
+    createMessageChannel(deps as any);
+    const routerConfig = mockCreateRouter.mock.calls[0][0];
+    for (let i = 0; i < 3; i++) {
+      routerConfig.onPeerBlocked!("analyzer", "mover");
+    }
+    routerConfig.onPeerBlocked!("worker", "analyzer");
+    // analyzer 已达上限（3/3），worker 是另一个发送方 → 回照常回执
+    expect(memberHandles.get("worker")!.sendCommand).toHaveBeenCalledTimes(1);
+    expect(memberHandles.get("analyzer")!.sendCommand).toHaveBeenCalledTimes(3);
+  });
+
+  it("P2 onPeerBlocked：成员 crashed/stopped → 回执静默放弃（TL 通知照发）", async () => {
+    const { createMessageChannel } = await loadModule();
+    memberOpsStates.set("analyzer", "crashed");
+    const deps = {
+      pi: pi as any,
+      memberOpsStates,
+      lastPendingCorrId,
+      memberHandles,
+      getPeerMessagingAllowed: vi.fn(() => false),
+    };
+
+    createMessageChannel(deps as any);
+    const routerConfig = mockCreateRouter.mock.calls[0][0];
+    routerConfig.onPeerBlocked!("analyzer", "mover");
+
+    expect(memberHandles.get("analyzer")!.sendCommand).not.toHaveBeenCalled();
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+    // ops 状态不被回执覆写（crashed 保持，绝不被标 working）
+    expect(memberOpsStates.get("analyzer")).toBe("crashed");
+  });
+
+  it("P2 onPeerBlocked：未知发送方（无 handle）→ 仅 TL 通知（dispatch 静默 no-op）", async () => {
+    const { createMessageChannel } = await loadModule();
+    const deps = {
+      pi: pi as any,
+      memberOpsStates,
+      lastPendingCorrId,
+      memberHandles,
+      getPeerMessagingAllowed: vi.fn(() => false),
+    };
+
+    createMessageChannel(deps as any);
+    const routerConfig = mockCreateRouter.mock.calls[0][0];
+    routerConfig.onPeerBlocked!("ghost", "mover");
+    // TL 通知恒发（故障可观测性）；无 handle → 回执 no-op，零异常
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+  });
 });

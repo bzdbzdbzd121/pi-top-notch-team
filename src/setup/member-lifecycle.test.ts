@@ -617,8 +617,11 @@ describe("createAndRegisterMember", () => {
     });
 
     it("should enqueue team_send_message tool result", () => {
+      // from 为真实成员名（worker）——D6 防绕过加固后 event-handler 交叉校验
+      // teamMsg.from 与成员名，不自洽的回传会被修正（见 event-handler.test.ts
+      // 红线 7 专锁用例）。
       const teamMsg = {
-        from: "analyzer",
+        from: "worker",
         to: "tl",
         content: "任务完成",
         subject: "报告",
@@ -631,7 +634,7 @@ describe("createAndRegisterMember", () => {
       });
       expect(messageQueue.enqueue).toHaveBeenCalledWith(
         expect.objectContaining({
-          from: "analyzer",
+          from: "worker",
           to: "tl",
           content: "任务完成",
           subject: "报告",

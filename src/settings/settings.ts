@@ -87,6 +87,9 @@ export const DEFAULT_SETTINGS: TeamSettings = {
 
 const SETTINGS_FILE = "settings.yaml";
 
+/** 近似意图非法值 warn 去重（每文件路径一次；loadSettings 每 dispatch 高频调用，防刷屏）。 */
+const warnedApproximatePeerMessaging = new Set<string>();
+
 export function getSettingsPath(rootDir: string): string {
   return join(rootDir, SETTINGS_FILE);
 }
@@ -221,6 +224,14 @@ export function loadSettings(rootDir: string): TeamSettings {
     const apm = rawData.allowPeerMessaging;
     if (typeof apm === "boolean") {
       settings.allowPeerMessaging = apm;
+    } else if (apm !== undefined && !warnedApproximatePeerMessaging.has(filePath)) {
+      // 近似意图非法值（如 YAML 引号包裹的 "false"、数字 0）被严格丢弃后，
+      // 用户的「禁用」意图会静默变回允许——补一次性 console.warn 让意图不被
+      // 吞掉（P2 建议，采 adherence：warn 只补信号不改行为；每文件路径一次）。
+      warnedApproximatePeerMessaging.add(filePath);
+      console.warn(
+        `[top-notch-team] settings: allowPeerMessaging 值 ${JSON.stringify(apm)} 非法（需要 true/false），已忽略并按「允许成员互发」处理——请经 /team setting 或编辑 ${filePath} 修正。`
+      );
     }
 
     // Migration (legacy key): batchMaxWaitMinutes used to live inside
