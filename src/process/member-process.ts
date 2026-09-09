@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { readdirSync } from "node:fs";
+import type { PeerMessagingMode } from "../settings/resolve-peer-messaging";
 
 /** Maximum allowed serialized command size in bytes (1 MB). */
 export const MAX_COMMAND_SIZE = 1024 * 1024;
@@ -54,7 +55,7 @@ export interface MemberProcessConfig {
    * (validTargets, tool descriptions, prompts). Only the blocked state is written; allowed is never set
    * (same structure as the model/thinking precedent), and member-process uses "allowed" as the default env value.
    */
-  peerMessaging?: string;
+  peerMessaging?: PeerMessagingMode;
   /**
    * Resume the member's previous pi session (`--continue`) instead of starting
    * fresh. Used by /team resume and by crash auto-restart so member context

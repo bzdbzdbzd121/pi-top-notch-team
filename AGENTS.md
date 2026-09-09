@@ -30,6 +30,8 @@ User's pi session (TL extension)
 
 Batch send: team_send_and_wait now supports tasks array for concurrent dispatch to multiple members. Previously single-target to/content/nextSteps; now unified tasks:[{to, content}] + nextSteps. **Batch when tasks are independent (parallel execution); sequential when task B depends on task A's output. See TL Tools table for decision rules.**
   ├── Message channel (queue → router → responseWaiter)
+  │     └── router 单点拦截 peer-messaging（决策 #41）：禁互发时成员→成员/→all
+  │         消息在此被拦（TL 派发 from="tl" 豁免；覆盖工具+标签双进队路径）
   ├── Activity display layer (activity-tracker: 纯函数细粒度阶段状态，与 memberOpsStates 并行不互写；onMemberActivity 多播 → Inspector + tracker + widget)
   ├── Member Process Manager
   │     ├── Member A (pi --mode rpc, member.ts)
@@ -354,8 +356,15 @@ src/
       | 进程退出（session_shutdown） | clearSessionSettingsMemory 无条件清空 | 保留（跨进程 resume，S3） |
       | 扩展 reload | 模块状态重置（同新进程） | 保留 |
     - **UI（阶段 4）**：/team setting 顶层作用域开关（●仅当前会话（临时）/ 全局，一次 select 往返切换重显菜单，默认临时）；五项子菜单「当前值」恒显示 merge 后生效值 + [临时] 徽标；⑦ 清除全部（仅 overlay 非空时显示）= 内存+快照双清（S7）；模型项在团队 YAML 指定 model 时附注「此设置不生效」；通知按场景附注（活跃期含 resume 恢复提示 / 会话外含重启失效提示）；sessionId 不可用 → 临时入口禁用（fail-open 强制全局）。临时作用域子菜单**字段级 pin**（审查 #1 修复）：persist 经 diffOverlayPatch 只写与全局不同的字段（undefined = 跟随全局；diff 空 → 解除 pin），未触及字段不烘焙（全局后续变更可传播），清除不留幻影 pin。
-    - **可观测性（阶段 5）**：start_member 结果附注「（设置来源：临时）」/「（设置来源：恢复自团队会话）」（仅 overlay 含 memberModel/memberThinkingLevel 时；isSnapshotRestored 由 loadSessionSettingsSnapshot 成功应用时置位，随 overlay 清空动作复位）。
+    - **可观测性（阶段 5）**：start_member 结果附注「（设置来源：临时）」/「（设置来源：恢复自团队会话）」（仅 overlay 含 spawn 相关键 memberModel/memberThinkingLevel/**allowPeerMessaging**；isSnapshotRestored 由 loadSessionSettingsSnapshot 成功应用时置位，随 overlay 清空动作复位）。
     - **测试**：全量 1410 通过（阶段 1-5，含审查回归 4 轮）；文档记录见 DESIGN.md §27。
+
+41. **成员互发消息开关（allowPeerMessaging，P1-P4）** — 需求：设置控制是否允许 member 之间互发；禁用时 member 只能回复 TL。四层四阶段方案（详见 DESIGN.md §28）：
+    - **P1 设置数据层**：`TeamSettings.allowPeerMessaging?: boolean`（DEFAULT 显式 `true` = 允许，现状全互连拓扑）；`src/settings/resolve-peer-messaging.ts` 纯函数 resolver（`=== false → "tl-only"`，fail-open 异常→allowed）+ 导出 `PeerMessagingMode` 共享词汇；`sanitizeSnapshotData` 登记该键（未登记则 `/team resume` 静默丢失）；近似意图非法值（如引号包裹字符串）console.warn 一次/文件路径防意图被静默吞掉。
+    - **P2 路由强制层（禁令实际生效点）**：`src/channel/router.ts` 单点拦截——`from ∈ memberSet ∧ (to="all" ∨ memberSet.has(to)) ∧ !isPeerMessagingAllowed()`（per-route resolver，getCoalescing 同构即时生效；缺省=恒允许 fail-open）；`from="tl"` 豁免为最高优先级红线（TL 派发/广播照常）、`to="tl"` 分支先行 return（成员→TL 与 corr 回复链不受影响）、unknown 目标语义不混写；拦截点在 coalescer/压缩 pending 上游（零入队）。覆盖双进队路径（team_send_message 工具 + assistant 正文 `<team-message>` 标签备份——同经 messageQueue→route()）。`onPeerBlocked`：TL 即时 team-route ⚠️ 通知 + sender 改道回执（`dispatchPromptTextToMember`，锚定改道指引；per-from 上限 3 次防刷屏；crashed/stopped 静默放弃）。**D6 加固**：event-handler tool 路径 `teamMsg.from` 三处交叉校验统一以真实 memberName 为准（防御纵深）。
+    - **P3 成员体验层（spawn 快照）**：`TEAM_PEER_MESSAGING = peerMessaging ?? "allowed"` env（member-process/member-lifecycle 推导，仅 tl-only 写字段，与 model/thinking 管线同构；auto-restart 复用已存 config）；`member.ts` tl-only 态：validTargets 收缩 `["tl"]`（to=all 同禁——all 分支只广播成员不含 TL，放行即 n-1 条互发通道）、工具/to 描述/拒绝文案两态、系统提示词删名册行（防凭空构造成员名）/换交流行/删讨论行、强制规则（必须回复 TL）两态不变；两态文案单一事实来源 `src/prompts/member-collab-rules.ts`（D4 防漂移），**允许态输出与旧内联模板逐字节一致（golden 测试锁定）**；start_member 附注仅 tl-only 态出现。
+    - **P4 UI/文档**：`/team setting` 顶层「成员互发消息（当前：…）」+ 标量两段式子菜单（● 标记当前值）；消息合并子菜单在互发禁用态附 no-op 退化注记（beta F7：合并输入源枯竭）。
+    - **边界声明**：本机制管消息通道拓扑，不封文件通道信息流（共享上下文/成员日志，R5）；团队 YAML 角色描述含「与 X 讨论」字样时宜同步改写（R7）；allow 态 `to:"all"` 不含 TL 的既有语义澄清见 DESIGN.md §28.5。
 
 ## Dependency Injection Pattern
 
@@ -387,6 +396,10 @@ Member A calls team_send_message({to: "mover", content: "..."})
     → router.route(msg)
       ├── to="mover"  → handle.sendCommand({type:"prompt", streamingBehavior:"followUp", ...}) on Member B's stdin
       ├── to="tl"     → responseWaiter.resolveIfWaiting(corrId, ...) OR buffer
+      │                 （to=tl 先行 return，除：不受互发禁令影响，决策 #41）
+      │                 ← 拦截分支（决策 #41）：from∈memberSet ∧ (to=all ∨ memberSet.has(to))
+      │                   ∧ 禁互发 → onPeerBlocked（TL ⚠️ 通知 + sender 改道回执 ≤3 次）→ 不入下游
+      │                 （unknown to 不走拦截，仍走 onUnknownTarget）
                           → team_send_and_wait 等待在飞（S3，决策 #39）：入 tlWaitGate 扩展侧缓冲，
                             门控打开后并入 team_send_and_wait 工具结果一并返回（[from message] 段落）
                           → 否则 pi.sendMessage({customType:"team-message", ...}, {deliverAs:"nextTurn"})  ← S2：下一次任意回合统一注入，零 steer（决策 #36）
@@ -496,6 +509,7 @@ printf '' | timeout 10 ./node_modules/.bin/pi --mode json --no-tools -e ./index.
 | `TEAM_MEMBER_DESCRIPTION` | Member process | System prompt for role |
 | `TEAM_SESSION_DIR` | Member process | Session file storage path (`sessions/<team-name>/<sessionId>/<memberName>/`) |
 | `TEAM_SHARED_CONTEXT_PATH` | Member process | Shared context file path (`sessions/<team-name>/<sessionId>/.shared-context.md`) |
+| `TEAM_PEER_MESSAGING` | Member process | Peer-messaging policy snapshot (决策 #41：`"allowed" \| "tl-only"`，缺省 "allowed"；tl-only 收缩 validTargets / 工具描述两态 / 提示词两态) |
 
 ## Commands Reference
 
@@ -513,7 +527,7 @@ printf '' | timeout 10 ./node_modules/.bin/pi --mode json --no-tools -e ./index.
 | `/team cancel`           | Alias for `/team done` (backward compatibility) |
 | `/team delete <name>` | Delete a team definition (with confirmation) |
 | `/team status` | Show active session + member process statuses |
-| `/team setting` | Interactive settings menu — 顶层作用域开关（决策 #40）：默认「仅当前会话（临时）」，切换「全局」后直写 settings.yaml。临时作用域写入 overlay（不触碰 settings.yaml），「当前值」恒显示 merge 后生效值，覆盖键带 [临时] 徽标；⑦ 一键清除全部临时设置（内存+快照双清，仅 overlay 非空时显示）。五项子菜单：member default model (follow / fixed；团队 YAML 指定 model 时附注不生效) + member thinking level (成员思考强度三段式：默认 / 跟随 TL（当前：TL 级别，未知时显示「TL 级别未知」）/ 指定级别…二级 7 级别；对象形态 {mode:follow|fixed, level?}，follow = spawn 时快照 TL 思考强度) + auto-compaction (toggle / percent & token thresholds / timeout) + wait budget (等待上限, 0=永不超时 — wait 工具 all-idle deadline 与批屏障共享的顶层通用预算) + message coalescing (消息合并: 开关/批量上限/字符上限，S1 阶段 2). 通知按场景附注「（仅当前 pi 会话生效；/team resume 本团队会话时将恢复）」/「（仅当前 pi 会话生效，重启后失效）」；sessionId 不可用时临时入口禁用（fail-open）。Also allowed during a session |
+| `/team setting` | Interactive settings menu — 顶层作用域开关（决策 #40）：默认「仅当前会话（临时）」，切换「全局」后直写 settings.yaml。临时作用域写入 overlay（不触碰 settings.yaml），「当前值」恒显示 merge 后生效值，覆盖键带 [临时] 徽标；⑦ 一键清除全部临时设置（内存+快照双清，仅 overlay 非空时显示）。五项子菜单：member default model (follow / fixed；团队 YAML 指定 model 时附注不生效) + member thinking level (成员思考强度三段式：默认 / 跟随 TL（当前：TL 级别，未知时显示「TL 级别未知」）/ 指定级别…二级 7 级别；对象形态 {mode:follow|fixed, level?}，follow = spawn 时快照 TL 思考强度) + auto-compaction (toggle / percent & token thresholds / timeout) + wait budget (等待上限, 0=永不超时 — wait 工具 all-idle deadline 与批屏障共享的顶层通用预算) + message coalescing (消息合并: 开关/批量上限/字符上限，S1 阶段 2；互发禁用态子菜单附 no-op 退化注记) + 成员互发消息 (P4 决策 #41: 「允许 / 仅限回复 TL」标量两段式，● 标记当前值；TL 侧即时生效，成员侧仅影响之后启动的成员). 通知按场景附注「（仅当前 pi 会话生效；/team resume 本团队会话时将恢复）」/「（仅当前 pi 会话生效，重启后失效）」；sessionId 不可用时临时入口禁用（fail-open）。Also allowed during a session |
 | `/team help` | Display usage help for all subcommands |
 
 ## TL Tools (session-scoped registration + activation; exception below)
@@ -531,7 +545,7 @@ printf '' | timeout 10 ./node_modules/.bin/pi --mode json --no-tools -e ./index.
 | `add_dynamic_member(name, label, systemPrompt, model?)` | Register a member in `/team dynamic` mode. Name is the identifier, label is Chinese display name, systemPrompt is role definition. Only available in dynamic mode. |
 | `set_goal(text, criteria)` | Set a session goal with verifiable completion criteria. The system reminds the TL only after one run is fully settled (with no automatic retry, compaction, or queued continuation) while the goal remains active (not yet closed); `agent_end` alone never sends a reminder. **可见性**：仅团队会话（`/team start`/`/team dynamic`）期间可见——`onSessionStart` 注册，`before_agent_start` 回合边界强制（见决策 #10）。 |
 | `finish_goal()` | Mark the current goal as completed and stop the reminder system. Call when all goal criteria are met, or when an unresolvable blocker is encountered. **仅条件全部满足或遇到不可解决阻塞时调用**——条件未满足且仍可推进时不得调用，继续派发任务；仅口头宣称完成不会停止提醒（提醒系统只认真实的 finish_goal 调用）。promptSnippet 区分于 set_goal（Finish 语义）。 |
-| `start_member(name)` | Launch a Member's pi RPC process. In dynamic mode, the first call triggers the design→execution phase transition. |
+| `start_member(name)` | Launch a Member's pi RPC process. In dynamic mode, the first call triggers the design→execution phase transition. 结果附注：tl-only 态显示「成员间互发：禁用（只能回复 TL）」及设置来源（决策 #41；allowed 态不附注避免噪音）。 |
 | `stop_member(name)` | Gracefully terminate a Member process |
 | `list_members()` | Show all member statuses |
 | `get_member_log(name, lines?, maxContentLength?)` | Query Member's recent session via RPC. `maxContentLength` truncates each message content (default 200 chars). Truncation uses `slice(0, max-3) + "..."` so total length = maxContentLength. |
@@ -690,4 +704,4 @@ TL: 监控进展、协调异常、write_shared_context 更新共享上下文（�
 
 ## Design Document
 
-See [DESIGN.md](./DESIGN.md) for the full design specification (26 sections), including the Goal reminder lifecycle and release verification checklist.
+See [DESIGN.md](./DESIGN.md) for the full design specification (28 sections), including the Goal reminder lifecycle and release verification checklist.

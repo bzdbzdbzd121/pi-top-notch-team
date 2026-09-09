@@ -351,7 +351,7 @@ describe("member.ts — team member extension", () => {
   // ── P3 成员体验层：peer messaging 两态（矩阵 + 红线 8 golden）─────────
 
   /**
-   * member.ts 旧内联模板的逐字复制品（红线 8 golden 窗口）： qualsiasi 重构后
+   * member.ts 旧内联模板的逐字复制品（红线 8 golden 窗口）：任何重构后
    * allowed 态（缺省，无 TEAM_PEER_MESSAGING env）的 extraPrompt 必须与此函数
    * 输出逐字节一致。复制品与 member.ts 重构前源码同步，一字符之差即红。
    */

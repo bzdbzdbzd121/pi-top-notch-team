@@ -9,6 +9,7 @@ import type { TlWaitGate } from "../channel/tl-wait-gate";
 import type { ResolvedAutoCompact } from "../settings/resolve-auto-compact";
 import type { TeamSettings } from "../settings/settings";
 import type { MemberThinkingSetting } from "../settings/resolve-thinking";
+import type { PeerMessagingMode } from "../settings/resolve-peer-messaging";
 import { getSessionSettings, isSnapshotRestored } from "../settings/session-settings";
 import {
   DEFAULT_WAIT_TIMEOUT_MINUTES,
@@ -45,7 +46,7 @@ function tempSourceAnnotation(): string {
  * 仅影响之后启动的成员）；allowed 态不附注（避免噪音，方案明确）。
  */
 export function describePeerMessagingSpawnAnnotation(
-  peerMessaging: string | undefined
+  peerMessaging: PeerMessagingMode | undefined
 ): string {
   return peerMessaging === "tl-only" ? "；成员间互发：禁用（只能回复 TL）" : "";
 }
@@ -232,9 +233,7 @@ export function registerTlTools(deps: TlToolsDeps): void {
           config.thinking
         );
         // P3：互发策略快照附注（仅 tl-only 出现，避免噪音）
-        const peerNote = describePeerMessagingSpawnAnnotation(
-          (config as { peerMessaging?: string }).peerMessaging
-        );
+        const peerNote = describePeerMessagingSpawnAnnotation(config.peerMessaging);
         return {
           details: {},
           content: [

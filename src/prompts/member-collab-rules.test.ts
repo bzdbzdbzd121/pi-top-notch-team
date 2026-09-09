@@ -33,15 +33,11 @@ describe("buildMemberCollabRules", () => {
     // 讨论行（allowed 态第 8 行）删除
     expect(rows).toHaveLength(ALLOWED_RULES.length - 1);
     expect(rows.some((r) => r.includes("发现问题可以先通过消息通道与相关成员讨论"))).toBe(false);
-    // 其余行逐字与 allowed 态一致（顺序保持）
+    // 其余行逐字与 allowed 态一致（顺序保持：index i 对应删行后的同位行）
     const expectedWithoutDiscussion = ALLOWED_RULES.filter(
       (r) => !r.includes("发现问题可以先通过消息通道与相关成员讨论")
     );
-    for (let i = 0; i < expectedWithoutDiscussion.length; i++) {
-      const exp = i === 0
-        ? expectedWithoutDiscussion[0]
-        : expectedWithoutDiscussion[i];
-      if (i === 0) continue; // 第 1 行已单独断言（替换行）
+    for (let i = 1; i < expectedWithoutDiscussion.length; i++) {
       expect(rows[i]).toBe(expectedWithoutDiscussion[i]);
     }
   });

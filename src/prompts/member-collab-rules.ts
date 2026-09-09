@@ -46,7 +46,7 @@ export function buildMemberCollabRules(peerMessaging: PeerMessagingMode): string
 
 /**
  * team_send_message 工具 description 两态（成员侧 schema 即提示词面 / beta
- * progressive disclosure：tl-only 态不描述 меж成员通道）。
+ * progressive disclosure：tl-only 态不描述成员间通道）。
  */
 export function buildSendToolDescription(peerMessaging: PeerMessagingMode): string {
   if (peerMessaging === "tl-only") {

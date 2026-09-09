@@ -670,9 +670,10 @@ event-handler.ts (createMemberEventHandler)
 Message Queue (FIFO)
   │
   ▼
-Router (processes one message at a time)
+Router (processes one message at a time; 决策 #41 拦截分支见图后说明)
   │
-  ├── to === "tl"
+  ├── from === to            → self-skip, 不路由
+  ├── to === "tl"            → （先行 return，不受互发禁令影响）
   │     → ResponseWaiter.check(msg.correlationId or scan content for <corr:...>)
   │       ├── MATCH → resolve pending wait (skip pi.sendMessage())
   │       └── NO MATCH → team_send_and_wait 等待在飞（S3，决策 #39）：
@@ -687,6 +688,21 @@ Router (processes one message at a time)
   │                           （含 corrId 到达且桶非空时先 flush 合并包再派发，FIFO 保序）
   ├── to === "all"          → write prompt to ALL Members' RPC stdin (不合并)
   └── to === unknown        → log warning, drop
+
+### Peer-messaging 拦截分支（决策 #41，P4 — 详见 §28）
+
+位置：`from === to` 早退与 `to === "tl"` 先行 return 之后、`to === "all"` / `memberSet.has(to)` 分支之前。两个进队口（`team_send_message` 工具路径与 assistant 正文 `<team-message>` 标签备份路径）都经 `messageQueue → router.route()`，单点拦截天然全覆盖。
+
+```ts
+const peerBlocked =
+  config.isPeerMessagingAllowed !== undefined &&
+  !config.isPeerMessagingAllowed() &&
+  memberSet.has(from) &&                      // 发送方是成员：TL 派发（from="tl"）与未知来源豁免
+  (to === "all" || memberSet.has(to));        // 仅作用于有效互发目标
+if (peerBlocked) {
+  config.onPeerBlocked?.(from, to);
+  return;                                     // 不进入下游 coalescer / 压缩 pending / 派发
+}
 ```
 
 ### Message Types
@@ -2014,3 +2030,44 @@ export function loadEffectiveSettings(rootDir: string): TeamSettings {
 - 守卫验收：静态扫描正例（全仓零违规）+ 负例（人为新增消费点 → 红）+ 子串安全 + 测试文件豁免。
 - 快照文件格式：YAML（JSON 亦为合法 YAML）；stringify 跳过 undefined 字段；load 端字段级 sanitize（非法字段丢弃，全非法 → 视为无有效内容 fail-open）。
 - 阶段 6（可选，未实现）：实时跟随（model_select 跟踪扩展）+ 临时提升为全局（overlay → settings.yaml 后清内存+清快照）。
+
+## 28. 成员互发消息开关（决策 #41，P1-P4）
+
+**需求**：设置中控制是否允许 member 之间互发消息；不允许时 member 只能回复 TL（成员侧系统提示词同步两态）。最终方案四层四阶段：设置数据层（P1）→ TL 路由强制层（P2）→ 成员体验层（P3）→ UI/文档（P4）。
+
+### 28.1 设置源与 resolver（P1）
+
+- `TeamSettings.allowPeerMessaging?: boolean`，`DEFAULT_SETTINGS` 显式入列 `true`（默认允许 = 现状全互连拓扑；工程默认 deny 属静默全景破坏性变更，deny 的动机——防回音室/可观测/信息隔离——以文档呈现、用户确认门裁决）。
+- `loadSettings` 严格 boolean 解析（非法值丢弃回退默认）；近似意图非法值（引号包裹字符串 `"false"` 等）console.warn 一次/文件路径——防禁用意图被静默吞掉（warn 只补信号不改行为；loadSettings 每 dispatch 高频调用，模块级 Set 去重防刷屏）。
+- `src/settings/resolve-peer-messaging.ts`：`resolvePeerMessaging(settings)` = `=== false → "tl-only"`，否则 `"allowed"`；内部 try/catch fail-open（异常 → allowed：禁令缺失时保持现状可用性，与压缩/合并机制同姿态）。`describePeerMessagingSetting`：「允许」/「仅限回复 TL」。导出 `PeerMessagingMode` 类型为 P2/P3 共享词汇。
+- `session-settings.sanitizeSnapshotData()` 登记该键 boolean 校验——**未登记则 `/team resume` 静默丢失**（决策 #40 S3 场景破坏）；临时/全局双作用域经 `loadEffectiveSettings` 标量深合并自动贯通（`diffOverlayPatch` 标量分支泛型，零改动）。
+
+### 28.2 TL 路由强制层（P2，禁令实际生效点）
+
+- 拦截分支见 §8（单点、fail-closed、覆盖工具+标签双进队路径）；`isPeerMessagingAllowed` 为 per-route resolver（getCoalescing 同构，per-route 实时查询 → 设置切换即时生效；缺省 = 恒允许 fail-open；resolver 自身异常 fail-open 在 P1 层闭合）。
+- `from="tl"` 豁免为最高优先级红线（TL 派发 / TL 广播同走 all/memberSet 分支，禁用态必须照常通过）；`to === "tl"` 分支先行 return（禁用态成员→TL、corr 回复链不受影响，resolver 恒不被调用）。
+- unknown 目标语义解耦：拦截条件第二括号保证只作用于有效互发目标，未知 to 仍走 `onUnknownTarget`，两分支文案不混写。
+- **coalescer 零入队**：拦截点位于 coalescer 入桶与压缩 pending 的上游（`sendToMember` 是唯一入桶点，route 在其之前 return）；corrId 仅存在于 `to==="tl"` 路径（先行 return，不受拦截影响）。
+- `onPeerBlocked`（message-channel.ts 接线）：① TL 即时 team-route ⚠️ 通知（onUnknownTarget 同构；MVP 恒发，刷屏为已知噪音，输入端由回执上限收口）；② sender 改道回执——新提取的 `dispatchPromptTextToMember`（dispatchPromptToMember 的文本变体，working 标记 + followUp 保序 + 失败 notify 语义 1:1 复用；不传 coalescer，失败通知不误带合并注记），文案锚定 `[系统通知（消息通道）] 你发送给 <to> 的消息未送达——该团队已禁用成员互发（只能回复 TL）。后续请直接回复 TL 说明协作需求。`回执不进 messageQueue、不计 corrId；**per-from 上限 3 次**（Map 计数 + 整体剪枝，达上限后仅 TL 通知），防循环重试刷屏；crashed/stopped 成员回执静默放弃（TL 通知已有）。
+- **D6 防绕过加固（防御纵深）**：`event-handler.ts` tool 路径 `teamMsg.from` 三处（dedup/corr/入队）交叉校验统一以真实 `memberName` 为准——member.ts `const from = role` 硬绑定使当前 LLM 无法谎报（冒名绕过链不可达），加固封堵未来演化路径；标签备份路径本就用真实 memberName。
+
+### 28.3 成员体验层（P3，spawn 快照）
+
+- 生效时点契约：TL 侧 per-route 动态查询（**切换即时生效**）；成员侧 spawn 快照（`TEAM_PEER_MESSAGING` env，memberModel/memberThinkingLevel 管线同构，**仅影响之后启动的成员**；崩溃 auto-restart 复用已存 config 自然保留）。窗口期行为：新成员「看不见也发不出」、旧成员「看得见但发被拦并以回执改道」，由 TL 通知兜底。
+- `member.ts`（缺省 "allowed"，非法 env 值 fail-open）：tl-only 态 `validTargets = ["tl"]`（`to:"all"` 同禁——all 分支只广播成员不含 TL，放行 all 即放行 n-1 条互发通道）；工具 description `Send a message to the Team Lead. Member-to-member messaging is disabled.`；`to` 参数 description 只写 `"tl"`（schema 即提示词面 / 渐进披露：不展示的目标几乎不被调用）；非法目标拒绝返回可行动指引；系统提示词删「团队其他成员：…」名单行（防凭空构造成员名）、交流行换「只能与 Team Lead 交流（成员间互发已禁用；与其他成员协作须经 TL 中转）」、删「发现问题可以先通过消息通道与相关成员讨论」行；**强制规则（每次任务完成后必须且只能回复 TL）两态不变**。
+- 两态文案单一事实来源 `src/prompts/member-collab-rules.ts`（D4，tl-first-action.ts 先例）：`buildMemberCollabRules`（规则行两态）+ 工具描述/to 描述/拒绝文案三个纯函数；允许态输出与旧内联模板**逐字节一致**（member.test.ts golden 等值双测锁定，红线 8 零回归）。
+- `start_member` 结果附注（沿 thinking 附注先例）：tl-only 态附「；成员间互发：禁用（只能回复 TL）」；allowed 态不附注（避免噪音）；`tempSourceAnnotation` 键集纳入 allowPeerMessaging（overlay 含该键时显示「（设置来源：临时/恢复自团队会话）」）。
+- P2 评审遗留采纳：`peerMessaging` 类型收窄为 `PeerMessagingMode`（MemberProcessConfig 字段与附注函数参数）；prompt 模块注释与测试注释西里尔/意地绪语词修正为中文；collab-rules 测试第二用例死变量与恒真三元清理。
+
+### 28.4 UI（P4）
+
+- `/team setting` 顶层新增「成员互发消息（当前：允许/仅限回复 TL [临时]）」；子菜单标量两段式（允许 / 仅限回复 TL，● 标记当前值；DEFAULT 显式 true，「当前值」恒有值，无 R8 三段式问题）。标量 diff-pin 走现成泛型分支。通知含生效时点（TL 侧即时 / 成员侧仅影响之后启动的成员）与场景后缀（决策 #40 模式）。
+- **coalescer no-op 联动注记（beta F7）**：消息合并子菜单标题在互发禁用态附「合并输入源近乎枯竭，机制自动退化为 no-op」，防「设置了却无效果」困惑。
+
+### 28.5 边界声明（R5/R7）与语义澄清（alpha C5）
+
+- **R5 完备性边界**：本方案管的是**消息通道拓扑**，不封文件通道信息流——共享上下文文件（全团队可读）、成员 session 日志、git 等仍可传递信息。若团队需要严格信息隔离，须另行限制文件读写面。
+- **R7 团队 YAML 冲突提醒**：团队角色描述（systemPrompt）含「与 X 讨论/协作」字样时，禁互发团队的政策会导致成员尝试 → 被拦 + 回执。禁互发的团队作者应相应改写角色描述与 workflow（改为经 TL 中转）。
+- **allow 态 `to:"all"` 既有语义澄清**：`route()` 的 all 分支广播给**全部其他成员、不含 TL**（成员的 all 广播到不了 TL；TL 需单独 `to:"tl"`，或由 TL 主动向成员派发）——防后续需求误读。
+- members 命名 "tl" 的病态边界：router from/to 的既有歧义（如成员名恰为 "tl" 时 all 分支 skip-self 语义），与本需求无关，仅记录既有事实。
+- **演进空间**：拓扑词汇（`"allowed" | "tl-only"` 枚举）可承载 proxy 子模式；团队 YAML defaults 覆盖（与 model 解析链同构）为二期；per-member 能力矩阵出现时标量升级对象零成本。TL 审批制代理转（TL 代转发成员间消息）留档未采纳（TL 上下文成本最大、与「TL 只调度」纪律冲突，如确需可审计通道可为特定团队显式配置开启）。

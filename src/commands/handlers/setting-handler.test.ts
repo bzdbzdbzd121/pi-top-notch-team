@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createMockContext } from "../../test/fixtures/mock-extension-api";
 import { handleSetting } from "./setting-handler";
-import { loadSettings } from "../../settings/settings";
+import { loadSettings, getSettingsPath } from "../../settings/settings";
 import { endSession } from "../../session/state";
 import {
   getSessionSettings,
@@ -741,5 +741,141 @@ describe("/team setting — 阶段 4 审查修复 (字段级 pin)", () => {
     // 第二轮（切换作用域后重显）：overlay 已非空 → ⑦ 出现 + [临时] 徽标
     expect(second[0]?.some((o) => o.includes("清除全部临时设置"))).toBe(true);
     expect(second[0]?.find((o) => o.includes("等待上限"))).toContain("[临时]");
+  });
+});
+
+describe("/team setting — 成员互发消息 (P4)", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "team-setting-peer-test-"));
+    process.env.TOP_NOTCH_TEAM_ROOT = tmpDir;
+    resetSessionSettingsState();
+  });
+
+  afterEach(() => {
+    endSession();
+    resetSessionSettingsState();
+    delete process.env.TOP_NOTCH_TEAM_ROOT;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("顶层菜单显示互发项「当前：允许」（DEFAULT true）+ 子菜单两选项与 ● 标记", async () => {
+    const selectCalls: Array<{ title: string; options: string[] }> = [];
+    const ctx = createCtx({
+      sessionId: "session-A",
+      selectImpl: (_title, options) => {
+        selectCalls.push({ title: _title, options });
+        if (selectCalls.length === 1) {
+          return Promise.resolve(options.find((o) => o.includes("成员互发消息")));
+        }
+        return Promise.resolve(undefined); // 子菜单 Esc
+      },
+    });
+    await handleSetting(ctx as any);
+
+    // 顶层项：配额值恒显（describe 函数）
+    expect(selectCalls[0]!.options.some((o) => o.startsWith("成员互发消息（当前：允许）"))).toBe(true);
+    // 子菜单：两选项，当前值 ● 标记在「允许」上
+    expect(selectCalls[1]!.title).toContain("成员互发消息");
+    expect(selectCalls[1]!.title).toContain("当前：允许");
+    expect(selectCalls.length === 2 && selectCalls[1]!.options.some((o) => o.startsWith("●") && o.includes("允许"))).toBe(true);
+    expect(selectCalls[1]!.options.some((o) => o.includes("仅限回复 TL"))).toBe(true);
+  });
+
+  it("子菜单切「仅限回复 TL」→ settings.yaml allowPeerMessaging=false + 通知含生效时点（全局作用域）", async () => {
+    const ctx = createCtx({
+      sessionId: "session-A",
+      selectImpl: pickContaining("设置作用域", "成员互发消息", "仅限回复 TL"),
+    });
+    await handleSetting(ctx as any);
+
+    expect(loadSettings(tmpDir).allowPeerMessaging).toBe(false);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("仅影响之后启动的成员"),
+      "info"
+    );
+    // 切换通知提及 TL 侧路由拦截即时生效
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("路由层被拦截"),
+      "info"
+    );
+  });
+
+  it("子菜单切回「允许」→ settings.yaml allowPeerMessaging=true（可逆，两轮 handleSetting）", async () => {
+    // 注意：handler 主循环在子菜单配置一次后 return（既有结构），可逆路径 = 两次打开
+    const first = createCtx({
+      sessionId: "session-A",
+      selectImpl: pickContaining("设置作用域", "成员互发消息", "仅限回复 TL"),
+    });
+    await handleSetting(first as any);
+    expect(loadSettings(tmpDir).allowPeerMessaging).toBe(false);
+
+    // 第二次打开：切全局 → 选「允许」
+    const second = createCtx({
+      sessionId: "session-A",
+      selectImpl: pickContaining("设置作用域", "成员互发消息", "允许"),
+    });
+    await handleSetting(second as any);
+    expect(loadSettings(tmpDir).allowPeerMessaging).toBe(true);
+  });
+
+  it("临时作用域：tl-only → overlay pin（磁盘全局零改动）+ [临时] 徽标 + 场景通知后缀", async () => {
+    const ctx = createCtx({
+      sessionId: "session-A",
+      selectImpl: pickContaining("成员互发消息", "仅限回复 TL"),
+    });
+    await handleSetting(ctx as any);
+
+    // overlay pin（标量 diff）；磁盘全局零改动（临时作用域契约）
+    expect(getSessionSettings().allowPeerMessaging).toBe(false);
+    expect(loadSettings(tmpDir).allowPeerMessaging).toBe(true);
+    expect(existsSync(getSettingsPath(tmpDir))).toBe(false);
+    // 通知带场景后缀（本用例未开团队会话 → 非活跃后缀「重启后失效」）
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("仅当前 pi 会话生效，重启后失效"),
+      "info"
+    );
+  });
+
+  it("coalescer no-op 注记：互发禁用时消息合并子菜单标题附退化提示；恢复允许态时无注记", async () => {
+    /** 打开消息合并子菜单并抓取其 select 标题（子菜单配置一次即 return）。 */
+    async function captureCoalesceTitle(): Promise<string> {
+      const calls: Array<{ title: string; options: string[] }> = [];
+      const ctx = createCtx({
+        sessionId: "session-A",
+        selectImpl: (title, options) => {
+          calls.push({ title, options });
+          if (calls.length === 1) {
+            return Promise.resolve(options.find((o) => o.includes("消息合并")));
+          }
+          return Promise.resolve(undefined);
+        },
+      });
+      await handleSetting(ctx as any);
+      return calls[1]!.title;
+    }
+
+    // ① 全局禁用互发（auto scope 默认 temp→切 global）
+    const disableCtx = createCtx({
+      sessionId: "session-A",
+      selectImpl: pickContaining("设置作用域", "成员互发消息", "仅限回复 TL"),
+    });
+    await handleSetting(disableCtx as any);
+    expect(loadSettings(tmpDir).allowPeerMessaging).toBe(false);
+
+    // ② 打开消息合并子菜单 → 标题含退化提示（temp scope working=effective，读全局 false）
+    expect(await captureCoalesceTitle()).toContain("no-op");
+
+    // ③ 恢复全局允许（再次全局写入 true）
+    const restoreCtx = createCtx({
+      sessionId: "session-A",
+      selectImpl: pickContaining("设置作用域", "成员互发消息", "允许（"),
+    });
+    await handleSetting(restoreCtx as any);
+    expect(loadSettings(tmpDir).allowPeerMessaging).toBe(true);
+
+    // ④ 注记消失
+    expect(await captureCoalesceTitle()).not.toContain("no-op");
   });
 });

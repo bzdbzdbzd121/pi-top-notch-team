@@ -23,6 +23,10 @@ import {
   describeMemberThinkingSetting,
 } from "../../settings/resolve-thinking";
 import {
+  describePeerMessagingSetting,
+  resolvePeerMessaging,
+} from "../../settings/resolve-peer-messaging";
+import {
   getSessionSettings,
   setSessionSetting,
   clearSessionSetting,
@@ -40,9 +44,14 @@ const OPT_MEMBER_THINKING = "成员思考强度";
 const OPT_AUTO_COMPACT = "自动压缩";
 const OPT_WAIT_TIMEOUT = "等待上限";
 const OPT_COALESCE = "消息合并";
+const OPT_PEER = "成员互发消息";
 const OPT_CLEAR_ALL = "清除全部临时设置";
 const OPT_FOLLOW = "跟随当前配置";
 const OPT_FIXED = "指定模型";
+
+// Peer-messaging submenu options（P4 标量两段式：DEFAULT 显式 true，「当前值」恒有值）
+const PEER_ALLOW_LABEL = "允许（成员间可互发消息）";
+const PEER_TL_ONLY_LABEL = "仅限回复 TL（互发禁用，消息在 TL 路由层被拦截）";
 
 // Auto-compaction submenu options
 const AC_TOGGLE = "开关切换";
@@ -138,6 +147,7 @@ export async function handleSetting(
       `${OPT_AUTO_COMPACT}（当前：${describeAutoCompactSetting(effective)}）${badge("autoCompact")}`,
       `${OPT_WAIT_TIMEOUT}（当前：${describeWaitTimeoutSetting(effective)}）${badge("waitTimeoutMinutes")}`,
       `${OPT_COALESCE}（当前：${describeMessageCoalescingSetting(effective)}）${badge("messageCoalescing")}`,
+      `${OPT_PEER}（当前：${describePeerMessagingSetting(effective)}）${badge("allowPeerMessaging")}`,
       ...(Object.keys(overlay).length > 0 ? [`${OPT_CLEAR_ALL}（恢复全局）`] : []),
     ];
 
@@ -199,6 +209,8 @@ export async function handleSetting(
       await configureWaitTimeout(ctx, working, persistFor("waitTimeoutMinutes"), noticeSuffix);
     } else if (topChoice.startsWith(OPT_COALESCE)) {
       await configureMessageCoalescing(ctx, working, persistFor("messageCoalescing"), noticeSuffix);
+    } else if (topChoice.startsWith(OPT_PEER)) {
+      await configurePeerMessaging(ctx, working, persistFor("allowPeerMessaging"), noticeSuffix);
     }
     return;
   }
@@ -347,6 +359,8 @@ async function configureAutoCompact(
 /**
  * 消息合并子菜单（S1，阶段 2）：开关 + 批量上限 + 总字符上限。
  * 循环直至 Esc；每次变更即持久化（按作用域）。关闭时派发层完全走原逐条路径（fail-open）。
+ * P4 注记（beta F7）：成员互发禁用时 member→member 消息在路由层被拦截，合并的
+ * 输入源近乎枯竭、机制自动退化为 no-op——注记防「设置了却无效果」困惑。
  */
 async function configureMessageCoalescing(
   ctx: ExtensionCommandContext,
@@ -362,7 +376,7 @@ async function configureMessageCoalescing(
       `${COALESCE_SET_CHARS}（当前：${mc.maxBatchChars} 字符）`,
     ];
     const choice = await ctx.ui.select(
-      `消息合并 — 生效中：${describeMessageCoalescingSetting(settings)}（Esc 返回）`,
+      `消息合并 — 生效中：${describeMessageCoalescingSetting(settings)}${resolvePeerMessaging(settings) === "tl-only" ? "（注：成员互发已禁用，合并输入源近乎枯竭，机制自动退化为 no-op）" : ""}（Esc 返回）`,
       items
     );
     if (choice === undefined) return; // Esc
@@ -407,6 +421,44 @@ async function configureMessageCoalescing(
       persist();
     }
   }
+}
+
+/**
+ * 成员互发消息子菜单（P4，标量两段式）：DEFAULT 显式 true，「当前值」恒有值，
+ * 标量 diff-pin 走现成泛型分支（无 R8 三段式问题——不存在「缺省无态」差异）。
+ * 语义：tl-only 态 → TL 路由层拦截成员→成员 / →all（即时生效，fail-closed）；
+ * 成员侧提示词/工具面为 spawn 快照（仅影响之后启动的成员，memberModel 先例）。
+ */
+async function configurePeerMessaging(
+  ctx: ExtensionCommandContext,
+  settings: TeamSettings,
+  persist: () => void,
+  noticeSuffix: string,
+): Promise<void> {
+  const mode = resolvePeerMessaging(settings);
+  const allowItem = `${mode === "allowed" ? "●" : "  "}${PEER_ALLOW_LABEL}`;
+  const tlOnlyItem = `${mode === "tl-only" ? "●" : "  "}${PEER_TL_ONLY_LABEL}`;
+  const choice = await ctx.ui.select(
+    `成员互发消息（当前：${describePeerMessagingSetting(settings)}）— TL 侧拦截即时生效；成员侧仅影响之后启动的成员（Esc 返回）`,
+    [allowItem, tlOnlyItem]
+  );
+  if (choice === undefined) return; // Esc
+
+  if (choice.includes(PEER_ALLOW_LABEL)) {
+    settings.allowPeerMessaging = true;
+    persist();
+    ctx.ui.notify(
+      `成员互发消息已设为「允许」：成员间互发恢复（全互连拓扑）。TL 侧路由策略即时生效；成员侧仅影响之后启动的成员。${noticeSuffix}`,
+      "info"
+    );
+    return;
+  }
+  settings.allowPeerMessaging = false;
+  persist();
+  ctx.ui.notify(
+    `成员互发消息已设为「仅限回复 TL」：成员→成员 / →all 消息将在 TL 路由层被拦截（成员收到改道回执）。TL 侧立即生效（per-route）；仅影响之后启动的成员的提示词与工具面。${noticeSuffix}`,
+    "info"
+  );
 }
 
 /**
