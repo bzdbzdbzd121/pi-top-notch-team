@@ -31,6 +31,7 @@ function makeGlobal(): TeamSettings {
     waitTimeoutMinutes: 15,
     memberThinkingLevel: undefined,
     messageCoalescing: { enabled: true, maxBatchSize: 5, maxBatchChars: 4000 },
+    allowPeerMessaging: true,
   };
 }
 
@@ -158,6 +159,22 @@ describe("resolveEffectiveSettings — 深字段级 merge（纯函数）", () =>
     expect(global.autoCompact.thresholdPercent).toBe(80);
     expect(overlay.autoCompact?.thresholdPercent).toBe(30);
     expect(global.messageCoalescing?.maxBatchSize).toBe(5);
+  });
+
+  it("merges the allowPeerMessaging scalar (标量 pin 现成泛型路径验证, 零改动)", () => {
+    expect(
+      resolveEffectiveSettings(makeGlobal(), { allowPeerMessaging: false }).allowPeerMessaging
+    ).toBe(false);
+    expect(
+      resolveEffectiveSettings(makeGlobal(), { allowPeerMessaging: true }).allowPeerMessaging
+    ).toBe(true);
+    // undefined = 不覆盖（跟随全局）
+    const global = makeGlobal();
+    const result = resolveEffectiveSettings(global, { allowPeerMessaging: undefined });
+    expect(result).toEqual(global);
+    // 克隆隔离：改结果不影响 global
+    result.allowPeerMessaging = false;
+    expect(global.allowPeerMessaging).toBe(true);
   });
 });
 
@@ -457,6 +474,47 @@ describe("snapshot primitives — save/load/clearBinding（resume 恢复通道�
       waitTimeoutMinutes: 0,
       memberThinkingLevel: { mode: "fixed", level: "high" },
     });
+  });
+
+  it("round-trips allowPeerMessaging through the snapshot (快照登记: 写盘 → 清内存 → 恢复 → 生效)", () => {
+    setSessionSetting("allowPeerMessaging", false);
+    expect(saveSessionSettingsSnapshot(sessionDir)).toBe(true);
+    const parsed = parseYaml(
+      readFileSync(getSessionSettingsSnapshotPath(sessionDir), "utf-8")
+    ) as Record<string, unknown>;
+    expect(parsed.allowPeerMessaging).toBe(false);
+
+    // 模拟跨进程 resume：清内存 → 加载快照 → 新键进入 overlay 且 resolver 判定生效
+    clearSessionSettingsMemory();
+    expect(getSessionSettings()).toEqual({});
+    expect(loadSessionSettingsSnapshot(sessionDir, "session-B")).toBe(true);
+    expect(getSessionSettings()).toEqual({ allowPeerMessaging: false });
+    expect(
+      resolveEffectiveSettings(makeGlobal(), getSessionSettings()).allowPeerMessaging
+    ).toBe(false);
+  });
+
+  it("drops non-boolean allowPeerMessaging from snapshots (字段级校验负例: 未登记直接红)", () => {
+    mkdirSync(sessionDir, { recursive: true });
+    for (const raw of [
+      'allowPeerMessaging: "false"\nwaitTimeoutMinutes: 5\n', // string
+      "allowPeerMessaging: 0\nwaitTimeoutMinutes: 5\n", // number
+      "allowPeerMessaging: null\nwaitTimeoutMinutes: 5\n", // null
+    ]) {
+      resetSessionSettingsState();
+      writeFileSync(getSessionSettingsSnapshotPath(sessionDir), raw, "utf-8");
+      expect(loadSessionSettingsSnapshot(sessionDir, "session-B")).toBe(true);
+      const overlay = getSessionSettings() as Record<string, unknown>;
+      expect("allowPeerMessaging" in overlay).toBe(false);
+      expect(overlay.waitTimeoutMinutes).toBe(5);
+    }
+  });
+
+  it("load returns false when only an invalid allowPeerMessaging value exists (无可恢复内容)", () => {
+    mkdirSync(sessionDir, { recursive: true });
+    writeFileSync(getSessionSettingsSnapshotPath(sessionDir), "allowPeerMessaging: 0\n", "utf-8");
+    expect(loadSessionSettingsSnapshot(sessionDir, "session-B")).toBe(false);
+    expect(getSessionSettings()).toEqual({});
   });
 
   it("migrates legacy string-form thinking from snapshots (R3 快照兼容, 原始 YAML 值守卫)", () => {

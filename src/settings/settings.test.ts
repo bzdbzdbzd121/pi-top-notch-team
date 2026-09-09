@@ -11,6 +11,7 @@ import {
 } from "./settings";
 import { resolveMessageCoalescing } from "./resolve-message-coalescing";
 import { MEMBER_THINKING_LEVELS } from "./resolve-thinking";
+import { resolvePeerMessaging } from "./resolve-peer-messaging";
 
 describe("settings store", () => {
   let tmpDir: string;
@@ -380,5 +381,50 @@ describe("messageCoalescing (消息合并设置)", () => {
     const r = resolveMessageCoalescing(loaded);
     expect(r.maxBatchSize).toBe(5);
     expect(r.maxBatchChars).toBe(4000);
+  });
+});
+
+describe("allowPeerMessaging (成员互发开关)", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "team-settings-peer-test-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("defaults to true (allow) when unset — DEFAULT_SETTINGS 显式入列", () => {
+    expect(DEFAULT_SETTINGS.allowPeerMessaging).toBe(true);
+    const settings = loadSettings(tmpDir);
+    expect(settings.allowPeerMessaging).toBe(true);
+    // resolver 联动：缺省即允许（现状全互连拓扑）
+    expect(resolvePeerMessaging(settings)).toBe("allowed");
+  });
+
+  it("round-trips explicit false and true through save/load", () => {
+    saveSettings(
+      { ...structuredClone(DEFAULT_SETTINGS), allowPeerMessaging: false },
+      tmpDir
+    );
+    expect(loadSettings(tmpDir).allowPeerMessaging).toBe(false);
+
+    saveSettings(
+      { ...structuredClone(DEFAULT_SETTINGS), allowPeerMessaging: true },
+      tmpDir
+    );
+    expect(loadSettings(tmpDir).allowPeerMessaging).toBe(true);
+  });
+
+  it("drops non-boolean values (严格姿态，其余丢弃回退默认 true)", () => {
+    for (const raw of [
+      'allowPeerMessaging: "false"\n', // string
+      "allowPeerMessaging: 0\n", // number
+      "allowPeerMessaging: null\n", // null
+    ]) {
+      writeFileSync(getSettingsPath(tmpDir), raw, "utf-8");
+      expect(loadSettings(tmpDir).allowPeerMessaging).toBe(true);
+    }
   });
 });

@@ -67,6 +67,14 @@ export interface TeamSettings {
   memberThinkingLevel?: MemberThinkingSetting;
   /** 消息合并（S1，阶段 2）。缺省 = 开启（默认 5 条 / 4000 字符）。 */
   messageCoalescing?: MessageCoalescingSetting;
+  /**
+   * 成员互发开关。true = 允许（默认，现状全互连拓扑）；false = 仅回复 TL
+   * （星型拓扑：成员→成员与→all 消息在 TL 路由层被拦截，成员只能回复 TL）。
+   * 缺省/非法值回退为 true（允许）。生效时点分层：TL 侧 per-route 动态查询
+   * （切换即时生效）；成员侧 spawn 快照（TEAM_PEER_MESSAGING env，仅影响之后启动的成员）。
+   * 演进空间：per-member/team 粒度（hub-spoke 语义），以注释/文档承载。
+   */
+  allowPeerMessaging?: boolean;
 }
 
 export const DEFAULT_SETTINGS: TeamSettings = {
@@ -74,6 +82,7 @@ export const DEFAULT_SETTINGS: TeamSettings = {
   autoCompact: { enabled: true, thresholdPercent: 80, timeoutMinutes: 10 },
   waitTimeoutMinutes: 15,
   messageCoalescing: { enabled: true, maxBatchSize: 5, maxBatchChars: 4000 },
+  allowPeerMessaging: true,
 };
 
 const SETTINGS_FILE = "settings.yaml";
@@ -205,6 +214,13 @@ export function loadSettings(rootDir: string): TeamSettings {
       } else {
         settings.messageCoalescing!.maxBatchChars = undefined;
       }
+    }
+
+    // allowPeerMessaging (top-level): member-to-member messaging toggle.
+    // 严格姿态：仅接受 boolean，其余丢弃回退默认（DEFAULT true = 允许）。
+    const apm = rawData.allowPeerMessaging;
+    if (typeof apm === "boolean") {
+      settings.allowPeerMessaging = apm;
     }
 
     // Migration (legacy key): batchMaxWaitMinutes used to live inside

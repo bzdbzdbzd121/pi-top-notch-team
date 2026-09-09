@@ -291,6 +291,12 @@ function sanitizeSnapshotData(data: Record<string, unknown>): DeepPartial<TeamSe
     }
   }
 
+  // allowPeerMessaging：成员互发开关（标量 boolean；非 boolean 丢弃 = 不覆盖，
+  // 跟随全局）。**必须登记**——未登记则 /team resume 静默丢失该键（S3 场景破坏）。
+  if (typeof data.allowPeerMessaging === "boolean") {
+    out.allowPeerMessaging = data.allowPeerMessaging;
+  }
+
   return out;
 }
 
