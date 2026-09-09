@@ -124,6 +124,8 @@ src/
 │   ├── goal-closing-protocol.ts ← 共享「强制 Goal 关闭协议」提示词片段（预定义/dynamic/agent-initiated 三模式复用防漂移）
 │   ├── workflow-prompt.ts ← 预定义团队的工作流提示词构建（纯函数）：激活横幅 + 操作型执行协议，替代旧内联描述性注入
 │   ├── workflow-prompt.test.ts ← 工作流提示词测试
+│   ├── member-collab-rules.ts ← 成员协作规则/工具面两态（决策 #41）：buildMemberCollabRules 规则行 + 工具描述/to 描述/拒绝文案四纯函数，单一事实来源防漂移；allowed 态逐字=现状（golden 锁）
+│   ├── member-collab-rules.test.ts ← 两态矩阵 + 红线 8 逐行对照（allowed 9 行逐字）
 │   ├── orchestration-playbook.md  ← TL 编排方法论：需求对齐(grilling)/任务拆分/质量加固模式库/确认门，注入设计阶段提示词
 │   └── dynamic-mode.test.ts  ← 动态模式提示词测试
 ├── setup/            ← Modular extracted setup modules
@@ -138,7 +140,9 @@ src/
 │   ├── resolve-thinking.ts ← 纯函数：成员思考强度解析（对象两态 {mode:follow|fixed, level?}；支持集复刻 pi-ai getSupportedThinkingLevels + 旧字符串迁移解析 parseMemberThinkingSetting + resolveMemberThinking(requested, tlLevel, supportedLevels) 支持→传 --thinking / 不支持或未知→fail-open 不传）
 │   ├── resolve-auto-compact.ts ← Pure functions: auto-compaction resolution + threshold check + menu label
 │   ├── resolve-message-coalescing.ts ← 纯函数：消息合并设置解析（enabled + 上限回退默认）与菜单标签
-│   └── resolve-wait-timeout.ts ← Pure functions: 顶层通用等待预算 waitTimeoutMinutes（wait 工具 all-idle deadline + 批屏障共享，独立于自动压缩）
+│   ├── resolve-wait-timeout.ts ← Pure functions: 顶层通用等待预算 waitTimeoutMinutes（wait 工具 all-idle deadline + 批屏障共享，独立于自动压缩）
+│   ├── resolve-peer-messaging.ts ← 纯函数：成员互发策略解析（决策 #41：===false→tl-only，fail-open 异常→allowed）+ PeerMessagingMode 共享词汇 + 菜单标签；DEFAULT 显式 true
+│   └── resolve-peer-messaging.test.ts ← resolver fail-open 矩阵（undefined/true/false/异常/null settings）+ 菜单标签用例
 ├── ui/               ← TUI components for team mode
 │   ├── team-status-widget.ts  ← Bordered widget: live member status + context %；阶段 2 实时化 + v2 简化：细粒度阶段渲染（💭×2/🔧×2/✏️/✅——working 与 thinking 同 💭 靠颜色区分（默认 vs accent），无耗时无工具名）+ N1 双层渲染去重（调度侧签名 logical|phase + 渲染侧 styled 行比较闸门）+ N2 轮询完成保留 refresh + N3 轮询并行化 + 合并节流（120ms + nextStreamFlushDelay 自适应退避，上限 1s）
 │   ├── team-status-widget.test.ts ← widget 单测：徽标/截断/overlay 优先级/时长格式/N1 双闸门（颜色盲区 B1）/S1 进程死亡强制调度/定时器清理
@@ -527,7 +531,7 @@ printf '' | timeout 10 ./node_modules/.bin/pi --mode json --no-tools -e ./index.
 | `/team cancel`           | Alias for `/team done` (backward compatibility) |
 | `/team delete <name>` | Delete a team definition (with confirmation) |
 | `/team status` | Show active session + member process statuses |
-| `/team setting` | Interactive settings menu — 顶层作用域开关（决策 #40）：默认「仅当前会话（临时）」，切换「全局」后直写 settings.yaml。临时作用域写入 overlay（不触碰 settings.yaml），「当前值」恒显示 merge 后生效值，覆盖键带 [临时] 徽标；⑦ 一键清除全部临时设置（内存+快照双清，仅 overlay 非空时显示）。五项子菜单：member default model (follow / fixed；团队 YAML 指定 model 时附注不生效) + member thinking level (成员思考强度三段式：默认 / 跟随 TL（当前：TL 级别，未知时显示「TL 级别未知」）/ 指定级别…二级 7 级别；对象形态 {mode:follow|fixed, level?}，follow = spawn 时快照 TL 思考强度) + auto-compaction (toggle / percent & token thresholds / timeout) + wait budget (等待上限, 0=永不超时 — wait 工具 all-idle deadline 与批屏障共享的顶层通用预算) + message coalescing (消息合并: 开关/批量上限/字符上限，S1 阶段 2；互发禁用态子菜单附 no-op 退化注记) + 成员互发消息 (P4 决策 #41: 「允许 / 仅限回复 TL」标量两段式，● 标记当前值；TL 侧即时生效，成员侧仅影响之后启动的成员). 通知按场景附注「（仅当前 pi 会话生效；/team resume 本团队会话时将恢复）」/「（仅当前 pi 会话生效，重启后失效）」；sessionId 不可用时临时入口禁用（fail-open）。Also allowed during a session |
+| `/team setting` | Interactive settings menu — 顶层作用域开关（决策 #40）：默认「仅当前会话（临时）」，切换「全局」后直写 settings.yaml。临时作用域写入 overlay（不触碰 settings.yaml），「当前值」恒显示 merge 后生效值，覆盖键带 [临时] 徽标；⑦ 一键清除全部临时设置（内存+快照双清，仅 overlay 非空时显示）。六项子菜单：member default model (follow / fixed；团队 YAML 指定 model 时附注不生效) + member thinking level (成员思考强度三段式：默认 / 跟随 TL（当前：TL 级别，未知时显示「TL 级别未知」）/ 指定级别…二级 7 级别；对象形态 {mode:follow|fixed, level?}，follow = spawn 时快照 TL 思考强度) + auto-compaction (toggle / percent & token thresholds / timeout) + wait budget (等待上限, 0=永不超时 — wait 工具 all-idle deadline 与批屏障共享的顶层通用预算) + message coalescing (消息合并: 开关/批量上限/字符上限，S1 阶段 2；互发禁用态子菜单附 no-op 退化注记) + 成员互发消息 (P4 决策 #41: 「允许 / 仅限回复 TL」标量两段式，● 标记当前值；TL 侧即时生效，成员侧仅影响之后启动的成员). 通知按场景附注「（仅当前 pi 会话生效；/team resume 本团队会话时将恢复）」/「（仅当前 pi 会话生效，重启后失效）」；sessionId 不可用时临时入口禁用（fail-open）。Also allowed during a session |
 | `/team help` | Display usage help for all subcommands |
 
 ## TL Tools (session-scoped registration + activation; exception below)
