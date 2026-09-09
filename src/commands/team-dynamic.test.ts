@@ -1,10 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createMockExtensionAPI, createMockContext } from "../test/fixtures/mock-extension-api";
 import { registerTeamCommand } from "./team";
-import { endSession, getSessionState } from "../session/state";
+import { endSession, getSessionState, startSession } from "../session/state";
+import { registerStartTeamSessionTool } from "../tools/agent-session-tools";
+import { DEFAULT_SETTINGS, type TeamSettings } from "../settings/settings";
 import type { TeamContext, SessionUI } from "../session/context";
 
 function createTeamContext(): TeamContext {
@@ -174,5 +176,72 @@ describe("/team dynamic", () => {
       expect.stringContaining("/team dynamic"),
       expect.any(String)
     );
+  });
+});
+
+describe("红线守护（beta A4）：禁用态下 /team dynamic 仍可正常开会（阶段③ 随行落地）", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "team-dynamic-gate-test-"));
+    process.env.TOP_NOTCH_TEAM_ROOT = tmpDir;
+    endSession();
+  });
+
+  afterEach(() => {
+    endSession();
+    delete process.env.TOP_NOTCH_TEAM_ROOT;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("allowAgentInitiatedSessions=false 时：/team dynamic 会话正常 bootstrap（origin user）、成员可注册——开关只管 agent 启动相，手动入口零影响", async () => {
+    // 环境全禁用态：磁盘全局设置写禁用 + L2 依赖注入禁用（与生产接线同构）
+    writeFileSync(
+      join(tmpDir, "settings.yaml"),
+      "allowAgentInitiatedSessions: false\n",
+      "utf-8"
+    );
+    const pi = createMockExtensionAPI();
+    const teamCtx = createTeamContext();
+    teamCtx.onSessionStart = vi.fn();
+    registerStartTeamSessionTool({
+      pi,
+      teamCtx,
+      getSettings: (): TeamSettings => ({
+        ...structuredClone(DEFAULT_SETTINGS),
+        allowAgentInitiatedSessions: false,
+      }),
+    });
+    registerTeamCommand(pi, teamCtx);
+    const cmdHandler = (pi.registerCommand as any).mock.calls[0][1];
+    const ctx = createMockContext();
+
+    // /team dynamic 正常开会（红线：无差别门控会在此红）
+    await cmdHandler.handler("dynamic", ctx);
+    const state = getSessionState();
+    expect(state.active).toBe(true);
+    expect(state.origin).toBe("user");
+    expect(state.teamDefinition!.name).toMatch(/^_dynamic_/);
+    expect(teamCtx.isDynamicSession).toBe(true);
+    expect(teamCtx.dynamicPhase).toBe("design");
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("动态团队模式已启动"), "info");
+
+    // 开会继续：add_dynamic_member 已注册且实际可注册成员（getSessionState 返回深拷贝，重新读取）
+    const addToolCall = (pi.registerTool as any).mock.calls.find(
+      ([def]: any) => def.name === "add_dynamic_member"
+    );
+    expect(addToolCall).toBeDefined();
+    await addToolCall[0].execute("id", { name: "analyzer", label: "分析员", systemPrompt: "负责分析" }, undefined, undefined, ctx);
+    expect(getSessionState().teamDefinition!.members.map((m: any) => m.name)).toContain("analyzer");
+
+    // 对照组：同环境下 L2 门控对 start_team_session 仍然生效（工具路径与命令路径分流）
+    const startTool = (pi.registerTool as any).mock.calls.find(
+      ([def]: any) => def.name === "start_team_session"
+    );
+    const rejected = await startTool[0].execute("id", { task: "测试任务" }, undefined, undefined, ctx);
+    expect(rejected.content[0].text).toContain("已被设置禁用");
+    // 且未扰动进行中的 user 会话
+    expect(getSessionState().active).toBe(true);
+    expect(getSessionState().origin).toBe("user");
   });
 });

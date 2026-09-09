@@ -1,6 +1,9 @@
 import { GOAL_TOOL_NAMES } from "../tools/goal-tools";
 import { SHARED_CONTEXT_TOOL_NAME } from "../tools/shared-context-tool";
-import { STOP_TEAM_SESSION_TOOL_NAME } from "../tools/agent-session-tool-names";
+import {
+  START_TEAM_SESSION_TOOL_NAME,
+  STOP_TEAM_SESSION_TOOL_NAME,
+} from "../tools/agent-session-tool-names";
 
 /**
  * Session-only tool visibility enforcement.
@@ -24,6 +27,27 @@ import { STOP_TEAM_SESSION_TOOL_NAME } from "../tools/agent-session-tool-names";
  * active-tool list (extension reload, other extensions calling
  * setActiveTools, plan-mode tool toggles, future code paths) can thus never
  * leak the session tools outside a session.
+ *
+ * Invariant 2 (阶段③ L1 策略门控，D3 统一不变式): start_team_session — the
+ * load-time-registration exception (decision #21's single exception) — is
+ * POLICY-gated instead of session-gated. Its visibility ⇔ the
+ * allowAgentInitiatedSessions setting (resolver: resolveAgentSessionAllowed),
+ * INDEPENDENT of session state:
+ *   - `startTeamSessionVisible === false` ⇒ NOT in activeTools at the end of
+ *     either branch (removed on discovery, same path as leaked session tools;
+ *     stale re-injected lists are re-removed at the next turn boundary).
+ *   - otherwise (true/undefined, fail-open default) ⇒ in activeTools
+ *     (re-added after a disabled→enabled round-trip, E8).
+ * Its registration is a load-time fait accompli (F1): the gate NEVER calls
+ * registerTools for it — a missing registration is a load-layer defect, and
+ * silently re-registering would mask it (the name may still enter the active
+ * list; pi's setActiveTools ignores unknown names).
+ * E9 known window (recorded, no code needed): a process booted while the
+ * setting is disabled briefly exposes the tool between load-time
+ * registration/auto-activation and the first before_agent_start — actual
+ * exposure is zero (no LLM call opportunity before the first turn, corrected
+ * at the boundary) and the L2 execute gate (agent-session-tools.ts) makes it
+ * structurally harmless.
  *
  * Mode-scoped tools (create_team_definition / update_team_definition /
  * add_dynamic_member) are NOT covered here — they already have their own
@@ -55,6 +79,13 @@ export interface SessionToolVisibilityDeps {
   agentInitiated: boolean;
   /** Current active tool names (pi.getActiveTools()). */
   activeTools: string[];
+  /**
+   * 阶段③ L1（D8 具体入参，非泛型）：start_team_session 的策略可见性。
+   * 缺省/undefined/true = 可见（fail-open，现状）；false = 统一不可见（D3：
+   * 与会话状态无关，两个分支结束时均从 activeTools 移除）。调用点经
+   * getEffectiveSettings 合并层每回合实时求值（index.ts before_agent_start）。
+   */
+  startTeamSessionVisible?: boolean;
   /** Whether a tool name is already registered (pi.getAllTools()). */
   isRegistered(name: string): boolean;
   /**
@@ -78,6 +109,9 @@ export function enforceSessionToolVisibility(
 ): SessionToolVisibilityResult {
   const { sessionActive, agentInitiated, activeTools } = deps;
   const active = new Set(activeTools);
+  // 阶段③ L1 策略门控（D3 统一不变式）：start_team_session 可见性 ⇔ 开关值，
+  // 与会话状态无关。缺省 true（fail-open）。
+  const startVisible = deps.startTeamSessionVisible !== false;
 
   if (sessionActive) {
     // Session active → session tools must be registered (idempotent) and
@@ -88,18 +122,24 @@ export function enforceSessionToolVisibility(
       ? [...SESSION_TOOL_NAMES, ...AGENT_SESSION_TOOL_NAMES]
       : [...SESSION_TOOL_NAMES];
     const forbidden = agentInitiated ? [] : [...AGENT_SESSION_TOOL_NAMES];
+    // L1 策略门控：disabled ⇒ start_team_session 并入 forbidden（发现即移除，
+    // 含活跃会话期间——E4 运行中会话不终止，stop 照常可见）；enabled ⇒ 并入
+    // wanted（E8：disabled→enabled 往返后补回）。移除/补回只经 setActiveTools，
+    // registerTools 永不为它触发（F1 加载时注册既成事实，见模块 docstring）。
+    const policyForbidden = startVisible ? [] : [START_TEAM_SESSION_TOOL_NAME];
+    const wanted = startVisible ? [...required, START_TEAM_SESSION_TOOL_NAME] : required;
 
-    const missingActive = required.filter((n) => !active.has(n));
-    const leakedActive = forbidden.filter((n) => active.has(n));
+    const missingActive = wanted.filter((n) => !active.has(n));
+    const leakedActive = [...forbidden, ...policyForbidden].filter((n) => active.has(n));
     if (missingActive.length > 0 || leakedActive.length > 0) {
       if (required.some((n) => !deps.isRegistered(n))) {
         deps.registerTools();
       }
-      const leakedSet: ReadonlySet<string> = new Set(leakedActive);
+      const leakedSet: ReadonlySet<string> = new Set([...forbidden, ...policyForbidden]);
       const next = [
         ...new Set([
           ...activeTools.filter((n) => !leakedSet.has(n)),
-          ...required,
+          ...wanted,
         ]),
       ];
       deps.setActiveTools(next);
@@ -110,11 +150,26 @@ export function enforceSessionToolVisibility(
 
   // No session → session tools must never be active (they may remain
   // registered; pi has no unregisterTool API, but the active set is the only
-  // visibility gate).
-  const leakedSet: ReadonlySet<string> = new Set([...SESSION_TOOL_NAMES, ...AGENT_SESSION_TOOL_NAMES]);
+  // visibility gate). start_team_session follows the policy (统一不变式):
+  // removed when disabled (incl. stale re-injected lists — re-removed at the
+  // next turn boundary), re-added when enabled (E8 round-trip). Never
+  // registered either way (F1).
+  const policyLeaked = startVisible ? [] : [START_TEAM_SESSION_TOOL_NAME];
+  const policyWanted = startVisible ? [START_TEAM_SESSION_TOOL_NAME] : [];
+  const leakedSet: ReadonlySet<string> = new Set([
+    ...SESSION_TOOL_NAMES,
+    ...AGENT_SESSION_TOOL_NAMES,
+    ...policyLeaked,
+  ]);
   const leaked = [...leakedSet].filter((n) => active.has(n));
-  if (leaked.length > 0) {
-    const next = activeTools.filter((n) => !leakedSet.has(n));
+  const missingPolicy = policyWanted.filter((n) => !active.has(n));
+  if (leaked.length > 0 || missingPolicy.length > 0) {
+    const next = [
+      ...new Set([
+        ...activeTools.filter((n) => !leakedSet.has(n)),
+        ...policyWanted,
+      ]),
+    ];
     deps.setActiveTools(next);
     return { changed: true, activeTools: next };
   }

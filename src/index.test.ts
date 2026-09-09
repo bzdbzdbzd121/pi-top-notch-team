@@ -1279,12 +1279,12 @@ describe("per-session settings wiring (阶段 2)", () => {
     expect(loadSettingsCallSites.length).toBe(0);
     // 唯一入口形态：委托合并层
     expect(source).toContain("loadEffectiveSettings(getRootDir())");
-    // 8 个消费点全部经 getEffectiveSettings：getAutoCompact×2 / getCoalescing /
+    // 9 个消费点全部经 getEffectiveSettings：getAutoCompact×2 / getCoalescing /
     // getPeerMessagingAllowed（P2）/ getSettings（tlToolsDeps）+ buildMemberConfig 两
     // 调用点（start_member、startResumedMember）/ start_team_session getSettings
-    // （阶段② L2 execute 门控）
+    // （阶段② L2 execute 门控）/ startTeamSessionVisible（阶段③ L1 可见性门控）
     const effectiveCalls = source.match(/getEffectiveSettings\(\)/g) ?? [];
-    expect(effectiveCalls.length).toBe(8);
+    expect(effectiveCalls.length).toBe(9);
   });
 });
 

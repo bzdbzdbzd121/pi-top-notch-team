@@ -20,6 +20,7 @@ import {
 import { resolveAutoCompact } from "./src/settings/resolve-auto-compact";
 import { resolveMessageCoalescing } from "./src/settings/resolve-message-coalescing";
 import { resolvePeerMessaging } from "./src/settings/resolve-peer-messaging";
+import { resolveAgentSessionAllowed } from "./src/settings/resolve-agent-session";
 import { getSupportedThinkingLevelsFor } from "./src/settings/resolve-thinking";
 import { registerTlTools, type TlToolsDeps } from "./src/tools/tl-tools";
 import { registerGoalTools, registerGoalAgentHandler, resetGoal, GOAL_TOOL_NAMES } from "./src/tools/goal-tools";
@@ -961,6 +962,13 @@ export default function (pi: ExtensionAPI) {
     enforceSessionToolVisibility({
       sessionActive: session.active,
       agentInitiated: session.active && session.origin === "agent",
+      // 阶段③ L1 可见性门控（D3 统一不变式 + D8 字面 boolean）：start_team_session
+      // 的可见性 ⇔ 设置开关，与会话状态无关。before_agent_start 每回合实时求值
+      // （late-evaluation，切换下一回合边界即生效）；经 getEffectiveSettings 合并层
+      // （R4 合规）。disabled ⇒ 工具列表与 promptSnippet/promptGuidelines 同步消失；
+      // enabled ⇒ 补回。补回/移除只经 setActiveTools，registerTools 永不为它触发。
+      // resolver fail-open（异常/缺省 → true）。
+      startTeamSessionVisible: resolveAgentSessionAllowed(getEffectiveSettings()),
       activeTools: pi.getActiveTools(),
       isRegistered: (name) =>
         (((pi as any).getAllTools?.() ?? []) as Array<{ name: string }>).some(
