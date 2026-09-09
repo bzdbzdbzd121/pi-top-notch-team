@@ -6,6 +6,8 @@ import { teardownTeamSession } from "../session/teardown";
 import { setGoalInternal } from "./goal-tools";
 import { setManifestRuntimeContext, syncActiveManifest } from "../session/manifest";
 import { START_TEAM_SESSION_TOOL_NAME, STOP_TEAM_SESSION_TOOL_NAME } from "./agent-session-tool-names";
+import type { TeamSettings } from "../settings/settings";
+import { resolveAgentSessionAllowed } from "../settings/resolve-agent-session";
 
 /**
  * Agent-initiated team session tools (ADR-0003).
@@ -18,11 +20,21 @@ import { START_TEAM_SESSION_TOOL_NAME, STOP_TEAM_SESSION_TOOL_NAME } from "./age
  *   ensureSessionToolsRegistered in index.ts) but ACTIVATED only in
  *   agent-initiated sessions — user-initiated sessions keep their lifecycle
  *   user-owned (/team stop).
+ *
+ * 阶段② L2 execute 门控（正确性硬闸门）：start_team_session 的 execute 首步检查
+ * 设置 allowAgentInitiatedSessions，禁用时拒绝且零副作用（不进 bootstrap）。
+ * 设置层五件套见 src/settings/resolve-agent-session.ts 与最终方案阶段①。
  */
 
 export interface AgentSessionToolsDeps {
   pi: ExtensionAPI;
   teamCtx: TeamContext;
+  /**
+   * 惰性设置读取（D5，与 TlToolsDeps.getSettings 同构）：per-call 动态求值
+   * （late-evaluation 纪律，绝不在注册点缓存）——切换即时生效，无需重启。
+   * 缺省/求值异常 = 允许（fail-open），现有测试与 embedder 零破坏。
+   */
+  getSettings?: () => TeamSettings;
 }
 
 type ToolResult = {
@@ -32,6 +44,33 @@ type ToolResult = {
 
 function textResult(text: string, details: Record<string, unknown> = {}): ToolResult {
   return { details, content: [{ type: "text" as const, text }] };
+}
+
+/**
+ * 拒绝文案（阶段②，信息一次给足：抑制重试 + prose 建设性出路不受拦截）。
+ * 「请勿再次调用」抑制重试；手动入口（/team start、/team dynamic）与菜单重开
+ * 提供出路；「否则请直接自行完成任务」给出明确降级行为。
+ */
+const START_TEAM_SESSION_DISABLED_TEXT =
+  "start_team_session 已被设置禁用（Agent 自主团队会话：禁止），本次未启动任何会话。请勿再次调用。" +
+  "若判断本任务仍值得以团队方式推进：请告知用户该功能已被禁用——用户可执行 /team start（预定义团队）" +
+  "或 /team dynamic（动态设计团队）手动启动，也可在 /team setting 中重新开启「Agent 自主团队会话」；" +
+  "否则请直接自行完成任务。";
+
+/**
+ * L2 门控判定（D5/D6/D7）：getSettings 缺省或求值异常时 fail-open 放行。
+ * resolver 内部已 fail-open（settings 字段访问异常），此处仅兜 getSettings 闭包
+ * 本身抛错（生产路径 loadEffectiveSettings 自带 fail-open，此层是防御纵深）。
+ */
+function entryAllowed(getSettings?: () => TeamSettings): boolean {
+  if (!getSettings) {
+    return true;
+  }
+  try {
+    return resolveAgentSessionAllowed(getSettings());
+  } catch {
+    return true;
+  }
 }
 
 /** Registered once at extension load (see module docstring). */
@@ -69,6 +108,15 @@ export function registerStartTeamSessionTool(deps: AgentSessionToolsDeps): void 
       required: ["task"],
     },
     async execute(_toolCallId: string, params: { task: string }, _signal, _onUpdate, ctx): Promise<ToolResult> {
+      // 阶段② L2（D6）：设置禁用检查最先行——先于 task 空校验、先于活跃会话校验、
+      // 先于 bootstrap/setGoalInternal。disabled 对任何参数成立，判定确定性最好
+      // （禁用+空 task 场景返回策略错误而非参数错误，避免信息错位）；检查与拒绝
+      // 同函数体内同步完成，无 TOCTOU 窗口。零副作用：不进 bootstrap、不置 Goal、
+      // 不建目录。stop_team_session 不受开关影响（与开关正交）。
+      if (!entryAllowed(deps.getSettings)) {
+        return textResult(START_TEAM_SESSION_DISABLED_TEXT, { disabledBySettings: true });
+      }
+
       const task = typeof params.task === "string" ? params.task.trim() : "";
       if (!task) {
         return textResult("start_team_session 需要非空的 task 参数（使命陈述 + 验收标准）。");

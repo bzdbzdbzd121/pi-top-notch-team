@@ -13,6 +13,7 @@ import {
 } from "./agent-session-tool-names";
 import { endSession, getSessionState, startSession } from "../session/state";
 import { getGoalState, resetGoal } from "./goal-tools";
+import { DEFAULT_SETTINGS, type TeamSettings } from "../settings/settings";
 import type { TeamContext } from "../session/context";
 
 function createTeamContext(): TeamContext {
@@ -216,5 +217,147 @@ describe("stop_team_session (ADR-0003)", () => {
     expect(result.content[0].text).toContain("会话数据已保留");
     expect(result.content[0].text).toContain("/team resume");
     expect(result.details.stopped).toBe(true);
+  });
+});
+
+describe("start_team_session execute 门控 (L2 正确性硬闸门, 阶段②)", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "agent-session-gate-test-"));
+    process.env.TOP_NOTCH_TEAM_ROOT = tmpDir;
+    endSession();
+    resetGoal();
+  });
+
+  afterEach(() => {
+    endSession();
+    resetGoal();
+    delete process.env.TOP_NOTCH_TEAM_ROOT;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  /** 禁用态 deps：allowAgentInitiatedSessions = false（其余字段用 DEFAULT）。 */
+  function disabledDeps(pi: any, teamCtx: TeamContext) {
+    return {
+      pi,
+      teamCtx,
+      getSettings: (): TeamSettings => ({
+        ...structuredClone(DEFAULT_SETTINGS),
+        allowAgentInitiatedSessions: false,
+      }),
+    };
+  }
+
+  it("禁用态：拒绝文案 + 零副作用（不 bootstrap、不置 Goal、不建目录、不动 activeTools）", async () => {
+    const pi = createMockExtensionAPI();
+    const teamCtx = createTeamContext();
+    teamCtx.onSessionStart = vi.fn();
+    registerStartTeamSessionTool(disabledDeps(pi, teamCtx) as any);
+    const tool = getRegisteredTool(pi, START_TEAM_SESSION_TOOL_NAME);
+    const ctx = createMockContext();
+
+    const result = await tool.execute("id", { task: TASK }, undefined, undefined, ctx);
+    const text = result.content[0].text;
+    // 拒绝文案骨架：信息一次给足 + 抑制重试 + 建设性出路（prose 建议不受拦截）
+    expect(text).toContain("已被设置禁用");
+    expect(text).toContain("请勿再次调用");
+    expect(text).toContain("/team start");
+    expect(text).toContain("/team dynamic");
+    expect(text).toContain("/team setting");
+    expect(text).toContain("自行完成任务");
+
+    // 零副作用断言（最锋利的一条测试设计）
+    expect(getSessionState().active).toBe(false);
+    expect(getGoalState()).toBeNull();
+    expect(existsSync(join(tmpDir, "sessions"))).toBe(false);
+    expect(teamCtx.onSessionStart).not.toHaveBeenCalled();
+    expect(teamCtx.agentInitiatedTask).toBeNull();
+    expect(pi.setActiveTools).not.toHaveBeenCalled();
+    expect(ctx.ui.notify).not.toHaveBeenCalled();
+  });
+
+  it("启用态：现状回归（bootstrap 正常进行）", async () => {
+    const pi = createMockExtensionAPI();
+    const teamCtx = createTeamContext();
+    teamCtx.onSessionStart = vi.fn();
+    registerStartTeamSessionTool({
+      pi,
+      teamCtx,
+      getSettings: (): TeamSettings => structuredClone(DEFAULT_SETTINGS),
+    } as any);
+    const tool = getRegisteredTool(pi, START_TEAM_SESSION_TOOL_NAME);
+
+    await tool.execute("id", { task: TASK }, undefined, undefined, createMockContext());
+    expect(getSessionState().active).toBe(true);
+    expect(getSessionState().origin).toBe("agent");
+    expect(getGoalState()?.text).toBe(TASK);
+  });
+
+  it("getSettings 未注入 → 放行（现状路径零破坏）", async () => {
+    const pi = createMockExtensionAPI();
+    const teamCtx = createTeamContext();
+    teamCtx.onSessionStart = vi.fn();
+    registerStartTeamSessionTool({ pi, teamCtx });
+    const tool = getRegisteredTool(pi, START_TEAM_SESSION_TOOL_NAME);
+
+    await tool.execute("id", { task: TASK }, undefined, undefined, createMockContext());
+    expect(getSessionState().active).toBe(true);
+    expect(getSessionState().origin).toBe("agent");
+  });
+
+  it("getSettings 求值异常 → fail-open 放行（防御纵深）", async () => {
+    const pi = createMockExtensionAPI();
+    const teamCtx = createTeamContext();
+    teamCtx.onSessionStart = vi.fn();
+    registerStartTeamSessionTool({
+      pi,
+      teamCtx,
+      getSettings: (): TeamSettings => {
+        throw new Error("boom");
+      },
+    } as any);
+    const tool = getRegisteredTool(pi, START_TEAM_SESSION_TOOL_NAME);
+
+    await tool.execute("id", { task: TASK }, undefined, undefined, createMockContext());
+    expect(getSessionState().active).toBe(true);
+  });
+
+  it("D6 顺序锁定：禁用 + task 空 → 返回设置禁用文案（策略先于参数校验）", async () => {
+    const pi = createMockExtensionAPI();
+    const teamCtx = createTeamContext();
+    registerStartTeamSessionTool(disabledDeps(pi, teamCtx) as any);
+    const tool = getRegisteredTool(pi, START_TEAM_SESSION_TOOL_NAME);
+
+    const result = await tool.execute("id", { task: "  " }, undefined, undefined, createMockContext());
+    expect(result.content[0].text).toContain("已被设置禁用");
+    expect(result.content[0].text).not.toContain("需要非空的 task");
+    expect(getSessionState().active).toBe(false);
+  });
+
+  it("D6 顺序锁定：禁用 + 活跃会话 → 仍返回设置禁用文案（策略先于重入检查，会话不受扰动）", async () => {
+    startSession({ name: "user-team", description: "", members: [] }, { origin: "user" });
+    const pi = createMockExtensionAPI();
+    const teamCtx = createTeamContext();
+    registerStartTeamSessionTool(disabledDeps(pi, teamCtx) as any);
+    const tool = getRegisteredTool(pi, START_TEAM_SESSION_TOOL_NAME);
+
+    const result = await tool.execute("id", { task: TASK }, undefined, undefined, createMockContext());
+    expect(result.content[0].text).toContain("已被设置禁用");
+    expect(result.content[0].text).not.toContain("已有活跃团队会话");
+    // 会话不受影响：仍为原 user 会话（零副作用）
+    expect(getSessionState().active).toBe(true);
+    expect(getSessionState().teamDefinition!.name).toBe("user-team");
+    expect(getSessionState().origin).toBe("user");
+  });
+
+  it("stop_team_session 不受开关影响（与开关正交）", async () => {
+    const pi = createMockExtensionAPI();
+    const teamCtx = createTeamContext();
+    registerStopTeamSessionTool(disabledDeps(pi, teamCtx) as any);
+    const tool = getRegisteredTool(pi, STOP_TEAM_SESSION_TOOL_NAME);
+
+    const result = await tool.execute("id", {}, undefined, undefined, createMockContext());
+    expect(result.content[0].text).toContain("无活跃团队会话");
   });
 });

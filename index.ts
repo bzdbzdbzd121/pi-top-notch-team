@@ -343,7 +343,9 @@ export default function (pi: ExtensionAPI) {
   // autonomously enter a team session. stop_team_session stays session-scoped
   // (registered via ensureSessionToolsRegistered, activated only in
   // agent-initiated sessions — see session-tool-visibility.ts).
-  registerStartTeamSessionTool({ pi, teamCtx });
+  // 阶段② L2 execute 门控：注入 getSettings（per-call 动态读，late-evaluation
+  // 纪律——不缓存）；禁用态 execute 首步拒绝且零副作用（agent-session-tools.ts）。
+  registerStartTeamSessionTool({ pi, teamCtx, getSettings: () => getEffectiveSettings() });
 
   // TL tools (start_member … wait_and_get_member_status) are registered only
   // when a session starts. The deps are captured here (module scope) and passed
