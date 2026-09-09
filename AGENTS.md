@@ -379,7 +379,7 @@ src/
     - **UI（阶段④）**：`/team setting` 顶层「Agent 自主团队会话（当前：…）」插在成员互发消息之后 + 标量两段式子菜单（● 标记当前值），经 `persistFor` 作用域分流（临时字段级 pin / 全局 settings.yaml，决策 #40 机制）；⑦ 清除全部经通用机制覆盖该键。
     - **语义边界**：仅影响启动相——运行中的 agent 会话不终止（E4）、`stop_team_session` 不受影响（收尾是安全方向，正交）、`/team resume` 不受影响（E5）、prose 建议不受拦截（agent 可建议用户手动入口）；成员进程结构性无关（TEAM_ROLE 早退，零改动）；白名单正交（start_team_session 在白名单中的存在意义是活跃会话内重入友好错误）；禁用态 LLM 幻觉调用非活跃工具 → pi 短路报晦涩 Tool not found——接受为已知残差（F2 消除诱导源后概率进一步下降）。
     - **红线与演进空间**：开关逻辑绝不进入共享 `bootstrapDynamicSession`/`startSession` 无差别拦截（守护测试锁定：禁用态 /team dynamic 正常开会 + 对照组 L2 仍拒绝）——两者同时服务用户路径与 agent 路径；bootstrap 第三层加固（origin==="agent" 分支内检查）不做（YAGNI，假想调用方 + 塞检查进共享 bootstrap 的失败模式恰是红线防的事故类别），概念留档「gate 跟随 origin 而非调用方」（DESIGN.md §29.6），未来出现第三个 agent-origin 调用方时再评估；三态 confirm 演进空间以注释/ADR 留档（真到三态时新增键 + 迁移，waitTimeoutMinutes 先例）。
-    - **测试**：新增 38 例（resolver 8 + settings 5 + 快照 3 + L2 6 + L1 7 + 红线守护 1 + 菜单 8，TDD 先红后绿）；文档记录见 DESIGN.md §29。
+    - **测试**：新增 39 例（resolver 8 + settings 5 + 快照 3 + L2 7 + L1 7 + 红线守护 1 + 菜单 8，TDD 先红后绿）；文档记录见 DESIGN.md §29。
 
 ## Dependency Injection Pattern
 

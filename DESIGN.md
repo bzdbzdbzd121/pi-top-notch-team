@@ -2103,7 +2103,7 @@ export function loadEffectiveSettings(rootDir: string): TeamSettings {
 - `SessionToolVisibilityDeps` 新增 `startTeamSessionVisible?: boolean`（D8 裁决：具体入参非泛型——无第二个 policy-gated 工具时泛型是负资产，YAGNI 一致性；缺省/undefined/true = 可见 fail-open）。index.ts 调用点传 `resolveAgentSessionAllowed(getEffectiveSettings())`（before_agent_start 每回合实时求值，字面 boolean）。
 - **D3 统一不变式**：可见性 ⇔ 开关值、与会话状态无关——
   - disabled ⇒ 两个分支（session-active / no-session）结束时该工具均不在 activeTools（发现即移除，与 SESSION_TOOL_NAMES leaked 处理同路；陈旧列表重注入 → 下回合边界再移除）；
-  - enabled（true/undefined）⇒ 结束时在 activeTools（E8：disabled→enabled 往返后补回，**无会话分支同样补回**——「禁用→启用往返下一回合边界即恢复」承诺的结构前提；既有 13 例测试按统一契约更新而非破坏覆盖）。
+  - enabled（true/undefined）⇒ 结束时在 activeTools（E8：disabled→enabled 往返后补回，**无会话分支同样补回**——「禁用→启用往返下一回合边界即恢复」承诺的结构前提；既有 12 例测试按统一契约更新而非破坏覆盖：9 例标题随契约更新 + 3 例仅改断言）。
 - **实现约束**：补回/移除只经 setActiveTools，**registerTools 永不为它触发**——该工具是加载时注册的既成事实（F1），注册缺失属加载层缺陷，静默补注册会掩盖问题（未注册场景仅名单进入活跃列表，pi setActiveTools 对未知名 no-op；与 session tools 的 required→registerTools 逻辑隔离）。`changed` 标志正确反映实际变更，正确状态幂等 no-op。
 - **E9 已知窗口**（记录，无需代码）：进程启动时已禁用 → 加载期 registerTool 自动激活 → 首个 before_agent_start 之前工具短暂 active。实际暴露面为零（首回合前 LLM 无调用机会、回合边界即纠正），L2 兜底使其结构性无害。写入模块注释与测试注释。
 - **已知残差**：禁用期间 LLM 幻觉调用非活跃工具 → pi agent-loop 短路报晦涩 `Tool not found`（决策 #24 记录的行为）——低概率、无害、到达不了 execute；F2 消除诱导源后概率进一步下降。接受。
@@ -2137,6 +2137,6 @@ export function loadEffectiveSettings(rootDir: string): TeamSettings {
 - **bootstrap 第三层加固不做**（D4 裁决，2:1）：agent 可达路径已被 L1+L2 闭合；第三层防的「第三个 agent-origin 调用方」（MCP 暴露等）是假想场景（YAGNI）；向共享 bootstrap 塞设置检查的失败模式（origin 守卫写错 → 误伤 /team dynamic）恰是红线要防的事故类别。**概念留档**：gate 跟随 **origin** 而非调用方——若未来出现第三个 agent-origin 调用方，在其调用点套用 `resolveAgentSessionAllowed` 检查（概念自洽：origin==="agent" 分支内检查），并重估守护测试面。
 - **未采纳留档**：三态 confirm 模式（用户裁决二元范围；confirm 有阻塞等待语义 + RPC 无 UI 降级路径）——演进空间：真到三态时新增键 + 迁移（waitTimeoutMinutes 先例），boolean 命名不焊死语义；方案 A/E（加载时条件注册/注册点读设置）被 pi 无 unregisterTool API + late-evaluation 纪律双重否决（「关了再开」需重启违反即时生效）；方案 H（纯提示词抑制）被决策 #17 自身教训否决。
 
-### 29.7 测试面（38 新例，TDD 先红后绿）
+### 29.7 测试面（39 新例，TDD 先红后绿）
 
-resolver 矩阵 8（undefined/true/false/getter 异常/null·undefined settings + describe 三态）+ settings 解析矩阵 5（DEFAULT 锁定/往返/非法值丢弃/warn-once per 文件路径/resolver 联动）+ 快照 3（S3 往返/非 boolean 丢弃/仅非法值 load false）+ L2 门控 6（禁用拒绝零副作用/启用回归/未注入放行/闭包抛错放行/D6 顺序×2/stop 正交）+ L1 门控 7（两分支移除/E8 补回×2/registerTools 隔离/未注册场景/幂等三态/user 会话双 forbidden）+ 红线守护 1 + 菜单 8。既有 session-tool-visibility 13 例按统一契约更新。
+resolver 矩阵 8（undefined/true/false/getter 异常/null·undefined settings + describe 三态）+ settings 解析矩阵 5（DEFAULT 锁定/往返/非法值丢弃/warn-once per 文件路径/resolver 联动）+ 快照 3（S3 往返/非 boolean 丢弃/仅非法值 load false）+ L2 门控 7（禁用拒绝零副作用/启用回归/未注入放行/闭包抛错放行/D6 顺序×2/stop 正交）+ L1 门控 7（两分支移除/E8 补回×2/registerTools 隔离/未注册场景/幂等三态/user 会话双 forbidden）+ 红线守护 1 + 菜单 8。既有 session-tool-visibility 12 例按统一契约更新（9 例标题随契约更新 + 3 例仅改断言；总数 14→21 与 +7 新例吻合）。
