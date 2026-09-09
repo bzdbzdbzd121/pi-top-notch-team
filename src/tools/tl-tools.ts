@@ -29,10 +29,25 @@ import { spawn } from "node:child_process";
  */
 function tempSourceAnnotation(): string {
   const overlay = getSessionSettings();
-  if (overlay.memberModel === undefined && overlay.memberThinkingLevel === undefined) {
+  if (
+    overlay.memberModel === undefined &&
+    overlay.memberThinkingLevel === undefined &&
+    // P3：互发策略也影响 spawn（TEAM_PEER_MESSAGING env 快照）——包含在此来源标注内
+    overlay.allowPeerMessaging === undefined
+  ) {
     return "";
   }
   return isSnapshotRestored() ? "（设置来源：恢复自团队会话）" : "（设置来源：临时）";
+}
+
+/**
+ * start_member 结果「成员间互发」附注（P3，两态）：仅禁止态附注（快照语义：
+ * 仅影响之后启动的成员）；allowed 态不附注（避免噪音，方案明确）。
+ */
+export function describePeerMessagingSpawnAnnotation(
+  peerMessaging: string | undefined
+): string {
+  return peerMessaging === "tl-only" ? "；成员间互发：禁用（只能回复 TL）" : "";
 }
 
 /**
@@ -216,6 +231,10 @@ export function registerTlTools(deps: TlToolsDeps): void {
           deps.getTlThinkingLevel?.(),
           config.thinking
         );
+        // P3：互发策略快照附注（仅 tl-only 出现，避免噪音）
+        const peerNote = describePeerMessagingSpawnAnnotation(
+          (config as { peerMessaging?: string }).peerMessaging
+        );
         return {
           details: {},
           content: [
@@ -223,7 +242,7 @@ export function registerTlTools(deps: TlToolsDeps): void {
               type: "text" as const,
               text:
                 `成员 "${params.name}" 已启动 (PID: ${handle.getState().pid})。` +
-                `模型：${config.model ?? "默认"}；${thinkingNote}。` +
+                `模型：${config.model ?? "默认"}；${thinkingNote}${peerNote}。` +
                 `${tempSourceAnnotation()}使用 list_members 查看状态，通过消息通道分配任务。`,
             },
           ],

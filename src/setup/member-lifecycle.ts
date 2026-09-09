@@ -14,6 +14,7 @@ import { getRootDir } from "../config";
 import { loadEffectiveSettings } from "../settings/session-settings";
 import { resolveMemberThinking, isMemberThinkingLevel } from "../settings/resolve-thinking";
 import { resolveMemberModel } from "../settings/resolve-model";
+import { resolvePeerMessaging } from "../settings/resolve-peer-messaging";
 import { createMemberEventHandler } from "../channel/event-handler";
 import type { AutoCompactRuntime } from "../channel/auto-compact";
 import type { MessageCoalescer } from "../channel/message-coalescer";
@@ -190,6 +191,9 @@ export function buildMemberConfig(
       new URL("../../member.ts", import.meta.url)
     ),
     cwd: process.cwd(),
+    // P3 成员体验层：互发策略 spawn 快照（仅禁止态写入，allowed 恒不设字段——
+    // 与 model/thinking 先例同构；member.ts/member-process 侧同异缺省 allowed）。
+    ...(resolvePeerMessaging(settings) === "tl-only" ? { peerMessaging: "tl-only" } : {}),
     // Resume whenever this member already has persisted session files — covers
     // /team resume, TL-process restarts, and intentional stop/start cycles.
     // A fresh sessionId dir has no files and starts clean.

@@ -347,4 +347,199 @@ describe("member.ts — team member extension", () => {
       expect(result.content[0].text).toContain("Invalid target");
     });
   });
+
+  // ── P3 成员体验层：peer messaging 两态（矩阵 + 红线 8 golden）─────────
+
+  /**
+   * member.ts 旧内联模板的逐字复制品（红线 8 golden 窗口）： qualsiasi 重构后
+   * allowed 态（缺省，无 TEAM_PEER_MESSAGING env）的 extraPrompt 必须与此函数
+   * 输出逐字节一致。复制品与 member.ts 重构前源码同步，一字符之差即红。
+   */
+  function legacyExtraPrompt(
+    teamName: string,
+    roleLabel: string,
+    role: string,
+    memberDescription: string,
+    memberList: string
+  ): string {
+    return `
+## 当前角色
+
+你是团队 **${teamName}** 的 **${roleLabel}**（${role}）。
+
+${memberDescription ? `职责：${memberDescription}\n` : ""}
+${memberList ? `团队其他成员：${memberList}\n` : ""}
+
+### 协作规则
+- 使用 \`team_send_message\` 工具与其他成员或 Team Lead 交流
+- Team Lead 会通过消息通道给你分配任务
+- **‼️ 强制规则：每次任务完成后必须且只能使用 \`team_send_message(to="tl", content="...")\` 向 TL 报告处理结果。** 在最终回复之前，可以通过 \`team_send_message\` 发送中间进展、问题或请求帮助。但任务最终完成后，**必须发送一条最终回复给 TL**，包含任务结果、产出文件路径或遇到的问题。
+- ⚠️ **不要忽略这条规则**——如果任务完成而不回复 TL，TL 将无法知晓你的工作进展，整个流程会阻塞。
+- **输出报告、方案、设计文档时，写入文件**（放在项目目录下），然后在消息中告知其他成员文件路径。不要将大量内容直接嵌入消息通道。
+- 如果收到的消息中包含 \`<corr:...>\` 标签，在回复 Team Lead 时请将完整的标签一并附上
+- 如果 Team Lead 通知 Shared Context 已更新，请仔细阅读
+- 发现问题可以先通过消息通道与相关成员讨论
+- 重大变更需先向 Team Lead 汇报
+
+### 沟通风格
+- **简洁精炼**：剔除客套话、语气词、多余铺垫与模棱两可的表述
+- **保持完整句式与语法**，专业术语、代码内容、报错信息原样不变
+- **只输出核心内容**，全程保持精简风格，不添加冗余文字
+`;
+  }
+
+  describe("peer messaging two-state (P3)", () => {
+    it("红线 8 golden：allowed 缺省态系统提示词与旧内联模板逐字节一致（有职责+有名单）", async () => {
+      process.env.TEAM_ROLE = "worker";
+      process.env.TEAM_ROLE_LABEL = "编码员";
+      process.env.TEAM_NAME = "test-team";
+      process.env.TEAM_MEMBERS = JSON.stringify(["analyzer", "reviewer"]);
+      process.env.TEAM_MEMBER_DESCRIPTION = "你负责写代码";
+
+      const api = createMockApi();
+      const mod = await import("./member");
+      mod.default(api);
+      const handler = (api.on as ReturnType<typeof vi.fn>).mock.calls.find(
+        (c: any[]) => c[0] === "before_agent_start"
+      )?.[1];
+
+      const result = await handler({ systemPrompt: "原始提示词" }, {});
+      expect(result.systemPrompt).toBe(
+        "原始提示词" +
+          legacyExtraPrompt("test-team", "编码员", "worker", "你负责写代码", "analyzer、reviewer")
+      );
+    });
+
+    it("红线 8 golden 变体：无职责+空名单的 allowed 态拼接与旧模板逐字节一致", async () => {
+      process.env.TEAM_ROLE = "worker";
+      process.env.TEAM_NAME = "test-team";
+      process.env.TEAM_MEMBERS = JSON.stringify([]);
+
+      const api = createMockApi();
+      const mod = await import("./member");
+      mod.default(api);
+      const handler = (api.on as ReturnType<typeof vi.fn>).mock.calls.find(
+        (c: any[]) => c[0] === "before_agent_start"
+      )?.[1];
+
+      const result = await handler({ systemPrompt: "" }, {});
+      expect(result.systemPrompt).toBe(legacyExtraPrompt("test-team", "worker", "worker", "", ""));
+    });
+
+    it("allowed 显式 env（TEAM_PEER_MESSAGING=allowed）与缺省输出逐字节一致（两态矩阵）", async () => {
+      process.env.TEAM_ROLE = "worker";
+      process.env.TEAM_ROLE_LABEL = "编码员";
+      process.env.TEAM_NAME = "test-team";
+      process.env.TEAM_MEMBERS = JSON.stringify(["analyzer", "reviewer"]);
+      process.env.TEAM_MEMBER_DESCRIPTION = "你负责写代码";
+      process.env.TEAM_PEER_MESSAGING = "allowed";
+
+      const api = createMockApi();
+      const mod = await import("./member");
+      mod.default(api);
+      const handler = (api.on as ReturnType<typeof vi.fn>).mock.calls.find(
+        (c: any[]) => c[0] === "before_agent_start"
+      )?.[1];
+      const result = await handler({ systemPrompt: "原始提示词" }, {});
+      expect(result.systemPrompt).toBe(
+        "原始提示词" +
+          legacyExtraPrompt("test-team", "编码员", "worker", "你负责写代码", "analyzer、reviewer")
+      );
+    });
+
+    it("非法 env 值 fail-open 视为 allowed（与缺省一致；仅 tl-only 收缩）", async () => {
+      process.env.TEAM_ROLE = "worker";
+      process.env.TEAM_NAME = "test-team";
+      process.env.TEAM_MEMBERS = JSON.stringify(["analyzer"]);
+      process.env.TEAM_PEER_MESSAGING = "tlo"; // 非法值 → allowed
+
+      const api = createMockApi();
+      const mod = await import("./member");
+      mod.default(api);
+      const toolDef = (api.registerTool as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      // to=成员 照常合法（validTargets 未收缩）
+      const result = await toolDef.execute("pm-1", { to: "analyzer", content: "hi" });
+      expect(result.details.teamMessage.to).toBe("analyzer");
+    });
+
+    it("tl-only 工具面：description 两态 + to 参数 description 不列成员名与 all（schema 即提示词面）", async () => {
+      process.env.TEAM_ROLE = "worker";
+      process.env.TEAM_NAME = "test-team";
+      process.env.TEAM_MEMBERS = JSON.stringify(["analyzer", "reviewer"]);
+      process.env.TEAM_PEER_MESSAGING = "tl-only";
+
+      const api = createMockApi();
+      const mod = await import("./member");
+      mod.default(api);
+      const toolDef = (api.registerTool as ReturnType<typeof vi.fn>).mock.calls[0][0];
+      expect(toolDef.description).toBe(
+        "Send a message to the Team Lead. Member-to-member messaging is disabled."
+      );
+      expect(toolDef.parameters.properties.to.description).toBe(
+        `Target: "tl" for the Team Lead`
+      );
+      expect(toolDef.parameters.properties.to.description).not.toContain("analyzer");
+      expect(toolDef.parameters.properties.to.description).not.toContain("all");
+    });
+
+    it("tl-only validTargets：to=成员 与 to=all 被拒（可行动指引，无 teamMessage）；to=tl 仍正常", async () => {
+      process.env.TEAM_ROLE = "worker";
+      process.env.TEAM_NAME = "test-team";
+      process.env.TEAM_MEMBERS = JSON.stringify(["analyzer", "reviewer"]);
+      process.env.TEAM_PEER_MESSAGING = "tl-only";
+
+      const api = createMockApi();
+      const mod = await import("./member");
+      mod.default(api);
+      const toolDef = (api.registerTool as ReturnType<typeof vi.fn>).mock.calls[0][0];
+
+      const blockedMember = await toolDef.execute("pm-2", { to: "analyzer", content: "hi" });
+      expect(blockedMember.content[0].text).toContain("成员互发已禁用，只能发送给");
+      expect(blockedMember.content[0].text).toContain("回复 TL");
+      expect(blockedMember.details).toEqual({});
+
+      const blockedAll = await toolDef.execute("pm-3", { to: "all", content: "hi" });
+      expect(blockedAll.content[0].text).toContain("成员互发已禁用");
+      expect(blockedAll.details).toEqual({});
+
+      const okTl = await toolDef.execute("pm-4", { to: "tl", content: "报告" });
+      expect(okTl.details.teamMessage.to).toBe("tl");
+    });
+
+    it("tl-only 提示词：删名单行（防凭空构造成员名）、交流行换仅 TL 语义、删讨论行、强制规则不变", async () => {
+      process.env.TEAM_ROLE = "worker";
+      process.env.TEAM_ROLE_LABEL = "编码员";
+      process.env.TEAM_NAME = "test-team";
+      process.env.TEAM_MEMBERS = JSON.stringify(["analyzer", "reviewer"]);
+      process.env.TEAM_MEMBER_DESCRIPTION = "你负责写代码";
+      process.env.TEAM_PEER_MESSAGING = "tl-only";
+
+      const api = createMockApi();
+      const mod = await import("./member");
+      mod.default(api);
+      const handler = (api.on as ReturnType<typeof vi.fn>).mock.calls.find(
+        (c: any[]) => c[0] === "before_agent_start"
+      )?.[1];
+
+      const result = await handler({ systemPrompt: "原始提示词" }, {});
+      const sp: string = result.systemPrompt;
+      expect(sp).toContain("原始提示词");
+      // D7：名单行删除（不展示名册 → 不引导成员构造成员名）；成员名不应出现在提示词
+      expect(sp).not.toContain("团队其他成员：");
+      expect(sp).not.toContain("analyzer");
+      expect(sp).not.toContain("reviewer");
+      // 交流行替换（唯一交流渠道语义）
+      expect(sp).toContain("只能与 Team Lead 交流（成员间互发已禁用；与其他成员协作须经 TL 中转）");
+      expect(sp).not.toContain("使用 `team_send_message` 工具与其他成员或 Team Lead 交流");
+      // 讨论行删除
+      expect(sp).not.toContain("发现问题可以先通过消息通道与相关成员讨论");
+      // 强制规则（两态不变）与 corr/汇报/输出报告行保留
+      expect(sp).toContain("**‼️ 强制规则：");
+      expect(sp).toContain("`<corr:...>`");
+      expect(sp).toContain("**输出报告、方案、设计文档时，写入文件**");
+      expect(sp).toContain("重大变更需先向 Team Lead 汇报");
+      // 允许态才有的沟通骨架与上下文路径行仍在
+      expect(sp).toContain("### 沟通风格");
+    });
+  });
 });

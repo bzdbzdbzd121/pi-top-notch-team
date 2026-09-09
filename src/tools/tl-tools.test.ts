@@ -246,6 +246,59 @@ describe("registerTlTools", () => {
     expect(text).not.toContain("已显式指定");
   });
 
+  it("P3 start_member 附注：tl-only config → 「成员间互发：禁用（只能回复 TL）」；allowed/缺省 → 不附注（避免噪音）", async () => {
+    resetSessionSettingsState();
+    openStartMemberGate();
+
+    const makeConfig = (peerMessaging?: string) => ({
+      name: "analyzer",
+      role: "analyzer",
+      teamName: "test",
+      ...(peerMessaging ? { peerMessaging } : {}),
+    });
+    let executeFn: Function = () => {};
+    let capturedBuildConfig: any;
+    pi.registerTool = vi.fn((def: any) => {
+      if (def.name === "start_member") executeFn = def.execute;
+    });
+    callRegisterTlTools({
+      createMember: vi.fn().mockReturnValue({
+        name: "analyzer",
+        start: vi.fn().mockResolvedValue(undefined),
+        getState: vi.fn().mockReturnValue({ name: "analyzer", pid: 12345, status: "running" }),
+        stop: vi.fn(),
+        onEvent: vi.fn(),
+        sendCommand: vi.fn(),
+        sendCommandAndWait: vi.fn(),
+      }),
+      buildMemberConfig: capturedBuildConfig = vi.fn(),
+    });
+
+    // tl-only：附注出现（注意分号前导，与思考强度同列）
+    capturedBuildConfig.mockReturnValue(makeConfig("tl-only"));
+    const blocked = await executeFn("call-1", { name: "analyzer" });
+    expect(blocked.content[0].text).toContain("成员间互发：禁用（只能回复 TL）");
+
+    // allowed：同一位置零附注
+    capturedBuildConfig.mockReturnValue(makeConfig("allowed"));
+    const allowed = await executeFn("call-2", { name: "analyzer" });
+    expect(allowed.content[0].text).not.toContain("成员间互发");
+
+    // 缺省 config（无 peerMessaging 字段）：零附注（既有用例形态不受影响）
+    capturedBuildConfig.mockReturnValue(makeConfig(undefined));
+    const unset = await executeFn("call-3", { name: "analyzer" });
+    expect(unset.content[0].text).not.toContain("成员间互发");
+  });
+
+  it("P3 start_member 附注：overlay 含 allowPeerMessaging → （设置来源：临时）计入来源标注", async () => {
+    resetSessionSettingsState();
+    const { setSessionSetting } = await import("../settings/session-settings");
+    setSessionSetting("allowPeerMessaging", false);
+    openStartMemberGate();
+    const result = await executeStartMember();
+    expect(result.content[0].text).toContain("（设置来源：临时）");
+  });
+
   it("start_member 结果显示实际解析出的模型与思考强度（不受设置来源影响）", async () => {
     resetSessionSettingsState();
     openStartMemberGate();

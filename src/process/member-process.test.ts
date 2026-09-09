@@ -494,4 +494,35 @@ describe("createMemberProcess", () => {
       expect(member.getState().status).toBe("running");
     });
   });
+
+  describe("peerMessaging env（P3 成员体验层）", () => {
+    it("config.peerMessaging=tl-only → spawn env.TEAM_PEER_MESSAGING=tl-only", async () => {
+      const { process: mockProcess, stdout } = createMockSpawn();
+      const spawnMock = vi.fn().mockReturnValue(mockProcess);
+
+      const member = createMemberProcess(
+        { ...defaultConfig, peerMessaging: "tl-only" },
+        spawnMock
+      );
+      const startPromise = member.start();
+      emitReadyStdout(stdout);
+      await startPromise;
+
+      const env = spawnMock.mock.calls[0][2].env;
+      expect(env.TEAM_PEER_MESSAGING).toBe("tl-only");
+    });
+
+    it("config.peerMessaging 缺省 → env.TEAM_PEER_MESSAGING=allowed（member.ts 缺省语义同构）", async () => {
+      const { process: mockProcess, stdout } = createMockSpawn();
+      const spawnMock = vi.fn().mockReturnValue(mockProcess);
+
+      const member = createMemberProcess(defaultConfig, spawnMock);
+      const startPromise = member.start();
+      emitReadyStdout(stdout);
+      await startPromise;
+
+      const env = spawnMock.mock.calls[0][2].env;
+      expect(env.TEAM_PEER_MESSAGING).toBe("allowed");
+    });
+  });
 });

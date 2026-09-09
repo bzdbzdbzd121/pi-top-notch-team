@@ -6,6 +6,7 @@ import type { MemberProcessHandle, MemberProcessConfig } from "../process/member
 import type { MemberOperationalState } from "../session/context";
 import type { TeamSessionState } from "../session/state";
 import type { TeamDefinition } from "../team/definition";
+import { DEFAULT_SETTINGS } from "../settings/settings";
 
 // ── Mock the modules that member-lifecycle imports ──────────
 
@@ -101,6 +102,25 @@ describe("buildMemberConfig", () => {
     const { buildMemberConfig } = await loadModule();
     const result = buildMemberConfig("nonexistent", session);
     expect(result).toBeNull();
+  });
+
+  it("P3：settings.allowPeerMessaging=false → config.peerMessaging=\"tl-only\"并传给 spawn 配置", async () => {
+    const { buildMemberConfig } = await loadModule();
+    const result = buildMemberConfig("worker", session, {
+      settings: { ...structuredClone(DEFAULT_SETTINGS), allowPeerMessaging: false },
+    });
+    expect(result!.peerMessaging).toBe("tl-only");
+  });
+
+  it("P3：settings.allowPeerMessaging=true/缺失 → peerMessaging 字段不写入（allowed 缺省语义同构，与 model/thinking 先例一致）", async () => {
+    const { buildMemberConfig } = await loadModule();
+    const explicit = buildMemberConfig("worker", session, {
+      settings: { ...structuredClone(DEFAULT_SETTINGS), allowPeerMessaging: true },
+    });
+    expect(explicit!.peerMessaging).toBeUndefined();
+    // options.settings 缺省回退（loadEffectiveSettings 全局） → 默认允许
+    const fallback = buildMemberConfig("worker", session);
+    expect(fallback!.peerMessaging).toBeUndefined();
   });
 
   it("should return a valid MemberProcessConfig for a valid member", async () => {

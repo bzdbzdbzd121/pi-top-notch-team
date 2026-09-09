@@ -50,6 +50,12 @@ export interface MemberProcessConfig {
   /** Override the pi command path (for testing or custom installs). */
   piCommand?: string;
   /**
+   * Peer-messaging policy snapshot (P3 member experience layer): "tl-only" narrows the member-side send surface
+   * (validTargets, tool descriptions, prompts). Only the blocked state is written; allowed is never set
+   * (same structure as the model/thinking precedent), and member-process uses "allowed" as the default env value.
+   */
+  peerMessaging?: string;
+  /**
    * Resume the member's previous pi session (`--continue`) instead of starting
    * fresh. Used by /team resume and by crash auto-restart so member context
    * survives process death. Only honored when persisted session files exist.
@@ -102,6 +108,9 @@ export function createMemberProcess(
     thinking,
     piCommand = "pi",
   } = config;
+
+  // P3 member experience layer: peer-messaging policy env snapshot (default allowed; member.ts side has the same default semantics)
+  const peerMessaging = config.peerMessaging;
 
   let child: ChildProcess | null = null;
   let status: MemberStatus = "stopped";
@@ -293,6 +302,8 @@ export function createMemberProcess(
         TEAM_NAME: teamName,
         TEAM_MEMBERS: JSON.stringify(teamMembers),
         TEAM_MEMBER_DESCRIPTION: memberDescription,
+        // P3: peer-messaging policy snapshot (allowed | tl-only; plan literal peerMessaging ?? "allowed")
+        TEAM_PEER_MESSAGING: peerMessaging ?? "allowed",
       };
 
       if (sharedContextPath) {

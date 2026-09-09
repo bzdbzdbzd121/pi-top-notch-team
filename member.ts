@@ -1,4 +1,11 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { PeerMessagingMode } from "./src/settings/resolve-peer-messaging";
+import {
+  buildMemberCollabRules,
+  buildSendToolDescription,
+  buildToParamDescription,
+  buildInvalidTargetText,
+} from "./src/prompts/member-collab-rules";
 
 export default function (pi: ExtensionAPI) {
   const role = process.env.TEAM_ROLE;
@@ -23,22 +30,28 @@ export default function (pi: ExtensionAPI) {
       memberNames = teamMembers.split(",");
     }
   }
-  const validTargets = new Set(["tl", "all", ...memberNames]);
+  // P3 成员体验层：互发策略 spawn 快照（TEAM_PEER_MESSAGING env；缺省 "allowed"）。
+  // 仅严格 "tl-only" 收缩面（非法值 fail-open 视为 allowed，与设置层缺省语义同构）。
+  const peerMessaging: PeerMessagingMode =
+    process.env.TEAM_PEER_MESSAGING === "tl-only" ? "tl-only" : "allowed";
+  const validTargets =
+    peerMessaging === "tl-only" ? new Set(["tl"]) : new Set(["tl", "all", ...memberNames]);
   const memberList = memberNames.join("、");
+  // 协作规则段两态（单一事实来源：src/prompts/member-collab-rules.ts，D4 防漂移）
+  const rulesBlock = buildMemberCollabRules(peerMessaging).join("\n");
 
   // ── team_send_message tool ───────────────────────────────
   pi.registerTool({
     name: "team_send_message",
     label: "Team Send Message",
-    description:
-      "Send a message to another team member or the Team Lead via the real-time message channel. " +
-      "Use this to share findings, ask for help, or report progress.",
+    description: buildSendToolDescription(peerMessaging),
     parameters: {
       type: "object",
       properties: {
         to: {
           type: "string",
-          description: `Target: one of ${teamMembers}, or "tl" for the Team Lead, or "all"`,
+          // 传入原始 env 串（现状插值语义：未设置时描述中保留 "undefined" 字样，逐字不变）
+          description: buildToParamDescription(peerMessaging, teamMembers as string),
         },
         subject: {
           type: "string",
@@ -66,7 +79,7 @@ export default function (pi: ExtensionAPI) {
           content: [
             {
               type: "text" as const,
-              text: `Invalid target: ${to}. Valid members: ${memberNames.join(", ")}`,
+              text: buildInvalidTargetText(to, peerMessaging, memberNames),
             },
           ],
           details: {},
@@ -98,6 +111,9 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ── Inject team awareness into system prompt ─────────────
+  // P3 两态：名册行仅 allowed 态注入（tl-only 删除，防凭空构造成员名，D7）；
+  // 协作规则段由 member-collab-rules.ts 两态输出插值；模板骨架逐字保留
+  // （红线 8：allowed 态输出与旧内联模板逐字节一致，golden 测试锁定）。
   pi.on("before_agent_start", async (event, _ctx) => {
     let extraPrompt = `
 ## 当前角色
@@ -105,18 +121,10 @@ export default function (pi: ExtensionAPI) {
 你是团队 **${teamName}** 的 **${roleLabel}**（${role}）。
 
 ${memberDescription ? `职责：${memberDescription}\n` : ""}
-${memberList ? `团队其他成员：${memberList}\n` : ""}
+${peerMessaging === "tl-only" ? "" : memberList ? `团队其他成员：${memberList}\n` : ""}
 
 ### 协作规则
-- 使用 \`team_send_message\` 工具与其他成员或 Team Lead 交流
-- Team Lead 会通过消息通道给你分配任务
-- **‼️ 强制规则：每次任务完成后必须且只能使用 \`team_send_message(to="tl", content="...")\` 向 TL 报告处理结果。** 在最终回复之前，可以通过 \`team_send_message\` 发送中间进展、问题或请求帮助。但任务最终完成后，**必须发送一条最终回复给 TL**，包含任务结果、产出文件路径或遇到的问题。
-- ⚠️ **不要忽略这条规则**——如果任务完成而不回复 TL，TL 将无法知晓你的工作进展，整个流程会阻塞。
-- **输出报告、方案、设计文档时，写入文件**（放在项目目录下），然后在消息中告知其他成员文件路径。不要将大量内容直接嵌入消息通道。
-- 如果收到的消息中包含 \`<corr:...>\` 标签，在回复 Team Lead 时请将完整的标签一并附上
-- 如果 Team Lead 通知 Shared Context 已更新，请仔细阅读
-- 发现问题可以先通过消息通道与相关成员讨论
-- 重大变更需先向 Team Lead 汇报
+${rulesBlock}
 
 ### 沟通风格
 - **简洁精炼**：剔除客套话、语气词、多余铺垫与模棱两可的表述
