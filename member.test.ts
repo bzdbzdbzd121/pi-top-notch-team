@@ -43,14 +43,27 @@ describe("member.ts — team member extension", () => {
   beforeEach(() => {
     vi.resetModules();
     vi.restoreAllMocks();
-    // Reset env to known state
-    process.env = { ...ORIGINAL_ENV };
-    delete process.env.TEAM_ROLE;
-    delete process.env.TEAM_NAME;
-    delete process.env.TEAM_MEMBERS;
-    delete process.env.TEAM_MEMBER_DESCRIPTION;
-    delete process.env.TEAM_ROLE_LABEL;
-    delete process.env.TEAM_SHARED_CONTEXT_PATH;
+    // Reset env to a known state, then strip ALL inherited TEAM_* variables.
+    // Ambient hosts (member processes of a tl-only team) carry spawn-snapshot
+    // env (决策 #41 P3); the member-side test contract is "each test sets the
+    // env it needs" — inherited TEAM_* values have no legitimate use here.
+    // Prefix stripping is list-free: a new TEAM_* key can never be missed
+    // again (the P3 incident root cause). Note: TOP_NOTCH_TEAM_ROOT does NOT
+    // match the TEAM_ prefix (config.ts rootDir override unaffected).
+    // 长期约束：未来若引入语义上不应被剥离的 TEAM_* 前缀键须人工核对。
+    process.env = Object.fromEntries(
+      Object.entries(ORIGINAL_ENV).filter(([k]) => !k.startsWith("TEAM_"))
+    );
+  });
+
+  it("env hygiene: beforeEach strips all inherited TEAM_* variables", () => {
+    // 防退化锁定（决策 #41 P3 事故回归）：beforeEach 的 env 卫生必须是 TEAM_ 前缀
+    // 剥离（无清单形态）。若未来有人改回列表式清单且漏新增键，本用例在携带该键
+    // 的宿主环境（如 tl-only 团队成员进程的 spawn 快照）中变红。
+    // 时序：断言的正是 beforeEach 本身的卫生效果——置于用例体 set 任何键之前。
+    // 注：TOP_NOTCH_TEAM_ROOT 不匹配 TEAM_ 前缀，config.ts rootDir 覆盖不受误伤。
+    const leaked = Object.keys(process.env).filter((k) => k.startsWith("TEAM_"));
+    expect(leaked).toEqual([]);
   });
 
   it("should return early without registering tools when TEAM_ROLE is not set", async () => {
