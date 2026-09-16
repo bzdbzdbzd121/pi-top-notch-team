@@ -11,7 +11,7 @@ The primary agent that directly interacts with the user. Responsible for clarify
 _Avoid_: Main agent, primary agent, orchestrator agent
 
 **Member**:
-A background agent that executes subtasks assigned by the Team Lead. Members do not interact with the user directly. They can communicate with other members via the real-time message channel.
+A background agent that executes subtasks assigned by the Team Lead. Members do not interact with the user directly. They can communicate with other members via the real-time message channel when the Peer Messaging Policy allows it.
 _Avoid_: Worker, sub-agent, child agent, slave agent
 
 **Team Definition File**:
@@ -32,6 +32,10 @@ A set of tools that become active only during an active Team Session. The 9 sess
 **Real-time Message Channel**:
 The communication medium through which agents (Team Lead and Members) exchange information during a Team Session. Implementation is separate from the team orchestration logic.
 
+**Peer Messaging Policy** (成员互发策略):
+Controls whether Members may message each other, set via `/team setting` (`allowPeerMessaging`). `allowed` (default) keeps the fully connected topology. `tl-only` makes the router drop Member→Member and Member→`all` messages at the TL side (TL→Member dispatch is exempt) and sends the sender a redirect receipt; newly spawned Members additionally get a shrunk tool surface and prompt that only address the TL. The router decision is per-route and immediate; the Member-side snapshot is taken at spawn.
+_Avoid_: muting members, disabling the channel
+
 **Shared Context**:
 A Markdown document (`.shared-context.md`) maintained by the TL during a team session. Contains project background, goals, team member overview, terminology glossary, collaboration rules, and current progress. Created by the TL before spawning Members, and updated as needed. Members receive the Shared Context via the message channel on their first task assignment, and are notified of updates thereafter.
 _Avoid_: Mission brief, team doc, session context
@@ -51,8 +55,12 @@ _Avoid_: Workflow guide, design checklist
 A session-scoped objective set by the TL at the start of a task using the `set_goal` tool. Consists of a summary text and verifiable completion criteria. When the TL run is fully settled—after any retry, compaction, or queued continuation has finished—with an active, incomplete goal, the system submits a reminder to continue rather than asking the user for permission. `agent_end` is only an intermediate boundary and does not send the reminder. The TL calls `finish_goal` when the goal is met or an unresolvable blocker prevents completion.
 _Avoid_: Task objective, milestone, checkpoint
 
+**Temporary (Per-session) Settings** (临时设置):
+The default scope of `/team setting`: values live in an in-process overlay plus a per-team-session snapshot (`session-settings.yaml`), never in the global `settings.yaml`. They apply to the current pi session only and are restored when that team session is resumed via `/team resume`; the **Global** scope writes `settings.yaml` instead. Fields pinned temporarily are marked `[临时]`, and one menu action clears the whole overlay.
+_Avoid_: editing settings.yaml by hand, global settings
+
 **Auto-Compaction** (自动压缩):
-A dispatch-time mechanism: when a Member is idle and about to receive a new prompt via the Real-time Message Channel, the TL first checks the Member's context usage (`get_session_stats`). If usage exceeds the configured **Compaction Threshold**, the Member is compacted (`compact` RPC) before the prompt is delivered. Configured globally via `/team setting` (toggle + optional percent and/or absolute-token thresholds — either one triggers; compaction wait timeout in minutes). Success is silent; the TL is only notified when a configured compaction did not happen (compaction failure/timeout, or stats query failure — both fail open and dispatch anyway). At most one compaction per dispatch; no re-check loop afterwards. Member Inspector direct messages bypass this mechanism.
+A dispatch-time mechanism: when a Member is idle and about to receive a new prompt via the Real-time Message Channel, the TL first checks the Member's context usage (`get_session_stats`). If usage exceeds the configured **Compaction Threshold**, the Member is compacted (`compact` RPC) before the prompt is delivered. Configured via `/team setting` (temporary per-session scope by default, switchable to global): toggle + optional percent and/or absolute-token thresholds — either one triggers; compaction wait timeout in minutes. Success is silent; the TL is only notified when a configured compaction did not happen (compaction failure/timeout, or stats query failure — both fail open and dispatch anyway). At most one compaction per dispatch; no re-check loop afterwards. Member Inspector direct messages bypass this mechanism.
 _Avoid_: auto-compact (pi's own built-in per-session feature), context cleanup
 
 **Compacting** (压缩中):
@@ -67,7 +75,7 @@ _Avoid_: 监控面板, 第二终端
 A Team Session attribute (`origin: "user" | "agent"`) recording how the session was started. Determines guard strength (dispatch-policing guards AND write guards apply only to user-initiated sessions; the `.shared-context.md` → `write_shared_context` redirect applies to both) and tool visibility (`stop_team_session` is offered only in agent-initiated sessions). See ADR-0003.
 
 **Agent-initiated Team Session** (自主会话):
-A Dynamic Team Mode session started by the TL itself via the `start_team_session(task)` tool — registered at extension load time, the single deliberate exception to session-scoped tool registration. Fully autonomous: no requirements grilling, no plan confirmation gate; the TL designs, launches, coordinates, reports, and tears the session down via `stop_team_session`. Dispatch-policing guards (TL read guard, design-phase read soft limit, first-action protocol) and write guards are lifted (ADR-0003 revision) — the TL may freely read and edit files (any extension, both phases), the user cares about the result, not the process; only the `.shared-context.md` → `write_shared_context` redirect remains. The team status widget carries a persistent 🤖 origin marker.
+A Dynamic Team Mode session started by the TL itself via the `start_team_session(task)` tool — registered at extension load time, the single deliberate exception to session-scoped tool registration. Fully autonomous: no requirements grilling, no plan confirmation gate; the TL designs, launches, coordinates, reports, and tears the session down via `stop_team_session`. Dispatch-policing guards (TL read guard, design-phase read soft limit, first-action protocol) and write guards are lifted (ADR-0003 revision) — the TL may freely read and edit files (any extension, both phases), the user cares about the result, not the process; only the `.shared-context.md` → `write_shared_context` redirect remains. The team status widget carries a persistent 🤖 origin marker. Can be switched off via `/team setting` → Agent-initiated Team Sessions (`allowAgentInitiatedSessions: false`), which rejects the tool at execute time with zero side effects and removes it from `activeTools` at the next round boundary; running sessions and the manual entry points are unaffected.
 _Avoid_: sub-agent delegation, self-spawned team
 
 **User-initiated Team Session** (手动会话):
