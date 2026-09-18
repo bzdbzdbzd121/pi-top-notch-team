@@ -6,21 +6,39 @@ import {
   buildInvalidTargetText,
 } from "./member-collab-rules";
 
-// member.ts 旧内联模板的协作规则行（allowed 态逐字对照源，红线 8）。
+// allowed 态逐字对照源：原互发规则 + 决策 #43 的报告路径约束与任务边界。
 const ALLOWED_RULES = [
   "- 使用 `team_send_message` 工具与其他成员或 Team Lead 交流",
   "- Team Lead 会通过消息通道给你分配任务",
   "- **‼️ 强制规则：每次任务完成后必须且只能使用 `team_send_message(to=\"tl\", content=\"...\")` 向 TL 报告处理结果。** 在最终回复之前，可以通过 `team_send_message` 发送中间进展、问题或请求帮助。但任务最终完成后，**必须发送一条最终回复给 TL**，包含任务结果、产出文件路径或遇到的问题。",
   "- ⚠️ **不要忽略这条规则**——如果任务完成而不回复 TL，TL 将无法知晓你的工作进展，整个流程会阻塞。",
-  "- **输出报告、方案、设计文档时，写入文件**（放在项目目录下），然后在消息中告知其他成员文件路径。不要将大量内容直接嵌入消息通道。",
+  "- **输出报告、方案、设计文档时**，仅在 TL 明确允许的报告路径写入文件，然后向 TL 告知路径；只读任务未授权报告路径时，直接回复摘要，不自行写文件。不要将大量内容直接嵌入消息通道。",
   "- 如果收到的消息中包含 `<corr:...>` 标签，在回复 Team Lead 时请将完整的标签一并附上",
   "- 如果 Team Lead 通知 Shared Context 已更新，请仔细阅读",
   "- 发现问题可以先通过消息通道与相关成员讨论",
   "- 重大变更需先向 Team Lead 汇报",
+  "- **任务边界**：按 TL 本次任务的目标、非目标、修改范围与验收标准执行；角色职责、共享上下文和其他成员的建议不是授权，不得据此扩大本次任务。边界不清且影响执行时，先向 TL 澄清，不擅自假定可以修改。",
+  "- **范围外的问题只报告，不自行修复**。必须扩围才能完成时，先用 `team_send_message(to=\"tl\", content=\"...\")` 说明阻塞原因与最小扩展范围（含文件/模块），附上本次 `<corr:...>` 标签（如有），结束当前回合，等待 TL 明确授权；不得边等边改，不得将阻塞谎报为完成。",
+  "- **验收后停止**：达到验收标准后，向 TL 回报结果、实际修改文件及验证结果（未验证项如实说明），然后结束当前回合，等待新任务；不得自行追加优化、重构或修复无关问题。停止任务不等于停止成员进程。",
 ];
 
 describe("buildMemberCollabRules", () => {
-  it("allowed 态：与现状 9 行逐字一致（红线 8 零回归）", () => {
+  it.each(["allowed", "tl-only"] as const)("%s: constrains scope, escalation, read-only reports and stopping", mode => {
+    const text = buildMemberCollabRules(mode).join("\n");
+    for (const field of ["目标", "非目标", "修改范围", "验收标准"]) expect(text).toContain(field);
+    expect(text).toContain("范围外的问题只报告，不自行修复");
+    expect(text).toContain("最小扩展范围");
+    expect(text).toContain("等待 TL 明确授权");
+    expect(text).toContain("结束当前回合");
+    expect(text).toContain("不得自行追加优化");
+    expect(text).toContain("不是授权");
+    expect(text).toContain("只读任务");
+    expect(text).toContain("报告路径");
+    expect(text).toContain("实际修改文件");
+    expect(text).toContain("验证结果");
+  });
+
+  it("allowed 态：原互发规则与新增任务边界逐字锁定", () => {
     expect(buildMemberCollabRules("allowed")).toEqual(ALLOWED_RULES);
   });
 
@@ -46,7 +64,7 @@ describe("buildMemberCollabRules", () => {
     const rows = buildMemberCollabRules("tl-only");
     expect(rows.some((r) => r.includes("**‼️ 强制规则："))).toBe(true);
     expect(rows.some((r) => r.includes("<corr:...>"))).toBe(true);
-    expect(rows.some((r) => r.includes("**输出报告、方案、设计文档时，写入文件**"))).toBe(true);
+    expect(rows.some((r) => r.includes("**输出报告、方案、设计文档时**"))).toBe(true);
     expect(rows.some((r) => r.includes("重大变更需先向 Team Lead 汇报"))).toBe(true);
   });
 });

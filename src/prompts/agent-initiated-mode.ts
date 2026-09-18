@@ -1,5 +1,6 @@
 import type { TeamDefinition } from "../team/definition";
 import { GOAL_CLOSING_PROTOCOL_PROMPT } from "./goal-closing-protocol";
+import { TASK_DISPATCH_PROTOCOL_PROMPT } from "./task-dispatch-protocol";
 import { getSharedContextPath } from "../session/shared-context";
 
 /**
@@ -57,6 +58,7 @@ ${
     ? designPhasePrompt(sharedCtxPath, memberLines, team)
     : executionPhasePrompt(sharedCtxPath, memberLines, team)
 }
+${TASK_DISPATCH_PROTOCOL_PROMPT}
 `;
 }
 
@@ -117,7 +119,7 @@ function executionPhasePrompt(sharedCtxPath: string, memberLines: string, team: 
   ⚠️ .shared-context.md 必须通过 \`write_shared_context\` 写入（该工具会记录写入状态，未写入前 start_member 会被系统拦截）
 
 ### 委派规范
-1. 用 \`team_send_and_wait\` 派发，消息中明确：任务完成后必须回复 TL；报告/方案/设计文档**写入文件**，不要在消息通道塞大段内容；说明前置依赖
+1. 用 \`team_send_and_wait\` 派发，消息中明确：任务完成后必须回复 TL；需要落盘的报告/方案/设计文档须明确允许的产出路径，只读且未授权报告路径时回复摘要，不自行写文件；不要在消息通道塞大段内容；说明前置依赖
 2. **Batch vs Sequential**：相互独立的任务放同一 tasks 数组并发派发；有依赖的串行等待产出传递；大批量任务分批派发（完成一批→验证→微调→下一批）
 3. 监控：\`wait_and_get_member_status\` 优先，\`get_member_log\` 仅在需要细节时使用
 4. 共享上下文有更新 → \`write_shared_context\` 覆盖写入后通知全体成员重读

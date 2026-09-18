@@ -122,10 +122,12 @@ src/
 │   ├── agent-initiated-mode.ts ← agent 自主会话提示词（ADR-0003）：使命锚定、无 grilling/确认门/第一动作协议
 │   ├── tl-first-action.ts ← 共享「第一动作协议」提示词片段，注入两种模式 TL 提示词顶部
 │   ├── goal-closing-protocol.ts ← 共享「强制 Goal 关闭协议」提示词片段（预定义/dynamic/agent-initiated 三模式复用防漂移）
+│   ├── task-dispatch-protocol.ts ← 共享任务派发协议（决策 #43）：目标/非目标/修改范围/验收标准，三模式及 team_send_and_wait promptGuidelines 同源
+│   ├── task-dispatch-protocol.test.ts ← 协议语义与 dynamic/agent 两阶段注入测试
 │   ├── workflow-prompt.ts ← 预定义团队的工作流提示词构建（纯函数）：激活横幅 + 操作型执行协议，替代旧内联描述性注入
 │   ├── workflow-prompt.test.ts ← 工作流提示词测试
-│   ├── member-collab-rules.ts ← 成员协作规则/工具面两态（决策 #41）：buildMemberCollabRules 规则行 + 工具描述/to 描述/拒绝文案四纯函数，单一事实来源防漂移；allowed 态逐字=现状（golden 锁）
-│   ├── member-collab-rules.test.ts ← 两态矩阵 + 红线 8 逐行对照（allowed 9 行逐字）
+│   ├── member-collab-rules.ts ← 成员协作规则/工具面两态（决策 #41）：buildMemberCollabRules 规则行 + 工具描述/to 描述/拒绝文案四纯函数，单一事实来源防漂移；两态共用任务边界与报告路径约束（决策 #43，golden 锁）
+│   ├── member-collab-rules.test.ts ← 两态矩阵 + 协作规则逐行对照 + 任务边界/扩围/停止语义
 │   ├── orchestration-playbook.md  ← TL 编排方法论：需求对齐(grilling)/任务拆分/质量加固模式库/确认门，注入设计阶段提示词
 │   └── dynamic-mode.test.ts  ← 动态模式提示词测试
 ├── setup/            ← Modular extracted setup modules
@@ -368,7 +370,7 @@ src/
 41. **成员互发消息开关（allowPeerMessaging，P1-P4）** — 需求：设置控制是否允许 member 之间互发；禁用时 member 只能回复 TL。四层四阶段方案（详见 DESIGN.md §28）：
     - **P1 设置数据层**：`TeamSettings.allowPeerMessaging?: boolean`（DEFAULT 显式 `true` = 允许，现状全互连拓扑）；`src/settings/resolve-peer-messaging.ts` 纯函数 resolver（`=== false → "tl-only"`，fail-open 异常→allowed）+ 导出 `PeerMessagingMode` 共享词汇；`sanitizeSnapshotData` 登记该键（未登记则 `/team resume` 静默丢失）；近似意图非法值（如引号包裹字符串）console.warn 一次/文件路径防意图被静默吞掉。
     - **P2 路由强制层（禁令实际生效点）**：`src/channel/router.ts` 单点拦截——`from ∈ memberSet ∧ (to="all" ∨ memberSet.has(to)) ∧ !isPeerMessagingAllowed()`（per-route resolver，getCoalescing 同构即时生效；缺省=恒允许 fail-open）；`from="tl"` 豁免为最高优先级红线（TL 派发/广播照常）、`to="tl"` 分支先行 return（成员→TL 与 corr 回复链不受影响）、unknown 目标语义不混写；拦截点在 coalescer/压缩 pending 上游（零入队）。覆盖双进队路径（team_send_message 工具 + assistant 正文 `<team-message>` 标签备份——同经 messageQueue→route()）。`onPeerBlocked`：TL 即时 team-route ⚠️ 通知 + sender 改道回执（`dispatchPromptTextToMember`，锚定改道指引；per-from 上限 3 次防刷屏；crashed/stopped 静默放弃）。**D6 加固**：event-handler tool 路径 `teamMsg.from` 三处交叉校验统一以真实 memberName 为准（防御纵深）。
-    - **P3 成员体验层（spawn 快照）**：`TEAM_PEER_MESSAGING = peerMessaging ?? "allowed"` env（member-process/member-lifecycle 推导，仅 tl-only 写字段，与 model/thinking 管线同构；auto-restart 复用已存 config）；`member.ts` tl-only 态：validTargets 收缩 `["tl"]`（to=all 同禁——all 分支只广播成员不含 TL，放行即 n-1 条互发通道）、工具/to 描述/拒绝文案两态、系统提示词删名册行（防凭空构造成员名）/换交流行/删讨论行、强制规则（必须回复 TL）两态不变；两态文案单一事实来源 `src/prompts/member-collab-rules.ts`（D4 防漂移），**允许态输出与旧内联模板逐字节一致（golden 测试锁定）**；start_member 附注仅 tl-only 态出现。
+    - **P3 成员体验层（spawn 快照）**：`TEAM_PEER_MESSAGING = peerMessaging ?? "allowed"` env（member-process/member-lifecycle 推导，仅 tl-only 写字段，与 model/thinking 管线同构；auto-restart 复用已存 config）；`member.ts` tl-only 态：validTargets 收缩 `["tl"]`（to=all 同禁——all 分支只广播成员不含 TL，放行即 n-1 条互发通道）、工具/to 描述/拒绝文案两态、系统提示词删名册行（防凭空构造成员名）/换交流行/删讨论行、强制规则（必须回复 TL）两态不变；两态文案单一事实来源 `src/prompts/member-collab-rules.ts`（D4 防漂移），**初始交付允许态输出与旧内联模板逐字节一致；决策 #43 后显式更新 golden 纳入任务边界及报告路径约束，互发语义不变**；start_member 附注仅 tl-only 态出现。
     - **P4 UI/文档**：`/team setting` 顶层「成员互发消息（当前：…）」+ 标量两段式子菜单（● 标记当前值）；消息合并子菜单在互发禁用态附 no-op 退化注记（beta F7：合并输入源枯竭）。
     - **边界声明**：本机制管消息通道拓扑，不封文件通道信息流（共享上下文/成员日志，R5）；团队 YAML 角色描述含「与 X 讨论」字样时宜同步改写（R7）；allow 态 `to:"all"` 不含 TL 的既有语义澄清见 DESIGN.md §28.5。
 
@@ -380,6 +382,13 @@ src/
     - **语义边界**：仅影响启动相——运行中的 agent 会话不终止（E4）、`stop_team_session` 不受影响（收尾是安全方向，正交）、`/team resume` 不受影响（E5）、prose 建议不受拦截（agent 可建议用户手动入口）；成员进程结构性无关（TEAM_ROLE 早退，零改动）；白名单正交（start_team_session 在白名单中的存在意义是活跃会话内重入友好错误）；禁用态 LLM 幻觉调用非活跃工具 → pi 短路报晦涩 Tool not found——接受为已知残差（F2 消除诱导源后概率进一步下降）。
     - **红线与演进空间**：开关逻辑绝不进入共享 `bootstrapDynamicSession`/`startSession` 无差别拦截（守护测试锁定：禁用态 /team dynamic 正常开会 + 对照组 L2 仍拒绝）——两者同时服务用户路径与 agent 路径；bootstrap 第三层加固（origin==="agent" 分支内检查）不做（YAGNI，假想调用方 + 塞检查进共享 bootstrap 的失败模式恰是红线防的事故类别），概念留档「gate 跟随 origin 而非调用方」（DESIGN.md §29.6），未来出现第三个 agent-origin 调用方时再评估；三态 confirm 演进空间以注释/ADR 留档（真到三态时新增键 + 迁移，waitTimeoutMinutes 先例）。
     - **测试**：新增 39 例（resolver 8 + settings 5 + 快照 3 + L2 7 + L1 7 + 红线守护 1 + 菜单 8，TDD 先红后绿）；文档记录见 DESIGN.md §29。
+
+43. **任务派发边界协议（目标与非目标）** — 针对 Member 发散与越界，采用提示词双侧约束，不增加工具参数或运行时关键词校验：
+    - `src/prompts/task-dispatch-protocol.ts` 单一来源：每个 `tasks[].content` 明确**目标、非目标、修改范围、验收标准**，首次、补派、返工一致；简单任务可用短句，非目标须针对本次任务。三种 TL 模式（预定义、dynamic 两阶段、agent-initiated 两阶段）与 `team_send_and_wait.promptGuidelines` 共用。
+    - 范围包含测试与报告产出；只读任务默认不写文件，需要报告落盘时须明确允许路径。实现范围未知时先派只读侦察。长详情仍引用独立任务文件，消息保留四项摘要，不将任务详情塞进 `.shared-context.md` 或仅放在 `nextSteps`。
+    - Member 两种互发模式共用边界规则：范围外只报告；必要扩围先说明阻塞原因与最小范围，带 corr 回复 TL 后**结束当前回合等待明确授权**（避免 all-idle 等待死锁）；角色职责/共享上下文/同伴建议不自动授权扩围。TL 核对用户目标与约束后明确批准或拒绝，批准时重述四项边界。
+    - 验收后回报结果、实际修改文件与验证结果，结束当前任务，不追加优化；**不停止成员进程**。既有无条件「报告必须写文件」指引同步收窄为授权路径，golden 显式更新。
+    - 本机制是行为引导，不是文件权限隔离，也不保证模型绝不越界。接口、消息路由、等待门控与运行时守卫不变；详见 DESIGN.md §30。
 
 ## Dependency Injection Pattern
 
@@ -719,4 +728,4 @@ TL: 监控进展、协调异常、write_shared_context 更新共享上下文（�
 
 ## Design Document
 
-See [DESIGN.md](./DESIGN.md) for the full design specification (28 sections), including the Goal reminder lifecycle and release verification checklist.
+See [DESIGN.md](./DESIGN.md) for the full design specification (30 sections), including the Goal reminder lifecycle and release verification checklist.

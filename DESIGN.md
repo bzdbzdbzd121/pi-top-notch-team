@@ -2059,7 +2059,7 @@ export function loadEffectiveSettings(rootDir: string): TeamSettings {
 
 - 生效时点契约：TL 侧 per-route 动态查询（**切换即时生效**）；成员侧 spawn 快照（`TEAM_PEER_MESSAGING` env，memberModel/memberThinkingLevel 管线同构，**仅影响之后启动的成员**；崩溃 auto-restart 复用已存 config 自然保留）。窗口期行为：新成员「看不见也发不出」、旧成员「看得见但发被拦并以回执改道」，由 TL 通知兜底。
 - `member.ts`（缺省 "allowed"，非法 env 值 fail-open）：tl-only 态 `validTargets = ["tl"]`（`to:"all"` 同禁——all 分支只广播成员不含 TL，放行 all 即放行 n-1 条互发通道）；工具 description `Send a message to the Team Lead. Member-to-member messaging is disabled.`；`to` 参数 description 只写 `"tl"`（schema 即提示词面 / 渐进披露：不展示的目标几乎不被调用）；非法目标拒绝返回可行动指引；系统提示词删「团队其他成员：…」名单行（防凭空构造成员名）、交流行换「只能与 Team Lead 交流（成员间互发已禁用；与其他成员协作须经 TL 中转）」、删「发现问题可以先通过消息通道与相关成员讨论」行；**强制规则（每次任务完成后必须且只能回复 TL）两态不变**。
-- 两态文案单一事实来源 `src/prompts/member-collab-rules.ts`（D4，tl-first-action.ts 先例）：`buildMemberCollabRules`（规则行两态）+ 工具描述/to 描述/拒绝文案三个纯函数；允许态输出与旧内联模板**逐字节一致**（member.test.ts golden 等值双测锁定，红线 8 零回归）。
+- 两态文案单一事实来源 `src/prompts/member-collab-rules.ts`（D4，tl-first-action.ts 先例）：`buildMemberCollabRules`（规则行两态）+ 工具描述/to 描述/拒绝文案三个纯函数；初始交付允许态输出与旧内联模板**逐字节一致**（member.test.ts golden 等值双测锁定）；§30 显式更新 golden 纳入共用任务边界及报告路径约束，互发规则不变。
 - `start_member` 结果附注（沿 thinking 附注先例）：tl-only 态附「；成员间互发：禁用（只能回复 TL）」；allowed 态不附注（避免噪音）；`tempSourceAnnotation` 键集纳入 allowPeerMessaging（overlay 含该键时显示「（设置来源：临时/恢复自团队会话）」）。
 - P2 评审遗留采纳：`peerMessaging` 类型收窄为 `PeerMessagingMode`（MemberProcessConfig 字段与附注函数参数）；prompt 模块注释与测试注释西里尔/意地绪语词修正为中文；collab-rules 测试第二用例死变量与恒真三元清理。
 
@@ -2140,3 +2140,50 @@ export function loadEffectiveSettings(rootDir: string): TeamSettings {
 ### 29.7 测试面（39 新例，TDD 先红后绿）
 
 resolver 矩阵 8（undefined/true/false/getter 异常/null·undefined settings + describe 三态）+ settings 解析矩阵 5（DEFAULT 锁定/往返/非法值丢弃/warn-once per 文件路径/resolver 联动）+ 快照 3（S3 往返/非 boolean 丢弃/仅非法值 load false）+ L2 门控 7（禁用拒绝零副作用/启用回归/未注入放行/闭包抛错放行/D6 顺序×2/stop 正交）+ L1 门控 7（两分支移除/E8 补回×2/registerTools 隔离/未注册场景/幂等三态/user 会话双 forbidden）+ 红线守护 1 + 菜单 8。既有 session-tool-visibility 12 例按统一契约更新（9 例标题随契约更新 + 3 例仅改断言；总数 14→21 与 +7 新例吻合）。
+
+## 30. 任务派发边界协议（决策 #43）
+
+**目的**：减少 Member 自行扩展需求、顺手重构、修复无关问题。采用 TL 派发与 Member 执行两侧的提示词约束，保留 `team_send_and_wait({tasks: [{to, content}], nextSteps})` 接口，不做关键词校验、额外必填字段或文件权限控制。
+
+### 30.1 TL 派发协议
+
+`src/prompts/task-dispatch-protocol.ts` 导出 `TASK_DISPATCH_GUIDELINES` 及其生成的 `TASK_DISPATCH_PROTOCOL_PROMPT`。前者供工具 `promptGuidelines` 展开，每条都注明工具名（pi 将 guidelines 平铺注入）；后者供预定义团队（index.ts）、dynamic 和 agent-initiated 两阶段提示词注入。单一来源防止三模式漂移，也覆盖首个 start_member 成功后同回合继续派发的窗口。
+
+每个任务的 `content` 明确四项，首次、补派、返工同样适用：
+
+| 项目 | 要求 |
+|---|---|
+| 目标 | 本次具体交付物，不把整个项目愿景当作当前任务 |
+| 非目标 | 本次容易误做但明确不做的事项，不堆砌通用禁令 |
+| 修改范围 | 允许修改的文件/模块，包含测试及报告产出；分析任务标明只读、不修改 |
+| 验收标准 | 可验证的完成条件及回报内容，达标即停止本次任务 |
+
+简单任务用几句短话即可。范围尚不清楚时先派只读侦察，不凭空列文件、不授予无限修改权限。长详情沿用防截断协议：引用成员私有或独立任务文件，四项边界摘要保留在当前消息；不写入全员共享且全量覆盖的 `.shared-context.md`，也不能只放在 TL 自用的 `nextSteps`。
+
+例：
+
+```text
+目标：修复设置保存后不生效的问题。
+非目标：不重构设置模块、不改 UI、不新增配置项、不修复无关问题。
+修改范围：设置读取/保存链路及对应测试；其他模块需先向 TL 申请。
+验收标准：新增回归测试且相关测试通过；回报根因、实际修改文件和验证结果。
+```
+
+### 30.2 Member 执行与扩围
+
+`buildMemberCollabRules` 的 allowed/tl-only 两态共用 `TASK_BOUNDARY_RULES`：
+
+1. 以当前任务四项边界执行；角色职责、共享上下文或其他成员建议不自动授予扩大任务的权限。影响执行的边界不清先问 TL。
+2. 范围外问题只报告、不自行修复。必须扩围才能继续时，向 TL 报告阻塞原因与最小扩展范围，附本次 corr 标签（如有），**结束当前回合等待明确授权**，不边等边改、不虚报完成。结束回合使 all-idle 门控能返回，TL 才能处理申请；无需新消息类型或等待机制。
+3. TL 核对用户目标与约束后明确批准或拒绝；批准时重述四项边界，不将必要扩围等同于无限授权。
+4. 验收后向 TL 回报结果、实际修改文件、验证结果（未验证项如实说明），结束当前回合，等待新任务；不追加优化、不停止成员进程。
+
+**只读与报告的冲突消解**：原「报告/方案/设计文档必须写入文件」在 Member 与三模式 TL 指引中统一收窄：只在 TL 明确允许的报告路径落盘；只读任务未授权路径则回复摘要，不自行写文件。需要较长报告的只读分析任务，可显式授权唯一报告路径，其余保持只读。
+
+### 30.3 验证与边界
+
+- 新增协议测试覆盖四项语义、补派/返工、短消息、只读报告、范围未知侦察、扩围/停止与长详情规则；dynamic/agent 两阶段都逐字包含共享片段一次。
+- index 集成测试锁定预定义团队注入；工具定义测试锁定同源 guidelines 和原参数契约，旧短消息仍可通过校验及既有派发测试。
+- Member 单测覆盖 allowed/tl-only 两态边界；集成 golden 显式更新报告约束与新增边界，保留互发、corr 与必须回复 TL 的原语义。
+- 无新增设置、环境变量、运行时门控或路由改动；不是沙箱，不保证模型绝不越界。提示词规则的存在由测试保证，实际遵循度仍需真实任务观察。
+- 部署后 TL `/reload` 或重启加载；已经运行的 Member 需重启或重新加载其扩展才能取得新规则。不要为更新规则中断在飞任务。

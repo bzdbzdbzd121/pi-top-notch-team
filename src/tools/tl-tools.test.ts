@@ -916,6 +916,17 @@ describe("registerTlTools", () => {
       expect(typeof toolDef.prepareArguments).toBe("function");
     });
 
+    it("publishes the shared task boundaries without adding required parameters", async () => {
+      const { TASK_DISPATCH_GUIDELINES } = await import("../prompts/task-dispatch-protocol");
+      const toolDef = getTeamSendAndWaitDef();
+      expect(toolDef.promptGuidelines).toEqual(expect.arrayContaining([...TASK_DISPATCH_GUIDELINES]));
+      expect(toolDef.parameters.required).toEqual(["tasks", "nextSteps"]);
+      // Old short messages remain valid: boundaries are prompt guidance, not a keyword gate.
+      expect(Compile(toolDef.parameters).Check({
+        tasks: [{ to: "planner", content: "Report status" }], nextSteps: "Review",
+      })).toBe(true);
+    });
+
     // ── P3 promptGuidelines 防截断协议 ──
 
     it("P3: promptGuidelines 含防截断协议（5 条：长 content 拆分/独立文件引用、tool call 数量、短重试、先 to 后 content、未知成员疑截断）", () => {

@@ -41,6 +41,7 @@ import { createMessageChannel } from "./src/setup/message-channel";
 import { buildDynamicModePrompt } from "./src/prompts/dynamic-mode";
 import { FIRST_ACTION_PROTOCOL_PROMPT } from "./src/prompts/tl-first-action";
 import { GOAL_CLOSING_PROTOCOL_PROMPT } from "./src/prompts/goal-closing-protocol";
+import { TASK_DISPATCH_PROTOCOL_PROMPT } from "./src/prompts/task-dispatch-protocol";
 import { buildWorkflowPrompt, WORKFLOW_ACTIVATION_BANNER } from "./src/prompts/workflow-prompt";
 import { createTlReadGuard, createDesignReadGuard } from "./src/session/tl-read-guard";
 import { enforceSessionToolVisibility, SESSION_TOOL_NAMES } from "./src/session/session-tool-visibility";
@@ -1233,7 +1234,9 @@ Member 进程保持运行以便继续接收新任务。仅当成员进程异常�
 
 .shared-context.md 应作为术语表和关键决策记录，不包含实现细节。当某个决策满足以下三个条件时，考虑创建 ADR 文档（在 docs/adr 目录下）：逆决策成本高、外人看会觉得意外、是经过真正权衡后选择的。
 
-讨论达成共识后，拆解任务并委派给各 Member。**委派时明确要求：需要产出的报告、方案、设计文档直接写入文件，避免成员间通过消息传递大段内容。**
+讨论达成共识后，拆解任务并委派给各 Member。需要落盘的报告、方案、设计文档须明确允许的产出路径；只读且未授权报告路径时回复摘要，不自行写文件，避免成员间通过消息传递大段内容。
+
+${TASK_DISPATCH_PROTOCOL_PROMPT}
 
 ### 沟通风格
 - 与用户交流时保持简洁精炼，剔除客套话、语气词、多余铺垫与模棱两可的表述
@@ -1266,7 +1269,7 @@ Member 进程保持运行以便继续接收新任务。仅当成员进程异常�
 3. 拆解任务，制定计划
 4. 调用 \`write_shared_context\` 编写 Shared Context（共享上下文），记录：团队成员、项目背景和目标、协作规则、术语表。**未调用前 start_member 会被系统拦截**
 5. 用 start_member 启动各 Member
-6. 将 Shared Context 随首次任务消息一起发送给各 Member。**在消息中明确告知 Member 任务完成后必须回复 TL，并指示 Member：输出报告/方案/设计文档时写入文件，不要在消息通道中塞入大量内容。**
+6. 将 Shared Context 随首次任务消息一起发送给各 Member。**在消息中明确告知 Member 任务完成后必须回复 TL，并指示 Member：报告/方案/设计文档仅在授权路径落盘，只读且未授权报告路径时回复摘要，不要在消息通道中塞入大量内容。**
 7. 通过消息通道与 Member 交流，监控进展（可使用 team_send_and_wait 等待成员回复）
 8. 根据需要更新 Shared Context，通知所有 Member 重新阅读
 9. **汇总并验证（不要结束回合）** — 检查各成员产出，逐条对照完成条件（若已设定目标）

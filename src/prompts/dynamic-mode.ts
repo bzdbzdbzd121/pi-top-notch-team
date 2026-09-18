@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { FIRST_ACTION_PROTOCOL_PROMPT } from "./tl-first-action";
 import { GOAL_CLOSING_PROTOCOL_PROMPT } from "./goal-closing-protocol";
+import { TASK_DISPATCH_PROTOCOL_PROMPT } from "./task-dispatch-protocol";
 import { getSharedContextPath } from "../session/shared-context";
 
 /**
@@ -65,6 +66,7 @@ ${
     ? designPhasePrompt(sharedCtxPath, memberLines, team)
     : executionPhasePrompt(sharedCtxPath, memberLines, team)
 }
+${TASK_DISPATCH_PROTOCOL_PROMPT}
 `;
 }
 
@@ -227,7 +229,7 @@ Member 进程保持运行以便继续接收新任务。仅当成员进程异常�
 ### 委派任务的方式
 使用 \`team_send_and_wait\` 向成员分配任务。在消息中：
 1. 明确告知 Member 任务完成后必须回复 TL
-2. 要求 Member：输出报告/方案/设计文档时写入文件，不要在消息通道中塞入大量内容
+2. 需要落盘的报告/方案/设计文档须明确允许的产出路径；只读且未授权报告路径时回复摘要，不自行写文件，不在消息通道中塞入大量内容
 3. 说明前置依赖（如需要等待其他成员的结果）
 
 ### 可用工具

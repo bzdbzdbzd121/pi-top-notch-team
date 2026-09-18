@@ -160,6 +160,22 @@ describe("index.ts default export (integration)", () => {
       return entry![1];
     }
 
+    it("injects the shared task dispatch protocol once for a pre-defined team", async () => {
+      const { TASK_DISPATCH_PROTOCOL_PROMPT } = await import("./prompts/task-dispatch-protocol");
+      const { startSession, endSession } = await import("./session/state");
+      endSession();
+      startSession({
+        name: "test-team", description: "Test",
+        members: [{ name: "worker", systemPrompt: "do work" }],
+      });
+      try {
+        const result = await getBeforeAgentStartHandler()({ systemPrompt: "BASE" }, { ui: createMockUi() });
+        expect(result.systemPrompt.split(TASK_DISPATCH_PROTOCOL_PROMPT)).toHaveLength(2);
+      } finally {
+        endSession();
+      }
+    });
+
     it("injects strict workflow prompt when workflow.strictness is strict", async () => {
       const { startSession, endSession } = await import("./session/state");
       endSession();

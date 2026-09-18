@@ -20,6 +20,7 @@ import { getSessionState } from "../session/state";
 import { syncActiveManifest } from "../session/manifest";
 import { createMemberProcess } from "../process/member-process";
 import { spawn } from "node:child_process";
+import { TASK_DISPATCH_GUIDELINES } from "../prompts/task-dispatch-protocol";
 
 /**
  * 阶段 5 可观测性：start_member 结果附注设置来源。仅当 overlay 含成员 spawn 相关
@@ -437,6 +438,7 @@ export function registerTlTools(deps: TlToolsDeps): void {
       + "For multiple concurrent members: tasks: [{to: \"a\", content: \"...\"}, {to: \"b\", content: \"...\"}]",
     promptGuidelines: [
       "Use team_send_and_wait when you need a member result before continuing.",
+      ...TASK_DISPATCH_GUIDELINES,
       "⚠️ CRITICAL — tasks MUST be a raw JSON array, NOT a JSON-string-encoded array.",
       '   CORRECT: "tasks": [{ "to": "planner", "content": "..." }]',
       '   WRONG:   "tasks": "[{\"to\": \"planner\", ...}]"  ← Do NOT stringify. If you do, the system will auto-recover via JSON.parse.',

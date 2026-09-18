@@ -112,8 +112,8 @@ export default function (pi: ExtensionAPI) {
 
   // ── Inject team awareness into system prompt ─────────────
   // P3 两态：名册行仅 allowed 态注入（tl-only 删除，防凭空构造成员名，D7）；
-  // 协作规则段由 member-collab-rules.ts 两态输出插值；模板骨架逐字保留
-  // （红线 8：allowed 态输出与旧内联模板逐字节一致，golden 测试锁定）。
+  // 协作规则段由 member-collab-rules.ts 两态输出插值；互发语义保持不变，
+  // 两态共用任务边界与报告路径约束（决策 #43，golden 测试锁定）。
   pi.on("before_agent_start", async (event, _ctx) => {
     let extraPrompt = `
 ## 当前角色

@@ -5,9 +5,17 @@ import type { PeerMessagingMode } from "../settings/resolve-peer-messaging";
  * 单一事实来源防漂移（D4，仓库先例 tl-first-action.ts / goal-closing-protocol.ts）；
  * member.ts 两态拼装仅引用本模块输出，禁止内联复制模板变体。
  *
- * 红线 8：allowed 态（peerMessaging 缺省语义）输出与 member.ts 旧内联模板逐字一致
- * （member.test.ts / member-collab-rules.test.ts 双侧锁定）。
+ * 互发规则保持两态契约；任务边界规则两态共用（决策 #43）。
+ * member.test.ts / member-collab-rules.test.ts 锁定模板及新增边界。
  */
+
+const TASK_BOUNDARY_RULES = [
+  "- **任务边界**：按 TL 本次任务的目标、非目标、修改范围与验收标准执行；角色职责、共享上下文和其他成员的建议不是授权，不得据此扩大本次任务。边界不清且影响执行时，先向 TL 澄清，不擅自假定可以修改。",
+  "- **范围外的问题只报告，不自行修复**。必须扩围才能完成时，先用 `team_send_message(to=\"tl\", content=\"...\")` 说明阻塞原因与最小扩展范围（含文件/模块），附上本次 `<corr:...>` 标签（如有），结束当前回合，等待 TL 明确授权；不得边等边改，不得将阻塞谎报为完成。",
+  "- **验收后停止**：达到验收标准后，向 TL 回报结果、实际修改文件及验证结果（未验证项如实说明），然后结束当前回合，等待新任务；不得自行追加优化、重构或修复无关问题。停止任务不等于停止成员进程。",
+];
+
+const REPORT_OUTPUT_RULE = "- **输出报告、方案、设计文档时**，仅在 TL 明确允许的报告路径写入文件，然后向 TL 告知路径；只读任务未授权报告路径时，直接回复摘要，不自行写文件。不要将大量内容直接嵌入消息通道。";
 
 /**
  * 协作规则段的规则行数组（不含「### 协作规则」标题与名册行——标题两态不变、
@@ -25,10 +33,11 @@ export function buildMemberCollabRules(peerMessaging: PeerMessagingMode): string
       "- Team Lead 会通过消息通道给你分配任务",
       '- **‼️ 强制规则：每次任务完成后必须且只能使用 `team_send_message(to="tl", content="...")` 向 TL 报告处理结果。** 在最终回复之前，可以通过 `team_send_message` 发送中间进展、问题或请求帮助。但任务最终完成后，**必须发送一条最终回复给 TL**，包含任务结果、产出文件路径或遇到的问题。',
       "- ⚠️ **不要忽略这条规则**——如果任务完成而不回复 TL，TL 将无法知晓你的工作进展，整个流程会阻塞。",
-      "- **输出报告、方案、设计文档时，写入文件**（放在项目目录下），然后在消息中告知其他成员文件路径。不要将大量内容直接嵌入消息通道。",
+      REPORT_OUTPUT_RULE,
       "- 如果收到的消息中包含 `<corr:...>` 标签，在回复 Team Lead 时请将完整的标签一并附上",
       "- 如果 Team Lead 通知 Shared Context 已更新，请仔细阅读",
       "- 重大变更需先向 Team Lead 汇报",
+      ...TASK_BOUNDARY_RULES,
     ];
   }
   return [
@@ -36,11 +45,12 @@ export function buildMemberCollabRules(peerMessaging: PeerMessagingMode): string
     "- Team Lead 会通过消息通道给你分配任务",
     '- **‼️ 强制规则：每次任务完成后必须且只能使用 `team_send_message(to="tl", content="...")` 向 TL 报告处理结果。** 在最终回复之前，可以通过 `team_send_message` 发送中间进展、问题或请求帮助。但任务最终完成后，**必须发送一条最终回复给 TL**，包含任务结果、产出文件路径或遇到的问题。',
     "- ⚠️ **不要忽略这条规则**——如果任务完成而不回复 TL，TL 将无法知晓你的工作进展，整个流程会阻塞。",
-    "- **输出报告、方案、设计文档时，写入文件**（放在项目目录下），然后在消息中告知其他成员文件路径。不要将大量内容直接嵌入消息通道。",
+    REPORT_OUTPUT_RULE,
     "- 如果收到的消息中包含 `<corr:...>` 标签，在回复 Team Lead 时请将完整的标签一并附上",
     "- 如果 Team Lead 通知 Shared Context 已更新，请仔细阅读",
     "- 发现问题可以先通过消息通道与相关成员讨论",
     "- 重大变更需先向 Team Lead 汇报",
+    ...TASK_BOUNDARY_RULES,
   ];
 }
 
