@@ -372,6 +372,24 @@ describe("index.ts default export (integration)", () => {
       expect(finishIdx).toBeLessThan(reportIdx);
       expect(reportIdx).toBeLessThan(stopIdx);
     });
+
+    it("does not advertise third-party orchestration aids (decision #44: their own prompts cover discovery)", async () => {
+      const { startSession, endSession } = await import("./session/state");
+      endSession();
+      startSession({
+        name: "test-team",
+        description: "Test",
+        members: [{ name: "worker", systemPrompt: "do work" }],
+      });
+
+      const handler = getBeforeAgentStartHandler();
+      const result = await handler({ systemPrompt: "BASE" }, { ui: createMockUi() });
+      // ask_user_question / todo are whitelisted (see the tool_call guard tests)
+      // but must not be listed in our prompt — they are third-party tools whose
+      // own promptSnippet/promptGuidelines handle discoverability.
+      expect(result.systemPrompt).not.toContain("ask_user_question");
+      expect(result.systemPrompt).not.toContain("todo");
+    });
   });
 });
 
@@ -663,6 +681,33 @@ describe("TL pre-dispatch guard in tool_call handler", () => {
     }
   });
 
+  it("allows orchestration aids (ask_user_question, todo) and never counts them toward the guard", async () => {
+    await startActiveSession();
+    const toolCall = getHandler("tool_call");
+
+    // Planning/alignment calls are coordination, not "doing the work": many
+    // calls must neither trip the threshold nor be blocked while sticky.
+    for (let i = 0; i < 5; i++) {
+      expect(toolCall({ toolName: "ask_user_question", input: { questions: [] } })).toBeUndefined();
+      expect(toolCall({ toolName: "todo", input: { action: "list" } })).toBeUndefined();
+    }
+
+    // Budget untouched: exactly `threshold` (3) code reads still pass.
+    expect(toolCall({ toolName: "read", input: { path: "src/a.ts" } })).toBeUndefined();
+    expect(toolCall({ toolName: "read", input: { path: "src/b.ts" } })).toBeUndefined();
+    expect(toolCall({ toolName: "read", input: { path: "src/c.ts" } })).toBeUndefined();
+    expect(toolCall({ toolName: "read", input: { path: "src/d.ts" } })).toEqual(
+      expect.objectContaining({ block: true })
+    );
+
+    // Even in sticky mode the orchestration aids stay usable.
+    expect(toolCall({ toolName: "ask_user_question", input: { questions: [] } })).toBeUndefined();
+    expect(toolCall({ toolName: "todo", input: { action: "create", subject: "x" } })).toBeUndefined();
+    expect(toolCall({ toolName: "read", input: { path: "src/e.ts" } })).toEqual(
+      expect.objectContaining({ block: true })
+    );
+  });
+
   it("does nothing when no team session is active", async () => {
     const { endSession } = await import("./session/state");
     endSession();
@@ -708,6 +753,14 @@ describe("design-phase read limiter in tool_call handler", () => {
     const blocked = toolCall({ toolName: "bash", input: { command: "ls" } });
     expect(blocked).toEqual(expect.objectContaining({ block: true }));
     expect(blocked.reason).toContain("设计阶段");
+  });
+
+  it("allows ask_user_question and todo in the design phase (orchestration aids)", () => {
+    const toolCall = getHandler("tool_call");
+    // Structured user questioning (grilling) and design-progress tracking are
+    // legitimate design-phase work — only code work is blocked there.
+    expect(toolCall({ toolName: "ask_user_question", input: { questions: [] } })).toBeUndefined();
+    expect(toolCall({ toolName: "todo", input: { action: "list" } })).toBeUndefined();
   });
 
   it("allows read, then soft-blocks every 4th code read with a reminder (next read passes again)", () => {

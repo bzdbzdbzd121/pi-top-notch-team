@@ -390,6 +390,12 @@ src/
     - 验收后回报结果、实际修改文件与验证结果，结束当前任务，不追加优化；**不停止成员进程**。既有无条件「报告必须写文件」指引同步收窄为授权路径，golden 显式更新。
     - 本机制是行为引导，不是文件权限隔离，也不保证模型绝不越界。接口、消息路由、等待门控与运行时守卫不变；详见 DESIGN.md §30。
 
+44. **TL 编排辅助工具放行（ask_user_question / todo）** — 团队会话白名单此前只含团队管理工具与只读/文档工具，两件第三方编排辅助工具被硬阻断：`ask_user_question`（`@juicesharp/rpiv-ask-user-question`，结构化问卷）与 `todo`（`@juicesharp/rpiv-todo`，任务清单）。两者均不写项目/工作区文件（todo 状态为进程内 per-session + 会话分支回放；ask_user_question 仅 UI 交互，其 external-editor 功能只在系统临时目录 `os.tmpdir()` 建临时文件、用后清理），属于编排/沟通而非「亲自做 Member 的工作」，因此：
+    - **两阶段白名单均放行**（`DESIGN_PHASE_WHITELIST` + `EXECUTION_PHASE_WHITELIST`）。设计阶段同样放行：结构化提问与设计流程跟踪不触碰代码工作，「设计阶段禁止代码工作」的意图不受影响。
+    - **加入 `tl-read-guard.ts` 的 `MANAGEMENT_TOOLS`**：不消耗派发前预算、sticky 拦截期间仍可用——TL 先建 4 条 todo 再派发是正确行为，不能被守卫拦下。
+    - **不做提示词/README 推广（用户裁决）**：第三方工具与本扩展相互独立，发现性由工具自身的 promptSnippet/promptGuidelines 承担（pi 按 activeTools 自动注入）——本扩展的预定义提示词、dynamic 设计/执行两阶段提示词与 README 均不列举这两件工具（负例测试锁定，防无意回写）。
+    - **agent 来源会话不受影响**（已旁路白名单）；未安装对应插件时白名单条目为惰性（工具不存在，无行为）。测试：index.test.ts 双阶段放行 + 守卫预算不消耗 + sticky 期可用 + 预定义提示词负例；tl-read-guard.test.ts 显式豁免用例；dynamic-mode.test.ts 两阶段负例。
+
 ## Dependency Injection Pattern
 
 The codebase uses an explicit Dependency Injection (DI) pattern to decouple modules and enable testability. Every subsystem receives its dependencies through a typed interface, rather than importing them directly.
@@ -612,6 +618,7 @@ add_dynamic_member, start_member, stop_member, list_members,
 get_member_log, wait_and_get_member_status, team_send_and_wait,
 set_goal, finish_goal, write_shared_context,
 start_team_session, stop_team_session,   ← ADR-0003（重入报错/放弃委派）
+ask_user_question, todo,                 ← 第三方编排辅助（决策 #44）：不写项目文件，白名单放行；提示词不列举
 read (unrestricted),
 write (only .md files — checked per-call)   ← 仅约束 user 来源会话；agent 来源早退旁路（ADR-0003 修订，见决策 #22)
 ```
@@ -622,6 +629,7 @@ start_member, stop_member, list_members, get_member_log,
 wait_and_get_member_status, team_send_and_wait,
 set_goal, finish_goal, add_dynamic_member, write_shared_context,
 start_team_session, stop_team_session,   ← ADR-0003
+ask_user_question, todo,                 ← 第三方编排辅助（决策 #44）：不写项目文件，白名单放行；提示词不列举
 read, bash, web_search, fetch_content, get_search_content,
 write, edit (both only .md files — checked per-call)   ← 仅约束 user 来源会话；agent 来源早退旁路（ADR-0003 修订，见决策 #22）
 ctx_search, ctx_stats, ctx_doctor, ctx_insight,
@@ -638,6 +646,7 @@ Key points:
 - **`write`/`edit` are on both whitelists** — but an additional per-call check restricts them to `.md` files only. **仅 user 来源会话**：agent 来源会话早退旁路白名单与扩展名检查（ADR-0003 修订，见决策 #22）。
 - **`.shared-context.md` 专属拦截** — `write`/`edit` 的目标若是 `.shared-context.md`，无论哪个阶段都会被 block 并重定向到 `write_shared_context` 工具（保证 start_member 门控标记准确）。
 - **TL 预派发守卫（执行阶段）** — `read`/`bash`/`web_search` 等虽在白名单中，但 `src/session/tl-read-guard.ts` 会对"turn 内未派发任务且非管理工具调用超过 3 次"的情况**持续拦截**（sticky block）：派发前每次非管理工具调用都被 block（首次含用户可见通知），直到 `team_send_and_wait` 发生。防止 TL 亲自分析代码而不派发，且无法用 grep/rg 绕过。详见 DESIGN.md。**仅 `origin: "user"` 会话生效**——自主会话（ADR-0003 修订）移除此守卫、设计阶段 read 软限制**与代码写入守卫**（读与分析自由、可自由编辑任意文件，写纪律见系统提示词）。
+- **编排辅助工具豁免预派发守卫（决策 #44）** — 第三方工具 `ask_user_question`（rpiv-ask-user-question）与 `todo`（rpiv-todo）加入 `tl-read-guard.ts` 的 `MANAGEMENT_TOOLS`：结构化提问与任务清单是编排/沟通而非「亲自做 Member 的工作」，**不消耗派发前预算、sticky 拦截期间仍可用**（TL 先建 4 条 todo 再派发是正确行为）。两者均不写项目/工作区文件（todo 为进程内 per-session 状态；ask_user_question 仅 UI 交互），因此在设计阶段同样放行；未安装对应插件时白名单条目惰性无行为。发现性不做提示词推广——交给工具自身 promptSnippet/promptGuidelines。
 - The design phase whitelist lifts to the execution phase whitelist on the first `start_member` call.
 
 The design phase guard is active from the moment `/team dynamic` is entered. It lifts when the first `start_member` call succeeds, transitioning to the execution phase.
@@ -728,4 +737,4 @@ TL: 监控进展、协调异常、write_shared_context 更新共享上下文（�
 
 ## Design Document
 
-See [DESIGN.md](./DESIGN.md) for the full design specification (30 sections), including the Goal reminder lifecycle and release verification checklist.
+See [DESIGN.md](./DESIGN.md) for the full design specification (31 sections), including the Goal reminder lifecycle and release verification checklist.

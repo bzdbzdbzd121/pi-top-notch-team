@@ -330,7 +330,7 @@ The dynamic mode is split into two phases: **design** and **execution**.
 
 **Phase 1: Design phase** — entered on `/team dynamic`
 - `teamCtx.dynamicPhase` is set to `"design"`
-- A **whitelist-based** tool guard activates: only team management tools + `write` (`.md` only) are allowed. All other tools (including `bash`, `read`, `web_search`, `fetch_content`, `edit`, `ctx_*`, `mcp`, etc.) are blocked at runtime. （user 来源会话路径——agent 来源会话早退旁路白名单，见 §18）
+- A **whitelist-based** tool guard activates: only team management tools + `read` (soft-limited) + `write` (`.md` only) + third-party orchestration aids (`ask_user_question`, `todo` — whitelisted only, never listed in our prompts; decision #44) are allowed. All other tools (including `bash`, `web_search`, `fetch_content`, `edit`, `ctx_*`, `mcp`, etc.) are blocked at runtime. （user 来源会话路径——agent 来源会话早退旁路白名单，见 §18）
 - TL can only discuss with the user, register members with `add_dynamic_member`, and write `.shared-context.md`
 - This forces TL to focus on requirements alignment and team design rather than exploring code
 
@@ -358,7 +358,7 @@ The TL follows the **Orchestration Playbook** (`src/prompts/orchestration-playbo
 
 **Phase 2: Execution phase** — entered automatically on first `start_member` success
 - `start_member` tool calls `onDynamicPhaseTransition()` callback → `teamCtx.dynamicPhase = "execution"`
-- The design-phase tool guard lifts; execution phase whitelist applies (team management + read-only analysis tools + `write`/`edit` on `.md` only)（user 来源会话路径；agent 来源会话早退旁路，见 §18）
+- The design-phase tool guard lifts; execution phase whitelist applies (team management + read-only analysis tools + `write`/`edit` on `.md` only + third-party orchestration aids `ask_user_question`/`todo`, whitelisted only — decision #44)（user 来源会话路径；agent 来源会话早退旁路，见 §18）
 - TL regains access to `bash`/`read`/`web_search`/`fetch_content`/`ctx_search`/`true_sight_*` for monitoring and coordination, but tools like `ctx_execute`/`mcp` remain blocked
 - The `before_agent_start` handler switches to **execution phase** prompt injection
 - TL starts remaining Members, dispatches work via `team_send_and_wait`, monitors progress
@@ -902,12 +902,12 @@ Strict 模式的注入结构相同，但标题为「严格模式 ⚡ — 必须�
 > **白名单仅约束 `origin: "user"` 会话**（ADR-0003 修订）：`origin: "agent"`（start_team_session）在 `tool_call` 守卫中早退旁路白名单与扩展名检查（设计+执行两阶段同权，工具面与普通模式一致），唯一保留 `.shared-context.md` → `write_shared_context` 重定向（机制契约，所有 origin 生效）。user 来源会话（`/team start`、`/team dynamic`）行为不变。
 
 **设计阶段白名单（`DESIGN_PHASE_WHITELIST`）：**
-- 仅允许：`add_dynamic_member`、`start_member`、`stop_member`、`list_members`、`get_member_log`、`wait_and_get_member_status`、`team_send_and_wait`、`set_goal`、`finish_goal`、`write_shared_context`、`read`（不受限）、`write`（仅 `.md` 文件）
+- 仅允许：`add_dynamic_member`、`start_member`、`stop_member`、`list_members`、`get_member_log`、`wait_and_get_member_status`、`team_send_and_wait`、`set_goal`、`finish_goal`、`write_shared_context`、`read`（不受限）、`write`（仅 `.md` 文件）、`ask_user_question`/`todo`（第三方编排辅助，决策 #44——白名单放行，不写项目文件；提示词不列举）
 - 其他工具全部被阻断（包括 `bash`、`edit`、`web_search` 等），TL 只能讨论方案、有限度读取文件、写入共享上下文。
 - **设计阶段 read 软限制**（`src/session/tl-read-guard.ts` 的 `createDesignReadGuard`）：read 是允许的（了解项目以设计方案是合法设计工作），但非 `.md` 读取每 4 次会被**拦截一次并提醒**「是否真的需要 read」——若确实需要，再次调用 read 即可放行（单次提醒、不持续拦截，与执行阶段的 sticky 拦截不同：设计阶段没有可派发的 Member）。`.md` 读取不计数、不拦截；首次拦截带 `firstBlock` 标记触发用户可见通知与状态栏警示；`agent_start` 重置每轮计数。
 
 **执行阶段白名单（`EXECUTION_PHASE_WHITELIST`）：**
-- 团队管理工具 + 只读分析工具（`read`、`bash`、`web_search`、`fetch_content`、`ctx_search`、`true_sight_*` 等）+ `write`/`edit`（仅 `.md` 文件）
+- 团队管理工具 + 第三方编排辅助工具（`ask_user_question`、`todo`，决策 #44——仅白名单放行；提示词不列举）+ 只读分析工具（`read`、`bash`、`web_search`、`fetch_content`、`ctx_search`、`true_sight_*` 等）+ `write`/`edit`（仅 `.md` 文件）
 - `ctx_execute`、`ctx_execute_file`、`ctx_batch_execute`、`mcp` 等具有文件写入能力的工具不在白名单中，自动被阻断。
 - 设计阶段的阻断在首次 `start_member` 成功后自动解除（同时 `dynamicPhase` 切换至 `"execution"`）
 
@@ -916,7 +916,7 @@ Strict 模式的注入结构相同，但标题为「严格模式 ⚡ — 必须�
 - 机制：以 `agent_start` 为 turn 边界重置计数；每个 turn 内未发生 `team_send_and_wait` 派发时，TL 对**所有非管理工具**（read、bash、web_search、ctx_execute 等——不只 `read`，否则可用 bash grep/rg/cat 绕过）的调用计数，超过阈值（默认 3）即进入**持续拦截模式**：派发前每次非管理工具调用都会被 block，reason 中包含纠偏指引。
 - 设计属性：
   - **持续拦截（sticky）**：阈值触发后不是 block 一次就放行——一次性的软提醒实测可被模型无视（看到一次错误后继续用下一个工具分析）。现在派发前所有非管理工具调用持续被拦截，TL 唯一出路是 `team_send_and_wait` 派发任务或直接回复用户。首次拦截带 `firstBlock` 标记，供 UI 弹通知/状态栏警示；派发（`team_send_and_wait`）后立即解锁，后续工具调用全部放行。
-  - **fail-open**：`.md` 读取不计数（文档工作是 TL 本职）；管理工具（start/stop/list_members、team_send_and_wait、write/edit 等）永不拦截（解锁通道永远畅通）；派发后不再拦截（派发后的 read 视为协调/审阅）；设计阶段不启用本守卫（无 Member 可派发），取而代之的是**设计阶段 read 软限制**（`createDesignReadGuard`，见上）：非 `.md` read 每 4 次拦截一次提醒，确需读取时再次调用即放行。
+  - **fail-open**：`.md` 读取不计数（文档工作是 TL 本职）；管理工具（start/stop/list_members、team_send_and_wait、write/edit 等）与编排辅助工具（`ask_user_question`、`todo`，决策 #44——不消耗预算、sticky 期间仍可用）永不拦截（解锁通道永远畅通）；派发后不再拦截（派发后的 read 视为协调/审阅）；设计阶段不启用本守卫（无 Member 可派发），取而代之的是**设计阶段 read 软限制**（`createDesignReadGuard`，见上）：非 `.md` read 每 4 次拦截一次提醒，确需读取时再次调用即放行。
   - 提示词层（`src/prompts/tl-first-action.ts` 的"第一动作协议"，注入预定义团队与动态模式执行阶段提示词顶部）与运行时层（本守卫）配对，模型能预知规则被强制执行。
 
 The handler stays registered for the entire pi session but checks `session.active` to decide whether to inject regular TL instructions. When `/team stop` ends the session, `session.active` becomes `false` and no regular TL instructions are injected; a one-shot session-ended banner may be injected on the next turn and is then consumed.
@@ -2187,3 +2187,24 @@ resolver 矩阵 8（undefined/true/false/getter 异常/null·undefined settings 
 - Member 单测覆盖 allowed/tl-only 两态边界；集成 golden 显式更新报告约束与新增边界，保留互发、corr 与必须回复 TL 的原语义。
 - 无新增设置、环境变量、运行时门控或路由改动；不是沙箱，不保证模型绝不越界。提示词规则的存在由测试保证，实际遵循度仍需真实任务观察。
 - 部署后 TL `/reload` 或重启加载；已经运行的 Member 需重启或重新加载其扩展才能取得新规则。不要为更新规则中断在飞任务。
+
+## 31. TL 编排辅助工具放行（决策 #44：ask_user_question / todo）
+
+**目的**：让 TL 在团队会话中可用两件第三方编排辅助工具——`ask_user_question`（`@juicesharp/rpiv-ask-user-question`，结构化问卷）与 `todo`（`@juicesharp/rpiv-todo`，任务清单）。此前白名单只含团队管理工具与只读/文档工具，两者被 `tool_call` 守卫硬阻断。
+
+### 31.1 判定依据
+
+两者均不写项目/工作区文件：`todo` 状态为进程内 per-session 槽位 + 会话分支回放（无 fs 写入）；`ask_user_question` 仅 UI 交互（唯一 fs 接触是 external-editor 功能在系统临时目录 `os.tmpdir()` 建临时文件、用后清理）。因此不属于「亲自做 Member 的工作」，与 `write`/`edit`（受限 .md）和团队管理工具同类，属编排/沟通。
+
+### 31.2 改动点
+
+- **白名单**：`index.ts` 的 `DESIGN_PHASE_WHITELIST` 与 `EXECUTION_PHASE_WHITELIST` 均加入两工具——放行是功能诉求（不被守卫硬阻断）；设计阶段同样放行，因为结构化提问与设计流程跟踪不触碰代码工作。
+- **预派发守卫**：`src/session/tl-read-guard.ts` 的 `MANAGEMENT_TOOLS` 加入两工具——不消耗派发前预算、sticky 拦截期间仍可用。TL 先建 4 条 todo 再派发是正确行为，不能被守卫拦下。
+- **不做提示词/README 推广（用户裁决）**：第三方工具与本扩展相互独立，发现性由工具自身的 promptSnippet/promptGuidelines 承担（pi 按 activeTools 自动注入）——本扩展的预定义提示词、dynamic 设计/执行两阶段提示词与 README 均不列举这两件工具（负例测试锁定，防无意回写）。
+- **不做**：不为两工具做专门配置项；未安装插件时白名单条目为惰性（工具不存在，零行为）；agent 来源会话本就旁路白名单，天然可用。
+
+### 31.3 验证
+
+- `src/index.test.ts`：设计/执行两阶段放行；守卫预算不消耗（多次调用后仍恰好 3 次 read 通过）；sticky 期间两工具仍可用而 read 继续被拦；预定义提示词负例（不列举）。
+- `src/session/tl-read-guard.test.ts`：显式豁免用例（sticky 下不拦截、不计数）。
+- `src/prompts/dynamic-mode.test.ts`：两阶段提示词负例（不列举）。

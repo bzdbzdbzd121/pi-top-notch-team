@@ -146,6 +146,15 @@ describe("createTlReadGuard", () => {
     expect(g.preDispatchCalls).toBe(0);
   });
 
+  it("ask_user_question / todo are exempt: never counted, never sticky-blocked", () => {
+    const g = createTlReadGuard({ threshold: 0 }); // sticky immediately for non-mgmt
+    expect(g.checkToolCall("bash", undefined).block).toBe(true); // sticky on
+    // Planning/alignment tools remain usable and do not consume the budget.
+    expect(g.checkToolCall("ask_user_question", undefined).block).toBe(false);
+    expect(g.checkToolCall("todo", undefined).block).toBe(false);
+    expect(g.preDispatchCalls).toBe(1); // only bash counted
+  });
+
   it("management tools remain usable while sticky (dispatch path stays open)", () => {
     const g = createTlReadGuard({ threshold: 0 });
     expect(g.checkToolCall("bash", undefined).block).toBe(true); // sticky

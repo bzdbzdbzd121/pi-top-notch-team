@@ -475,6 +475,13 @@ export default function (pi: ExtensionAPI) {
     // read/write: read unrestricted, write restricted to .md files (checked separately)
     "read",
     "write",
+    // Third-party orchestration aids (rpiv-ask-user-question / rpiv-todo):
+    // structured user questionnaire + in-memory task list. Neither writes
+    // project files, so both stay available in the design phase as well.
+    // Deliberately NOT advertised in our prompts — each third-party tool's own
+    // promptSnippet/promptGuidelines (auto-injected by pi from activeTools)
+    // covers discoverability (decision #44).
+    "ask_user_question", "todo",
   ]);
 
   /** Tools allowed during execution phase (normal session + dynamic execution). */
@@ -490,6 +497,8 @@ export default function (pi: ExtensionAPI) {
     "web_search", "fetch_content", "get_search_content",
     // write/edit: restricted to .md files (checked separately)
     "write", "edit",
+    // Third-party orchestration aids (see design-phase note, decision #44).
+    "ask_user_question", "todo",
     // Context-mode read-only / indexing
     "ctx_search", "ctx_stats", "ctx_doctor", "ctx_insight",
     "ctx_index", "ctx_fetch_and_index",

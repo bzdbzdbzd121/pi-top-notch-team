@@ -55,6 +55,14 @@ describe("buildDynamicModePrompt — design phase", () => {
     expect(prompt).toContain("再次调用 read 即可放行");
   });
 
+  it("不列举第三方编排工具 ask_user_question / todo（发现性交给工具自身提示词）", () => {
+    // 决策 #44：白名单放行这两件第三方工具，但本扩展的提示词不提及它们——
+    // 第三方工具由其自身 promptSnippet/promptGuidelines 负责发现性。
+    // 负例锁定，防止无意间把第三方工具重新写回提示词。
+    expect(prompt).not.toContain("ask_user_question");
+    expect(prompt).not.toContain("todo");
+  });
+
   it("空团队时提示使用 add_dynamic_member", () => {
     expect(prompt).toContain("add_dynamic_member");
     expect(prompt).toContain("尚无成员");
@@ -117,5 +125,10 @@ describe("buildDynamicModePrompt — execution phase", () => {
 
   it("不注入 playbook（playbook 仅设计阶段使用）", () => {
     expect(prompt).not.toContain("TL 编排方法论 Playbook");
+  });
+
+  it("不列举第三方编排工具 ask_user_question / todo（决策 #44）", () => {
+    expect(prompt).not.toContain("ask_user_question");
+    expect(prompt).not.toContain("todo");
   });
 });

@@ -11,8 +11,9 @@
  * web_search, etc.) — not just `read` — because the TL can easily bypass a
  * read-only guard by using `bash` with grep/rg/cat or ctx_execute to read
  * code files. The only tools exempt from counting are the team-management
- * tools (start_member, stop_member, team_send_and_wait, etc.) and write/edit
- * (already restricted to .md-only during sessions).
+ * tools (start_member, stop_member, team_send_and_wait, etc.), write/edit
+ * (already restricted to .md-only during sessions), and the third-party
+ * orchestration aids ask_user_question / todo (coordination, not analysis).
  *
  * Behavior (per user-message turn):
  * - Management tools (start/stop/list members, team_send_and_wait, set_goal,
@@ -47,6 +48,12 @@ export const MANAGEMENT_TOOLS = new Set([
   // coordination, not "doing the work".
   "start_team_session", "stop_team_session",
   "write", "edit",  // Restricted to .md-only during sessions; legitimate TL management work
+  // Third-party orchestration aids (rpiv-ask-user-question / rpiv-todo):
+  // asking the user structured questions and tracking a task list is
+  // coordination, not "doing the work" — they must never consume the
+  // pre-dispatch budget, and a sticky block must not stop a TL that is
+  // planning (e.g. 4 todo calls before the first dispatch is good behavior).
+  "ask_user_question", "todo",
 ]);
 
 export interface TlReadGuardOptions {
