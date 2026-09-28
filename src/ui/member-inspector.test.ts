@@ -793,6 +793,33 @@ describe("MemberInspectorComponent — 场景 O：输入模式 Home/End（功能
   });
 });
 
+describe("MemberInspectorComponent — 场景 P：输入模式提示文案（阶段 2）", () => {
+  const FRAGMENT = "Home/End 行首/行尾";
+
+  it("P1: INPUT_HINTS 前段含 Home/End，且按 80 列生产预算（68）可见", () => {
+    // 既有子串保持不变
+    expect(INPUT_HINTS).toContain("←→ 移动光标");
+    expect(INPUT_HINTS).toContain("alt+Enter");
+    expect(INPUT_HINTS).toContain(FRAGMENT);
+    // 前段位置：位于 Enter 提示之前（尾部截断不影响它）
+    expect(INPUT_HINTS.indexOf(FRAGMENT)).toBeGreaterThan(INPUT_HINTS.indexOf("←→ 移动光标"));
+    expect(INPUT_HINTS.indexOf(FRAGMENT)).toBeLessThan(INPUT_HINTS.indexOf("Enter 发送"));
+    // 生产宽度链：浮窗宽 = 终端 80 × 90% = 72 → 内部宽 −2 = 70 → 提示行内容预算 = 68
+    const budget = Math.max(20, Math.floor(80 * 0.9) - 2) - 2;
+    const end = INPUT_HINTS.indexOf(FRAGMENT) + FRAGMENT.length;
+    expect(visibleWidth(" " + INPUT_HINTS.slice(0, end))).toBeLessThanOrEqual(budget);
+  });
+
+  it("P2: 渲染的输入提示包含新片段（前段稳定可见）", () => {
+    const deps = makeDeps({ handles: {}, opStates: {} });
+    const { comp } = makeComponent(deps);
+    comp.handleInput("i");
+    const joined = comp.render(80).join("\n");
+    expect(joined).toContain("←→ 移动光标");
+    expect(joined).toContain(FRAGMENT);
+  });
+});
+
 describe("MemberInspectorComponent — control commands", () => {
   it("ctrl+a sends abort to active member", () => {
     const handleA = makeHandle();
@@ -1540,10 +1567,14 @@ describe("MemberInspectorComponent — render", () => {
     expect(joined).toContain("> abc");
     // Navigation hints replaced by the input box…
     expect(joined).not.toContain("切换成员");
-    // …and action hints replaced by input-mode hints
+    // …and action hints replaced by input-mode hints（阶段 2：Home/End 在前段）
     expect(joined).toContain("Enter 发送");
-    expect(joined).toContain("ctrl+Enter/alt+Enter 立即转向");
-    expect(joined).toContain("Esc 取消");
+    expect(joined).toContain("Home/End 行首/行尾");
+    expect(joined).toContain("ctrl+Enter/alt+Enter");
+    // 尾部既有项因提示行变长在 80 列渲染中被截断（既有已接受行为，方案 §4.7，
+    // 本次不修）；完整文案仍保留在 INPUT_HINTS 常量中（可见性断言见场景 P）
+    expect(INPUT_HINTS).toContain("立即转向");
+    expect(INPUT_HINTS).toContain("Esc 取消");
     expect(joined).not.toContain("Esc 关闭");
   });
 });

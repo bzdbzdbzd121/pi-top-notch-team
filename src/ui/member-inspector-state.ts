@@ -433,7 +433,7 @@ export const KEY_HINTS_ACTION =
   "ctrl+a 中断  ctrl+b/ctrl+shift+a 全中断  ctrl+o 压缩  Esc 关闭";
 /** Hints shown while the input box is open. */
 export const INPUT_HINTS =
-  "←→ 移动光标  Enter 发送/排队  ctrl+Enter/alt+Enter 立即转向  Esc 取消";
+  "←→ 移动光标  Home/End 行首/行尾  Enter 发送/排队  ctrl+Enter/alt+Enter 立即转向  Esc 取消";
 
 // ── Text helpers ───────────────────────────────────────────
 
