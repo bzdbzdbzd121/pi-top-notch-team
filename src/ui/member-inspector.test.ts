@@ -5,7 +5,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 // The per-frame width-tax test counts visibleWidth calls via a wrapper that
 // forwards everything else untouched.
 
-import { visibleWidth, setKittyProtocolActive } from "@earendil-works/pi-tui";
+import { visibleWidth, setKittyProtocolActive, CURSOR_MARKER } from "@earendil-works/pi-tui";
 
 // Per-frame width-tax counter (P1-① acceptance #1). The wrapper forwards to
 // the real implementation; only the call count is tracked.
@@ -119,6 +119,11 @@ function makeComponent(deps: any) {
 /** Type text into the (open) input box char by char. */
 function typeText(comp: MemberInspectorComponent, text: string) {
   for (const ch of text) comp.handleInput(ch);
+}
+
+/** 阶段 3：剥除零宽 CURSOR_MARKER，便于对渲染内容做既有断言。 */
+function stripCursorMarker(line: string): string {
+  return line.replaceAll(CURSOR_MARKER, "");
 }
 
 // ── Tests ──────────────────────────────────────────────────
@@ -527,7 +532,8 @@ describe("MemberInspectorComponent — 场景 M：输入模式左右键与光标
     const lines = comp.render(80);
     const inputLine = lines.find((l) => l.includes("✎"));
     expect(inputLine).toBeDefined();
-    expect(inputLine!).toContain("ab▌cd");
+    // 内容断言前剥除阶段 3 零宽标记（不影响既有渲染断言）
+    expect(stripCursorMarker(inputLine!)).toContain("ab▌cd");
     expect(visibleWidth(inputLine!)).toBe(80);
     for (const l of lines) expect(visibleWidth(l)).toBeLessThanOrEqual(80);
   });
@@ -538,7 +544,7 @@ describe("MemberInspectorComponent — 场景 M：输入模式左右键与光标
     state.insertInput("x".repeat(80)); // > 旧缺陷阈值 inner-6 = 72
     let line = comp.render(80).find((l) => l.includes("✎"))!;
     expect(line).toContain("▌"); // 旧实现：▌ 被外层兜底省略号顶掉
-    expect(line).toMatch(/xxx▌/); // 光标在末尾：▌ 紧跟内容尾部
+    expect(stripCursorMarker(line)).toMatch(/xxx▌/); // 光标在末尾：▌ 紧跟内容尾部
     expect(visibleWidth(line)).toBe(80);
 
     for (let i = 0; i < 40; i++) state.moveInputCursor(-1); // 移至中段
@@ -554,7 +560,7 @@ describe("MemberInspectorComponent — 场景 M：输入模式左右键与光标
     let line = comp.render(80).find((l) => l.includes("✎"))!;
     expect(line).toContain("▌");
     expect(visibleWidth(line)).toBe(80);
-    const before = line.replace(/^.*> /, "").split("▌")[0];
+    const before = stripCursorMarker(line).replace(/^.*> /, "").split("▌")[0];
     const seg = new Intl.Segmenter(undefined, { granularity: "grapheme" });
     for (const g of seg.segment(before)) expect(g.segment).toBe(FAMILY);
 
@@ -562,7 +568,7 @@ describe("MemberInspectorComponent — 场景 M：输入模式左右键与光标
     line = comp.render(80).find((l) => l.includes("✎"))!;
     expect(line).toContain("▌");
     expect(visibleWidth(line)).toBe(80);
-    const after = line.replace(/^.*> /, "").split("▌")[1] ?? "";
+    const after = stripCursorMarker(line).replace(/^.*> /, "").split("▌")[1] ?? "";
     const tail = after.replace(/\s*│?\s*$/, "");
     if (tail.length > 0) for (const g of seg.segment(tail)) expect(g.segment).toBe(FAMILY);
   });
@@ -580,6 +586,50 @@ describe("MemberInspectorComponent — 场景 M：输入模式左右键与光标
     const { comp } = makeComponent(deps);
     comp.handleInput("i");
     expect(comp.render(80).join("\n")).toContain("←→ 移动光标");
+  });
+});
+
+describe("MemberInspectorComponent — 场景 N：输入法硬件光标标记（阶段 3）", () => {
+  let deps: any;
+
+  beforeEach(() => {
+    deps = makeDeps({
+      handles: { a: makeHandle() },
+      opStates: { a: "idle", b: "idle" },
+    });
+  });
+
+  it("N1: 输入框打开时 CURSOR_MARKER 恰好出现一次、位于 ▌ 之前、不影响行宽", () => {
+    const { comp } = makeComponent(deps);
+    comp.handleInput("i");
+    typeText(comp, "abcd");
+    comp.handleInput(K.left);
+    comp.handleInput(K.left); // 光标 ab|cd
+    const lines = comp.render(80);
+    const inputLine = lines.find((l) => l.includes("✎"))!;
+    // 恰好一次
+    expect(inputLine.split(CURSOR_MARKER).length - 1).toBe(1);
+    // 紧跟块状光标字形之前（真实光标位置）
+    expect(inputLine).toContain("ab" + CURSOR_MARKER + "▌cd");
+    // 零宽：不影响行宽与既有内容
+    expect(visibleWidth(inputLine)).toBe(80);
+    for (const l of lines) expect(visibleWidth(l)).toBeLessThanOrEqual(80);
+  });
+
+  it("N2: 输入框关闭时不发射标记（导航模式无硬件光标锚点）", () => {
+    const { comp } = makeComponent(deps);
+    const lines = comp.render(80);
+    expect(lines.join("\n")).not.toContain(CURSOR_MARKER);
+  });
+
+  it("N3: 长输入（窗口滚动）标记仍紧贴 ▌ 且宽度精确", () => {
+    const { comp, state } = makeComponent(deps);
+    comp.handleInput("i");
+    state.insertInput("x".repeat(80));
+    const line = comp.render(80).find((l) => l.includes("✎"))!;
+    expect(line.split(CURSOR_MARKER).length - 1).toBe(1);
+    expect(line).toContain(CURSOR_MARKER + "▌");
+    expect(visibleWidth(line)).toBe(80);
   });
 });
 

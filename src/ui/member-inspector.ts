@@ -1,4 +1,4 @@
-import { matchesKey, Key, visibleWidth } from "@earendil-works/pi-tui";
+import { matchesKey, Key, visibleWidth, CURSOR_MARKER } from "@earendil-works/pi-tui";
 // CSI-u 解码纪律：任何字符插入路径必须经 decodePrintableKey（与 pi 主输入框
 // editor.js 一致）。本地实现见 pi-key-decode.ts——不能深导入
 // `@earendil-works/pi-tui/dist/keys.js`：扩展加载器（loader.js）的 jiti alias
@@ -1217,9 +1217,12 @@ export class MemberInspectorComponent {
       // 阶段 2：`> ` + 光标前文字 + ▌ + 光标后文字，长输入横向窗口保证光标
       // 可见；输出宽度精确等于 inner-4，外层兜底截断/补齐不介入（既有缺陷
       // 修复：旧的宽度预算多 1 列，长输入时兜底省略号会顶掉 ▌）。
+      // 阶段 3：光标字形前插入 pi-tui 的 CURSOR_MARKER（零宽 APC）——TUI 渲染
+      // 时提取并剥除，把硬件光标移到该列，使输入法候选框锚定真实光标位置；
+      // 块状 ▌ 保留，标记仅输入框打开时发射。
       footer2 =
         theme.fg("accent", "✎ ") +
-        buildInputBoxLine(this.state.inputBuffer, this.state.inputCursor, inner - 4);
+        buildInputBoxLine(this.state.inputBuffer, this.state.inputCursor, inner - 4, CURSOR_MARKER);
     } else {
       footer2 = " " + buildNavHints(this.state.expanded, this.state.showThinking);
     }
