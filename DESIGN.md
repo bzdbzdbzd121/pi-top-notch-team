@@ -1212,9 +1212,10 @@ Overlay: `ctx.ui.custom(component, { overlay: true, overlayOptions: { width: "90
 | Key | Action |
 |-----|--------|
 | `←` / `→` | Switch member tab (wraps around). **In the input box** they move the cursor by one visible character instead (grapheme — a Chinese character, emoji ZWJ family or combining sequence counts as one; stops at the ends, no wrap; branches sit after backspace and before the character fallback, so arrows are never inserted as text) |
+| `Home` / `End` | **In the input box**: jump the text cursor to the start / end of the input (one step, idempotent at the ends; matched after `←`/`→` and before the clear/character fallback). **Outside the input box**: `Home` is unbound, `End` keeps its original meaning (jump the conversation to the bottom + resume tail-following). Plain keys only — `Shift`/`Alt`/`Ctrl` combinations are no-ops (the editor keybinding manager is deliberately not used: its line-start default includes `Ctrl+A`, which is “abort member” here, and its defaults drift across pi-tui versions) |
 | `↑` / `↓` / `PgUp` / `PgDn` | Scroll conversation |
-| `End` | Jump to bottom + resume tail-following |
-| `i` / `Enter` | Open input box. Editing inside the input box: characters insert at the cursor, backspace deletes the visible character before it (emoji/combining sequences delete whole — intentional fix vs. the old codepoint delete), `←`/`→` move the cursor |
+| `End` | See the `Home`/`End` row above — outside the input box: jump to bottom + resume tail-following |
+| `i` / `Enter` | Open input box. Editing inside the input box: characters insert at the cursor, backspace deletes the visible character before it (emoji/combining sequences delete whole — intentional fix vs. the old codepoint delete), `←`/`→` move the cursor, `Home`/`End` jump to the input start/end |
 | `Enter` (in input) | Send: `prompt` when idle, `follow_up` when busy（含字面 `\n` 兜底——kitty 协议激活时 pi-tui 不再将 `\n` 识别为 enter，LF 编码混合终端靠此放行；兜底必须位于任何未来 ctrl+j 分支之后） |
 | `Ctrl+Enter` / `Alt+Enter` (in input) | Send `steer` (immediate redirect). **Ctrl+Enter 依赖终端协议**（kitty CSI-u `\x1b[13;5u` / modifyOtherKeys `\x1b[27;5;13~`）；legacy 终端两者同字节 `\r` 无法区分，**Alt+Enter 是协议无关的 steer 路径**（legacy `\x1b\r` / kitty `\x1b[13;3u`）。空文本或无成员时显式 notice，不再静默 |
 | `e` | Toggle tool call/result detail expansion — **GLOBAL**: flips ALL member tabs (P3-①: 全 tab 本地重建零 RPC——running/stopped/crashed 同样适用，lastMessages 为空的 tab 保留 refetch 兜底) |
