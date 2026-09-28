@@ -792,35 +792,46 @@ describe("MemberInspectorComponent — 场景 O：输入模式 Home/End（功能
     expect(state.tabs[0].followTail).toBe(false);
   });
 
-  it("O10: modifyOtherKeys 特殊键形跳转生效且不插入（\\x1b[27;1;72~ / \\x1b[27;1;70~）", () => {
+  it("O10: modifyOtherKeys 键码 72/70 是普通键 H/F（非 Home/End）：plain/shift 键形均插入", () => {
+    // xterm modifyOtherKeys level 2 对可打印键按结果字符编码：
+    // `\x1b[27;1;72~` / `\x1b[27;2;72~` = 'H'（无修饰 / Shift），70 = 'F'；
+    // 不得拦截消费（曾误映射为 Home/End 导致 Shift+H/F 丢字符）。
     const { comp, state } = makeComponent(deps);
     comp.handleInput("i");
-    typeText(comp, "abcd"); // 光标在末尾
-    comp.handleInput("\x1b[27;1;72~"); // modifyOtherKeys Home → 跳到开头（不得插入 "H"）
-    expect(state.inputCursor).toBe(0);
-    expect(state.inputBuffer).toBe("abcd");
-    comp.handleInput("\x1b[27;1;70~"); // modifyOtherKeys End → 跳到末尾（不得插入 "F"）
-    expect(state.inputCursor).toBe(4);
-    expect(state.inputBuffer).toBe("abcd");
-    expect(state.activeIndex).toBe(0);
-  });
-
-  it("O11: modifyOtherKeys 修饰变体无操作且不插入（shift/alt/ctrl）", () => {
-    const { comp, state } = makeComponent(deps);
-    comp.handleInput("i");
-    typeText(comp, "ab"); // 光标在末尾
     for (const seq of [
-      "\x1b[27;2;72~",
-      "\x1b[27;2;70~", // shift+Home/End
-      "\x1b[27;3;72~",
-      "\x1b[27;3;70~", // alt+Home/End
-      "\x1b[27;5;72~",
-      "\x1b[27;5;70~", // ctrl+Home/End
+      "\x1b[27;1;72~",
+      "\x1b[27;2;72~", // plain / shift 键形 → 'H'
+      "\x1b[27;1;70~",
+      "\x1b[27;2;70~", // plain / shift 键形 → 'F'
     ]) {
       comp.handleInput(seq);
     }
-    expect(state.inputBuffer).toBe("ab");
-    expect(state.inputCursor).toBe(2);
+    expect(state.inputBuffer).toBe("HHFF");
+    expect(state.inputCursor).toBe(4);
+    expect(state.activeIndex).toBe(0); // 不跳转、不切标签
+  });
+
+  it("O11: Shift+H/F 恢复插入；alt/ctrl 变体维持不插入（decoder 既有拒绝，非拦截功劳）", () => {
+    const { comp, state } = makeComponent(deps);
+    comp.handleInput("i");
+    typeText(comp, "ab"); // 光标在末尾
+    // shift 变体 = 可打印字符 → 恢复插入（回归锁定）
+    comp.handleInput("\x1b[27;2;72~"); // Shift+H
+    comp.handleInput("\x1b[27;2;70~"); // Shift+F
+    expect(state.inputBuffer).toBe("abHF");
+    expect(state.inputCursor).toBe(4);
+    // alt/ctrl 变体：decodePrintableKey 既有拒绝（不插入、不移动）——与拦截无关
+    const cursorBefore = state.inputCursor;
+    for (const seq of [
+      "\x1b[27;3;72~",
+      "\x1b[27;3;70~", // alt+H/F
+      "\x1b[27;5;72~",
+      "\x1b[27;5;70~", // ctrl+H/F
+    ]) {
+      comp.handleInput(seq);
+    }
+    expect(state.inputBuffer).toBe("abHF");
+    expect(state.inputCursor).toBe(cursorBefore);
   });
 });
 

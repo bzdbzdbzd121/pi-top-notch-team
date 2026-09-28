@@ -1050,27 +1050,21 @@ export class MemberInspectorComponent {
         this.sendControl("compact");
         return;
       } else {
-        // modifyOtherKeys 特殊键形（阶段 2 补强）：xterm `CSI 27;mod;code~`。
-        // 功能键码 72/70（Home/End）不被 pi-tui matchesKey 识别；若不在此
-        // （decodePrintableKey 之前）拦截，会被 modifyOtherKeys 回退解码成
-        // "H"/"F" 插入。无修饰 → 跳首/尾；修饰变体 → 消费但无操作。
-        const mokEdge = matchModifyOtherKeysEdge(data);
-        if (mokEdge === "start") {
-          this.state.moveInputCursorTo("start");
-        } else if (mokEdge === "end") {
-          this.state.moveInputCursorTo("end");
-        } else if (mokEdge !== "ignore") {
-          // CSI-u 解码（场景 K 主线）：kitty 键盘协议 flag 1（disambiguate）激活后
-          // 所有按键均编码为 CSI-u（按 a → \x1b[97u），不解码则文字永远进不去。
-          // decodePrintableKey 仅接受纯字符/Shift 字符：ctrl/alt 修饰序列返回
-          // undefined（不劫持上方的 ctrl+enter/enter 匹配——分支顺序双保险），
-          // legacy 原字符也返回 undefined（走下方兜底，零影响）。
-          const printable = decodePrintableKey(data);
-          if (printable !== undefined) {
-            this.state.insertInput(printable); // kitty CSI-u / modifyOtherKeys 字符 → 解码后插入
-          } else if (data.length >= 1 && !isControlSequence(data)) {
-            this.state.insertInput(data); // legacy 原字符兜底（零影响）
-          }
+        // ⚠️ 不得拦截 modifyOtherKeys `CSI 27;m;72/70~` 键形：level 2 对可打印
+        // 键按结果字符编码（`27;2;72~` = Shift+H），它们不是 Home/End——曾把
+        // 72/70 误映射为 Home/End 拦截，导致 Shift+H/F 在主输入路径丢字符。
+        // 该键形必须继续走下方 decodePrintableKey 既有路径（plain/shift → 'H'/'F'；
+        // alt/ctrl 由 decoder 既有逻辑拒绝）。
+        // CSI-u 解码（场景 K 主线）：kitty 键盘协议 flag 1（disambiguate）激活后
+        // 所有按键均编码为 CSI-u（按 a → \x1b[97u），不解码则文字永远进不去。
+        // decodePrintableKey 仅接受纯字符/Shift 字符：ctrl/alt 修饰序列返回
+        // undefined（不劫持上方的 ctrl+enter/enter 匹配——分支顺序双保险），
+        // legacy 原字符也返回 undefined（走下方兜底，零影响）。
+        const printable = decodePrintableKey(data);
+        if (printable !== undefined) {
+          this.state.insertInput(printable); // kitty CSI-u / modifyOtherKeys 字符 → 解码后插入
+        } else if (data.length >= 1 && !isControlSequence(data)) {
+          this.state.insertInput(data); // legacy 原字符兜底（零影响）
         }
       }
       this.requestRenderSafe(true);
@@ -1267,24 +1261,6 @@ function padVisible(text: string, width: number): string {
 /** Heuristic: printable input is 1+ chars that doesn't start with ESC. */
 function isControlSequence(data: string): boolean {
   return data.startsWith("\x1b") || data.charCodeAt(0) < 32;
-}
-
-/** xterm modifyOtherKeys 格式：CSI 27 ; modifiers(1-indexed) ; keycode ~ */
-const MODIFY_OTHER_KEYS_EDGE_RE = /^\x1b\[27;(\d+);(72|70)~$/;
-
-/**
- * modifyOtherKeys 特殊键形 Home/End（xterm 功能键码 72/70）。
- *
- * pi-tui 的 matchesKey 不识别这两个功能键码，若不显式拦截，序列会落入
- * decodePrintableKey 的 modifyOtherKeys 回退，被解码为 "H"/"F" 插入。
- * 仅无修饰（modifier = 1）映射为光标跳转；带修饰变体返回 "ignore"，
- * 由调用方消费但不动作（保持无操作且不插入）；其他序列返回 null。
- */
-function matchModifyOtherKeysEdge(data: string): "start" | "end" | "ignore" | null {
-  const m = MODIFY_OTHER_KEYS_EDGE_RE.exec(data);
-  if (!m) return null;
-  if (Number(m[1]) !== 1) return "ignore";
-  return m[2] === "72" ? "start" : "end";
 }
 
 /** P1-④: scrolling keys open the interaction window (browsing intent). */
