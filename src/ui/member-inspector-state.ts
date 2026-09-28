@@ -426,7 +426,7 @@ export const KEY_HINTS_ACTION =
   "ctrl+a 中断  ctrl+b/ctrl+shift+a 全中断  ctrl+o 压缩  Esc 关闭";
 /** Hints shown while the input box is open. */
 export const INPUT_HINTS =
-  "Enter 发送（忙碌时排队）  ctrl+Enter/alt+Enter 立即转向  Esc 取消";
+  "←→ 移动光标  Enter 发送/排队  ctrl+Enter/alt+Enter 立即转向  Esc 取消";
 
 // ── Text helpers ───────────────────────────────────────────
 
@@ -485,6 +485,103 @@ export function fitLinesToWidth(lines: string[], width: number): string[] {
     if (vw > width) return truncateLine(l, width);
     return vw === width ? l : l + " ".repeat(width - vw);
   });
+}
+
+/**
+ * Build the input-box line: `> ` + text before the cursor + `▌` + text after
+ * the cursor, windowed horizontally so the cursor stays visible, then padded
+ * to exactly `width` visible columns.
+ *
+ * Output contract: `visibleWidth(result) === width`. The component wraps the
+ * result as `│ ✎ <line> │`; since the widths match exactly, the outer
+ * fallback truncate/pad never fires. That is the fix for the long-input
+ * defect: the old assembly budgeted one column too many, so the fallback
+ * ellipsis replaced the `▌` once the text reached `inner - 6` columns.
+ *
+ * Window strategy (centered, edge-sticky — same feel as pi's main editor):
+ * short input shows from column 0 (unchanged visuals); long input centers on
+ * the cursor where possible and sticks to either edge near the ends. The
+ * window only ever takes whole graphemes (CJK / emoji ZWJ / combining
+ * sequences are never split) and never runs past the end of the text.
+ *
+ * @param cursorMarker stage-3 hook: a zero-width marker emitted right before
+ *   the `▌` glyph; empty in stage 2.
+ */
+export function buildInputBoxLine(
+  buffer: string,
+  cursor: number,
+  width: number,
+  cursorMarker = ""
+): string {
+  if (width <= 0) return "";
+  const prompt = "> ";
+  if (width <= prompt.length) return prompt.slice(0, width);
+
+  // Defensive clamp: 0..length, snapped forward to a grapheme boundary. The
+  // state layer maintains this invariant; the render layer stays safe if a
+  // cursor built elsewhere breaks it.
+  const rawPos = Number.isFinite(cursor) ? cursor : buffer.length;
+  const cursorAt = snapForwardGraphemeBoundary(
+    buffer,
+    Math.max(0, Math.min(rawPos, buffer.length))
+  );
+
+  // Split into visible characters with cumulative display columns.
+  const segs: string[] = [];
+  const tokWidths: number[] = [];
+  const col: number[] = [0]; // col[i] = columns before token i; col[n] = total
+  for (const { seg, width: w } of graphemeTokens(buffer)) {
+    segs.push(seg);
+    tokWidths.push(w);
+    col.push(col[col.length - 1] + w);
+  }
+  const n = segs.length;
+  const total = col[n];
+
+  // Cursor boundary index: tokens [0, cursorIdx) sit before the cursor.
+  let cursorIdx = n;
+  let cursorCol = total;
+  {
+    let at = 0;
+    for (let i = 0; i < n; i++) {
+      if (at >= cursorAt) {
+        cursorIdx = i;
+        cursorCol = col[i];
+        break;
+      }
+      at += segs[i].length;
+    }
+  }
+
+  const A = width - 2; // columns for text + cursor glyph
+  const textBudget = Math.max(0, A - 1); // reserve one column for `▌`
+
+  let startIdx = 0;
+  if (total + 1 > A) {
+    // Windowed. Center on the cursor, clamp to the text edges, then snap
+    // DOWN to a token boundary (a window may not start mid-grapheme).
+    const half = Math.floor(textBudget / 2);
+    const maxStartCol = Math.max(0, total - textBudget);
+    const startCol = Math.max(0, Math.min(cursorCol - half, maxStartCol));
+    while (startIdx < n && col[startIdx + 1] <= startCol) startIdx++;
+    // Snapping down may still push the `▌` past the right edge — advance the
+    // window one character at a time until the cursor glyph fits.
+    while (startIdx < n && cursorCol - col[startIdx] + 1 > A) startIdx++;
+  }
+
+  let used = 0;
+  let before = "";
+  let after = "";
+  for (let i = startIdx; i < n; i++) {
+    if (used + tokWidths[i] > textBudget) break; // whole graphemes only
+    if (i < cursorIdx) before += segs[i];
+    else after += segs[i];
+    used += tokWidths[i];
+  }
+
+  const result = prompt + before + cursorMarker + "▌" + after;
+  const pad = width - 2 - used - 1;
+  return pad > 0 ? result + " ".repeat(pad) : result;
 }
 
 /** Word/char wrap text to the given visible width. */

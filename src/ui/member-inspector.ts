@@ -21,6 +21,7 @@ import {
   buildHeaderLine,
   buildFooterStatusLine,
   truncateLine,
+  buildInputBoxLine,
   nextStreamFlushDelay,
   KEY_HINTS_ACTION,
   INPUT_HINTS,
@@ -1021,6 +1022,12 @@ export class MemberInspectorComponent {
         return;
       } else if (matchesKey(data, Key.backspace)) {
         this.state.backspaceInput();
+      } else if (matchesKey(data, Key.left)) {
+        // ←→ 在输入模式内按可见字符移动光标（阶段 2）；分支位于退格之后、
+        // 字符兜底之前，不触碰解码路径；导航模式的 ←→ 切换成员不变。
+        this.state.moveInputCursor(-1);
+      } else if (matchesKey(data, Key.right)) {
+        this.state.moveInputCursor(1);
       } else if (matchesKey(data, "ctrl+u")) {
         this.state.clearInput();
       } else if (matchesKey(data, "ctrl+a")) {
@@ -1207,8 +1214,12 @@ export class MemberInspectorComponent {
     // ── Footer line 2: navigation key hints, or the input box ──
     let footer2: string;
     if (this.state.inputOpen) {
-      const label = `> ${this.state.inputBuffer}`;
-      footer2 = theme.fg("accent", "✎ ") + truncateLine(label, inner - 4) + "▌";
+      // 阶段 2：`> ` + 光标前文字 + ▌ + 光标后文字，长输入横向窗口保证光标
+      // 可见；输出宽度精确等于 inner-4，外层兜底截断/补齐不介入（既有缺陷
+      // 修复：旧的宽度预算多 1 列，长输入时兜底省略号会顶掉 ▌）。
+      footer2 =
+        theme.fg("accent", "✎ ") +
+        buildInputBoxLine(this.state.inputBuffer, this.state.inputCursor, inner - 4);
     } else {
       footer2 = " " + buildNavHints(this.state.expanded, this.state.showThinking);
     }

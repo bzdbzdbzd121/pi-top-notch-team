@@ -49,6 +49,14 @@ const K = {
   ctrlB: "\x02",
   ctrlShiftA: "\x1b[65;6u", // kitty CSI-u: 'A' + ctrl+shift
   ctrlO: "\x0f",
+  // 应用光标模式方向键（DECCKM）与 kitty 方向键两种编码
+  appCursorLeft: "\x1bOD",
+  appCursorRight: "\x1bOC",
+  kittyLeft: "\x1b[1;1D",
+  kittyRight: "\x1b[1;1C",
+  kittyFuncLeft: "\x1b[57417u",
+  kittyFuncRight: "\x1b[57418u",
+  altLeft: "\x1b[1;3D", // 带修饰键的方向键：保持无操作
   // kitty CSI-u printable sequences (keyboard protocol flag 1 active)
   kittyA: "\x1b[97u", // kitty 'a'
   kittyShiftA: "\x1b[65;1u", // kitty 'A' (shift, shifted keycode reported)
@@ -386,6 +394,192 @@ describe("MemberInspectorComponent — 场景 L：legacy 终端 steer 可用 + �
     comp.handleInput(K.altEnterKitty);
     expect(handleA.sendCommand).not.toHaveBeenCalled();
     expect(state.notice).toBe("✗ 无成员可发送");
+  });
+});
+
+describe("MemberInspectorComponent — 场景 M：输入模式左右键与光标渲染（阶段 2）", () => {
+  const FAMILY = "👨‍👩‍👧";
+  let deps: any;
+  let handleA: any;
+
+  beforeEach(() => {
+    handleA = makeHandle();
+    deps = makeDeps({
+      handles: { a: handleA },
+      opStates: { a: "idle", b: "idle" },
+    });
+  });
+
+  it("M1: 传统方向键按可见字符移动（端点停住、Buffer 不变、不切标签）", () => {
+    const { comp, state } = makeComponent(deps);
+    comp.handleInput("i");
+    typeText(comp, "abcd");
+    comp.handleInput(K.left);
+    expect(state.inputCursor).toBe(3);
+    comp.handleInput(K.right);
+    expect(state.inputCursor).toBe(4);
+    comp.handleInput(K.right); // 末尾 no-op
+    expect(state.inputCursor).toBe(4);
+    for (let i = 0; i < 4; i++) comp.handleInput(K.left);
+    expect(state.inputCursor).toBe(0);
+    comp.handleInput(K.left); // 开头 no-op
+    expect(state.inputCursor).toBe(0);
+    expect(state.inputBuffer).toBe("abcd"); // 方向键不插入字符
+    expect(state.activeIndex).toBe(0); // 输入模式下 ←→ 不切换成员标签
+  });
+
+  it("M2: 应用光标模式（\\x1bOD / \\x1bOC）移动", () => {
+    const { comp, state } = makeComponent(deps);
+    comp.handleInput("i");
+    typeText(comp, "ab");
+    comp.handleInput(K.appCursorLeft);
+    expect(state.inputCursor).toBe(1);
+    comp.handleInput(K.appCursorLeft);
+    expect(state.inputCursor).toBe(0);
+    comp.handleInput(K.appCursorRight);
+    expect(state.inputCursor).toBe(1);
+    comp.handleInput(K.appCursorRight);
+    expect(state.inputCursor).toBe(2);
+    comp.handleInput(K.appCursorRight); // 末尾 no-op
+    expect(state.inputCursor).toBe(2);
+    expect(state.inputBuffer).toBe("ab");
+  });
+
+  it("M3: kitty 两种方向键编码（\\x1b[1;1D / \\x1b[57417u）均移动", () => {
+    const { comp, state } = makeComponent(deps);
+    comp.handleInput("i");
+    typeText(comp, "abc");
+    comp.handleInput(K.kittyLeft);
+    expect(state.inputCursor).toBe(2);
+    comp.handleInput(K.kittyFuncLeft);
+    expect(state.inputCursor).toBe(1);
+    comp.handleInput(K.kittyFuncRight);
+    expect(state.inputCursor).toBe(2);
+    comp.handleInput(K.kittyRight);
+    expect(state.inputCursor).toBe(3);
+    expect(state.inputBuffer).toBe("abc");
+  });
+
+  it("M4: 按住连发（重复事件）逐次生效", () => {
+    const { comp, state } = makeComponent(deps);
+    comp.handleInput("i");
+    typeText(comp, "abcdef");
+    for (let i = 0; i < 3; i++) comp.handleInput(K.left);
+    expect(state.inputCursor).toBe(3);
+    for (let i = 0; i < 2; i++) comp.handleInput(K.right);
+    expect(state.inputCursor).toBe(5);
+  });
+
+  it("M5: 端到端 — 输入 abcd → 左移两次 → 插入 X → Enter 发送 abXcd", () => {
+    const { comp, state } = makeComponent(deps);
+    comp.handleInput("i");
+    typeText(comp, "abcd");
+    comp.handleInput(K.left);
+    comp.handleInput(K.left);
+    typeText(comp, "X");
+    expect(state.inputBuffer).toBe("abXcd");
+    comp.handleInput(K.enter);
+    expect(handleA.sendCommand).toHaveBeenCalledTimes(1);
+    const cmd = handleA.sendCommand.mock.calls[0][0];
+    expect(cmd.type).toBe("prompt");
+    expect(cmd.message).toBe(`${USER_DIRECT_PREFIX}\n` + "abXcd");
+    expect(state.inputOpen).toBe(false);
+  });
+
+  it("M6: 中段退格 — 删除光标前的 X 后发送 abcd", () => {
+    const { comp, state } = makeComponent(deps);
+    comp.handleInput("i");
+    typeText(comp, "abXcd");
+    comp.handleInput(K.left);
+    comp.handleInput(K.left); // 光标在 X 之后：abX|cd
+    expect(state.inputCursor).toBe(3);
+    comp.handleInput(K.backspace);
+    expect(state.inputBuffer).toBe("abcd");
+    expect(state.inputCursor).toBe(2);
+    comp.handleInput(K.enter);
+    const cmd = handleA.sendCommand.mock.calls[0][0];
+    expect(cmd.message).toBe(`${USER_DIRECT_PREFIX}\n` + "abcd");
+  });
+
+  it("M7: 负例 — 方向键不被当作字符插入；修饰方向键保持无操作", () => {
+    const { comp, state } = makeComponent(deps);
+    comp.handleInput("i");
+    typeText(comp, "ab");
+    comp.handleInput(K.left);
+    expect(state.inputBuffer).toBe("ab");
+    expect(state.inputCursor).toBe(1);
+    comp.handleInput(K.altLeft); // 带修饰键：既不移也不插入
+    expect(state.inputBuffer).toBe("ab");
+    expect(state.inputCursor).toBe(1);
+    comp.handleInput(K.appCursorRight);
+    comp.handleInput(K.kittyRight);
+    comp.handleInput(K.kittyFuncRight);
+    expect(state.inputBuffer).toBe("ab");
+    expect(state.inputCursor).toBe(2);
+  });
+
+  it("M8: 渲染 — 光标出现在真实位置（ab▌cd）且帧行宽精确", () => {
+    const { comp } = makeComponent(deps);
+    comp.handleInput("i");
+    typeText(comp, "abcd");
+    comp.handleInput(K.left);
+    comp.handleInput(K.left);
+    const lines = comp.render(80);
+    const inputLine = lines.find((l) => l.includes("✎"));
+    expect(inputLine).toBeDefined();
+    expect(inputLine!).toContain("ab▌cd");
+    expect(visibleWidth(inputLine!)).toBe(80);
+    for (const l of lines) expect(visibleWidth(l)).toBeLessThanOrEqual(80);
+  });
+
+  it("M9: 长输入（超过既有缺陷阈值）▌ 仍可见 — 缺陷回归", () => {
+    const { comp, state } = makeComponent(deps);
+    comp.handleInput("i");
+    state.insertInput("x".repeat(80)); // > 旧缺陷阈值 inner-6 = 72
+    let line = comp.render(80).find((l) => l.includes("✎"))!;
+    expect(line).toContain("▌"); // 旧实现：▌ 被外层兜底省略号顶掉
+    expect(line).toMatch(/xxx▌/); // 光标在末尾：▌ 紧跟内容尾部
+    expect(visibleWidth(line)).toBe(80);
+
+    for (let i = 0; i < 40; i++) state.moveInputCursor(-1); // 移至中段
+    line = comp.render(80).find((l) => l.includes("✎"))!;
+    expect(line).toContain("▌");
+    expect(visibleWidth(line)).toBe(80);
+  });
+
+  it("M10: 长 emoji 输入 — 帧宽精确、窗口只含完整 ZWJ 家族", () => {
+    const { comp, state } = makeComponent(deps);
+    comp.handleInput("i");
+    state.insertInput(FAMILY.repeat(30));
+    let line = comp.render(80).find((l) => l.includes("✎"))!;
+    expect(line).toContain("▌");
+    expect(visibleWidth(line)).toBe(80);
+    const before = line.replace(/^.*> /, "").split("▌")[0];
+    const seg = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+    for (const g of seg.segment(before)) expect(g.segment).toBe(FAMILY);
+
+    for (let i = 0; i < 10; i++) state.moveInputCursor(-1); // 移至中段（家族 20 处）
+    line = comp.render(80).find((l) => l.includes("✎"))!;
+    expect(line).toContain("▌");
+    expect(visibleWidth(line)).toBe(80);
+    const after = line.replace(/^.*> /, "").split("▌")[1] ?? "";
+    const tail = after.replace(/\s*│?\s*$/, "");
+    if (tail.length > 0) for (const g of seg.segment(tail)) expect(g.segment).toBe(FAMILY);
+  });
+
+  it("M11: 导航模式（输入框关闭）左右键仍切换成员标签", () => {
+    const { comp, state } = makeComponent(deps);
+    comp.handleInput(K.left);
+    expect(state.activeIndex).toBe(1);
+    comp.handleInput(K.right);
+    expect(state.activeIndex).toBe(0);
+  });
+
+  it("M12: 输入提示含「←→ 移动光标」并在渲染中可见", () => {
+    expect(INPUT_HINTS).toContain("←→ 移动光标");
+    const { comp } = makeComponent(deps);
+    comp.handleInput("i");
+    expect(comp.render(80).join("\n")).toContain("←→ 移动光标");
   });
 });
 
