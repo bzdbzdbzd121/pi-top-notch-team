@@ -1082,3 +1082,117 @@ describe("MemberInspectorState — 阶段 1：输入编辑内核（光标与按�
     }
   });
 });
+
+// ── Home / End：光标一步跳到输入首/尾 ────────────────────────
+describe("MemberInspectorState — moveInputCursorTo(\"start\" | \"end\")", () => {
+  function makeState() {
+    return new MemberInspectorState([
+      { name: "a", label: "A" },
+      { name: "b", label: "B" },
+    ]);
+  }
+
+  it("中段跳到开头 / 末尾，内容不变", () => {
+    const s = makeState();
+    s.openInput();
+    s.insertInput("abcd");
+    s.moveInputCursor(-1);
+    s.moveInputCursor(-1);
+    expect(s.inputCursor).toBe(2);
+    s.moveInputCursorTo("start");
+    expect(s.inputCursor).toBe(0);
+    s.moveInputCursorTo("end");
+    expect(s.inputCursor).toBe(4);
+    expect(s.inputBuffer).toBe("abcd");
+  });
+
+  it("端点与空输入幂等：重复按键无副作用", () => {
+    const s = makeState();
+    s.openInput();
+    for (let i = 0; i < 3; i++) {
+      s.moveInputCursorTo("start");
+      expect(s.inputCursor).toBe(0);
+      s.moveInputCursorTo("end");
+      expect(s.inputCursor).toBe(0); // 空输入：两端都是 0
+    }
+    s.insertInput("ab");
+    for (let i = 0; i < 3; i++) {
+      s.moveInputCursorTo("end");
+      expect(s.inputCursor).toBe(2);
+    }
+    s.moveInputCursorTo("start");
+    for (let i = 0; i < 3; i++) {
+      s.moveInputCursorTo("start");
+      expect(s.inputCursor).toBe(0);
+    }
+    expect(s.inputBuffer).toBe("ab");
+  });
+
+  it("跳转后插入生效：Home 插到最前，End 追加到末尾", () => {
+    const s = makeState();
+    s.openInput();
+    s.insertInput("bcd");
+    s.moveInputCursorTo("start");
+    s.insertInput("a");
+    expect(s.inputBuffer).toBe("abcd");
+    expect(s.inputCursor).toBe(1);
+    s.moveInputCursorTo("end");
+    s.insertInput("e");
+    expect(s.inputBuffer).toBe("abcde");
+    expect(s.inputCursor).toBe(5);
+  });
+
+  it("跳转后退格：End 后删除末尾完整可见字符（emoji 家族 / 中文）", () => {
+    const s = makeState();
+    s.openInput();
+    s.insertInput("a👨‍👩‍👧");
+    s.moveInputCursorTo("end");
+    s.backspaceInput(); // 整只家族删除，不留半个
+    expect(s.inputBuffer).toBe("a");
+    expect(s.inputCursor).toBe(1);
+
+    const t = makeState();
+    t.openInput();
+    t.insertInput("你好");
+    t.moveInputCursorTo("start"); // 先到开头再回来
+    t.moveInputCursorTo("end");
+    t.backspaceInput();
+    expect(t.inputBuffer).toBe("你");
+    expect(t.inputCursor).toBe(1);
+  });
+
+  it("与单步移动混合：光标仍落在可见字符边界且不越界", () => {
+    const s = makeState();
+    s.openInput();
+    const buffer = "你a👨‍👩‍👧b";
+    s.insertInput(buffer);
+    const bounds = graphemeBoundaries(buffer);
+    s.moveInputCursorTo("end");
+    expect(s.inputCursor).toBe(buffer.length);
+    expect(bounds.has(s.inputCursor)).toBe(true);
+    s.moveInputCursor(-1); // 跨过 'b'
+    s.moveInputCursorTo("start");
+    expect(s.inputCursor).toBe(0);
+    s.moveInputCursor(1); // 跨过 '你'
+    expect(s.inputCursor).toBe(1);
+    expect(bounds.has(s.inputCursor)).toBe(true);
+    s.moveInputCursorTo("end");
+    expect(bounds.has(s.inputCursor)).toBe(true);
+  });
+
+  it("打开/关闭/清空仍归零（跳转不改变重置语义）", () => {
+    const s = makeState();
+    s.openInput();
+    s.insertInput("abc");
+    s.moveInputCursorTo("end");
+    s.closeInput();
+    expect(s.inputCursor).toBe(0);
+
+    s.openInput();
+    s.insertInput("abc");
+    s.moveInputCursorTo("start");
+    s.clearInput();
+    expect(s.inputCursor).toBe(0);
+    expect(s.inputBuffer).toBe("");
+  });
+});

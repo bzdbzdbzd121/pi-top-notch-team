@@ -1926,6 +1926,14 @@ export class MemberInspectorState {
   }
 
   /**
+   * 光标一步跳到输入内容开头 / 末尾（Home / End）。
+   * 0 与 inputBuffer.length 恒为可见字符边界，不破坏类不变量；端点幂等。
+   */
+  moveInputCursorTo(edge: "start" | "end"): void {
+    this.inputCursor = edge === "start" ? 0 : this.inputBuffer.length;
+  }
+
+  /**
    * Insert `text` at the cursor; the cursor ends past the inserted text.
    * The inserted text may merge with the existing suffix into ONE new
    * cluster (e.g. "e" before a lone U+0301, or a regional indicator before

@@ -43,6 +43,7 @@ const K = {
   up: "\x1b[A",
   down: "\x1b[B",
   pageUp: "\x1b[5~",
+  home: "\x1b[H",
   end: "\x1b[F",
   backspace: "\x7f",
   ctrlA: "\x01",
@@ -630,6 +631,165 @@ describe("MemberInspectorComponent — 场景 N：输入法硬件光标标记（
     expect(line.split(CURSOR_MARKER).length - 1).toBe(1);
     expect(line).toContain(CURSOR_MARKER + "▌");
     expect(visibleWidth(line)).toBe(80);
+  });
+});
+
+describe("MemberInspectorComponent — 场景 O：输入模式 Home/End（功能内核）", () => {
+  // 六类终端编码 + kitty `;1` 变体（pi-tui 0.83.0 实测均匹配普通键）
+  const ENCODINGS: Array<[string, string, string]> = [
+    ["传统 CSI", "\x1b[H", "\x1b[F"],
+    ["应用光标模式", "\x1bOH", "\x1bOF"],
+    ["数字式 VT", "\x1b[1~", "\x1b[4~"],
+    ["数字式 rxvt", "\x1b[7~", "\x1b[8~"],
+    ["kitty CSI", "\x1b[1;1H", "\x1b[1;1F"],
+    ["kitty 功能码", "\x1b[57423u", "\x1b[57424u"],
+    ["kitty 功能码 ;1", "\x1b[57423;1u", "\x1b[57424;1u"],
+  ];
+  let deps: any;
+  let handleA: any;
+
+  beforeEach(() => {
+    handleA = makeHandle();
+    deps = makeDeps({
+      handles: { a: handleA },
+      opStates: { a: "idle", b: "idle" },
+    });
+  });
+
+  it("O1: 六类终端编码的 Home/End 均生效（含 ;1 变体）", () => {
+    for (const [label, home, end] of ENCODINGS) {
+      const { comp, state } = makeComponent(deps);
+      comp.handleInput("i");
+      typeText(comp, "abcd");
+      comp.handleInput(home);
+      expect(state.inputCursor, label).toBe(0);
+      comp.handleInput(K.right);
+      comp.handleInput(K.right);
+      expect(state.inputCursor, label).toBe(2);
+      comp.handleInput(end);
+      expect(state.inputCursor, label).toBe(4);
+      comp.handleInput(home);
+      expect(state.inputCursor, label).toBe(0);
+      expect(state.inputBuffer, label).toBe("abcd");
+      expect(state.activeIndex, label).toBe(0); // 不切标签
+    }
+  });
+
+  it("O2: 连发幂等；空输入无操作", () => {
+    const { comp, state } = makeComponent(deps);
+    comp.handleInput("i");
+    for (let i = 0; i < 3; i++) comp.handleInput(K.end);
+    expect(state.inputCursor).toBe(0);
+    expect(state.inputBuffer).toBe("");
+    typeText(comp, "ab");
+    for (let i = 0; i < 3; i++) comp.handleInput(K.end);
+    expect(state.inputCursor).toBe(2);
+    for (let i = 0; i < 3; i++) comp.handleInput(K.home);
+    expect(state.inputCursor).toBe(0);
+    expect(state.inputBuffer).toBe("ab");
+  });
+
+  it("O3: 修饰组合无操作且不插入（Shift/Alt/Ctrl+Home/End）", () => {
+    const { comp, state } = makeComponent(deps);
+    comp.handleInput("i");
+    typeText(comp, "ab"); // 光标在末尾
+    for (const seq of [
+      "\x1b[1;2H",
+      "\x1b[1;2F", // shift
+      "\x1b[1;3H",
+      "\x1b[1;3F", // alt
+      "\x1b[1;5H",
+      "\x1b[1;5F", // ctrl
+    ]) {
+      comp.handleInput(seq);
+    }
+    expect(state.inputBuffer).toBe("ab");
+    expect(state.inputCursor).toBe(2);
+  });
+
+  it("O4: 端到端 — abcd → Home → X → End → Y → 发送 XabcdY", () => {
+    const { comp, state } = makeComponent(deps);
+    comp.handleInput("i");
+    typeText(comp, "abcd");
+    comp.handleInput(K.home);
+    typeText(comp, "X");
+    expect(state.inputBuffer).toBe("Xabcd");
+    comp.handleInput(K.end);
+    typeText(comp, "Y");
+    expect(state.inputBuffer).toBe("XabcdY");
+    comp.handleInput(K.enter);
+    expect(handleA.sendCommand).toHaveBeenCalledTimes(1);
+    const cmd = handleA.sendCommand.mock.calls[0][0];
+    expect(cmd.type).toBe("prompt");
+    expect(cmd.message).toBe(`${USER_DIRECT_PREFIX}\n` + "XabcdY");
+  });
+
+  it("O5: End 后退格删除末尾完整字符（emoji 家族）", () => {
+    const { comp, state } = makeComponent(deps);
+    comp.handleInput("i");
+    typeText(comp, "ab");
+    state.insertInput("👨‍👩‍👧");
+    comp.handleInput(K.home);
+    comp.handleInput(K.end);
+    expect(state.inputCursor).toBe(state.inputBuffer.length);
+    comp.handleInput(K.backspace);
+    expect(state.inputBuffer).toBe("ab");
+    expect(state.inputCursor).toBe(2);
+  });
+
+  it("O6: 输入模式 End 不滚动对话、不切换成员", () => {
+    const { comp, state } = makeComponent(deps);
+    const lines = Array.from({ length: 50 }, (_, i) => `line ${i}`);
+    state.setTabLines("a", lines, 12);
+    state.scrollBy(-20, 12);
+    const offsetBefore = state.tabs[0].scrollOffset;
+    expect(offsetBefore).toBeGreaterThan(0);
+    expect(state.tabs[0].followTail).toBe(false);
+
+    comp.handleInput("i");
+    state.insertInput("abc");
+    comp.handleInput(K.end);
+    expect(state.inputCursor).toBe(3);
+    expect(state.tabs[0].scrollOffset).toBe(offsetBefore);
+    expect(state.tabs[0].followTail).toBe(false);
+    expect(state.activeIndex).toBe(0);
+  });
+
+  it("O7: 长输入跳转后光标可见、帧宽精确（头/尾窗口）", () => {
+    const { comp, state } = makeComponent(deps);
+    comp.handleInput("i");
+    state.insertInput("x".repeat(80));
+    comp.handleInput(K.home);
+    let line = comp.render(80).find((l) => l.includes("✎"))!;
+    expect(stripCursorMarker(line)).toContain("> ▌");
+    expect(visibleWidth(line)).toBe(80);
+    comp.handleInput(K.end);
+    line = comp.render(80).find((l) => l.includes("✎"))!;
+    expect(stripCursorMarker(line)).toMatch(/x▌/);
+    expect(visibleWidth(line)).toBe(80);
+  });
+
+  it("O8: 导航模式 End 仍跳到底部并恢复自动跟随（新增回归）", () => {
+    const { comp, state } = makeComponent(deps);
+    const lines = Array.from({ length: 50 }, (_, i) => `line ${i}`);
+    state.setTabLines("a", lines, 12);
+    state.scrollBy(-20, 12);
+    expect(state.tabs[0].followTail).toBe(false);
+    comp.handleInput(K.end);
+    expect(state.tabs[0].scrollOffset).toBe(38); // 50 行 - bodyHeight 12（测试环境）
+    expect(state.tabs[0].followTail).toBe(true);
+  });
+
+  it("O9: 导航模式 Home 维持现状（无绑定、不滚动、不切标签）", () => {
+    const { comp, state } = makeComponent(deps);
+    const lines = Array.from({ length: 50 }, (_, i) => `line ${i}`);
+    state.setTabLines("a", lines, 12);
+    state.scrollBy(-10, 12);
+    const before = state.tabs[0].scrollOffset;
+    comp.handleInput(K.home);
+    expect(state.activeIndex).toBe(0);
+    expect(state.tabs[0].scrollOffset).toBe(before);
+    expect(state.tabs[0].followTail).toBe(false);
   });
 });
 

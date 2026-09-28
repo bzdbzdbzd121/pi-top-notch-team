@@ -1028,6 +1028,13 @@ export class MemberInspectorComponent {
         this.state.moveInputCursor(-1);
       } else if (matchesKey(data, Key.right)) {
         this.state.moveInputCursor(1);
+      } else if (matchesKey(data, Key.home)) {
+        // Home/End 一步到首/尾（阶段 1）：置于 ←/→ 之后、清空/字符兜底
+        // 之前；仅输入模式生效——导航模式 End 跳底部（下方分支）不受影响，
+        // 修饰组合（Shift/Alt/Ctrl+Home/End）不匹配普通键、保持无操作。
+        this.state.moveInputCursorTo("start");
+      } else if (matchesKey(data, Key.end)) {
+        this.state.moveInputCursorTo("end");
       } else if (matchesKey(data, "ctrl+u")) {
         this.state.clearInput();
       } else if (matchesKey(data, "ctrl+a")) {
