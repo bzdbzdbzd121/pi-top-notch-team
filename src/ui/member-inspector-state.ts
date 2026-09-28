@@ -1505,6 +1505,17 @@ export class MemberInspectorState {
   activeIndex = 0;
   inputOpen = false;
   inputBuffer = "";
+  /**
+   * Input cursor: UTF-16 index into `inputBuffer`.
+   *
+   * Invariant: always on a grapheme (visible character) boundary and within
+   * [0, inputBuffer.length] — move/insert/backspace pin it to grapheme
+   * boundaries so the render layer can slice a prefix/suffix without
+   * splitting a Chinese character, emoji cluster or combining sequence.
+   * Only meaningful while `inputOpen`; open/close/clear reset it to 0.
+   * (Stage 1 only: key wiring + cursor rendering land in stage 2.)
+   */
+  inputCursor = 0;
   /** Transient notice shown in the footer (e.g. send result). */
   notice: string | null = null;
   /**
@@ -1702,24 +1713,68 @@ export class MemberInspectorState {
   openInput(): void {
     this.inputOpen = true;
     this.inputBuffer = "";
+    this.inputCursor = 0;
   }
 
   closeInput(): void {
     this.inputOpen = false;
     this.inputBuffer = "";
+    this.inputCursor = 0;
   }
 
+  /**
+   * Move the input cursor by ONE visible character (grapheme), no wrap:
+   * stops at the start / end (no-op there).
+   */
+  moveInputCursor(delta: -1 | 1): void {
+    if (delta < 0) {
+      if (this.inputCursor <= 0) return;
+      // Last grapheme of the prefix = the visible character directly left of
+      // the cursor (prefix ends on a boundary per the class invariant).
+      let step = 0;
+      for (const part of graphemeSegmenter.segment(this.inputBuffer.slice(0, this.inputCursor))) {
+        step = part.segment.length;
+      }
+      this.inputCursor -= step;
+    } else {
+      if (this.inputCursor >= this.inputBuffer.length) return;
+      const first = graphemeSegmenter
+        .segment(this.inputBuffer.slice(this.inputCursor))
+        [Symbol.iterator]()
+        .next();
+      if (!first.done) this.inputCursor += first.value.segment.length;
+    }
+  }
+
+  /**
+   * Insert `text` at the cursor; the cursor advances past the inserted text.
+   * (Insertion point is now the cursor — mid-string editing.)
+   */
   insertInput(text: string): void {
-    this.inputBuffer += text;
+    const at = Math.max(0, Math.min(this.inputCursor, this.inputBuffer.length));
+    this.inputBuffer = this.inputBuffer.slice(0, at) + text + this.inputBuffer.slice(at);
+    this.inputCursor = at + text.length;
   }
 
+  /**
+   * Delete the visible character immediately BEFORE the cursor (no-op at 0).
+   * Grapheme-based (not codepoint-based): an emoji ZWJ family, combining
+   * sequence or flag is removed as one whole character instead of half of it
+   * (intentional fix vs. the old `Array.from` codepoint delete).
+   */
   backspaceInput(): void {
-    const chars = Array.from(this.inputBuffer);
-    chars.pop();
-    this.inputBuffer = chars.join("");
+    if (this.inputCursor <= 0) return;
+    const prefix = this.inputBuffer.slice(0, this.inputCursor);
+    let last = "";
+    for (const part of graphemeSegmenter.segment(prefix)) last = part.segment;
+    if (!last) return;
+    this.inputBuffer =
+      prefix.slice(0, prefix.length - last.length) + this.inputBuffer.slice(this.inputCursor);
+    this.inputCursor -= last.length;
   }
 
   clearInput(): void {
     this.inputBuffer = "";
+    this.inputCursor = 0;
   }
 }

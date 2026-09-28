@@ -749,3 +749,221 @@ describe("MemberInspectorState", () => {
     expect(s.inputOpen).toBe(false);
   });
 });
+
+// ── 阶段 1：输入编辑内核（光标与按位编辑）─────────────────────
+//
+// 交付物（方案 §5 阶段 1）：光标记录与移动方法；插入改为在光标处拼接；
+// 退格改为删除光标前一个「可见字符」（grapheme）；打开/关闭/清空归零。
+// 本阶段不接线按键、不修改渲染——渲染窗口测试属阶段 2。
+
+/** UTF-16 下标集合：`text` 中所有可见字符（grapheme）边界。 */
+function graphemeBoundaries(text: string): Set<number> {
+  const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+  const bounds = new Set<number>();
+  for (const part of segmenter.segment(text)) {
+    bounds.add(part.index);
+    bounds.add(part.index + part.segment.length);
+  }
+  bounds.add(0);
+  bounds.add(text.length);
+  return bounds;
+}
+
+describe("MemberInspectorState — 阶段 1：输入编辑内核（光标与按位编辑）", () => {
+  function makeState() {
+    return new MemberInspectorState([
+      { name: "a", label: "A" },
+      { name: "b", label: "B" },
+    ]);
+  }
+
+  it("inputCursor 默认 0，打开/关闭/清空时归零", () => {
+    const s = makeState();
+    expect(s.inputCursor).toBe(0);
+
+    s.openInput();
+    s.insertInput("abc");
+    expect(s.inputCursor).toBe(3);
+    s.moveInputCursor(-1);
+    expect(s.inputCursor).toBe(2);
+    s.closeInput();
+    expect(s.inputCursor).toBe(0);
+    expect(s.inputBuffer).toBe("");
+
+    s.openInput();
+    s.insertInput("xy");
+    s.moveInputCursor(-1);
+    s.clearInput();
+    expect(s.inputCursor).toBe(0);
+    expect(s.inputBuffer).toBe("");
+  });
+
+  it("openInput 丢弃上一轮草稿并把光标归零", () => {
+    const s = makeState();
+    s.openInput();
+    s.insertInput("draft");
+    s.moveInputCursor(-1);
+    s.openInput(); // 再次打开（不应保留旧内容/旧光标）
+    expect(s.inputBuffer).toBe("");
+    expect(s.inputCursor).toBe(0);
+  });
+
+  it("移动边界：开头左移、末尾右移、空串移动均为无操作", () => {
+    const s = makeState();
+    s.openInput();
+    expect(s.inputCursor).toBe(0);
+    s.moveInputCursor(-1);
+    expect(s.inputCursor).toBe(0);
+    s.moveInputCursor(1);
+    expect(s.inputCursor).toBe(0); // 空串：两个方向都停住
+
+    s.insertInput("ab");
+    expect(s.inputCursor).toBe(2);
+    s.moveInputCursor(1);
+    expect(s.inputCursor).toBe(2); // 末尾：不越界
+
+    s.moveInputCursor(-1);
+    s.moveInputCursor(-1);
+    s.moveInputCursor(-1);
+    expect(s.inputCursor).toBe(0); // 开头：不越界、不环绕
+  });
+
+  it("中段插入：字符插入到光标处并推进光标", () => {
+    const s = makeState();
+    s.openInput();
+    s.insertInput("abcd");
+    s.moveInputCursor(-1);
+    s.moveInputCursor(-1); // 光标移到 ab|cd
+    s.insertInput("X");
+    expect(s.inputBuffer).toBe("abXcd");
+    expect(s.inputCursor).toBe(3);
+  });
+
+  it("中段退格：删除光标前一个字符并回退光标", () => {
+    const s = makeState();
+    s.openInput();
+    s.insertInput("abXcd");
+    s.moveInputCursor(-1);
+    s.moveInputCursor(-1); // 光标在 X 之后：abX|cd
+    s.backspaceInput();
+    expect(s.inputBuffer).toBe("abcd");
+    expect(s.inputCursor).toBe(2);
+  });
+
+  it("退格在光标为 0 时为无操作", () => {
+    const s = makeState();
+    s.openInput();
+    s.insertInput("a");
+    s.moveInputCursor(-1);
+    expect(s.inputCursor).toBe(0);
+    s.backspaceInput();
+    expect(s.inputBuffer).toBe("a");
+    expect(s.inputCursor).toBe(0);
+  });
+
+  it("中文：左右键与退格按一个汉字步进", () => {
+    const s = makeState();
+    s.openInput();
+    s.insertInput("你好a");
+    expect(s.inputCursor).toBe(3);
+    s.backspaceInput(); // 删 'a'
+    expect(s.inputBuffer).toBe("你好");
+    expect(s.inputCursor).toBe(2);
+    s.moveInputCursor(-1); // 你|好
+    expect(s.inputCursor).toBe(1);
+    s.insertInput("X");
+    expect(s.inputBuffer).toBe("你X好");
+    expect(s.inputCursor).toBe(2);
+    s.backspaceInput(); // 删 'X'
+    expect(s.inputBuffer).toBe("你好");
+    expect(s.inputCursor).toBe(1);
+    s.moveInputCursor(-1);
+    expect(s.inputCursor).toBe(0); // 再左移正好停在开头
+  });
+
+  it("emoji ZWJ 家族（👨‍👩‍👧）：整体步进、整体删除", () => {
+    const s = makeState();
+    s.openInput();
+    s.insertInput("a👨‍👩‍👧b"); // a(1) + 家族(8) + b(1) = 10
+    expect(s.inputCursor).toBe(10);
+    s.backspaceInput(); // 直接删 'b'（光标在末尾）
+    expect(s.inputBuffer).toBe("a👨‍👩‍👧");
+    expect(s.inputCursor).toBe(9);
+    s.moveInputCursor(-1); // 跨过整个家族（不是半个）
+    expect(s.inputCursor).toBe(1);
+    s.backspaceInput(); // 删 'a'
+    expect(s.inputBuffer).toBe("👨‍👩‍👧");
+    expect(s.inputCursor).toBe(0);
+    s.moveInputCursor(1); // 再右移跨过整个家族
+    expect(s.inputCursor).toBe(8);
+    s.backspaceInput(); // 整只删除，不留半个乱码
+    expect(s.inputBuffer).toBe("");
+    expect(s.inputCursor).toBe(0);
+  });
+
+  it("组合字符（e + U+0301）：整体步进、整体删除", () => {
+    const s = makeState();
+    s.openInput();
+    s.insertInput("ce\u0301d"); // c(1) + é(2) + d(1) = 4
+    expect(s.inputCursor).toBe(4);
+    s.backspaceInput(); // 删 'd'
+    expect(s.inputBuffer).toBe("ce\u0301");
+    expect(s.inputCursor).toBe(3);
+    s.moveInputCursor(-1); // 跨过整个 é（不是只剩重音）
+    expect(s.inputCursor).toBe(1);
+    s.backspaceInput(); // 删 'c'
+    expect(s.inputBuffer).toBe("e\u0301");
+    expect(s.inputCursor).toBe(0);
+    s.moveInputCursor(1);
+    expect(s.inputCursor).toBe(2);
+  });
+
+  it("旗帜符号（🇨🇳）：整体步进、整体删除", () => {
+    const s = makeState();
+    s.openInput();
+    s.insertInput("🇨🇳x"); // 旗帜(4) + x(1) = 5
+    s.moveInputCursor(-1);
+    expect(s.inputCursor).toBe(4);
+    s.backspaceInput(); // 删除整面旗帜
+    expect(s.inputBuffer).toBe("x");
+    expect(s.inputCursor).toBe(0);
+    s.insertInput("🇨🇳");
+    expect(s.inputBuffer).toBe("🇨🇳x");
+    expect(s.inputCursor).toBe(4);
+    s.moveInputCursor(1);
+    expect(s.inputCursor).toBe(5);
+  });
+
+  it("不变量：任意移动/插入/退格后光标始终落在可见字符边界且不越界", () => {
+    const s = makeState();
+    s.openInput();
+    s.insertInput("a你👨‍👩‍👧e\u0301🇨🇳z");
+    const text = s.inputBuffer;
+    const bounds = graphemeBoundaries(text);
+    expect(bounds.has(s.inputCursor)).toBe(true);
+
+    // 从末尾一路左移回开头，每一步都必须落在边界上
+    while (s.inputCursor > 0) {
+      s.moveInputCursor(-1);
+      expect(s.inputCursor).toBeGreaterThanOrEqual(0);
+      expect(s.inputCursor).toBeLessThanOrEqual(text.length);
+      expect(bounds.has(s.inputCursor)).toBe(true);
+    }
+    // 再一路右移到末尾
+    while (s.inputCursor < text.length) {
+      s.moveInputCursor(1);
+      expect(s.inputCursor).toBeLessThanOrEqual(text.length);
+      expect(bounds.has(s.inputCursor)).toBe(true);
+    }
+
+    // 中段插入 + 退格后仍保持不变量
+    s.moveInputCursor(-1);
+    s.insertInput("中");
+    const afterInsert = graphemeBoundaries(s.inputBuffer);
+    expect(afterInsert.has(s.inputCursor)).toBe(true);
+    s.backspaceInput();
+    const afterBackspace = graphemeBoundaries(s.inputBuffer);
+    expect(afterBackspace.has(s.inputCursor)).toBe(true);
+    expect(s.inputBuffer).toBe(text);
+  });
+});
