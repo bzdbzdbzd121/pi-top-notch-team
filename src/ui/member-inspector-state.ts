@@ -44,6 +44,13 @@ function snapForwardGraphemeBoundary(text: string, pos: number): number {
   return text.length;
 }
 
+/** Strip the last whole grapheme from `text` (empty stays empty). */
+function trimLastGrapheme(text: string): string {
+  let start = 0;
+  for (const part of graphemeSegmenter.segment(text)) start = part.index;
+  return text.slice(0, start);
+}
+
 /**
  * ANSI/OSC/APC escape sequence at `pos`, or null. Local copy of pi-tui's
  * extractAnsiCode (utils.js) so we can skip sequences without measuring
@@ -487,6 +494,15 @@ export function fitLinesToWidth(lines: string[], width: number): string[] {
   });
 }
 
+/** Single-entry result memo backing `buildInputBoxLine` (see there). */
+let inputLineMemo: {
+  buffer: string;
+  cursor: number;
+  width: number;
+  cursorMarker: string;
+  line: string;
+} | null = null;
+
 /**
  * Build the input-box line: `> ` + text before the cursor + `▌` + text after
  * the cursor, windowed horizontally so the cursor stays visible, then padded
@@ -512,6 +528,32 @@ export function buildInputBoxLine(
   cursor: number,
   width: number,
   cursorMarker = ""
+): string {
+  // Single-entry memo (建议 2): while the input box is open, render() runs on
+  // every member-activity refresh, but the buffer/cursor only change on a
+  // keystroke — repeated frames reuse the previous result instead of
+  // re-tokenizing the whole buffer (per frame → O(1) string compares; per
+  // edit → one O(n) grapheme pass over the buffer the user actually typed).
+  const memo = inputLineMemo;
+  if (
+    memo !== null &&
+    memo.buffer === buffer &&
+    memo.cursor === cursor &&
+    memo.width === width &&
+    memo.cursorMarker === cursorMarker
+  ) {
+    return memo.line;
+  }
+  const line = buildInputBoxLineUncached(buffer, cursor, width, cursorMarker);
+  inputLineMemo = { buffer, cursor, width, cursorMarker, line };
+  return line;
+}
+
+function buildInputBoxLineUncached(
+  buffer: string,
+  cursor: number,
+  width: number,
+  cursorMarker: string
 ): string {
   if (width <= 0) return "";
   const prompt = "> ";
@@ -579,9 +621,24 @@ export function buildInputBoxLine(
     used += tokWidths[i];
   }
 
-  const result = prompt + before + cursorMarker + "▌" + after;
-  const pad = width - 2 - used - 1;
-  return pad > 0 ? result + " ".repeat(pad) : result;
+  // Pad by MEASURING THE ASSEMBLED LINE — per-grapheme widths are not
+  // additive across boundaries: an orphan U+1F3FB–1F3FF skin-tone modifier
+  // measures 2 standalone but 0 once it follows the prompt space or the `▌`
+  // glyph, so a pad derived from the token sum would under-fill `width`.
+  let assembled = prompt + before + cursorMarker + "▌" + after;
+  let pad = width - visibleWidth(assembled);
+  // Defensive: should the assembled line ever measure wider than `width`
+  // (e.g. a caller passes a non-zero-width cursorMarker), drop whole
+  // trailing graphemes — after the cursor first, then before it — until it
+  // fits, then pad exactly.
+  while (pad < 0) {
+    if (after.length > 0) after = trimLastGrapheme(after);
+    else if (before.length > 0) before = trimLastGrapheme(before);
+    else break;
+    assembled = prompt + before + cursorMarker + "▌" + after;
+    pad = width - visibleWidth(assembled);
+  }
+  return pad > 0 ? assembled + " ".repeat(pad) : assembled;
 }
 
 /** Word/char wrap text to the given visible width. */

@@ -36,6 +36,7 @@ describe("buildInputBoxLine — width contract", () => {
       "x".repeat(200),
       "汉字".repeat(80),
       FAMILY.repeat(20),
+      "\u{1F3FD}abc", // 孤立肤色修饰符：跨边界宽度不可加（重要 1）
     ];
     for (const width of [16, 40, 74]) {
       for (const buffer of buffers) {
@@ -130,5 +131,53 @@ describe("buildInputBoxLine — 防御性光标钳制", () => {
     const buffer = "e\u0301x"; // é (2 units, 1 visible col) + x
     expect(buildInputBoxLine(buffer, 1, 10)).toBe(buildInputBoxLine(buffer, 2, 10));
     expect(buildInputBoxLine(buffer, 1, 10)).toBe("> " + "e\u0301" + "▌x" + " ".repeat(5));
+  });
+});
+
+// 孤立肤色修饰符（U+1F3FB–1F3FF）跨边界宽度不可加：单独量 2 列，紧跟提示符
+// 空格或光标符号后按 0 计——pad 必须按装配结果实测，不能由逐簇宽度求和推导
+// （重要 1 回归）。
+const ORPHAN_TONE = "\u{1F3FD}";
+
+describe("buildInputBoxLine — 孤立肤色修饰符（重要 1 回归）", () => {
+  it("首簇为孤立肤色修饰符时宽度仍精确（光标头/中/尾）", () => {
+    const buffer = ORPHAN_TONE + "abc";
+    // 装配结果 "> 🏽ab▌c" 实测 6 列 → 补 4 列空（旧实现按簇求和只补 2 列）
+    expect(buildInputBoxLine(buffer, 4, 10)).toBe("> " + ORPHAN_TONE + "ab▌c" + " ".repeat(4));
+    expect(buildInputBoxLine(buffer, 0, 10)).toBe("> ▌" + ORPHAN_TONE + "abc" + " ".repeat(4));
+    expect(buildInputBoxLine(buffer, buffer.length, 10)).toBe(
+      "> " + ORPHAN_TONE + "abc▌" + " ".repeat(4)
+    );
+    for (const cursor of [0, 2, 4, buffer.length]) {
+      expect(visibleWidth(buildInputBoxLine(buffer, cursor, 10)), `cursor=${cursor}`).toBe(10);
+    }
+  });
+
+  it("长窗口（孤立修饰符重复）宽度精确且 ▌ 可见", () => {
+    const buffer = ORPHAN_TONE.repeat(20);
+    for (const cursor of [0, Math.floor(buffer.length / 2), buffer.length]) {
+      const line = buildInputBoxLine(buffer, cursor, 16);
+      expect(visibleWidth(line), `cursor=${cursor}`).toBe(16);
+      expect(line).toContain("▌");
+    }
+  });
+});
+
+describe("buildInputBoxLine — cursorMarker 参数（阶段 3 预留契约）", () => {
+  it("零宽标记插在 ▌ 之前且不改变宽度（与默认空串一致）", () => {
+    const marker = "\x1b[0m"; // 零宽 ANSI 占位标记
+    const plain = buildInputBoxLine("abcd", 2, 10);
+    const withMarker = buildInputBoxLine("abcd", 2, 10, marker);
+    expect(plain).toBe("> ab▌cd" + " ".repeat(3));
+    expect(withMarker).toBe("> ab" + marker + "▌cd" + " ".repeat(3));
+    expect(visibleWidth(withMarker)).toBe(10);
+    expect(withMarker.indexOf(marker)).toBe(withMarker.indexOf("▌") - marker.length);
+    expect(buildInputBoxLine("abcd", 2, 10, "")).toBe(plain); // 显式空串 = 默认
+  });
+
+  it("非零宽标记（调用方错误）也被宽度契约兜住：从尾部整簇回退", () => {
+    // "MM" 有 2 列宽：装配 8 列 > width 6 → 光标后为空 → 从光标前回退整簇
+    expect(buildInputBoxLine("abc", 3, 6, "MM")).toBe("> aMM▌");
+    expect(visibleWidth(buildInputBoxLine("abc", 3, 6, "MM"))).toBe(6);
   });
 });
