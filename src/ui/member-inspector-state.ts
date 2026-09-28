@@ -27,6 +27,24 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 
 /**
+ * Smallest grapheme boundary of `text` that is >= `pos`, clamped to
+ * [0, text.length]. Used after both edit paths: an insertion can merge the
+ * new text with the existing suffix into one new cluster ("e" before a lone
+ * U+0301, one regional indicator before another, ZWJ joins), and a deletion
+ * can merge the clusters flanking the deletion point — either way the
+ * nominal position may land INSIDE the resulting cluster.
+ */
+function snapForwardGraphemeBoundary(text: string, pos: number): number {
+  if (pos <= 0) return 0;
+  if (pos >= text.length) return text.length;
+  for (const part of graphemeSegmenter.segment(text)) {
+    const end = part.index + part.segment.length;
+    if (end >= pos) return end;
+  }
+  return text.length;
+}
+
+/**
  * ANSI/OSC/APC escape sequence at `pos`, or null. Local copy of pi-tui's
  * extractAnsiCode (utils.js) so we can skip sequences without measuring
  * their inner characters — kept in sync with the width logic above.
@@ -1512,6 +1530,12 @@ export class MemberInspectorState {
    * [0, inputBuffer.length] — move/insert/backspace pin it to grapheme
    * boundaries so the render layer can slice a prefix/suffix without
    * splitting a Chinese character, emoji cluster or combining sequence.
+   * INSERTING may merge the new text with the existing suffix into one new
+   * cluster (combining mark, regional-indicator pair, ZWJ join), and
+   * DELETING may merge the clusters flanking the deletion point into one new
+   * cluster ("🇨" + "Z" + "🇳" → one flag). Both edit paths therefore snap
+   * the cursor forward to the first cluster boundary at/after the nominal
+   * position, so it never sits inside a cluster.
    * Only meaningful while `inputOpen`; open/close/clear reset it to 0.
    * (Stage 1 only: key wiring + cursor rendering land in stage 2.)
    */
@@ -1724,10 +1748,11 @@ export class MemberInspectorState {
 
   /**
    * Move the input cursor by ONE visible character (grapheme), no wrap:
-   * stops at the start / end (no-op there).
+   * stops at the start / end (no-op there). Any delta other than -1 / 1
+   * (possible at runtime from JS callers) is a no-op.
    */
   moveInputCursor(delta: -1 | 1): void {
-    if (delta < 0) {
+    if (delta === -1) {
       if (this.inputCursor <= 0) return;
       // Last grapheme of the prefix = the visible character directly left of
       // the cursor (prefix ends on a boundary per the class invariant).
@@ -1736,7 +1761,7 @@ export class MemberInspectorState {
         step = part.segment.length;
       }
       this.inputCursor -= step;
-    } else {
+    } else if (delta === 1) {
       if (this.inputCursor >= this.inputBuffer.length) return;
       const first = graphemeSegmenter
         .segment(this.inputBuffer.slice(this.inputCursor))
@@ -1747,13 +1772,17 @@ export class MemberInspectorState {
   }
 
   /**
-   * Insert `text` at the cursor; the cursor advances past the inserted text.
-   * (Insertion point is now the cursor — mid-string editing.)
+   * Insert `text` at the cursor; the cursor ends past the inserted text.
+   * The inserted text may merge with the existing suffix into ONE new
+   * cluster (e.g. "e" before a lone U+0301, or a regional indicator before
+   * another), so the cursor snaps forward to the first grapheme boundary
+   * at/after the nominal end — otherwise it would sit inside the cluster
+   * and a later backspace could delete half of it.
    */
   insertInput(text: string): void {
     const at = Math.max(0, Math.min(this.inputCursor, this.inputBuffer.length));
     this.inputBuffer = this.inputBuffer.slice(0, at) + text + this.inputBuffer.slice(at);
-    this.inputCursor = at + text.length;
+    this.inputCursor = snapForwardGraphemeBoundary(this.inputBuffer, at + text.length);
   }
 
   /**
@@ -1761,6 +1790,9 @@ export class MemberInspectorState {
    * Grapheme-based (not codepoint-based): an emoji ZWJ family, combining
    * sequence or flag is removed as one whole character instead of half of it
    * (intentional fix vs. the old `Array.from` codepoint delete).
+   * The deletion can merge the clusters flanking the deletion point into one
+   * new cluster, so the cursor snaps forward to the first boundary at/after
+   * the deletion point (same class of fix as `insertInput`).
    */
   backspaceInput(): void {
     if (this.inputCursor <= 0) return;
@@ -1768,9 +1800,9 @@ export class MemberInspectorState {
     let last = "";
     for (const part of graphemeSegmenter.segment(prefix)) last = part.segment;
     if (!last) return;
-    this.inputBuffer =
-      prefix.slice(0, prefix.length - last.length) + this.inputBuffer.slice(this.inputCursor);
-    this.inputCursor -= last.length;
+    const at = this.inputCursor - last.length;
+    this.inputBuffer = prefix.slice(0, at) + this.inputBuffer.slice(this.inputCursor);
+    this.inputCursor = snapForwardGraphemeBoundary(this.inputBuffer, at);
   }
 
   clearInput(): void {

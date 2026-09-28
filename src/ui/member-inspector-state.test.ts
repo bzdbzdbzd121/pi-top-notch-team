@@ -934,6 +934,90 @@ describe("MemberInspectorState — 阶段 1：输入编辑内核（光标与按�
     expect(s.inputCursor).toBe(5);
   });
 
+  it("回归（重要 1）：插入字符与既有后缀合并成新簇时光标吸附到簇边界", () => {
+    const s = makeState();
+    s.openInput();
+    // 孤立组合符之前插入 'e' → 合并为单簇 "é"（e + U+0301）
+    s.insertInput("\u0301");
+    expect(s.inputCursor).toBe(1);
+    s.moveInputCursor(-1);
+    expect(s.inputCursor).toBe(0);
+    s.insertInput("e");
+    expect(s.inputBuffer).toBe("e\u0301");
+    expect(graphemeBoundaries(s.inputBuffer).has(s.inputCursor)).toBe(true);
+    expect(s.inputCursor).toBe(2); // 吸附到合并簇末尾，不是名义位置 1
+    s.backspaceInput(); // 整簇删除，不留孤立组合符
+    expect(s.inputBuffer).toBe("");
+    expect(s.inputCursor).toBe(0);
+  });
+
+  it("回归（重要 1）：两张区域指示符合并成一面旗时不产生半簇光标", () => {
+    const s = makeState();
+    s.openInput();
+    s.insertInput("🇨"); // 单区域指示符（2）
+    s.moveInputCursor(-1);
+    expect(s.inputCursor).toBe(0);
+    s.insertInput("🇳"); // 插到前面 → 与后缀合并为一个区域指示符对 "🇳🇨"（4）
+    expect(s.inputBuffer).toBe("🇳🇨");
+    expect(graphemeBoundaries(s.inputBuffer).has(s.inputCursor)).toBe(true);
+    expect(s.inputCursor).toBe(4);
+    s.backspaceInput(); // 必须整对删除（旧缺陷：只删半个）
+    expect(s.inputBuffer).toBe("");
+    expect(s.inputCursor).toBe(0);
+  });
+
+  it("回归（重要 1 同类）：退格删除分隔符后左右碎片合并成新簇时光标吸附到边界", () => {
+    const s = makeState();
+    s.openInput();
+    s.insertInput("🇨Z🇳"); // 三个独立簇（2+1+2）
+    s.moveInputCursor(-1); // 光标移到 Z 与 🇳 之间（cursor 3）
+    expect(s.inputCursor).toBe(3);
+    s.backspaceInput(); // 删 Z → "🇨🇳" 合并为一面旗（4）
+    expect(s.inputBuffer).toBe("🇨🇳");
+    expect(graphemeBoundaries(s.inputBuffer).has(s.inputCursor)).toBe(true);
+    expect(s.inputCursor).toBe(4); // 吸附到合并簇末尾，不是名义位置 2
+    s.backspaceInput(); // 整面删除，不留半簇
+    expect(s.inputBuffer).toBe("");
+    expect(s.inputCursor).toBe(0);
+  });
+
+  it("回归（重要 1 同类）：退格删除 ZWJ 链中间字符后合并成单簇时光标吸附到边界", () => {
+    const s = makeState();
+    s.openInput();
+    s.insertInput("👨\u200dX👩"); // "👨‍"(3) + X(1) + "👩"(2)
+    s.moveInputCursor(-1); // 光标在 X 与 👩 之间（cursor 4）
+    expect(s.inputCursor).toBe(4);
+    s.backspaceInput(); // 删 X → "👨‍👩" 合并为单簇（5）
+    expect(s.inputBuffer).toBe("👨‍👩");
+    expect(graphemeBoundaries(s.inputBuffer).has(s.inputCursor)).toBe(true);
+    expect(s.inputCursor).toBe(5);
+    s.backspaceInput(); // 整簇删除
+    expect(s.inputBuffer).toBe("");
+    expect(s.inputCursor).toBe(0);
+  });
+
+  it("回归（重要 1）：ZWJ 链式合并（👨 + ZWJ + 👩）后光标仍在簇边界", () => {
+    const s = makeState();
+    s.openInput();
+    s.insertInput("👨");
+    s.insertInput("\u200d");
+    s.insertInput("👩"); // 合并为单簇 "👨‍👩"（5）
+    expect(s.inputBuffer).toBe("👨‍👩");
+    expect(graphemeBoundaries(s.inputBuffer).has(s.inputCursor)).toBe(true);
+    expect(s.inputCursor).toBe(5);
+  });
+
+  it("moveInputCursor(0) 运行时为无操作，不得右移（建议 3）", () => {
+    const s = makeState();
+    s.openInput();
+    s.insertInput("ab");
+    s.moveInputCursor(-1);
+    expect(s.inputCursor).toBe(1);
+    // 类型上不允许 0，但运行时（JS 调用方 / 外部数据）可能传入
+    (s.moveInputCursor as (delta: number) => void)(0);
+    expect(s.inputCursor).toBe(1);
+  });
+
   it("不变量：任意移动/插入/退格后光标始终落在可见字符边界且不越界", () => {
     const s = makeState();
     s.openInput();
@@ -965,5 +1049,36 @@ describe("MemberInspectorState — 阶段 1：输入编辑内核（光标与按�
     const afterBackspace = graphemeBoundaries(s.inputBuffer);
     expect(afterBackspace.has(s.inputCursor)).toBe(true);
     expect(s.inputBuffer).toBe(text);
+  });
+
+  it("不变量（建议 2）：随机操作序列（insert+move+backspace）每步均在簇边界内", () => {
+    // 含跨簇合并诱饵：孤立组合符 / ZWJ / 单个区域指示符 / 肤色修饰符
+    const inserts = ["a", "你", "👨", "\u200d", "👩", "e", "\u0301", "🇨", "🇳", "👍🏽", "Z"];
+    for (const seed0 of [0x2f6e2b1, 0x1234567, 0xdeadbeef, 0x5eed, 0xabcdef]) {
+      const s = makeState();
+      s.openInput();
+      // 固定种子的 LCG：可复现，不依赖运行器随机性
+      let seed = seed0;
+      const rand = () => {
+        seed = (seed * 1664525 + 1013904223) >>> 0;
+        return seed / 0xffffffff;
+      };
+      for (let i = 0; i < 800; i++) {
+        const roll = rand();
+        if (roll < 0.35) s.insertInput(inserts[Math.floor(rand() * inserts.length)]);
+        else if (roll < 0.6) s.moveInputCursor(-1);
+        else if (roll < 0.85) s.moveInputCursor(1);
+        else s.backspaceInput();
+
+        const bounds = graphemeBoundaries(s.inputBuffer);
+        const label = `seed=${seed0.toString(16)} step ${i}: type=${roll}`;
+        expect(s.inputCursor, label).toBeGreaterThanOrEqual(0);
+        expect(s.inputCursor, label).toBeLessThanOrEqual(s.inputBuffer.length);
+        expect(
+          bounds.has(s.inputCursor),
+          `${label} buffer=${JSON.stringify(s.inputBuffer)}`
+        ).toBe(true);
+      }
+    }
   });
 });
