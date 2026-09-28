@@ -791,10 +791,41 @@ describe("MemberInspectorComponent — 场景 O：输入模式 Home/End（功能
     expect(state.tabs[0].scrollOffset).toBe(before);
     expect(state.tabs[0].followTail).toBe(false);
   });
+
+  it("O10: modifyOtherKeys 特殊键形跳转生效且不插入（\\x1b[27;1;72~ / \\x1b[27;1;70~）", () => {
+    const { comp, state } = makeComponent(deps);
+    comp.handleInput("i");
+    typeText(comp, "abcd"); // 光标在末尾
+    comp.handleInput("\x1b[27;1;72~"); // modifyOtherKeys Home → 跳到开头（不得插入 "H"）
+    expect(state.inputCursor).toBe(0);
+    expect(state.inputBuffer).toBe("abcd");
+    comp.handleInput("\x1b[27;1;70~"); // modifyOtherKeys End → 跳到末尾（不得插入 "F"）
+    expect(state.inputCursor).toBe(4);
+    expect(state.inputBuffer).toBe("abcd");
+    expect(state.activeIndex).toBe(0);
+  });
+
+  it("O11: modifyOtherKeys 修饰变体无操作且不插入（shift/alt/ctrl）", () => {
+    const { comp, state } = makeComponent(deps);
+    comp.handleInput("i");
+    typeText(comp, "ab"); // 光标在末尾
+    for (const seq of [
+      "\x1b[27;2;72~",
+      "\x1b[27;2;70~", // shift+Home/End
+      "\x1b[27;3;72~",
+      "\x1b[27;3;70~", // alt+Home/End
+      "\x1b[27;5;72~",
+      "\x1b[27;5;70~", // ctrl+Home/End
+    ]) {
+      comp.handleInput(seq);
+    }
+    expect(state.inputBuffer).toBe("ab");
+    expect(state.inputCursor).toBe(2);
+  });
 });
 
 describe("MemberInspectorComponent — 场景 P：输入模式提示文案（阶段 2）", () => {
-  const FRAGMENT = "Home/End 行首/行尾";
+  const FRAGMENT = "Home/End 首尾";
 
   it("P1: INPUT_HINTS 前段含 Home/End，且按 80 列生产预算（68）可见", () => {
     // 既有子串保持不变
@@ -817,6 +848,15 @@ describe("MemberInspectorComponent — 场景 P：输入模式提示文案（阶
     const joined = comp.render(80).join("\n");
     expect(joined).toContain("←→ 移动光标");
     expect(joined).toContain(FRAGMENT);
+  });
+
+  it("P3: 宽终端（140 列）渲染完整呈现提示行（含尾部）", () => {
+    const deps = makeDeps({ handles: {}, opStates: {} });
+    const { comp } = makeComponent(deps);
+    comp.handleInput("i");
+    const joined = comp.render(140).join("\n");
+    expect(joined).toContain(INPUT_HINTS);
+    expect(joined).toContain("Esc 取消");
   });
 });
 
@@ -1569,11 +1609,11 @@ describe("MemberInspectorComponent — render", () => {
     expect(joined).not.toContain("切换成员");
     // …and action hints replaced by input-mode hints（阶段 2：Home/End 在前段）
     expect(joined).toContain("Enter 发送");
-    expect(joined).toContain("Home/End 行首/行尾");
-    expect(joined).toContain("ctrl+Enter/alt+Enter");
-    // 尾部既有项因提示行变长在 80 列渲染中被截断（既有已接受行为，方案 §4.7，
-    // 本次不修）；完整文案仍保留在 INPUT_HINTS 常量中（可见性断言见场景 P）
-    expect(INPUT_HINTS).toContain("立即转向");
+    expect(joined).toContain("Home/End 首尾");
+    // 备选措辞「首尾」把 80 列渲染的截断点后移，立即转向重新完整可见
+    expect(joined).toContain("ctrl+Enter/alt+Enter 立即转向");
+    // 尾部「Esc 取消」在 80 列渲染中仍被截断（既有已接受行为，方案 §4.7，本次
+    // 不修）；宽终端完整呈现见场景 P3，常量本身完整保留：
     expect(INPUT_HINTS).toContain("Esc 取消");
     expect(joined).not.toContain("Esc 关闭");
   });
