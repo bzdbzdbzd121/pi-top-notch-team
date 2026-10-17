@@ -134,7 +134,7 @@ src/
 │   ├── member-lifecycle.ts  ← createAndRegisterMember, buildMemberConfig, getMemberLog
 │   ├── message-channel.ts   ← createMessageChannel factory (queue+router+waiter wiring)；sendToTl 以 deliverAs:"nextTurn" 注入成员→TL 消息（S2 阶段 1，决策 #36；S3 修正：team_send_and_wait 等待期间改入 tlWaitGate 缓冲、门控打开后并入工具结果返回，决策 #39）；创建共享 coalescer 实例（S1 阶段 2，决策 #37）
 │   ├── dynamic-session-bootstrap.ts ← 动态会话共享 bootstrap（/team dynamic 与 start_team_session 复用）+ ensureAddDynamicMemberTool
-├── sync/             ← 团队定义云同步（ADR-0008；阶段 1–4 已交付）
+├── sync/             ← 团队定义云同步（ADR-0008；阶段 1–5 已交付 + 进行中反馈，行为规范见 DESIGN.md §33）
 │   ├── config.ts     ← sync.yaml 机器级配置（独立于 settings.yaml 与临时设置）：地址白名单校验、
 │   │                   读取时非法值清空 + warn-once、未知键保留、原子写 0600、maskRemoteUrl 脱敏
 │   ├── git-runner.ts ← 统一 git 执行器（生产代码唯一允许 spawn git 的模块）：环境硬化（LC_ALL=C／
@@ -154,8 +154,19 @@ src/
 │   ├── progress.ts   ← 进行中反馈（决策 #45 配套）：状态栏键 cloud-sync 的阶段/等待态纯函数文案 + 秒数
 │   │                   （时间戳差值）+ 生命周期（1s unref 计时器、幂等 end()、UI 与 timer 全 fail-open）；
 │   │                   唯一反馈通道，零 notify（模块内无任何聊天区输出）
-│   └── command.ts    ← /team sync 与 /team sync status 编排（三段式：先算 → 再问 → 最后改）+
-│                       格式化为纯函数（计划摘要/结果摘要/状态/失败/冲突概览）+ 进度挂点接线
+│   ├── command.ts    ← /team sync 与 /team sync status 编排（三段式：先算 → 再问 → 最后改）+
+│   │                   格式化为纯函数（计划摘要/结果摘要/状态/失败/冲突概览）+ 进度挂点接线
+│   ├── progress.test.ts ← 进行中反馈单测：阶段/等待态文案矩阵、秒数格式化、生命周期（幂等 end/定时器
+│   │                   纪律/unref）、fail-open、零 notify 静态断言
+│   ├── classify.test.ts ← 真值表 13 行全覆盖（含 add/add、delete/modify 两向）+ 行号防漏守卫 + 首次接入退化
+│   ├── config.test.ts ← 地址校验矩阵 / 往返 / 损坏 fail-open / 未知键保留 / 读取与写入校验 / 脱敏（含路径 @）/ 原子写与 0600
+│   ├── git-runner.test.ts ← 环境硬化 / 超时 kill / maxBuffer / 同步 spawn 异常不 reject / 真实 git 集成 / 失败分类表（含 spawn 码分流）
+│   ├── lock.test.ts  ← 获取/释放/陈旧夺取/空锁保守持有/link 原子性插桩（并发窗口回归）/token 身份
+│   ├── plan.test.ts / apply.test.ts ← 计划与快照纯函数/危险路径过滤；应用段（提交树构造、回滚、归档命名）
+│   ├── decide.test.ts / detect.test.ts ← 冲突形态与选项集、导入唯一名与改写校验；启动检测判定层与降级
+│   ├── command.test.ts / command.integration.test.ts ← 编排文案单测；真实 git 集成（裸仓库做云端，零网络；含进行中反馈阶段 2/3 用例）
+│   └── smoke.cloud-sync.test.ts ← 端到端冒烟（默认 describe.skipIf，SYNC_SMOKE=1 运行；
+│                                 scripts/run-cloud-sync-smoke.mjs）
 ├── settings/         ← Global settings (/team setting)
 │   ├── settings.ts        ← TeamSettings type + <rootDir>/settings.yaml read/write
 │   ├── session-settings.ts ← 临时设置数据层（决策 #40）：进程内 overlay + 深合并入口 loadEffectiveSettings + 快照原语（save/load/getPath/clearBinding）+ 生命周期（reconcile/clearSessionSettingsMemory/activeSessionDir/binding）+ isSnapshotRestored 恢复标记
@@ -183,15 +194,6 @@ src/
 │   ├── member-inspector-state.ts  ← Inspector pure display state + line building (no TUI deps; buildInputBoxLine 输入行纯函数)
 │   ├── pi-key-decode.ts      ← decodePrintableKey 本地实现（decodeKittyPrintable 主入口导入 + modifyOtherKeys 回退按上游 keys.js 复刻；不能深导入 pi-tui/dist/keys.js——loader jiti alias 前缀替换会拼坏子路径，见 DESIGN.md §17）
 │   └── pi-key-decode.test.ts ← 本地解码器单元测试（kitty CSI-u / modifyOtherKeys / legacy 三协议 + 修饰拒绝 + Caps Lock 掩码）
-├── sync/             ← 云同步（阶段 1 基础设施已交付；阶段 2–5 待实现：plan/apply/command/detect/decide + UI）
-│   ├── config.ts     ← sync.yaml 机器级配置：地址校验（scheme 白名单 / 拒绝内嵌密码 / 拒绝 `-` 前缀与控制字符 / scp 形态）、读取时校验（非法清空 + warn，审查 #3）、写入时拒绝非法值、未知键保留、损坏 fail-open、原子写（临时文件 + rename + 0600 + 尽力 fsync）、maskRemoteUrl 展示脱敏
-│   ├── git-runner.ts ← 统一 git 执行器：环境硬化（LC_ALL=C / GIT_TERMINAL_PROMPT=0 / 清除 GIT_DIR·GIT_WORK_TREE·GIT_CONFIG_* 等注入 / 默认 ssh BatchMode）、统一 git -C、硬超时 SIGTERM→SIGKILL、maxBuffer、-z 解析、结构化结果 {ok,stdout,stderr,code,...}、命令串 userinfo 脱敏；生产代码中唯一允许直接 child_process 的同步模块（阶段 5 静态守卫）
-│   ├── lock.ts       ← 进程级同步锁（<rootDir>/sync.lock）：候选文件 + linkSync 原子「带内容」创建（消除空文件窗口，审查 #2）、陈旧夺取（pid 死亡 → rename 抢占）、跨主机保守不夺取、不可解析文件新鲜度宽限、random token 身份校验释放（审查 #8）
-│   ├── classify.ts   ← 三方比较与冲突真值表（纯函数，零 IO）：§7.C 全 13 行 → unchanged / local-only / remote-only / local-modified / remote-modified / local-deleted / remote-deleted / both-deleted / conflict（冲突选项集按真值表顺序）
-│   ├── classify.test.ts ← 真值表 13 行全覆盖（含 add/add、delete/modify 两向）+ 行号防漏守卫 + 首次接入退化
-│   ├── config.test.ts ← 地址校验矩阵 / 往返 / 损坏 fail-open / 未知键保留 / 读取与写入校验 / 脱敏（含路径 @）/ 原子写与 0600
-│   ├── git-runner.test.ts ← 环境硬化 / 超时 kill / maxBuffer / 同步 spawn 异常不 reject / 真实 git 集成 / 失败分类表（含 spawn 码分流）
-│   └── lock.test.ts  ← 获取/释放/陈旧夺取/空锁保守持有/link 原子性插桩（并发窗口回归）/token 身份
 ├── config.ts         ← getRootDir() via env var or ~/.pi/top-notch-team
 ├── config.test.ts    ← getRootDir() env var tests
 ├── static-scan.test.ts ← 阶段 5 防退化守卫（R4）：静态扫描全仓 loadSettings( 调用点，除白名单（settings.ts / session-settings.ts / setting-handler.ts）外必须经合并层；负例 fixture 锁定「人为新增绕过 → 测试红」
