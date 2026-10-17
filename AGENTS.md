@@ -25,7 +25,7 @@ pi install ./pi-top-notch-team
 
 ```
 User's pi session (TL extension)
-  ├── 14 subcommands (/team create, dynamic, edit, done, cancel, start, stop, resume, list, show, delete, status, setting, help)
+  ├── 15 subcommands (/team create, dynamic, edit, done, cancel, start, stop, resume, list, show, delete, status, sync, setting, help)
   ├── TL tools：load-time `start_team_session`；9 个 session-scoped 工具首次会话按需注册、会话期间激活（teardown 后 registry 保留，会话外从 activeTools 移除）；agent session 激活 `stop_team_session`，dynamic mode 提供 `add_dynamic_member`
 
 Batch send: team_send_and_wait now supports tasks array for concurrent dispatch to multiple members. Previously single-target to/content/nextSteps; now unified tasks:[{to, content}] + nextSteps. **Batch when tasks are independent (parallel execution); sequential when task B depends on task A's output. See TL Tools table for decision rules.**
@@ -134,6 +134,25 @@ src/
 │   ├── member-lifecycle.ts  ← createAndRegisterMember, buildMemberConfig, getMemberLog
 │   ├── message-channel.ts   ← createMessageChannel factory (queue+router+waiter wiring)；sendToTl 以 deliverAs:"nextTurn" 注入成员→TL 消息（S2 阶段 1，决策 #36；S3 修正：team_send_and_wait 等待期间改入 tlWaitGate 缓冲、门控打开后并入工具结果返回，决策 #39）；创建共享 coalescer 实例（S1 阶段 2，决策 #37）
 │   ├── dynamic-session-bootstrap.ts ← 动态会话共享 bootstrap（/team dynamic 与 start_team_session 复用）+ ensureAddDynamicMemberTool
+├── sync/             ← 团队定义云同步（ADR-0008；阶段 1–4 已交付）
+│   ├── config.ts     ← sync.yaml 机器级配置（独立于 settings.yaml 与临时设置）：地址白名单校验、
+│   │                   读取时非法值清空 + warn-once、未知键保留、原子写 0600、maskRemoteUrl 脱敏
+│   ├── git-runner.ts ← 统一 git 执行器（生产代码唯一允许 spawn git 的模块）：环境硬化（LC_ALL=C／
+│   │                   禁交互／清除 GIT_* 注入）、硬超时 + SIGKILL、输出上限、-z 解析、
+│   │                   结构化结果（spawn 抛错不 reject）、classifyGitError 失败分类（纯函数）
+│   ├── lock.ts       ← 进程级同步锁 <rootDir>/sync.lock：候选文件 + linkSync 原子创建、
+│   │                   陈旧夺取后复验身份（绝不删他人活锁）、pid+token 身份校验的释放
+│   ├── classify.ts   ← 三方比较真值表（纯函数，零 IO）：§7.C 全 13 行；冲突选项集按真值表顺序
+│   ├── plan.ts       ← 仓库/远端预检、分支发现与对齐、fetch、计划与快照（含 TOCTOU 指纹）、
+│   │                   残留清理、isSafeRepoPath 危险路径过滤、listInvalidTeamFiles
+│   ├── apply.ts      ← 应用段：TOCTOU 复核、原子落盘 + 内存回滚日志、冲突决策落地（归档/导入）、
+│   │                   临时索引构造提交（read-tree 云端树 → 精确增删 → write-tree → commit-tree 双父）、
+│   │                   快进推送 --no-verify、留档目录 sync-conflicts（archiveFileName/uniqueArchivePath 导出）
+│   ├── decide.ts     ← 冲突决策模型（形态/选项集/生效动作/被放弃侧）、导入唯一名与 YAML 改写校验、
+│   │                   差异生成（系统临时目录 + git diff --no-index）、RPC/无 UI 降级文案
+│   ├── detect.ts     ← 启动检测（进程级一次 latch、fire-and-forget 自捕获 + 硬超时、失败分类静默/提示一次）
+│   └── command.ts    ← /team sync 与 /team sync status 编排（三段式：先算 → 再问 → 最后改）+
+│                       格式化为纯函数（计划摘要/结果摘要/状态/失败/冲突概览）
 ├── settings/         ← Global settings (/team setting)
 │   ├── settings.ts        ← TeamSettings type + <rootDir>/settings.yaml read/write
 │   ├── session-settings.ts ← 临时设置数据层（决策 #40）：进程内 overlay + 深合并入口 loadEffectiveSettings + 快照原语（save/load/getPath/clearBinding）+ 生命周期（reconcile/clearSessionSettingsMemory/activeSessionDir/binding）+ isSnapshotRestored 恢复标记
@@ -154,6 +173,9 @@ src/
 │   ├── edit-mode-widget.ts   ← Bordered widget: ✏️ EDIT MODE — <team name>
 │   ├── create-mode-widget.ts ← Bordered widget: 🆕 CREATE MODE
 │   ├── scroll-select.ts      ← Scrollable + filterable select dialog (ctx.ui.custom, maxVisible window + fuzzy search)
+│   ├── sync-diff-view.ts     ← 冲突差异视图（阶段 4）：纯状态（行规范化/增删统计/包装/滚动/选项/文案）
+│   │                           + 组件（render(width) 重排、↑↓/PgUp/Dn、←→/数字选动作、Enter/Esc）
+│   │                           + showSyncDiffView（ctx.ui.custom overlay，一冲突一屏）
 │   ├── member-inspector.ts   ← Member Inspector overlay (alt+t): tabs, conversation view, input box, footer
 │   ├── member-inspector-state.ts  ← Inspector pure display state + line building (no TUI deps; buildInputBoxLine 输入行纯函数)
 │   ├── pi-key-decode.ts      ← decodePrintableKey 本地实现（decodeKittyPrintable 主入口导入 + modifyOtherKeys 回退按上游 keys.js 复刻；不能深导入 pi-tui/dist/keys.js——loader jiti alias 前缀替换会拼坏子路径，见 DESIGN.md §17）
@@ -170,6 +192,7 @@ src/
 ├── config.ts         ← getRootDir() via env var or ~/.pi/top-notch-team
 ├── config.test.ts    ← getRootDir() env var tests
 ├── static-scan.test.ts ← 阶段 5 防退化守卫（R4）：静态扫描全仓 loadSettings( 调用点，除白名单（settings.ts / session-settings.ts / setting-handler.ts）外必须经合并层；负例 fixture 锁定「人为新增绕过 → 测试红」
+├── static-scan-child-process.test.ts ← 阶段 5 静态守卫：child_process 白名单（sync/git-runner.ts + 三个成员进程模块），同步模块绕过统一 git 执行器 → 测试红；含 `src/sync/` 目录专项检查
 └── test/fixtures/    ← Test YAML files + mock-extension-api.ts
 ```
 
@@ -405,6 +428,15 @@ src/
     - **不做提示词/README 推广（用户裁决）**：第三方工具与本扩展相互独立，发现性由工具自身的 promptSnippet/promptGuidelines 承担（pi 按 activeTools 自动注入）——本扩展的预定义提示词、dynamic 设计/执行两阶段提示词与 README 均不列举这两件工具（负例测试锁定，防无意回写）。
     - **agent 来源会话不受影响**（已旁路白名单）；未安装对应插件时白名单条目为惰性（工具不存在，无行为）。测试：index.test.ts 双阶段放行 + 守卫预算不消耗 + sticky 期可用 + 预定义提示词负例；tl-read-guard.test.ts 显式豁免用例；dynamic-mode.test.ts 两阶段负例。
 
+45. **团队定义云同步（ADR-0008，阶段 1–4 已交付）** — `teams/` 目录自身作为 git 工作区，与用户手工创建的**私有**远端仓库双向同步；`/team sync` 一条命令走完「先算（只读）→ 再问（零改动）→ 最后改（一次落盘）」。要点：
+    - **不自动合并**：文件级三方比较（git blob id 令牌，含属性/换行过滤）→ 真值表 13 行；冲突按形态给三个或两个选项；「两边都留」= 本机版本继续 + 云端版本导入为新团队（唯一名、内部 `name` 改写、过校验、随同步传播）。
+    - **提交树以云端树为基**（`read-tree` → 精确路径增删 → `write-tree` → `commit-tree` 双父）；全程不执行 `merge`（实测：单父会孤儿化本地历史；`merge -s ours` 会删掉云端独有文件）。
+    - **产物离开 `teams/`**：归档到 `<rootDir>/sync-conflicts/`（命名 = 路径安全化 + 原路径短哈希 + 时间戳，同秒不同路径不撞名；覆盖前留档；写失败即中止）；`/team list`、下一轮同步、云端都看不到它。
+    - **配置独立**：`<rootDir>/sync.yaml`（机器级，不进临时设置/快照）；拒绝任何内嵌密码的地址；`maskRemoteUrl` 展示脱敏。
+    - **允许的唯一中间态**：「本地已提交未推送」（摘要标注 + 修法，重跑收敛）；其余失败一律回滚到「未做任何改动」（文件回滚日志 + 新建留档清除 + 引用不动）。
+    - **启动提醒**：`session_start`（成员进程早退之后）挂载 `detect.ts`——进程级一次 latch、`reload` 跳过、处理器同步返回（网络在自捕获游离 promise + 硬超时；pi 0.83.0 确实 `await` 该处理链）、只报「云端有 N 个提交」、暂态静默 / 持久缺陷提示一次、非 TUI 静默降级。
+    - **静态守卫**：`src/static-scan-child-process.test.ts` 白名单（`sync/git-runner.ts`、`process/member-process.ts`、`setup/member-lifecycle.ts`、`tools/tl-tools.ts`）——同步模块必须经统一 git 执行器；既有 `loadSettings` 守卫保持绿（同步模块零 `loadSettings` 调用）。
+
 ## Dependency Injection Pattern
 
 The codebase uses an explicit Dependency Injection (DI) pattern to decouple modules and enable testability. Every subsystem receives its dependencies through a typed interface, rather than importing them directly.
@@ -416,6 +448,9 @@ The codebase uses an explicit Dependency Injection (DI) pattern to decouple modu
 | `MessageChannelDeps` | `setup/message-channel.ts` | `pi`, `memberOpsStates`, `lastPendingCorrId`, `memberHandles`, `onRouteNotification?`, `getAutoCompact?`, `getCoalescing?` |
 | `EventHandlerDeps` | `channel/event-handler.ts` | `pi`, `memberOpsStates`, `messageQueue`, `responseWaiter`, `lastPendingCorrId`, `recentlyProcessedMessages`, `processManager?`, `onMemberActivity?`, `memberHandles?`, `autoCompact?`, `coalescer?` |
 | `SendToMemberDeps` | `channel/event-handler.ts` | `pi`, `memberOpsStates`, `memberHandles`, `getAutoCompact?`, `autoCompact?`, `coalescer?`, `getCoalescing?` |
+| `SyncCommandDeps` | `sync/command.ts` | `rootDir?`, `runGit?`, `now?`, `statusTimeoutMs?`, `getEditingTeamName?`（编辑模式确认的唯一注入点，由 `commands/team.ts` 传 `teamCtx.editingTeamName`） |
+| `DetectOptions` | `sync/detect.ts` | `rootDir?`, `runGit?`, `loadConfig?`, `networkTimeoutMs?`, `hardTimeoutMs?`（生产不设置 → 统一执行器 + 真实 `sync.yaml`；`index.ts` 经 `setCloudDetectOptionsForTests` 暴露测试注入点） |
+| `DetectSession` | `sync/detect.ts` | `mode?`, `hasUI?`, `reason?`, `notify`（`session_start` 挂载点只传这些，检测逻辑与 UI 解耦） |
 
 Benefits:
 - **Testability**: each module can be tested with mocked dependencies
@@ -566,6 +601,8 @@ printf '' | timeout 10 ./node_modules/.bin/pi --mode json --no-tools -e ./index.
 | `/team cancel`           | Alias for `/team done` (backward compatibility) |
 | `/team delete <name>` | Delete a team definition (with confirmation) |
 | `/team status` | Show active session + member process statuses |
+| `/team sync` | 与云端私有仓库双向同步团队定义（ADR-0008）：首次运行引导配置 `sync.yaml`；无冲突同步零额外确认；冲突逐个决策（TUI 内置可滚动差异视图 / RPC 降级为选项 + 两侧信息）；被放弃的一侧留档到 `sync-conflicts/`；「两边都留」把云端版本导入为新团队。唯一允许的中间态是「本地已提交未推送」（摘要明确标注，重跑收敛）。**创建模式守卫**：create 落盘时目标 `teams/<name>.yaml` 已存在 → 拒绝创建并引导 `/team edit`（防止覆盖同步下载的同名团队） |
+| `/team sync status` | 查看云同步状态（不推送、不改团队文件与工作区；读取云端并更新 `.git` 内对象/远端跟踪引用，**不写 FETCH_HEAD**）：配置/分支/远端落后或领先/本机未提交与未推送/归档计数/非法 YAML/仓库需处理（`index.lock`） |
 | `/team setting` | Interactive settings menu — 顶层作用域开关（决策 #40）：默认「仅当前会话（临时）」，切换「全局」后直写 settings.yaml。临时作用域写入 overlay（不触碰 settings.yaml），「当前值」恒显示 merge 后生效值，覆盖键带 [临时] 徽标；⑦ 一键清除全部临时设置（内存+快照双清，仅 overlay 非空时显示）。七项子菜单：member default model (follow / fixed；团队 YAML 指定 model 时附注不生效) + member thinking level (成员思考强度三段式：默认 / 跟随 TL（当前：TL 级别，未知时显示「TL 级别未知」）/ 指定级别…二级 7 级别；对象形态 {mode:follow|fixed, level?}，follow = spawn 时快照 TL 思考强度) + auto-compaction (toggle / percent & token thresholds / timeout) + wait budget (等待上限, 0=永不超时 — wait 工具 all-idle deadline 与批屏障共享的顶层通用预算) + message coalescing (消息合并: 开关/批量上限/字符上限，S1 阶段 2；互发禁用态子菜单附 no-op 退化注记) + 成员互发消息 (P4 决策 #41: 「允许 / 仅限回复 TL」标量两段式，● 标记当前值；TL 侧即时生效，成员侧仅影响之后启动的成员) + Agent 自主团队会话 (决策 #42: 「允许 / 禁止」标量两段式，● 标记当前值；仅影响 agent 自主启动相，运行中会话不终止，手动 /team start、/team dynamic 不受影响；下一回合边界即生效，无需重启). 通知按场景附注「（仅当前 pi 会话生效；/team resume 本团队会话时将恢复）」/「（仅当前 pi 会话生效，重启后失效）」；sessionId 不可用时临时入口禁用（fail-open）。Also allowed during a session |
 | `/team help` | Display usage help for all subcommands |
 
@@ -742,8 +779,9 @@ TL: 监控进展、协调异常、write_shared_context 更新共享上下文（�
 - `docs/adr/0004-team-session-resume.md` — Team session resume: member session persistence + manifest + /team resume
 - `docs/adr/0005-pi-upstream-truncation-marking.md` — Upstream framework truncation marking proposal (finalize-time detection + length-protection extension + oneOf error de-noising; non-blocking, for pi upstream issue)
 - `docs/adr/0006-pi-upstream-abort-compaction-rpc.md` — Upstream `abort_compaction` RPC proposal (`agent-session.abortCompaction()` exists but is not reachable over RPC; ~3-line wiring in rpc-mode.js; non-blocking, for pi upstream issue)
+- `docs/adr/0008-team-definition-cloud-sync.md` — 团队定义云同步：git 私有仓库为后端、`teams/` 即工作区、提交树以云端树为基、不自动合并、冲突产物离开 `teams/`、配置独立文件、允许的唯一中间态
 - `docs/adr/0007-pi-upstream-context-usage-reason.md` — Upstream `getContextUsage()` structured-reason proposal (`percent:null` after compaction is a legal state, indistinguishable from config-missing `undefined` by consumers; reason field primary / estimate alternative; non-blocking, for pi upstream issue)
 
 ## Design Document
 
-See [DESIGN.md](./DESIGN.md) for the full design specification (31 sections), including the Goal reminder lifecycle and release verification checklist.
+See [DESIGN.md](./DESIGN.md) for the full design specification (33 sections), including the Goal reminder lifecycle and release verification checklist.

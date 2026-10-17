@@ -78,7 +78,7 @@ pi-top-notch-team/
 ├── member.ts                 ← Extension entry point — Member side (auto-discovered via pi manifest)
 ├── src/
 │   ├── commands/
-│   │   ├── team.ts             ← Single /team command (14 subcommands + autocomplete)
+│   │   ├── team.ts             ← Single /team command (15 subcommands + autocomplete)
 │   │   └── status.ts           ← StatusProvider type export
 │   ├── tools/
 │   │   ├── tl-tools.ts         ← 6 TL process management tools (DI-based dependencies)
@@ -151,7 +151,7 @@ Since TL and Member are declared as two separate extensions, but both are loaded
 
 | Scenario | `ctx.mode` | Role |
 |----------|-----------|------|
-| User's interactive session | `"tui"`, `"rpc"`, `"json"`, `"print"` | **TL** — registers /team command with 14 subcommands, waits for `/team start`, `/team dynamic`, or `start_team_session` to activate session tools |
+| User's interactive session | `"tui"`, `"rpc"`, `"json"`, `"print"` | **TL** — registers /team command with 15 subcommands, waits for `/team start`, `/team dynamic`, or `start_team_session` to activate session tools |
 | Member RPC process | `"rpc"` | **Member** — registers `team_send_message` tool, injects team system prompt via env vars |
 
 **Detection logic:**
@@ -2212,9 +2212,9 @@ resolver 矩阵 8（undefined/true/false/getter 异常/null·undefined settings 
 - `src/session/tl-read-guard.test.ts`：显式豁免用例（sticky 下不拦截、不计数）。
 - `src/prompts/dynamic-mode.test.ts`：两阶段提示词负例（不列举）。
 
-## 32. 云同步（Team Definition Cloud Sync）——阶段 1 基础设施
+## 32. 云同步（Team Definition Cloud Sync）——阶段 1–4 已交付
 
-**目的**：让团队定义（`teams/*.yaml`）多机一致并可云备份。整体机制（见方案定稿）：`teams/` 目录本身作为 git 工作区，与一个手工创建的**私有**远端仓库对应；`/team sync` 一条命令完成双向同步，启动时提醒云端更新，冲突不自动合并。本节只登记**阶段 1（基础设施，用户不可见）**；阶段 2–5（命令编排、启动检测、冲突决策 UI、文档与守卫）待实现。
+**目的**：让团队定义（`teams/*.yaml`）多机一致并可云备份。整体机制（见方案定稿）：`teams/` 目录本身作为 git 工作区，与一个手工创建的**私有**远端仓库对应；`/team sync` 一条命令完成双向同步，启动时提醒云端更新，冲突不自动合并。**交付进度（阶段 5 收口）**：阶段 1（基础设施）、阶段 2（`/team sync` 与 status）、阶段 3（启动提醒）、阶段 4（冲突决策与留档）均已交付；阶段 5 补齐文档、`child_process` 静态守卫与端到端冒烟。整体架构与关键决策见 `docs/adr/0008-team-definition-cloud-sync.md`；完整流程、失败语义与测试矩阵见 §33。
 
 ### 32.1 模块与契约
 
@@ -2237,12 +2237,12 @@ resolver 矩阵 8（undefined/true/false/getter 异常/null·undefined settings 
 - `src/sync/classify.ts` —— 三方比较真值表（纯函数，零 IO）：输入 `{ path, base, local, remote }` 内容令牌（生产用 git blob id），输出 §7.C 全 13 行分类；冲突选项集按真值表顺序（both-modified/add-add 三选项；delete/modify 与 modify/delete 各自两选项）；首次接入 `base=null` 退化为四类。
 - `src/team/store.ts` —— `writeTeam` 改为同目录临时文件（`*.tmp-<pid>`，不匹配 `*.yaml`）+ rename 原子替换 + 尽力 fsync；任一步失败清理临时文件、旧文件内容不变。
 
-### 32.2 边界与未做（阶段 1）
+### 32.2 边界与结构性排除
 
-- 不实现阶段 2–5：无 `/team sync` 命令、无 fetch/push、无启动检测、无冲突决策 UI、无归档与新团队导入、无静态 `child_process` 守卫、无 README/ADR。
-- 不写 `settings.yaml`、不进临时设置/`/team resume` 快照（机器级语义，结构性排除）。
-- 阶段 2 调用点须同时用 `--` 终止选项解析（双保险，登记为阶段 2 待办）。
-- 阶段 2 恢复清理需覆盖残留物：`*.candidate-*`、`.stale-*`、`sync.yaml.tmp-*`（含其它 pid 的），以及配置临时文件部分写入残留。
+- **不写 `settings.yaml`、不进临时设置/`/team resume` 快照**（机器级语义，结构性排除）：`/team setting` 里的「云同步（机器级）」入口恒写 `sync.yaml`，不参与作用域分流。
+- 所有调用点同时用 `--` 终止选项解析（双保险）。
+- 恢复清理覆盖残留物：`sync-index-<pid>-*`、`*.tmp-<pid>`、`sync.yaml.tmp-<other-pid>`、`*.candidate-*`、`.stale-*`——孤儿判定 = 写入 pid 已死或 mtime 超宽限；**从不删除 `index.lock`**（那份锁只报告、不代删）。
+- `index.lock` 语义：仅当 `git rev-parse --absolute-git-dir` 得到的目录里存在 `index.lock` 时，`/team sync` **安全中止**并提示「确认没有其它 git/sync 进程在运行（不要删除正在被使用的锁）；若确认是上次异常退出的残留，可手动删除 `.git/index.lock` 后重试」；`/team sync status` 只报告「仓库：需处理（存在 index.lock）」。
 
 ### 32.3 验证
 
@@ -2251,3 +2251,123 @@ resolver 矩阵 8（undefined/true/false/getter 异常/null·undefined settings 
 - `src/sync/lock.test.ts`：获取/释放/幂等、陈旧夺取、跨主机保守、空锁新鲜期保守持有与过期夺取、`linkSync` 插桩的原子性回归、**注入式时序回归（读取与 rename 之间锁被接手 → 不抢活锁；EEXIST 极端路径保留残留）**、硬链接降级、旧格式兼容、token 身份。
 - `src/sync/classify.test.ts`：13 行全覆盖 + 行号防漏守卫 + 首次接入退化。
 - `src/team/store.atomic.test.ts`：注入 fs 失败（rename/写半截/首次创建）原文件不变 + 临时文件清理 + fsync。
+
+## 33. 云同步：完整流程、失败语义与测试矩阵（阶段 2–5 收口）
+
+> 关键决策与理由见 `docs/adr/0008-team-definition-cloud-sync.md`；模块清单与契约见 §32.1。本节是**行为规范**：流程、真值表、失败语义、启动检测、归档与导入规则、测试矩阵、与其它子系统的边界。
+
+### 33.1 三段式流程（`/team sync`）
+
+```
+① 先算（只读；可能写 .git，不写工作区/团队文件）
+   配置/首次接入引导（写 sync.yaml）
+   → 进程锁（sync.lock；陈旧锁按 pid 判定，夺取后复验身份）
+   → index.lock 预检（存在 → 安全中止，绝不代删）
+   → inspectRepo（teams/ 是否为仓库、origin、HEAD、嵌套仓库警告）
+   → ensureRemoteAndBranch（init / remote add|set-url / 分支发现与对齐；换地址需显式确认 + 备份引用）
+   → fetchRemote（硬超时；FETCH_HEAD = 云端 tip）
+   → buildSyncPlan（三方比较 → 计划 + 快照 + TOCTOU 指纹）
+② 再问（零改动）
+   计划摘要展示
+   → 冲突存在时：编辑模式确认（若正在 /team edit 受影响的团队）→ 逐个冲突决策（TUI 差异视图 / RPC 降级）
+     → 最终计划确认（完整变更清单：下载/上传/删除/逐项决策/新团队导入/非团队文件覆盖/归档位置）
+   → 无冲突时：仅「删除」与「首次接入的上传」需要确认（其余零额外确认）
+③ 最后改（唯一写工作区与引用的阶段）
+   verifyPlanFingerprints（FETCH_HEAD / 本地分支 / 指纹路径逐一复验；不一致 → 中止，零改动）
+   → 落盘（原子替换 / 删除 / 冲突决策落地 / 归档 / 导入）+ 内存回滚日志
+   → 临时索引：read-tree 云端树 → 精确路径 add / update-index --force-remove → write-tree → commit-tree 双父
+   → update-ref + push --no-verify（无 upstream 时 -u）→ reset --mixed（索引对齐 HEAD）
+   → 结果摘要
+```
+
+- **唯一允许的中间态**：`本地已提交未推送`（摘要标注 + 原因/修法）。其余失败路径统一回滚：工作区文件还原、本次新建的留档清除、分支引用与索引不动、报「已回滚，未做任何改动」。
+- **快进路径**：最终树与云端树完全相同且本地 tip 是云端提交的祖先（本次只有下载）→ 分支直接指向云端提交，不制造空提交。
+- **临时索引**：`GIT_INDEX_FILE=<gitDir>/sync-index-<pid>-<ts>`，用后清理；`GIT_LITERAL_PATHSPECS=1` 保证团队名里的 glob 字符按字面处理。
+
+### 33.2 三方比较真值表（`classify.ts`，纯函数）
+
+`B` = 基准（merge-base 的树；首次接入为空树）、`L` = 本机工作区内容、`R` = 云端内容；内容比较用 git blob id（经属性/换行过滤，避免假冲突）。
+
+| # | 存在性 | 内容关系 | 分类 | 提问 |
+|---|---|---|---|---|
+| 1 | B/L/R 均存在 | L=R | 无变化 | 否 |
+| 2 | L 存在，R/B 存在 | L≠B，R=B | 仅本机改 → 上传 | 否 |
+| 3 | R 存在，L/B 存在 | R≠B，L=B | 仅云端改 → 下载 | 否 |
+| 4 | L 存在，B 缺失，R 存在 | L=R | 两边新增且相同 | 否 |
+| 5 | L 存在，B 缺失，R 存在 | L≠R | add/add 冲突 | 是（三选项） |
+| 6 | L/R 存在，B 存在 | L≠B，R≠B，L≠R | 两边都改 | 是（三选项） |
+| 7 | L 缺失，R 存在，B 存在 | R≠B | 本机删 + 云端改 | 是（恢复云端 / 保持删除） |
+| 8 | L 存在，R 缺失，B 存在 | L≠B | 本机改 + 云端删 | 是（保留本机 / 接受删除） |
+| 9 | L 缺失，R 存在，B 存在 | R=B | 仅本机删 → 云端删除 | 否 |
+| 10 | L 存在，R 缺失，B 存在 | L=B | 仅云端删 → 本机删除 | 否 |
+| 11 | L/R 缺失，B 存在 | — | 两边都删（提交树删除） | 否 |
+| 12 | L 存在，R/B 缺失 | — | 仅本机新增 → 上传 | 否 |
+| 13 | R 存在，L/B 缺失 | — | 仅云端新增 → 下载 | 否 |
+
+补充：`L` 取**工作区**内容（含未提交修改，故未提交编辑同样被正确分类上传）；非团队文件（`README.md` 等）不逐项决策，按「云端为准」覆盖（覆盖前留档 + 摘要提示）；本地已跟踪但云端没有的非管理路径保留（避免孤儿化）；远端树中的危险路径（绝对路径 / `..` / 反斜杠 / 空段）在**任何落盘之前**过滤并提示。
+
+### 33.3 冲突决策与产物
+
+| 形态 | 选项 | 生效动作 | 被放弃的一侧 → 留档 |
+|---|---|---|---|
+| 两边都改 / add-add | 保留本地 | 本机文件不动、提交树取本机版本 | 云端版本 |
+| | 采用远端 | 写云端内容、提交树取云端版本 | 本机版本 |
+| | 两边都留 | 本机版本继续；云端版本导入为新团队 | 云端版本（归档 + 导入副本） |
+| 本机删 + 云端改 | 恢复云端 | 写云端内容 | —（本机无内容） |
+| | 保持删除 | 提交树移除该路径 | 云端版本 |
+| 本机改 + 云端删 | 保留本机 | 本机文件不动、重新上传 | —（云端无内容） |
+| | 接受删除 | 删除本机文件、提交树移除 | 本机版本 |
+
+- **归档**：`<rootDir>/sync-conflicts/<路径安全化>-<原路径短哈希>[-序号].<YYYYMMDD-HHmmss>`（阶段 2 的非团队文件留档与阶段 4 的冲突留档共用同一规则）。短哈希保证**同一秒内不同路径绝不撞名**；路径安全化保留中文、只折路径分隔符与 Windows 非法字符（并规避保留设备名 CON/PRN/AUX/NUL/COM1-9/LPT1-9）；同路径同秒重复归档追加序号，绝不覆盖既有留档。归档写失败 → **中止整个同步**并回滚（宁可失败，不丢被放弃的一侧）；回滚时清理本次新建的留档。
+- **导入新团队**（两边都留）：名字 = `<slug>-remote-<YYYYMMDD>`，只含字母数字与连字符，且必须避开**本机磁盘 + 基准树 + 远端树**里已有的全部团队名（大小写不敏感归一；同一轮内的多个导入也互不冲突），冲突时追加 `-2`、`-3`…；内容 = 云端版本 YAML 且内部 `name` 同步改写，**必须通过 `validateTeamDefinition`** 才写入 `teams/`（校验失败 → 只留档 + 摘要里明确报告「未导入」）；写入后随本次提交推送。
+- **归档目录不参与任何机制**：不在 `teams/` 内，故不出现在 `/team list`、不参与下一轮同步、不会被当成团队；`/team sync status` 的「归档：N 个冲突留档待清理」按同一命名谓词计数。
+- **TUI 差异视图**（`src/ui/sync-diff-view.ts`）：一冲突一屏；差异由系统临时目录 + `git diff --no-index --no-color` 生成（exit 1 = 有差异；单侧缺失按空内容；读取失败/生成失败 → 降级为「仅两侧信息」并给出人工命令）。组件按 `render(width)` 重排（保留滚动位置与高亮动作）。
+- **RPC 降级**（§4.8）：两侧大小/修改时间 + 人工查看命令（`git --git-dir '<gitDir>' show '<sha>:<file>'`，注意工作区就是 `teams/` 本身，**树路径不带 `teams/` 前缀**；路径加引号可直接粘贴）。**无 UI 模式**（json/print）：明确拒绝写操作 + 人工命令，不发生静默 no-op。
+
+### 33.4 失败语义
+
+| 分类（`classifyGitError`） | 启动检测 | `/team sync` |
+|---|---|---|
+| 未配置 / 未启用 | 静默 | 引导配置 |
+| git 不可用（ENOENT） | 提示一次 + 安装指引 | 报错 + 修法 |
+| 认证 / 权限 / 仓库不存在 / SSH 指纹 | 提示一次 + 修法 | 报错 + 修法 |
+| 网络暂态（DNS / 连接 / TLS / 超时） | 静默 | 报错 + 建议重试 |
+| 并发 / 锁（`index.lock`、锁不可得） | 静默 | 「另一实例正在同步或上次异常退出」+ 处理动作 |
+| 需人工（游离 HEAD、未完成合并/变基、可疑所有权、多分支歧义） | 静默（下次命令处理） | 中止 + 诊断 + 安全出路 |
+| 未知 | 静默 | 原始 stderr（截尾保护）+ 失败命令 |
+
+**通知文案（定稿）**：云端有更新 → `☁️ 云端有 N 个提交尚未同步到本机（运行 /team sync 查看并同步）`；持久缺陷 → `☁️ 云同步暂不可用：<原因>。<修法>（运行 /team sync status 查看详情）`。启动通知**不兼报**本机未备份改动（D13；本机未备份只在 `/team sync status` 显示）。
+
+### 33.5 启动检测（`src/sync/detect.ts`）
+
+- 挂载点：`session_start`，位于 `TEAM_ROLE` 早退之后（成员进程结构性零网络）。
+- **进程级一次**：模块级 latch；`/new`、`/fork`、`/resume` 不重复；`reason === "reload"` 显式跳过且**不消费** latch（下一次真实启动仍检测）。
+- **非阻塞**：处理器同步返回，网络工作在自捕获的游离 promise 中（整体硬超时 20s、网络命令 15s、定时器 unref）。已对照 pi 0.83.0（声明的最低版本）dist 复核：`agent-session.js` 在会话初始化链中 `await` `session_start` 的处理链（`await this._extensionRunner.emit({ type: "session_start", … })`），因此处理器内不得 await 网络；同时 0.83.0 的 `ExtensionContext` 已提供 `mode`（`tui|rpc|json|print`）与 `hasUI`。
+- **判据**：配置未启用 → 返回；数据目录不存在 → 静默（cwd 缺失的 spawn ENOENT 与「没装 git」同码，先判目录可避免误报）；git 不可用 → 持久提示；无仓库 → 静默（首次接入走命令）；origin 缺失 → 静默；origin 与配置不一致 → 提示一次（绝不自动改写）；`ls-remote --heads` → 分类；空远端 → 静默；`fetch --no-write-fetch-head` → 图关系比较（`rev-list --left-right --count`，**不是**「SHA 不同」）；落后 > 0 才通知。
+- **非 TUI**（`mode !== "tui"`）→ 静默降级：不检测、不通知、不抛错（通知无处可去，顺带省掉一次网络访问）。
+
+### 33.6 与其它子系统的边界
+
+- **设置系统**：`sync.yaml` 不经 `loadSettings`（静态守卫保持绿）；`/team setting` 的「云同步（机器级）」入口恒写 `sync.yaml`，不参与临时设置/快照分流。
+- **团队会话**：`/team sync` 在团队会话期间可用（`SESSION_ALLOWED`）；同步只动 `teams/*.yaml` 与 `.git`，不触碰会话目录/成员进程。
+- **create/edit 模式**：create 落盘时目标 `teams/<name>.yaml` 已存在 → **拒绝创建**并引导 `/team edit <name>`（用 `existsSync` 判定，非法 YAML 也算存在——它可能正是刚同步下来的团队）；`/team edit` 进行中而同步会改动该团队的本机文件时，应用前必须明确确认（拒绝 → 零改动）。edit 路径本身不受守卫影响。
+- **成员进程**：成员侧 `TEAM_ROLE` 早退，不注册任何 TL 处理器（零检测、零同步）。
+- **`/team sync status` 的「只读」精确口径**：它**不推送、不改团队文件与工作区**；但它会**读取云端并更新 `.git` 内对象/远端跟踪引用**（`fetch --no-write-fetch-head`，**不写 `FETCH_HEAD`**，因而不与进行中的 `/team sync` 互相干扰）。命令帮助、README 与 `/team setting` 菜单文案统一按此口径书写，不使用「完全只读 / 不动分支引用」这类不可核验的表述。
+
+### 33.7 测试矩阵（最终形态）
+
+| 层 | 内容 | 位置 |
+|---|---|---|
+| 纯函数单测 | 真值表 13 行 + 行号防漏守卫；冲突形态/选项集/生效动作/被放弃侧；导入唯一名与 YAML 改写校验；归档命名（含同秒不撞名、Windows 保留名、路径安全化）；地址校验与脱敏；错误分类；文案与摘要格式；锁身份判定 | `sync/classify.test.ts`、`sync/decide.test.ts`、`sync/apply.test.ts`、`sync/config.test.ts`、`sync/git-runner.test.ts`、`sync/lock.test.ts`、`sync/command.test.ts`、`ui/sync-diff-view.test.ts` |
+| 编排测试（假执行器） | 应用序列（提交树构造、父提交选择、删除处理）、TOCTOU 中止、回滚、startup 检测分类与降级、检出命令可执行性 | `sync/detect.test.ts`、`sync/apply.test.ts`、`sync/command.test.ts` |
+| 集成测试（真实 git，零网络） | 首次接入三类起点、双向无冲突、删除传播、空远端、分支发现与对齐、推送被拒后重跑、取消零改动、非法 YAML、异形文件名（反斜杠/中文/空格）、危险路径树注入、二进制文件、备份恢复、四种冲突形态 × 各选项、归档与新团队导入（含唯一名与校验失败）、编辑模式确认、create 守卫、测试卫生（HOME 毒化 + git 联网 tripwire） | `sync/command.integration.test.ts`、`commands/team.test.ts`、`commands/save-team-definition.test.ts` |
+| 静态守卫 | `child_process` 白名单（同步模块必须经统一 git 执行器）+ `src/sync/` 目录专项；既有 `loadSettings` 守卫 | `static-scan-child-process.test.ts`、`static-scan.test.ts` |
+| 手工冒烟 | 真实 pi 加载 + 四类流程（无冲突同步 / 冲突决策 / 断网重跑 / 备份恢复），真实 git + 本地裸仓库 + 临时 `TOP_NOTCH_TEAM_ROOT`，零网络 | 阶段 5 冒烟记录（`/tmp/sync-stage5-smoke.log`、`/tmp/sync-stage5-pi-load.log`） |
+
+### 33.8 平台与已知限制
+
+- **平台**：Linux（git 2.53）完成机制验证；Windows/macOS **未实测**，按其行为做防御性设计（行尾交给 git 语义、大小写不敏感名字归一、保留设备名规避、路径安全化）。README 明确标注。
+- **备份强度 = 执行 `/team sync` 的频率**：不自动推送、不轮询、不提醒本机未备份改动。
+- **非团队文件「云端为准」**：本机改动不上传、会被云端版本覆盖（覆盖前留档 + 提示）。
+- **不支持多远端/多分支/多人协作**；远端分支歧义明确报错。
+- **`shellQuote` 只按 POSIX 规则转义**（单引号包裹 + `'\''`）：给出的人工命令面向 POSIX shell；Windows 用户请在 Git Bash/WSL 中执行（README 标注）。

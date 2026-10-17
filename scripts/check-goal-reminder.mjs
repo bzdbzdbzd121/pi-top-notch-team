@@ -76,9 +76,9 @@ requireMatch("AGENTS #21 existing registry qualification", agents, /已有进程
 requireMatch("DESIGN §6 registry/activeTools distinction", design, /remain in the registry after teardown[\s\S]{0,120}removed from `activeTools`/);
 requireMatch("DESIGN §18 resumable teardown", design, /preserve resumable[\s\S]{0,80}disk cleanup via \/team delete/);
 requireMatch("DESIGN session-ended banner", design, /no regular TL instructions[\s\S]{0,180}one-shot session-ended banner may be injected on the next turn/);
-requireMatch("AGENTS current team subcommand count", agents, /14 subcommands/);
-requireMatch("README current team subcommand count", readme, /\/team 命令（14 个子命令/);
-requireMatch("DESIGN current team subcommand count", design, /14 subcommands/);
+requireMatch("AGENTS current team subcommand count", agents, /15 subcommands/);
+requireMatch("README current team subcommand count", readme, /\/team 命令（15 个子命令/);
+requireMatch("DESIGN current team subcommand count", design, /15 subcommands/);
 requireMatch("DESIGN autonomous session entry point", design, /waits for `\/team start`, `\/team dynamic`, or `start_team_session` to activate session tools/);
 for (const adrFile of [
   "0001-members-as-independent-pi-rpc-processes.md",
@@ -88,6 +88,7 @@ for (const adrFile of [
   "0005-pi-upstream-truncation-marking.md",
   "0006-pi-upstream-abort-compaction-rpc.md",
   "0007-pi-upstream-context-usage-reason.md",
+  "0008-team-definition-cloud-sync.md",
 ]) {
   requireMatch(`DESIGN ADR layout includes ${adrFile}`, design, new RegExp(adrFile.replaceAll(".", "\\.")));
 }
