@@ -779,8 +779,8 @@ TL: 监控进展、协调异常、write_shared_context 更新共享上下文（�
 - `docs/adr/0004-team-session-resume.md` — Team session resume: member session persistence + manifest + /team resume
 - `docs/adr/0005-pi-upstream-truncation-marking.md` — Upstream framework truncation marking proposal (finalize-time detection + length-protection extension + oneOf error de-noising; non-blocking, for pi upstream issue)
 - `docs/adr/0006-pi-upstream-abort-compaction-rpc.md` — Upstream `abort_compaction` RPC proposal (`agent-session.abortCompaction()` exists but is not reachable over RPC; ~3-line wiring in rpc-mode.js; non-blocking, for pi upstream issue)
-- `docs/adr/0008-team-definition-cloud-sync.md` — 团队定义云同步：git 私有仓库为后端、`teams/` 即工作区、提交树以云端树为基、不自动合并、冲突产物离开 `teams/`、配置独立文件、允许的唯一中间态
 - `docs/adr/0007-pi-upstream-context-usage-reason.md` — Upstream `getContextUsage()` structured-reason proposal (`percent:null` after compaction is a legal state, indistinguishable from config-missing `undefined` by consumers; reason field primary / estimate alternative; non-blocking, for pi upstream issue)
+- `docs/adr/0008-team-definition-cloud-sync.md` — 团队定义云同步：git 私有仓库为后端、`teams/` 即工作区、提交树以云端树为基、不自动合并、冲突产物离开 `teams/`、配置独立文件、允许的唯一中间态
 
 ## Design Document
 

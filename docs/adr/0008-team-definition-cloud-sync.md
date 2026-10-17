@@ -57,7 +57,7 @@
 - 启动时**进程级一次**检测（latch；`reason === "reload"` 显式跳过）：`ls-remote` + `fetch --no-write-fetch-head` + 图关系比较（`rev-list --left-right --count`），只报「云端有 N 个提交尚未同步」。
 - **不兼报本机未备份改动**（用户已确认保持 D13）：本机未备份情况只在 `/team sync status` 显示；README 明确「备份强度 = 执行同步的频率」。
 - 失败分类：暂态（网络/超时/锁）与未知 → 静默；持久缺陷（git 未装、认证、仓库不存在、地址不一致）→ 恰好一次通知 + 修法；非 TUI（rpc/json/print）→ 静默降级（零网络、零通知、不抛错）。
-- 处理器**同步返回**，网络工作放在自捕获的游离 promise 中并设硬超时——上游在 pi 0.83.0（声明的最低版本）里确实 `await` `session_start` 的处理链（`agent-session.js:2070`），处理器内 await 网络会推迟启动。
+- 处理器**同步返回**，网络工作放在自捕获的游离 promise 中并设硬超时——上游在 pi 0.83.0（声明的最低版本）里确实 `await` `session_start` 的处理链：**启动路径 `agent-session.js:1761`**（`await this._extensionRunner.emit(this._sessionStartEvent)`，默认 `reason: "startup"`，见同文件 `:151`）；`reload` 分支另在 `:2070`（`emit({ type: "session_start", reason: "reload" })`）。处理器内 await 网络会推迟启动。
 
 **后果**：启动不阻塞、失败不打扰；代价是「长期不同步的机器既不上传也没有提醒」。
 

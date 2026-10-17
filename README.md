@@ -395,7 +395,18 @@ cd pi-top-notch-team
 npm install
 npm test           # 运行全部测试
 npm run test:watch # Watch 模式
+npm run check:goal-reminder   # 发布检查（Goal 生命周期 + 文档措辞/计数守卫）
 ```
+
+### 端到端冒烟（云同步，可复跑）
+
+```bash
+node scripts/run-cloud-sync-smoke.mjs          # ① 四类流程冒烟 ② 真实 pi 加载冒烟
+node scripts/run-cloud-sync-smoke.mjs --flow   # 只跑流程冒烟
+node scripts/run-cloud-sync-smoke.mjs --load   # 只跑真实 pi 加载冒烟
+```
+
+真实 git + 本地裸仓库做「云端」+ 临时数据目录，**零网络**；流程本体是 `src/sync/smoke.cloud-sync.test.ts`（默认跳过，仅 `SYNC_SMOKE=1` 时运行，也可直接用 `SYNC_SMOKE=1 npx vitest run src/sync/smoke.cloud-sync.test.ts`）。记录写入 `/tmp/sync-stage5-smoke.log` 与 `/tmp/sync-stage5-pi-load.log`（含执行命令与 EXIT 码）。
 
 完整源码地图与 DI 模式文档见 [AGENTS.md](AGENTS.md)。
 

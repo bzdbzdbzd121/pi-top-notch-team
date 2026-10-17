@@ -24,6 +24,12 @@ import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { ConflictOption } from "./classify";
 import { listTeams } from "../team/store";
 
+// ── 测试硬护栏（阶段 5 复审 #3）：把 git 允许的协议钉死为 file ──
+// 本文件所有「云端」都是本地裸仓库路径（零远程 URL）。一旦有人误把远端改成
+// https/ssh 地址，git 会立即失败而不是发起真实网络请求 —— 使「测试零真实网络」
+// 从人工核对变成持续护栏。（统一执行器会继承 process.env，故这里设置即可生效。）
+process.env.GIT_ALLOW_PROTOCOL = "file";
+
 /**
  * 阶段 2 集成测试（方案 §5 阶段 2 验收 1–12、14）：
  * 真实 git + 本地裸仓库做「云端」，TOP_NOTCH_TEAM_ROOT 指向临时目录，零网络。

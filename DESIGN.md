@@ -2342,7 +2342,7 @@ resolver 矩阵 8（undefined/true/false/getter 异常/null·undefined settings 
 
 - 挂载点：`session_start`，位于 `TEAM_ROLE` 早退之后（成员进程结构性零网络）。
 - **进程级一次**：模块级 latch；`/new`、`/fork`、`/resume` 不重复；`reason === "reload"` 显式跳过且**不消费** latch（下一次真实启动仍检测）。
-- **非阻塞**：处理器同步返回，网络工作在自捕获的游离 promise 中（整体硬超时 20s、网络命令 15s、定时器 unref）。已对照 pi 0.83.0（声明的最低版本）dist 复核：`agent-session.js` 在会话初始化链中 `await` `session_start` 的处理链（`await this._extensionRunner.emit({ type: "session_start", … })`），因此处理器内不得 await 网络；同时 0.83.0 的 `ExtensionContext` 已提供 `mode`（`tui|rpc|json|print`）与 `hasUI`。
+- **非阻塞**：处理器同步返回，网络工作在自捕获的游离 promise 中（整体硬超时 20s、网络命令 15s、定时器 unref）。已对照 pi 0.83.0（声明的最低版本）dist 复核：**启动路径**在 `agent-session.js:1761` 用 `await this._extensionRunner.emit(this._sessionStartEvent)`（默认 `reason: "startup"`，事件见同文件 `:151`）；**重载分支**在 `:2070`（`emit({ type: "session_start", reason: "reload" })`）——两类都被上游 **await**，因此处理器内不得 await 网络；同时 0.83.0 的 `ExtensionContext` 已提供 `mode`（`tui|rpc|json|print`）与 `hasUI`。
 - **判据**：配置未启用 → 返回；数据目录不存在 → 静默（cwd 缺失的 spawn ENOENT 与「没装 git」同码，先判目录可避免误报）；git 不可用 → 持久提示；无仓库 → 静默（首次接入走命令）；origin 缺失 → 静默；origin 与配置不一致 → 提示一次（绝不自动改写）；`ls-remote --heads` → 分类；空远端 → 静默；`fetch --no-write-fetch-head` → 图关系比较（`rev-list --left-right --count`，**不是**「SHA 不同」）；落后 > 0 才通知。
 - **非 TUI**（`mode !== "tui"`）→ 静默降级：不检测、不通知、不抛错（通知无处可去，顺带省掉一次网络访问）。
 
@@ -2360,9 +2360,10 @@ resolver 矩阵 8（undefined/true/false/getter 异常/null·undefined settings 
 |---|---|---|
 | 纯函数单测 | 真值表 13 行 + 行号防漏守卫；冲突形态/选项集/生效动作/被放弃侧；导入唯一名与 YAML 改写校验；归档命名（含同秒不撞名、Windows 保留名、路径安全化）；地址校验与脱敏；错误分类；文案与摘要格式；锁身份判定 | `sync/classify.test.ts`、`sync/decide.test.ts`、`sync/apply.test.ts`、`sync/config.test.ts`、`sync/git-runner.test.ts`、`sync/lock.test.ts`、`sync/command.test.ts`、`ui/sync-diff-view.test.ts` |
 | 编排测试（假执行器） | 应用序列（提交树构造、父提交选择、删除处理）、TOCTOU 中止、回滚、startup 检测分类与降级、检出命令可执行性 | `sync/detect.test.ts`、`sync/apply.test.ts`、`sync/command.test.ts` |
-| 集成测试（真实 git，零网络） | 首次接入三类起点、双向无冲突、删除传播、空远端、分支发现与对齐、推送被拒后重跑、取消零改动、非法 YAML、异形文件名（反斜杠/中文/空格）、危险路径树注入、二进制文件、备份恢复、四种冲突形态 × 各选项、归档与新团队导入（含唯一名与校验失败）、编辑模式确认、create 守卫、测试卫生（HOME 毒化 + git 联网 tripwire） | `sync/command.integration.test.ts`、`commands/team.test.ts`、`commands/save-team-definition.test.ts` |
+| 集成测试（真实 git，零网络） | 首次接入三类起点、双向无冲突、删除传播、空远端、分支发现与对齐、推送被拒后重跑、取消零改动、非法 YAML、异形文件名（反斜杠/中文/空格）、危险路径树注入、二进制文件、备份恢复、四种冲突形态 × 各选项、归档与新团队导入（含唯一名与校验失败）、编辑模式确认、create 守卫 | `sync/command.integration.test.ts`、`commands/team.test.ts`、`commands/save-team-definition.test.ts` |
+| 测试卫生（零真实网络） | ① `TOP_NOTCH_TEAM_ROOT` 指临时目录（不读真实数据目录）；② **硬护栏**：集成测试把 `GIT_ALLOW_PROTOCOL=file` 钉死——任何 https/ssh 远端尝试会立即失败，所有「云端」均为本地裸仓库路径；③ 启动检测注入假执行器；④ 一次性人工核对（历史记录）：PATH 前置包装 git 记录 `ls-remote/fetch/push` 调用，全量运行无任何外部地址调用 | 同上 + `sync/detect.test.ts` |
 | 静态守卫 | `child_process` 白名单（同步模块必须经统一 git 执行器）+ `src/sync/` 目录专项；既有 `loadSettings` 守卫 | `static-scan-child-process.test.ts`、`static-scan.test.ts` |
-| 手工冒烟 | 真实 pi 加载 + 四类流程（无冲突同步 / 冲突决策 / 断网重跑 / 备份恢复），真实 git + 本地裸仓库 + 临时 `TOP_NOTCH_TEAM_ROOT`，零网络 | 阶段 5 冒烟记录（`/tmp/sync-stage5-smoke.log`、`/tmp/sync-stage5-pi-load.log`） |
+| 手工冒烟（可复跑） | 真实 pi 加载 + 四类流程（无冲突同步 / 冲突决策 / 断网重跑 / 备份恢复），真实 git + 本地裸仓库 + 临时 `TOP_NOTCH_TEAM_ROOT`，零网络 | `node scripts/run-cloud-sync-smoke.mjs`（`--flow` / `--load` 可单跑）→ 测试本体 `src/sync/smoke.cloud-sync.test.ts`（默认 `describe.skipIf`，仅 `SYNC_SMOKE=1` 运行）；记录 `/tmp/sync-stage5-smoke.log`、`/tmp/sync-stage5-pi-load.log`（含命令与 EXIT 码） |
 
 ### 33.8 平台与已知限制
 
