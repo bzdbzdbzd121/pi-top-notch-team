@@ -176,7 +176,10 @@ export function registerTeamCommand(
           await handleStatus(ctx, getMemberStatuses);
           return;
         case "sync":
-          await handleSyncCommand(ctx, subargs);
+          await handleSyncCommand(ctx, subargs, {
+            // 阶段 4：编辑模式确认需要「正在编辑哪个团队」（唯一注入点）
+            getEditingTeamName: () => teamCtx.editingTeamName,
+          });
           return;
         case "setting":
           await handleSetting(ctx);

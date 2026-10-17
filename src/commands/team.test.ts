@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { stringify as stringifyYaml } from "yaml";
@@ -228,6 +228,27 @@ members:
       expect.stringContaining("不存在"),
       "warning"
     );
+  });
+
+  it("/team sync 注入编辑模式依赖（getEditingTeamName 接线锁）", () => {
+    // 接线锁（与 session-settings 的 wiring lock 同模式）：编辑模式确认依赖
+    // teamCtx.editingTeamName，而 sync 层无法访问 teamCtx —— 调用处必须显式注入。
+    const source = readFileSync(new URL("./team.ts", import.meta.url), "utf-8");
+    expect(source).toContain("getEditingTeamName: () => teamCtx.editingTeamName");
+    expect(source).toMatch(/handleSyncCommand\(ctx, subargs, \{/);
+  });
+
+  it("/team sync 在无界面模式下拒绝写操作（文案含冲突说明与人工命令）", async () => {
+    const pi = createMockExtensionAPI();
+    const ctx = createMockContext({ mode: "print" } as never);
+    let handler: Function = () => {};
+    pi.registerCommand = vi.fn((_name, opts) => { handler = opts.handler; });
+    registerTeamCommand(pi, createTeamContext());
+
+    await handler("sync", ctx);
+    const text = (ctx.ui.notify as any).mock.calls.map((c: unknown[]) => String(c[0])).join("\n");
+    expect(text).toContain("需要交互式界面");
+    expect(text).toContain("git --git-dir");
   });
 
   it("/team unknown shows usage", async () => {

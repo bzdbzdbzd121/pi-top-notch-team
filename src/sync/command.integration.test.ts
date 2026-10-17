@@ -21,6 +21,8 @@ import { getSyncConfigPath, saveSyncConfig } from "./config";
 import { getTeamsDir } from "../team/store";
 import { runGit } from "./git-runner";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ConflictOption } from "./classify";
+import { listTeams } from "../team/store";
 
 /**
  * 阶段 2 集成测试（方案 §5 阶段 2 验收 1–12、14）：
@@ -172,6 +174,8 @@ describe("阶段 2：/team sync 集成（真实 git，裸仓库做云端）", ()
   function makeHarness(options?: {
     confirm?: (title: string, message: string) => boolean | Promise<boolean>;
     input?: () => string | undefined | Promise<string | undefined>;
+    select?: (title: string, labels: string[]) => string | undefined | Promise<string | undefined>;
+    mode?: "tui" | "rpc";
   }): {
     ctx: ExtensionCommandContext;
     notify: ReturnType<typeof vi.fn>;
@@ -182,8 +186,8 @@ describe("阶段 2：/team sync 集成（真实 git，裸仓库做云端）", ()
     const notify = vi.fn();
     const confirm = vi.fn(options?.confirm ?? (async () => true));
     const input = vi.fn(options?.input ?? (async () => undefined));
-    const select = vi.fn(async () => undefined);
-    const ctx = createMockContext();
+    const select = vi.fn(options?.select ?? (async () => undefined));
+    const ctx = createMockContext(options?.mode ? ({ mode: options.mode } as never) : undefined);
     ctx.ui.notify = notify as never;
     ctx.ui.confirm = confirm as never;
     ctx.ui.input = input as never;
@@ -191,11 +195,78 @@ describe("阶段 2：/team sync 集成（真实 git，裸仓库做云端）", ()
     return { ctx: ctx as unknown as ExtensionCommandContext, notify, confirm, input, select };
   }
 
+  /** RPC 降级路径的选项 mock：按动作值选中对应标签。 */
+  function rpcChoice(choice: ConflictOption): (title: string, labels: string[]) => string {
+    return (_title, labels) => {
+      const found = labels.find((label) => CHOICE_PREFIX[choice].some((prefix) => label.startsWith(prefix)));
+      if (!found) throw new Error(`标签未找到：${choice}（可选：${labels.join(" | ")}）`);
+      return found;
+    };
+  }
+
+  /** 同一 option 值在不同形态下标签不同（保留本地/保持删除/保留本机…），全部登记。 */
+  const CHOICE_PREFIX: Record<ConflictOption, string[]> = {
+    "keep-local": ["保留本地", "保持删除", "保留本机"],
+    "take-remote": ["采用远端", "恢复云端", "接受删除"],
+    "keep-both": ["两边都留"],
+  };
+
+  /** TUI 路径：模拟用户在差异视图里按数字键选动作并 Enter（走真实组件键盘处理）。 */
+  function installTuiChoice(ctx: ExtensionCommandContext, choice: ConflictOption | undefined): void {
+    (ctx.ui as any).custom = async (factory: any) => {
+      let result: ConflictOption | undefined;
+      const done = (value: ConflictOption | undefined): void => {
+        result = value;
+      };
+      const component = factory(
+        { requestRender: vi.fn() },
+        { fg: (_c: string, s: string) => s, bold: (s: string) => s },
+        undefined,
+        done
+      );
+      if (choice === undefined) {
+        component.handleInput("\u001b");
+        return result;
+      }
+      const index = component.getState().actions.findIndex((a: { value: ConflictOption }) => a.value === choice);
+      if (index < 0) throw new Error(`该形态没有 ${choice} 选项：${JSON.stringify(component.getState().actions)}`);
+      component.handleInput(String(index + 1));
+      component.handleInput("\r");
+      return result;
+    };
+  }
+
   async function sync(
     ctx: ExtensionCommandContext,
-    deps?: { runGit?: typeof runGit }
+    deps?: { runGit?: typeof runGit; now?: () => Date; getEditingTeamName?: () => string | null }
   ): Promise<void> {
     await handleSyncCommand(ctx, "", { rootDir, ...deps });
+  }
+
+  /** 把团队 YAML 的 description 换掉（内容差异可被 YAML 重新序列化保留，便于断言导入内容）。 */
+  function withDesc(yaml: string, desc: string): string {
+    return yaml.replace(/description: .*/, `description: ${desc}`);
+  }
+
+  /** 建立「两边都改」冲突：基线同步 → 本机改 + 云端改（改的是真实字段，不是注释）。 */
+  async function setupBothModified(name = "a.yaml", baseline = teamYaml("a")): Promise<void> {
+    seedRemote({ [name]: baseline });
+    configure();
+    await sync(makeHarness().ctx);
+    writeLocal(name, withDesc(baseline, "本机描述"));
+    remoteCommit({ [name]: withDesc(baseline, "云端描述") }, "remote edit");
+  }
+
+  function archiveFiles(): string[] {
+    const dir = join(rootDir, "sync-conflicts");
+    if (!existsSync(dir)) return [];
+    return readdirSync(dir).sort();
+  }
+
+  function archiveContent(prefix: string): string {
+    const file = archiveFiles().find((f) => f.startsWith(prefix));
+    if (!file) throw new Error(`归档文件未找到（prefix=${prefix}，现有：${archiveFiles().join("、") || "无"}）`);
+    return readFileSync(join(rootDir, "sync-conflicts", file), "utf-8");
   }
 
   function notifyText(notify: ReturnType<typeof vi.fn>): string {
@@ -1019,5 +1090,245 @@ describe("阶段 2：/team sync 集成（真实 git，裸仓库做云端）", ()
       .split("\n")
       .filter(Boolean);
     expect(tracked).not.toContain("notes.md");
+  });
+
+  // ═══════ 阶段 4：冲突决策与留档（验收 1–7）═══════
+
+  it("阶段4-1 两边都改 → 保留本地（上传本机版本、云端版本归档）", async () => {
+    await setupBothModified();
+    const { ctx, notify } = makeHarness({ mode: "rpc", select: rpcChoice("keep-local") });
+    await sync(ctx, { now: () => new Date(2026, 9, 17) });
+
+    const text = notifyText(notify);
+    expect(text).toContain("冲突决策：1");
+    expect(text).toContain("保留本地");
+    expect(readLocal("a.yaml")).toContain("本机描述");
+    expect(remoteFile("a.yaml")).toContain("本机描述"); // 本机版本已上传
+    expect(archiveContent("a.yaml-")).toContain("云端描述"); // 被放弃的云端版本留档
+  });
+
+  it("阶段4-2 两边都改 → 采用远端（本机版本归档、云端版本落地）", async () => {
+    await setupBothModified();
+    const { ctx } = makeHarness({ mode: "rpc", select: rpcChoice("take-remote") });
+    await sync(ctx, { now: () => new Date(2026, 9, 17) });
+
+    expect(readLocal("a.yaml")).toContain("云端描述");
+    expect(archiveContent("a.yaml-")).toContain("本机描述"); // 被放弃的本机版本留档
+    expect(remoteFile("a.yaml")).toContain("云端描述");
+  });
+
+  it("阶段4-3 两边都改 → 两边都留（导为新团队、内部 name 改写、随下一次同步传播）", async () => {
+    await setupBothModified();
+    const { ctx, notify } = makeHarness({ mode: "rpc", select: rpcChoice("keep-both") });
+    await sync(ctx, { now: () => new Date(2026, 9, 17) });
+
+    const imported = "a-remote-20261017";
+    expect(existsSync(join(teamsDir, `${imported}.yaml`))).toBe(true);
+    const content = readLocal(`${imported}.yaml`);
+    expect(content).toContain(`name: ${imported}`); // 内部 name 同步改写
+    expect(content).toContain("云端描述"); // 内容来自云端版本
+    expect(readLocal("a.yaml")).toContain("本机描述"); // 本机版本继续作为该团队
+    expect(archiveContent("a.yaml-")).toContain("云端描述"); // 云端版本另存一份归档
+    expect(remoteHas(`${imported}.yaml`)).toBe(true); // 已随本次提交推送
+    expect(notifyText(notify)).toContain(`新团队导入：${imported}`);
+    expect(notifyText(notify)).toContain("将随下一次同步传播");
+
+    // 归档目录不被当团队、不参与下一轮同步
+    expect(listTeams(rootDir)).not.toContain("sync-conflicts");
+    const next = makeHarness();
+    await sync(next.ctx);
+    expect(notifyText(next.notify)).toContain("已是最新");
+  });
+
+  it("阶段4-4 两边都留且已有同名团队/`X.remote` → 唯一名，不覆盖任何文件", async () => {
+    writeLocal("a-remote-20261017.yaml", teamYaml("a-remote-20261017"));
+    writeLocal("a.remote.yaml", teamYaml("a.remote")); // 合法团队名，必须保留
+    const beforeRemote = teamYaml("a");
+    seedRemote({ "a.yaml": beforeRemote, "a-remote-20261017.yaml": teamYaml("a-remote-20261017") });
+    configure();
+    await sync(makeHarness().ctx);
+    writeLocal("a.yaml", withDesc(beforeRemote, "本机描述"));
+    remoteCommit({ "a.yaml": withDesc(beforeRemote, "云端描述") }, "remote edit");
+
+    const { ctx, notify } = makeHarness({ mode: "rpc", select: rpcChoice("keep-both") });
+    await sync(ctx, { now: () => new Date(2026, 9, 17) });
+
+    expect(notifyText(notify)).toContain("a-remote-20261017-2");
+    expect(existsSync(join(teamsDir, "a-remote-20261017-2.yaml"))).toBe(true);
+    expect(readLocal("a.remote.yaml")).toContain("name: a.remote"); // 既有合法团队未被覆盖
+    expect(remoteFile("a-remote-20261017.yaml")).toContain("a-remote-20261017"); // 未被改写
+  });
+
+  it("阶段4-5 两边都留但云端版本不合法 → 拒绝导入（只留档）+ 明确报告", async () => {
+    seedRemote({ "a.yaml": teamYaml("a") });
+    configure();
+    await sync(makeHarness().ctx);
+    writeLocal("a.yaml", withDesc(teamYaml("a"), "本机描述"));
+    remoteCommit({ "a.yaml": "name: a\ndescription: x\nmembers: []\n" }, "remote invalid");
+
+    const { ctx, notify } = makeHarness({ mode: "rpc", select: rpcChoice("keep-both") });
+    await sync(ctx, { now: () => new Date(2026, 9, 17) });
+
+    const text = notifyText(notify);
+    expect(text).toContain("未导入");
+    expect(text).toContain("团队校验失败");
+    expect(existsSync(join(teamsDir, "a-remote-20261017.yaml"))).toBe(false); // 不写入 teams/
+    expect(archiveContent("a.yaml-")).toContain("members: []"); // 只留档
+    expect(readLocal("a.yaml")).toContain("本机描述");
+  });
+
+  it("阶段4-6 本机删+云端改：保持删除（云端版本归档、提交树删除）；恢复云端（取回）", async () => {
+    seedRemote({ "a.yaml": teamYaml("a") });
+    configure();
+    await sync(makeHarness().ctx);
+    unlinkSync(join(teamsDir, "a.yaml"));
+    remoteCommit({ "a.yaml": withDesc(teamYaml("a"), "云端描述") }, "remote edit");
+
+    const keepDeleted = makeHarness({ mode: "rpc", select: rpcChoice("keep-local") });
+    await sync(keepDeleted.ctx, { now: () => new Date(2026, 9, 17) });
+    expect(existsSync(join(teamsDir, "a.yaml"))).toBe(false); // 保持删除
+    expect(archiveContent("a.yaml-")).toContain("云端描述"); // 云端版本归档
+    expect(remoteHas("a.yaml")).toBe(false); // 删除已传播
+
+    // 恢复云端
+    remoteCommit({ "a.yaml": withDesc(teamYaml("a"), "云端再来描述") }, "remote again");
+    const restore = makeHarness({ mode: "rpc", select: rpcChoice("take-remote") });
+    await sync(restore.ctx, { now: () => new Date(2026, 9, 17) });
+    expect(readLocal("a.yaml")).toContain("云端再来描述");
+  });
+
+  it("阶段4-7 本机改+云端删：保留本机（重新上传）；接受删除（本机版本归档后删除）", async () => {
+    seedRemote({ "a.yaml": teamYaml("a") });
+    configure();
+    await sync(makeHarness().ctx);
+    writeLocal("a.yaml", withDesc(teamYaml("a"), "本机描述"));
+    // 云端删除
+    const scratch = cloneRemote("main");
+    unlinkSync(join(scratch, "a.yaml"));
+    gitCli(scratch, ["add", "-A"]);
+    gitCli(scratch, [...GIT_ID, "commit", "-qm", "remove a"]);
+    gitCli(scratch, ["push", "-q", "origin", "HEAD:refs/heads/main"]);
+
+    const keepLocal = makeHarness({ mode: "rpc", select: rpcChoice("keep-local") });
+    await sync(keepLocal.ctx, { now: () => new Date(2026, 9, 17) });
+    expect(readLocal("a.yaml")).toContain("本机描述");
+    expect(remoteFile("a.yaml")).toContain("本机描述"); // 重新上传
+
+    // 再次制造 modify/delete → 接受删除
+    writeLocal("a.yaml", withDesc(teamYaml("a"), "本机描述2"));
+    const scratch2 = cloneRemote("main");
+    unlinkSync(join(scratch2, "a.yaml"));
+    gitCli(scratch2, ["add", "-A"]);
+    gitCli(scratch2, [...GIT_ID, "commit", "-qm", "remove a again"]);
+    gitCli(scratch2, ["push", "-q", "origin", "HEAD:refs/heads/main"]);
+    const acceptDelete = makeHarness({ mode: "rpc", select: rpcChoice("take-remote") });
+    await sync(acceptDelete.ctx, { now: () => new Date(2026, 9, 17) });
+    expect(existsSync(join(teamsDir, "a.yaml"))).toBe(false);
+    expect(archiveContent("a.yaml-")).toContain("本机描述2");
+  });
+
+  it("阶段4-8 取消任一步 → 零改动（归档目录未写、引用未动）", async () => {
+    await setupBothModified();
+    const headBefore = localSha();
+    // RPC 取消 = select 返回 undefined
+    const { ctx, notify } = makeHarness({ mode: "rpc", select: undefined });
+    await sync(ctx);
+    expect(notifyText(notify)).toContain("已取消，未做任何改动");
+    expect(archiveFiles()).toHaveLength(0);
+    expect(localSha()).toBe(headBefore);
+    expect(readLocal("a.yaml")).toContain("本机描述");
+
+    // TUI 取消 = Esc
+    const tui = makeHarness();
+    installTuiChoice(tui.ctx, undefined);
+    await sync(tui.ctx);
+    expect(archiveFiles()).toHaveLength(0);
+    expect(localSha()).toBe(headBefore);
+
+    // 最终计划确认拒绝（选择动作之后、应用之前）
+    const rejected = makeHarness({ mode: "rpc", select: rpcChoice("take-remote"), confirm: async () => false });
+    await sync(rejected.ctx);
+    expect(notifyText(rejected.notify)).toContain("已取消，未做任何改动");
+    expect(archiveFiles()).toHaveLength(0);
+    expect(localSha()).toBe(headBefore);
+    expect(readLocal("a.yaml")).toContain("本机描述"); // 云端版本未落地
+  });
+
+  it("阶段4-9 TUI 路径：差异视图按数字键选动作 → 决策生效", async () => {
+    await setupBothModified();
+    const { ctx } = makeHarness();
+    installTuiChoice(ctx, "take-remote");
+    await sync(ctx, { now: () => new Date(2026, 9, 17) });
+    expect(readLocal("a.yaml")).toContain("云端描述");
+    expect(archiveContent("a.yaml-")).toContain("本机描述");
+  });
+
+  it("阶段4-10 编辑模式确认：正在编辑的团队被同步触及 → 先确认；拒绝则零改动", async () => {
+    await setupBothModified();
+    const headBefore = localSha();
+    const rejected = makeHarness({ mode: "rpc", select: rpcChoice("take-remote"), confirm: async () => false });
+    await sync(rejected.ctx, { getEditingTeamName: () => "a" });
+    expect(rejected.confirm).toHaveBeenCalled();
+    expect(notifyText(rejected.notify)).toContain("已取消，未做任何改动");
+    expect(archiveFiles()).toHaveLength(0);
+    expect(localSha()).toBe(headBefore);
+
+    // 编辑的是别的团队 → 不额外确认（仍走冲突决策与计划确认）
+    const other = makeHarness({ mode: "rpc", select: rpcChoice("take-remote") });
+    await sync(other.ctx, { getEditingTeamName: () => "其他团队" });
+    expect(readLocal("a.yaml")).toContain("云端描述");
+  });
+
+  it("阶段4-11 无 UI 模式 → 明确拒绝 + 人工命令（不静默 no-op）", async () => {
+    await setupBothModified();
+    const headBefore = localSha();
+    const { ctx, notify } = makeHarness({ mode: "json" as never });
+    await sync(ctx);
+    const text = notifyText(notify);
+    expect(text).toContain("冲突");
+    expect(text).toContain("/team sync status");
+    expect(text).toContain("git --git-dir");
+    expect(localSha()).toBe(headBefore);
+    expect(archiveFiles()).toHaveLength(0);
+  });
+
+  it("阶段4-12 无冲突的普通计划不受影响（零额外确认，阶段 2 行为保持）", async () => {
+    seedRemote({ "a.yaml": teamYaml("a") });
+    configure();
+    await sync(makeHarness().ctx);
+    writeLocal("a.yaml", withDesc(teamYaml("a"), "本机描述"));
+
+    const { ctx, confirm, notify } = makeHarness();
+    await sync(ctx);
+    expect(confirm).not.toHaveBeenCalled(); // 仅本机改 → 不确认
+    expect(notifyText(notify)).toContain("云同步完成");
+    expect(archiveFiles()).toHaveLength(0);
+  });
+
+  it("阶段4-13 add/add 冲突（两边各自新增同名、内容不同）→ 提问并三选项", async () => {
+    writeLocal("new.yaml", withDesc(teamYaml("new"), "本机新增描述"));
+    seedRemote({ "new.yaml": withDesc(teamYaml("new"), "云端新增描述") });
+    configure();
+
+    const { ctx, notify, select } = makeHarness({ mode: "rpc", select: rpcChoice("keep-local") });
+    await sync(ctx, { now: () => new Date(2026, 9, 17) });
+    expect(select).toHaveBeenCalled(); // 提问
+    expect(notifyText(notify)).toContain("冲突决策：1");
+    expect(readLocal("new.yaml")).toContain("本机新增描述");
+    expect(archiveContent("new.yaml-")).toContain("云端新增描述");
+    expect(remoteFile("new.yaml")).toContain("本机新增描述");
+  });
+
+  it("阶段4-14 两边新增且内容相同 → 不提问、零决策界面", async () => {
+    const same = teamYaml("same");
+    writeLocal("same.yaml", same);
+    seedRemote({ "same.yaml": same });
+    configure();
+
+    const { ctx, notify, select } = makeHarness({ mode: "rpc" });
+    await sync(ctx);
+    expect(select).not.toHaveBeenCalled();
+    expect(notifyText(notify)).not.toContain("冲突决策");
+    expect(readLocal("same.yaml")).toBe(same);
   });
 });

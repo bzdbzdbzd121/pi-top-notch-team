@@ -9,8 +9,8 @@
  *  - **fire-and-forget**：`scheduleCloudDetection` 同步返回；网络工作放在游离 promise 中，
  *    自身 `try/catch`（游离 promise 的拒绝无人接住）+ 整体硬超时。上游在会话初始化时会
  *    await `session_start` 的处理链，处理器内直接 await 网络会推迟启动。
- *  - **只读**：仅 `ls-remote` + `fetch --no-write-fetch-head`（只写 `.git`，不改工作区、
- *    不写 FETCH_HEAD、不动分支引用）。
+ *  - **不推送、不改团队文件与工作区**：仅 `ls-remote` + `fetch --no-write-fetch-head`
+ *    （读取云端并更新 `.git` 内对象/远端跟踪引用；不写 FETCH_HEAD、不动分支引用）。
  *  - **失败分类**（§7.E 表）：暂态（网络/超时/锁）与未知 → 静默；持久缺陷（git 未装、
  *    认证/权限、仓库不存在、地址不一致）→ 恰好一次通知 + 修法；需人工 → 静默（留给命令处理）。
  *  - **无用户在场的 UI**（rpc/json/print）→ 静默降级：不检测、不通知、不抛错。
@@ -148,7 +148,7 @@ export function formatDetectNotification(outcome: DetectOutcome): string | null 
   return null;
 }
 
-// ── 判定逻辑（只读，可注入执行器）────────────────────────────
+// ── 判定逻辑（不推送、不改团队文件与工作区；可注入执行器）──────
 
 /**
  * 检测一次（不通知、不写任何文件）。

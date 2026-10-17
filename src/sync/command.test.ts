@@ -48,6 +48,8 @@ const baseSummary = {
   deletedOnRemote: [],
   passthroughUpdated: [],
   archivedFiles: [],
+  conflictDecisions: [],
+  importedTeams: [],
   keptLocalPaths: [],
   ignored: { nestedYaml: [], nonYamlLocalModified: [] },
   invalidTeams: [],
@@ -301,6 +303,45 @@ describe("命令层边界", () => {
     const { ctx, notify } = ctxWith({ mode: "print" });
     await handleSyncCommand(ctx, "", { rootDir });
     expect(notifyText(notify)).toContain("需要交互式界面");
+  });
+
+  it("非交互模式拒绝文案含冲突决策说明与人工命令（验收 6：不静默 no-op）", async () => {
+    for (const mode of ["print", "json"]) {
+      const { ctx, notify } = ctxWith({ mode });
+      await handleSyncCommand(ctx, "", { rootDir });
+      const text = notifyText(notify);
+      expect(text).toContain("需要交互式界面");
+      expect(text).toContain("冲突决策");
+      expect(text).toContain("/team sync status");
+      expect(text).toContain("git --git-dir");
+    }
+  });
+
+  it("冲突决策与导入在结果摘要中可见（含留档路径与导入失败）", () => {
+    const text = formatSyncResult({
+      ...baseSummary,
+      commit: "a1b2c3d",
+      pushed: true,
+      downloaded: ["a"],
+      conflictDecisions: [
+        {
+          path: "a.yaml",
+          choice: "keep-both",
+          shape: "both-modified",
+          archivePath: `${homedir()}/.pi/top-notch-team/sync-conflicts/a.yaml-1a2b3c4d.20261017-120100`,
+          importedName: "a-remote-20261017",
+        },
+        { path: "b.yaml", choice: "take-remote", shape: "both-modified" },
+        { path: "c.yaml", choice: "keep-both", shape: "both-modified", importError: "团队校验失败：members 不能为空" },
+      ],
+      importedTeams: [{ name: "a-remote-20261017", path: "a-remote-20261017.yaml" }],
+    });
+    expect(text).toContain("冲突决策：3");
+    expect(text).toContain("导为新团队 a-remote-20261017");
+    expect(text).toContain("sync-conflicts/a.yaml-1a2b3c4d.20261017-120100");
+    expect(text).toContain("采用远端（本机版本归档）");
+    expect(text).toContain("⚠️ 未导入（团队校验失败：members 不能为空）");
+    expect(text).toContain("新团队导入：a-remote-20261017（将随下一次同步传播）");
   });
 
   it("未配置 + 无界面 → 引导文案（不写任何文件）", async () => {

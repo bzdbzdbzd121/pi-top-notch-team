@@ -9,7 +9,8 @@ import { existsSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { getRootDir } from "../config";
-import { getTeamsDir } from "../team/store";
+import { getTeamsDir, listTeams } from "../team/store";
+import type { ConflictOption } from "./classify";
 import type { GitResult, GitRunOptions } from "./git-runner";
 import { runGit } from "./git-runner";
 import {
@@ -20,6 +21,20 @@ import {
   type SyncConfig,
 } from "./config";
 import { acquireSyncLock, isSyncLockStale, readSyncLock } from "./lock";
+import { normalizeDiffLines, showSyncDiffView } from "../ui/sync-diff-view";
+import {
+  cleanupConflictDiffs,
+  conflictChoices,
+  decisionSummary,
+  formatConflictRpcOverview,
+  formatFinalPlanSummary,
+  loadConflictDiffs,
+  nonInteractiveSyncMessage,
+  resolveImportNames,
+  type ConflictChoice,
+  type ConflictDecision,
+  type ConflictDiff,
+} from "./decide";
 import { applySync, isArchiveFileName, type ApplySummary } from "./apply";
 import {
   buildSyncPlan,
@@ -53,6 +68,11 @@ export interface SyncCommandDeps {
   now?: () => Date;
   /** 网络重试/检查超时覆写（测试用）。 */
   statusTimeoutMs?: number;
+  /**
+   * 当前处于 `/team edit <X>` 时的团队名（由 commands/team.ts 注入 teamCtx）。
+   * 缺省 = 无法判定编辑目标 → 跳过编辑模式确认（fail-open，不阻塞同步）。
+   */
+  getEditingTeamName?: () => string | null;
 }
 
 function buildContext(
@@ -120,6 +140,22 @@ export function formatSyncResult(summary: ApplySummary): string {
   if (summary.archivedFiles.length > 0) {
     const items = summary.archivedFiles.map((a) => `${a.path} → ${shortenHome(a.archivePath)}`);
     lines.push(`留档：${summary.archivedFiles.length} 个非团队文件的本机版本（${items.join("；")}）`);
+  }
+  if (summary.conflictDecisions.length > 0) {
+    lines.push(`冲突决策：${summary.conflictDecisions.length}`);
+    for (const decision of summary.conflictDecisions) {
+      const archive = decision.archivePath ? `；归档 ${shortenHome(decision.archivePath)}` : "";
+      if (decision.importedName) {
+        lines.push(`  - ${decision.path}：导为新团队 ${decision.importedName}${archive}`);
+      } else if (decision.importError) {
+        lines.push(`  - ${decision.path}：⚠️ 未导入（${decision.importError}）仅留档${archive}`);
+      } else {
+        lines.push(`  - ${decision.path}：${decisionSummary(decision.shape, decision.choice, decision.importedName)}${archive}`);
+      }
+    }
+  }
+  if (summary.importedTeams.length > 0) {
+    lines.push(`新团队导入：${summary.importedTeams.map((t) => t.name).join("、")}（将随下一次同步传播）`);
   }
   if (summary.keptLocalPaths.length > 0) {
     lines.push(
@@ -322,10 +358,7 @@ export async function handleSyncCommand(
   const now = deps?.now ?? (() => new Date());
 
   if (!isInteractive(ctx)) {
-    ctx.ui.notify(
-      "云同步需要交互式界面（TUI/RPC）才能执行写操作。\n可在交互式终端运行 /team sync；只读查询可用 /team sync status。",
-      "warning"
-    );
+    ctx.ui.notify(nonInteractiveSyncMessage(), "warning");
     return;
   }
 
@@ -420,32 +453,77 @@ export async function handleSyncCommand(
     }
     const { plan, snapshot } = built.result;
 
-    // 冲突 → 安全中止（决策界面在阶段 4）
-    const conflicts = listConflicts(plan);
-    if (conflicts.length > 0) {
-      const list = conflicts
-        .map((c) => `  ${c.path}（可选：${c.options.join(" / ")}）`)
-        .join("\n");
-      ctx.ui.notify(
-        `检测到 ${conflicts.length} 个冲突团队，已安全中止（未做任何改动）：\n${list}\n冲突决策界面将在后续版本提供；当前请手工处理这些团队后重试。`,
-        "warning"
-      );
-      return;
-    }
+    // ── 冲突决策（阶段 4）：TUI 走可滚动差异视图，RPC 退化为选项 + 两侧信息 ──
+    const conflictPaths = listConflicts(plan).map((c) => c.path);
+    let decisions: ConflictDecision[] = [];
+    if (conflictPaths.length > 0) {
+      // 编辑模式确认：正在 /team edit X 时同步触及 X → 应用前明确确认（拒绝则零改动）
+      const editingName = deps?.getEditingTeamName?.();
+      if (editingName) {
+        const touched = conflictPaths.some((path) => path.replace(/\.yaml$/i, "") === editingName);
+        if (touched) {
+          const proceed = await ctx.ui.confirm(
+            "云同步",
+            `正在编辑团队「${editingName}」，本次同步会改动它并需要你做冲突决策。\n继续处理？（选择「否」则整个同步取消，零改动）`
+          );
+          if (!proceed) {
+            ctx.ui.notify("已取消，未做任何改动。", "info");
+            return;
+          }
+        }
+      }
 
-    ctx.ui.notify(formatPlanSummary(plan), "info");
+      const loadedDiffs = await loadConflictDiffs({ ctx: syncCtx, snapshot, paths: conflictPaths });
+      try {
+        const importNames = resolveImportNames(conflictPaths, listTeams(rootDir), now());
+        for (const [i, path] of conflictPaths.entries()) {
+          const diff = loadedDiffs.diffs.get(path);
+          if (!diff) continue;
+          const choices = conflictChoices(diff.shape);
+          const choice = await pickConflictChoice(ctx, diff, choices, i + 1, conflictPaths.length);
+          if (!choice) {
+            ctx.ui.notify("已取消，未做任何改动。", "info");
+            return;
+          }
+          decisions.push({
+            path,
+            choice,
+            importName: choice === "keep-both" ? importNames[path] : undefined,
+          });
+        }
 
-    if (planNeedsConfirmation(plan)) {
-      const deletes = [...listRemoteDeletePaths(plan), ...listLocalDeletePaths(plan)];
-      const detail = deletes.length > 0 ? `\n将删除：${deletes.join("、")}` : "";
-      const confirmed = await ctx.ui.confirm("云同步", `按上述计划执行同步？${detail}`);
-      if (!confirmed) {
-        ctx.ui.notify("已取消，未做任何改动。", "info");
-        return;
+        // 最终计划确认：应用前展示完整变更清单（含逐项决策与新团队导入）
+        const decided = decisions.map((decision) => ({
+          path: decision.path,
+          shape: loadedDiffs.diffs.get(decision.path)?.shape ?? ("both-modified" as const),
+          decision,
+        }));
+        const confirmed = await ctx.ui.confirm(
+          "云同步",
+          `${formatFinalPlanSummary(plan, decided)}\n\n按上述计划执行同步？`
+        );
+        if (!confirmed) {
+          ctx.ui.notify("已取消，未做任何改动。", "info");
+          return;
+        }
+      } finally {
+        cleanupConflictDiffs(loadedDiffs);
+      }
+    } else {
+      ctx.ui.notify(formatPlanSummary(plan), "info");
+
+      if (planNeedsConfirmation(plan)) {
+        const deletes = [...listRemoteDeletePaths(plan), ...listLocalDeletePaths(plan)];
+        const detail = deletes.length > 0 ? `\n将删除：${deletes.join("、")}` : "";
+        const confirmed = await ctx.ui.confirm("云同步", `按上述计划执行同步？${detail}`);
+        if (!confirmed) {
+          ctx.ui.notify("已取消，未做任何改动。", "info");
+          return;
+        }
       }
     }
 
-    const applied = await applySync({ ctx: syncCtx, plan, snapshot });
+    const applied = await applySync({ ctx: syncCtx, plan, snapshot, decisions });
     if (!applied.ok) {
       const suffix = applied.rolledBack ? "\n已回滚，未做任何改动。" : "";
       ctx.ui.notify(`${formatSyncFailure(applied.failure!, { raw: true })}${suffix}`, "warning");
@@ -614,8 +692,54 @@ export async function handleSyncStatus(ctx: ExtensionCommandContext, deps?: Sync
   );
 }
 
+
+/**
+ * 让用户为一个冲突选择处理方式（§4.8）：
+ * - TUI：可滚动差异视图（一冲突一屏）；
+ * - RPC：两侧大小/修改时间 + 人工查看命令 + 选项列表（无差异视图）；
+ * 返回 undefined = 用户取消（调用方按「整个同步取消」处理，零改动）。
+ */
+async function pickConflictChoice(
+  ctx: ExtensionCommandContext,
+  diff: ConflictDiff,
+  choices: ConflictChoice[],
+  index: number,
+  total: number
+): Promise<ConflictOption | undefined> {
+  if (ctx.mode === "tui") {
+    return showSyncDiffView(ctx, {
+      path: diff.path,
+      index,
+      total,
+      summaryLines: conflictSummaryLines(diff),
+      diffLines: normalizeDiffLines(diff.diffText),
+      actions: choices,
+    });
+  }
+  // RPC 降级：先给出两侧信息与人工命令，再用选项列表收集决策
+  ctx.ui.notify(formatConflictRpcOverview(diff), "info");
+  const labels = choices.map((c) => c.label);
+  const selected = await ctx.ui.select(`冲突 ${index}/${total}：${diff.path} — 选择处理方式`, labels);
+  if (selected === undefined) return undefined;
+  return choices[labels.indexOf(selected)]?.value;
+}
+
+/** 冲突两侧信息（大小/修改时间），差异视图与 RPC 概览共用。 */
+function conflictSummaryLines(diff: ConflictDiff): string[] {
+  const lines: string[] = [];
+  lines.push(
+    diff.localExists
+      ? `  本机版本：${diff.localSize} 字节${
+          diff.localMtimeMs !== undefined ? `（修改于 ${formatClock(new Date(diff.localMtimeMs))}）` : ""
+        }`
+      : "  本机版本：已删除"
+  );
+  lines.push(diff.remoteExists ? `  云端版本：${diff.remoteSize} 字节` : "  云端版本：已删除");
+  return lines;
+}
+
 /** 供团队会话白名单/帮助引用（保持单一事实来源）。 */
 export const SYNC_USAGE = [
   "  /team sync              与云端双向同步（首次运行会引导配置仓库地址）",
-  "  /team sync status       查看云同步状态（只读）",
+  "  /team sync status       查看云同步状态（不推送、不改团队文件与工作区；读取云端并更新 .git 内对象/远端跟踪引用，不写 FETCH_HEAD）",
 ].join("\n");

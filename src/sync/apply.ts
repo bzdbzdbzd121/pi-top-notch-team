@@ -13,7 +13,15 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync, openSync, fsyncSync, closeSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createHash } from "node:crypto";
-import type { FileClass } from "./classify";
+import type { ConflictOption, FileClass } from "./classify";
+import {
+  abandonedSideFor,
+  buildImportedTeamYaml,
+  conflictEffectFor,
+  conflictShapeFor,
+  type ConflictDecision,
+  type ConflictShape,
+} from "./decide";
 import {
   describeSyncFailure,
   failureFromResult,
@@ -47,8 +55,19 @@ export interface ApplySummary {
   deletedOnRemote: string[];
   /** 非团队文件按「云端为准」覆盖的路径。 */
   passthroughUpdated: string[];
-  /** 覆盖前留档的本机版本（方案 §4.3/§6.2#2：改动不被静默丢弃）。 */
+  /** 非团队文件被云端覆盖前留档的本机版本（§4.3/§6.2#2）。 */
   archivedFiles: { path: string; archivePath: string }[];
+  /** 冲突决策的落地结果（§3.4：被放弃的一侧留档、keep-both 导入新团队）。 */
+  conflictDecisions: {
+    path: string;
+    choice: ConflictOption;
+    shape: ConflictShape;
+    archivePath?: string;
+    importedName?: string;
+    importError?: string;
+  }[];
+  /** keep-both 写入 teams/ 的新团队（随下一次同步传播）。 */
+  importedTeams: { name: string; path: string }[];
   /** 本地已跟踪但云端没有、被保留的路径（避免孤儿化）。 */
   keptLocalPaths: string[];
   ignored: IgnoredSummary;
@@ -88,6 +107,8 @@ function emptySummary(plan: SyncPlan): ApplySummary {
     deletedOnRemote: [],
     passthroughUpdated: [],
     archivedFiles: [],
+    conflictDecisions: [],
+    importedTeams: [],
     keptLocalPaths: [],
     ignored: plan.ignored,
     invalidTeams: [],
@@ -271,6 +292,8 @@ export async function applySync(input: {
   ctx: SyncContext;
   plan: SyncPlan;
   snapshot: PlanSnapshot;
+  /** 冲突决策（阶段 4）；每个冲突都必须有决策，缺一即中止（零改动）。 */
+  decisions?: ConflictDecision[];
 }): Promise<ApplyResult> {
   const { ctx, plan, snapshot } = input;
   const summary = emptySummary(plan);
@@ -279,17 +302,22 @@ export async function applySync(input: {
   const createdArchives: string[] = [];
 
   // ── 1. TOCTOU 复核（计划期间文件/引用被改动即中止） ──
-  const conflicts = listConflicts(plan);
-  if (conflicts.length > 0) {
-    return {
-      ok: false,
-      summary,
-      failure: manualFailure(
-        `存在 ${conflicts.length} 个需要决策的冲突团队（${conflicts.map((c) => c.path).join("、")}）`,
-        "冲突决策将在后续版本提供；当前请手工处理这些团队后重试"
-      ),
-      rolledBack: false,
-    };
+  const conflictList = listConflicts(plan);
+  const decisionMap = new Map((input.decisions ?? []).map((d) => [d.path, d]));
+  if (conflictList.length > 0) {
+    const missing = conflictList.filter((c) => !decisionMap.has(c.path));
+    // 决策未齐即中止（防御：命令层必须逐个收集决策；绝不静默按默认值处理）
+    if (missing.length > 0) {
+      return {
+        ok: false,
+        summary,
+        failure: manualFailure(
+          `有 ${missing.length} 个冲突团队尚未决策（${missing.map((c) => c.path).join("、")}）`,
+          "重新运行 /team sync 并完成冲突决策（未做任何改动）"
+        ),
+        rolledBack: false,
+      };
+    }
   }
 
   const stale = await verifyPlanFingerprints(ctx, snapshot);
@@ -309,10 +337,130 @@ export async function applySync(input: {
     }
     return resolveSafeWorktreePath(ctx.teamsDir, rel);
   };
+  /**
+   * 归档被放弃的一侧（§3.4）。复用阶段 2 的目录/命名/原子写规则；失败即中止
+   * （宁可同步失败，也不让「被放弃的一侧」无声道失）。
+   */
+  const archiveAbandonedSide = (content: Buffer, relPath: string): string => {
+    const archiveDir = syncConflictsDir(ctx.rootDir);
+    let archiveAbs = "";
+    try {
+      mkdirSync(archiveDir, { recursive: true });
+      archiveAbs = uniqueArchivePath(archiveDir, relPath, new Date());
+      writeFileAtomic(archiveAbs, content);
+    } catch (err) {
+      if (archiveAbs.length > 0) {
+        try {
+          rmSync(archiveAbs, { force: true });
+        } catch {
+          /* 尽力而为 */
+        }
+      }
+      throw manualFailure(
+        `冲突版本留档失败（${relPath}），已中止（未做任何改动）：${
+          err instanceof Error ? err.message : String(err)
+        }`,
+        "确认 sync-conflicts 目录可写、磁盘空间充足后重试"
+      );
+    }
+    createdArchives.push(archiveAbs);
+    return archiveAbs;
+  };
+
   try {
     for (const action of plan.actions) {
       const path = action.path;
       const kind = actionKind(action);
+
+      if (kind === "conflict") {
+        const decision = decisionMap.get(path);
+        if (!decision) continue; // 已在入口拦截
+        const shape = conflictShapeFor(snapshot, path);
+        const effect = conflictEffectFor(shape, decision.choice);
+        const abs = safeAbs(path);
+        if (!abs) continue;
+
+        // 被放弃的一侧留档（本机版本 / 云端版本）
+        const abandoned = abandonedSideFor(shape, decision.choice);
+        let archivePath: string | undefined;
+        if (abandoned === "local") {
+          archivePath = existsSync(abs) ? archiveAbandonedSide(readFileSync(abs), path) : undefined;
+        } else if (abandoned === "remote") {
+          const remoteEntry = remoteMap.get(path);
+          if (remoteEntry) {
+            const blob = await readRemoteBlob(ctx, remoteEntry.blob, blobCache);
+            if (!blob.ok) throw blob.failure;
+            archivePath = archiveAbandonedSide(blob.content, path);
+          }
+        }
+
+        // 生效：拿云端内容 / 接受删除 / 保留原样
+        if (effect.write === "remote") {
+          const remoteEntry = remoteMap.get(path);
+          if (!remoteEntry) {
+            throw manualFailure(
+              `冲突决策「采用远端」但云端没有 ${path} 的内容`,
+              "重新运行 /team sync（未做任何改动）"
+            );
+          }
+          const blob = await readRemoteBlob(ctx, remoteEntry.blob, blobCache);
+          if (!blob.ok) throw blob.failure;
+          const previous = existsSync(abs) ? readFileSync(abs) : null;
+          if (!bufferEquals(blob.content, previous)) {
+            const absDir = dirname(abs);
+            if (!existsSync(absDir)) mkdirSync(absDir, { recursive: true });
+            journal.push({ absPath: abs, previous });
+            writeFileAtomic(abs, blob.content);
+          }
+          summary.downloaded.push(toSummaryName(path));
+        } else if (effect.write === "delete") {
+          if (existsSync(abs)) {
+            journal.push({ absPath: abs, previous: readFileSync(abs) });
+            unlinkSync(abs);
+            summary.deletedOnLocal.push(toSummaryName(path));
+          }
+        }
+
+        // keep-both：云端版本改名导入为新团队（过校验才写入；否则只留档 + 报告）
+        let importedName: string | undefined;
+        let importError: string | undefined;
+        if (effect.importRemote && decision.importName) {
+          const remoteEntry = remoteMap.get(path);
+          if (remoteEntry) {
+            const blob = await readRemoteBlob(ctx, remoteEntry.blob, blobCache);
+            if (!blob.ok) throw blob.failure;
+            const built = buildImportedTeamYaml(blob.content.toString("utf-8"), decision.importName);
+            if (!built.ok) {
+              importError = built.error;
+            } else {
+              const importRel = `${decision.importName}.yaml`;
+              const importAbs = resolveSafeWorktreePath(ctx.teamsDir, importRel);
+              if (importAbs) {
+                journal.push({
+                  absPath: importAbs,
+                  previous: existsSync(importAbs) ? readFileSync(importAbs) : null,
+                });
+                writeFileAtomic(importAbs, Buffer.from(built.content, "utf-8"));
+                importedName = decision.importName;
+                summary.importedTeams.push({ name: decision.importName, path: importRel });
+              } else {
+                importError = "导入名不是安全路径（已跳过导入，仅留档）";
+              }
+            }
+          }
+        }
+
+        summary.conflictDecisions.push({
+          path,
+          choice: decision.choice,
+          shape,
+          archivePath,
+          importedName,
+          importError,
+        });
+        continue;
+      }
+
       if (ADD_KINDS.includes(kind)) {
         // 本机侧内容已在工作区，分类阶段已确认；仅计数
         summary.uploaded.push(toSummaryName(path));
@@ -454,6 +602,19 @@ export async function applySync(input: {
     for (const action of plan.actions) {
       if (!isSafeRepoPath(action.path)) continue; // 防御：危险路径不进入索引操作
       const kind = actionKind(action);
+      if (kind === "conflict") {
+        const decision = decisionMap.get(action.path);
+        if (!decision) continue; // 已在入口拦截
+        const effect = conflictEffectFor(conflictShapeFor(snapshot, action.path), decision.choice);
+        if (effect.index === "add") {
+          const add = await runLocalGit(ctx, ["add", "--", action.path], { env: addEnv });
+          if (!add.ok) return failBeforeCommit(failureFromResult(add));
+        } else {
+          const remove = await runLocalGit(ctx, ["update-index", "--force-remove", "--", action.path], { env: indexEnv });
+          if (!remove.ok) return failBeforeCommit(failureFromResult(remove));
+        }
+        continue;
+      }
       if (ADD_KINDS.includes(kind)) {
         const add = await runLocalGit(ctx, ["add", "--", action.path], { env: addEnv });
         if (!add.ok) return failBeforeCommit(failureFromResult(add));
@@ -461,6 +622,13 @@ export async function applySync(input: {
         const remove = await runLocalGit(ctx, ["update-index", "--force-remove", "--", action.path], { env: indexEnv });
         if (!remove.ok) return failBeforeCommit(failureFromResult(remove));
       }
+    }
+
+    // keep-both 导入的新团队：写入提交树（下一次同步即传播到其它机器）
+    for (const imported of summary.importedTeams) {
+      if (!isSafeRepoPath(imported.path)) continue;
+      const add = await runLocalGit(ctx, ["add", "--", imported.path], { env: addEnv });
+      if (!add.ok) return failBeforeCommit(failureFromResult(add));
     }
 
     // 本地已跟踪但云端没有的非管理路径：保留在提交树中
