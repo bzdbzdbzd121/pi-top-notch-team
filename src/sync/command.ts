@@ -6,6 +6,7 @@
  */
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { existsSync, readdirSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { getRootDir } from "../config";
 import { getTeamsDir } from "../team/store";
@@ -79,16 +80,27 @@ function formatClock(date: Date): string {
   return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
+/** 归档路径展示：home 前缀缩为 `~`（方案 §7.F 示例风格）。 */
+function shortenHome(absPath: string): string {
+  const home = homedir();
+  if (home.length > 0 && (absPath === home || absPath.startsWith(`${home}/`))) {
+    return `~${absPath.slice(home.length)}`;
+  }
+  return absPath;
+}
+
 function formatInvalidTeams(invalid: { name: string; errors: string[] }[]): string {
   return invalid
     .map((t) => `${t.name}.yaml：${t.errors[0] ?? "格式非法"}`)
     .join("；");
 }
 
-/** 异常行（真实后果：仍会落地；/team list 仍列出，/team start 报「团队不存在」）。 */
+/** 异常行（真实后果：文件已落地；/team list 仍列出，/team start 报「团队不存在」）。 */
 export function formatInvalidTeamsLine(invalid: { name: string; errors: string[] }[]): string | null {
   if (invalid.length === 0) return null;
-  return `异常：${invalid.length} 个团队文件校验失败（${formatInvalidTeams(invalid)}；文件已同步，修复后即可用）`;
+  return `异常：${invalid.length} 个团队文件校验失败（${formatInvalidTeams(
+    invalid
+  )}；文件已同步，/team list 仍列出该名，但 /team start 报「团队不存在」，修复后即可用）`;
 }
 
 /** 同步结果摘要（方案 §7.F）。 */
@@ -104,6 +116,10 @@ export function formatSyncResult(summary: ApplySummary): string {
   lines.push(`删除：${deleted.length}${deleted.length ? `（${deleted.join("；")}）` : ""}`);
   if (summary.passthroughUpdated.length > 0) {
     lines.push(`非团队文件（云端为准）：${summary.passthroughUpdated.length}（${summary.passthroughUpdated.join("、")}）`);
+  }
+  if (summary.archivedFiles.length > 0) {
+    const items = summary.archivedFiles.map((a) => `${a.path} → ${shortenHome(a.archivePath)}`);
+    lines.push(`留档：${summary.archivedFiles.length} 个非团队文件的本机版本（${items.join("；")}）`);
   }
   if (summary.keptLocalPaths.length > 0) {
     lines.push(

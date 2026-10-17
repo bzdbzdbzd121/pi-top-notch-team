@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   unlinkSync,
@@ -500,6 +501,8 @@ describe("阶段 2：/team sync 集成（真实 git，裸仓库做云端）", ()
     const localText = notifyText(localHarness.notify);
     expect(localText).toContain("校验失败");
     expect(localText).toContain("bad.yaml");
+    // 文案写明真实后果（偏差 2）
+    expect(localText).toContain("/team list 仍列出该名，但 /team start 报「团队不存在」，修复后即可用");
     expect(remoteHas("bad.yaml")).toBe(true);
 
     // 远端非法
@@ -883,6 +886,31 @@ describe("阶段 2：/team sync 集成（真实 git，裸仓库做云端）", ()
     expect(secondText).toContain("危险路径");
     expect(secondText).not.toContain("云同步失败");
     expect(secondText).toContain("已是最新");
+  });
+
+  it("非团队文件被云端覆盖前留档本机版本（偏差 1）", async () => {
+    seedRemote({ "README.md": "cloud v1\n" });
+    configure();
+    await sync(makeHarness().ctx);
+
+    const localVersion = "本机原内容 local v1\n";
+    writeLocal("README.md", localVersion);
+    remoteCommit({ "README.md": "cloud v2\n" }, "remote readme v2");
+
+    const { ctx, notify } = makeHarness();
+    await sync(ctx);
+
+    const archiveDir = join(rootDir, "sync-conflicts");
+    const archived = readdirSync(archiveDir);
+    expect(archived.length).toBe(1);
+    expect(archived[0].startsWith("README.md.")).toBe(true);
+    expect(readFileSync(join(archiveDir, archived[0]), "utf-8")).toBe(localVersion);
+    expect(readLocal("README.md")).toBe("cloud v2\n"); // 云端为准仍然成立
+
+    const text = notifyText(notify);
+    expect(text).toContain("留档：1 个非团队文件的本机版本（README.md → ");
+    expect(text).toContain(archived[0]);
+    expect(text).toContain("sync-conflicts");
   });
 
   it("keptLocalPaths 只统计仍存在的路径；本机已删除的已跟踪文件不再声称保留（复审建议 #2）", async () => {

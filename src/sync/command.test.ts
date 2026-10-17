@@ -1,10 +1,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { createMockContext } from "../test/fixtures/mock-extension-api";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import {
+  formatInvalidTeamsLine,
   formatSyncFailure,
   formatSyncResult,
   formatSyncStatus,
@@ -46,6 +47,7 @@ const baseSummary = {
   deletedOnLocal: [],
   deletedOnRemote: [],
   passthroughUpdated: [],
+  archivedFiles: [],
   keptLocalPaths: [],
   ignored: { nestedYaml: [], nonYamlLocalModified: [] },
   invalidTeams: [],
@@ -120,6 +122,25 @@ describe("阶段 2 输出文案（验收 13）", () => {
     expect(text).toContain("非团队文件的本机改动不会被上传");
     expect(text).toContain("已跳过危险路径（不落盘）：../escape.yaml");
     expect(text).toContain("已忽略子目录 yaml");
+  });
+
+  it("非团队文件被云端覆盖 → 留档行含本机版本与归档路径（偏差 1）", () => {
+    const text = formatSyncResult({
+      ...baseSummary,
+      commit: "a1b2c3d",
+      pushed: true,
+      passthroughUpdated: ["README.md"],
+      archivedFiles: [{ path: "README.md", archivePath: `${homedir()}/.pi/top-notch-team/sync-conflicts/README.md.20261017-120100` }],
+    });
+    expect(text).toContain("非团队文件（云端为准）：1（README.md）");
+    expect(text).toContain("留档：1 个非团队文件的本机版本（README.md → ~/.pi/top-notch-team/sync-conflicts/README.md.20261017-120100）");
+  });
+
+  it("非法 YAML 文案写明真实后果（偏差 2）", () => {
+    const line = formatInvalidTeamsLine([{ name: "bad", errors: ["members 不能为空"] }]);
+    expect(line).toBe(
+      "异常：1 个团队文件校验失败（bad.yaml：members 不能为空；文件已同步，/team list 仍列出该名，但 /team start 报「团队不存在」，修复后即可用）"
+    );
   });
 
   it("索引刷新失败独立于推送失败（审查 #8）", () => {

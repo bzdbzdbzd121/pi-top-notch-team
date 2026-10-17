@@ -46,6 +46,8 @@ export interface ApplySummary {
   deletedOnRemote: string[];
   /** 非团队文件按「云端为准」覆盖的路径。 */
   passthroughUpdated: string[];
+  /** 覆盖前留档的本机版本（方案 §4.3/§6.2#2：改动不被静默丢弃）。 */
+  archivedFiles: { path: string; archivePath: string }[];
   /** 本地已跟踪但云端没有、被保留的路径（避免孤儿化）。 */
   keptLocalPaths: string[];
   ignored: IgnoredSummary;
@@ -84,6 +86,7 @@ function emptySummary(plan: SyncPlan): ApplySummary {
     deletedOnLocal: [],
     deletedOnRemote: [],
     passthroughUpdated: [],
+    archivedFiles: [],
     keptLocalPaths: [],
     ignored: plan.ignored,
     invalidTeams: [],
@@ -147,6 +150,26 @@ function rollback(journal: JournalEntry[]): void {
 
 function toSummaryName(path: string): string {
   return path.endsWith(".yaml") ? path.slice(0, -".yaml".length) : path;
+}
+
+/** 归档目录（`<rootDir>/sync-conflicts/`）：不参与列表、不参与同步、不污染云端。阶段 4 复用同一目录。 */
+export function syncConflictsDir(rootDir: string): string {
+  return join(rootDir, "sync-conflicts");
+}
+
+/**
+ * 归档文件名：`<路径安全化>.<YYYYMMDD-HHmmss>`。
+ * 路径安全化把 `/`、`\` 等路径分隔符与非 ``[A-Za-z0-9._-]`` 字符换成 `_`；
+ * 前导 `.` 也换掉（避免 `.hidden` / `..` 形态），空名回退为 `file`。
+ * 阶段 4 的团队归档复用同一规则（目录 + 时间戳风格）。
+ */
+export function archiveFileName(relPath: string, now: Date): string {
+  const pad = (n: number): string => String(n).padStart(2, "0");
+  const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(
+    now.getMinutes()
+  )}${pad(now.getSeconds())}`;
+  const safe = relPath.replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^[._]+/, "_");
+  return `${safe.length > 0 ? safe : "file"}.${stamp}`;
 }
 
 /** 云端 blob 内容（按 sha 缓存；二进制安全捕获，非文本文件不被 utf8 解码损坏）。 */
@@ -272,6 +295,23 @@ export async function applySync(input: {
       const blob = await readRemoteBlob(ctx, entry.blob, blobCache);
       if (!blob.ok) throw blob.failure;
       if (!bufferEquals(blob.content, previous)) {
+        // 覆盖前留档本机版本（方案 §4.3/§6.2#2：「云端为准」不等于丢弃本机改动）。
+        // 留档失败则中止（宁可同步失败，不让用户改动消失）——回滚后本地文件保持原样。
+        if (previous !== null) {
+          const archiveAbs = join(syncConflictsDir(ctx.rootDir), archiveFileName(entry.path, new Date()));
+          try {
+            mkdirSync(dirname(archiveAbs), { recursive: true });
+            writeFileSync(archiveAbs, previous);
+          } catch (err) {
+            throw manualFailure(
+              `非团队文件被云端覆盖前的留档失败（${entry.path}），已中止（未做任何改动）：${
+                err instanceof Error ? err.message : String(err)
+              }`,
+              "确认 sync-conflicts 目录可写、磁盘空间充足后重试"
+            );
+          }
+          summary.archivedFiles.push({ path: entry.path, archivePath: archiveAbs });
+        }
         const absDir = dirname(abs);
         if (!existsSync(absDir)) mkdirSync(absDir, { recursive: true });
         journal.push({ absPath: abs, previous });
