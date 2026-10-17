@@ -1709,4 +1709,134 @@ describe("阶段 2：/team sync 集成（真实 git，裸仓库做云端）", ()
     expect(trace.nonEmpty().length).toBeGreaterThan(0);
     expect(trace.current()).toBeUndefined();
   });
+
+  // ═══════ 阶段 3：/team sync status 进度接线（进行中反馈）═══════
+
+  it("阶段3-1 status 网络检查：进入前写「正在检查云端状态…」（早于任何网络调用），结束后清空", async () => {
+    seedRemote({ "a.yaml": teamYaml("a") });
+    configure();
+    await sync(makeHarness().ctx);
+
+    const events: { kind: "status" | "git"; detail: string }[] = [];
+    const { ctx, notify, trace, confirm, select, input } = makeHarness({ events });
+    const recordingRunGit: typeof runGit = async (args, options) => {
+      events.push({ kind: "git", detail: args.join(" ") });
+      return runGit(args, options);
+    };
+    await handleSyncCommand(ctx, "status", { rootDir, runGit: recordingRunGit, statusTimeoutMs: 15_000 });
+
+    const firstStatus = events.findIndex((e) => e.kind === "status" && e.detail !== "(clear)");
+    const firstNetwork = events.findIndex(
+      (e) => e.kind === "git" && /(^|\s)(ls-remote|fetch)(\s|$)/.test(e.detail)
+    );
+    expect(firstStatus).toBeGreaterThanOrEqual(0);
+    expect(events[firstStatus].detail).toContain("正在检查云端状态…");
+    expect(firstNetwork).toBeGreaterThan(firstStatus); // ① 网络调用之前已有非空状态
+
+    // 出口闭合：命令返回时该键为空（成功路径）
+    expect(trace.nonEmpty().length).toBeGreaterThan(0);
+    expect(trace.current()).toBeUndefined();
+    expect(trace.writes.at(-1)).toBeUndefined();
+
+    // 结果照旧；无新增聊天输出；无新增对话框（status 从不问问题）
+    expect(notifyText(notify)).toContain("云同步状态");
+    expect(notifyText(notify)).not.toMatch(/正在检查云端状态|准备中|连接云端|获取云端更新|比对差异|应用并推送|等待你的/);
+    expect(confirm).not.toHaveBeenCalled();
+    expect(select).not.toHaveBeenCalled();
+    expect(input).not.toHaveBeenCalled();
+  });
+
+  it("阶段3-2 status 未配置 / 已配置但尚未接入 → 不发起网络检查，该键从未被设置", async () => {
+    // 未配置（无 sync.yaml）
+    const unconfigured = makeHarness();
+    await handleSyncCommand(unconfigured.ctx, "status", { rootDir });
+    expect(notifyText(unconfigured.notify)).toContain("未配置");
+    expect(unconfigured.trace.hadNoWrite()).toBe(true);
+
+    // 已配置但尚未接入（无本机仓库）→ 走 unchecked 分支，无网络调用
+    saveSyncConfig({ enabled: true, remoteUrl: remoteDir, branch: "" }, rootDir);
+    const notAttached = makeHarness();
+    await handleSyncCommand(notAttached.ctx, "status", { rootDir, statusTimeoutMs: 1000 });
+    expect(notifyText(notAttached.notify)).toContain("尚未接入");
+    expect(notAttached.trace.hadNoWrite()).toBe(true);
+  });
+
+  it("阶段3-3 status 检查失败（远端不可达）→ 曾写入非空状态且已清空，失败文案照旧", async () => {
+    seedRemote({ "a.yaml": teamYaml("a") });
+    configure();
+    await sync(makeHarness().ctx);
+    // 配置地址改为不存在的本地路径 → ls-remote 立即失败（走错误分支）
+    saveSyncConfig({ enabled: true, remoteUrl: join(base, "no-such-remote.git"), branch: "" }, rootDir);
+
+    const { ctx, notify, trace } = makeHarness();
+    await handleSyncCommand(ctx, "status", { rootDir, statusTimeoutMs: 1500 });
+
+    expect(trace.nonEmpty().length).toBeGreaterThan(0);
+    expect(trace.nonEmpty().every((t) => t.includes("正在检查云端状态…"))).toBe(true);
+    expect(trace.current()).toBeUndefined(); // 失败路径同样清空
+    expect(trace.writes.at(-1)).toBeUndefined();
+    expect(notifyText(notify)).toContain("云同步状态");
+    expect(notifyText(notify)).not.toMatch(/正在检查云端状态/);
+  });
+
+  it("阶段3-4 status 出口闭合不依赖网络结果（远端为空仓库路径）", async () => {
+    const emptyRemote = join(base, "empty-remote.git");
+    gitCli(base, ["init", "--bare", "-q", emptyRemote]); // 空远端：走 empty 分支
+    saveSyncConfig({ enabled: true, remoteUrl: emptyRemote, branch: "" }, rootDir);
+    gitCli(teamsDir, ["init", "-q"]);
+    gitCli(teamsDir, ["remote", "add", "--", "origin", emptyRemote]);
+    gitCli(teamsDir, ["symbolic-ref", "HEAD", "refs/heads/main"]);
+
+    const { ctx, trace } = makeHarness();
+    await handleSyncCommand(ctx, "status", { rootDir, statusTimeoutMs: 5_000 });
+    expect(trace.nonEmpty().length).toBeGreaterThan(0);
+    expect(trace.current()).toBeUndefined();
+  });
+
+  it("阶段3-5 替代验证（§6.3 第 5 项）：注入延迟假 git 执行器模拟网络窗口——在飞期间聊天区零新增行、状态栏秒数递增", async () => {
+    seedRemote({ "a.yaml": teamYaml("a") });
+    configure();
+    await sync(makeHarness().ctx);
+
+    const harness = makeHarness();
+    const notify = harness.notify;
+    const trace = harness.trace;
+    const inFlight: { call: string; status: string | undefined; chatLines: number }[] = [];
+    let networkCalls = 0;
+
+    const delayedRunGit: typeof runGit = async (args, options) => {
+      const isNetwork = args.includes("ls-remote") || args.includes("fetch");
+      if (!isNetwork) return runGit(args, options);
+      networkCalls += 1;
+      // 模拟真实网络窗口：命令在飞期间进度必须已经可见，而聊天区必须零新增行
+      if (networkCalls === 2) await new Promise((resolve) => setTimeout(resolve, 1_200));
+      const result = await runGit(args, options);
+      inFlight.push({
+        call: args.join(" "),
+        status: trace.current(),
+        chatLines: notify.mock.calls.length,
+      });
+      return result;
+    };
+
+    await handleSyncCommand(harness.ctx, "status", {
+      rootDir,
+      runGit: delayedRunGit,
+      statusTimeoutMs: 15_000,
+    });
+
+    expect(inFlight.length).toBeGreaterThanOrEqual(2); // ls-remote + fetch 两次网络调用
+    for (const sample of inFlight) {
+      expect(sample.status).toContain("正在检查云端状态…（");
+      expect(sample.status).toMatch(/（\d+s）/); // 秒数格式在位（真机递增性由 progress 单测的注入时钟覆盖）
+      expect(sample.chatLines).toBe(0); // 在飞期间聊天区零新增行（唯一反馈通道 = 状态栏）
+    }
+    // 延迟 1.2s 的那次网络调用时，秒数已推进到 ≥1s（时间戳差值 + 1s 刷新）
+    const seconds = inFlight.map((s) => Number.parseInt(/（(\d+)s）/.exec(s.status ?? "")?.[1] ?? "0", 10));
+    expect(Math.max(...seconds)).toBeGreaterThanOrEqual(1);
+
+    // 结束：状态栏清除、聊天区只出现既有的结果行
+    expect(trace.current()).toBeUndefined();
+    expect(notifyText(notify)).toContain("云同步状态");
+  });
 });

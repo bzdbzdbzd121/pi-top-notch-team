@@ -361,6 +361,8 @@ describe("命令层边界", () => {
     const text = notifyText(notify);
     expect(text).toContain("尚未接入");
     expect(text).toContain("仓库：需处理");
+    // 阶段 3：该分支不发起网络检查 → 进度键从未被设置
+    expect((ctx.ui.setStatus as unknown as { mock: { calls: unknown[][] } }).mock.calls).toEqual([]);
   });
 
   it("首次接入引导：地址非法 → 提示原因且不落盘", async () => {

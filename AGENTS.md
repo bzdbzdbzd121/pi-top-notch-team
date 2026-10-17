@@ -151,8 +151,11 @@ src/
 │   ├── decide.ts     ← 冲突决策模型（形态/选项集/生效动作/被放弃侧）、导入唯一名与 YAML 改写校验、
 │   │                   差异生成（系统临时目录 + git diff --no-index）、RPC/无 UI 降级文案
 │   ├── detect.ts     ← 启动检测（进程级一次 latch、fire-and-forget 自捕获 + 硬超时、失败分类静默/提示一次）
+│   ├── progress.ts   ← 进行中反馈（决策 #45 配套）：状态栏键 cloud-sync 的阶段/等待态纯函数文案 + 秒数
+│   │                   （时间戳差值）+ 生命周期（1s unref 计时器、幂等 end()、UI 与 timer 全 fail-open）；
+│   │                   唯一反馈通道，零 notify（模块内无任何聊天区输出）
 │   └── command.ts    ← /team sync 与 /team sync status 编排（三段式：先算 → 再问 → 最后改）+
-│                       格式化为纯函数（计划摘要/结果摘要/状态/失败/冲突概览）
+│                       格式化为纯函数（计划摘要/结果摘要/状态/失败/冲突概览）+ 进度挂点接线
 ├── settings/         ← Global settings (/team setting)
 │   ├── settings.ts        ← TeamSettings type + <rootDir>/settings.yaml read/write
 │   ├── session-settings.ts ← 临时设置数据层（决策 #40）：进程内 overlay + 深合并入口 loadEffectiveSettings + 快照原语（save/load/getPath/clearBinding）+ 生命周期（reconcile/clearSessionSettingsMemory/activeSessionDir/binding）+ isSnapshotRestored 恢复标记
@@ -601,8 +604,8 @@ printf '' | timeout 10 ./node_modules/.bin/pi --mode json --no-tools -e ./index.
 | `/team cancel`           | Alias for `/team done` (backward compatibility) |
 | `/team delete <name>` | Delete a team definition (with confirmation) |
 | `/team status` | Show active session + member process statuses |
-| `/team sync` | 与云端私有仓库双向同步团队定义（ADR-0008）：首次运行引导配置 `sync.yaml`；无冲突同步零额外确认；冲突逐个决策（TUI 内置可滚动差异视图 / RPC 降级为选项 + 两侧信息）；被放弃的一侧留档到 `sync-conflicts/`；「两边都留」把云端版本导入为新团队。唯一允许的中间态是「本地已提交未推送」（摘要明确标注，重跑收敛）。**创建模式守卫**：create 落盘时目标 `teams/<name>.yaml` 已存在 → 拒绝创建并引导 `/team edit`（防止覆盖同步下载的同名团队） |
-| `/team sync status` | 查看云同步状态（不推送、不改团队文件与工作区；读取云端并更新 `.git` 内对象/远端跟踪引用，**不写 FETCH_HEAD**）：配置/分支/远端落后或领先/本机未提交与未推送/归档计数/非法 YAML/仓库需处理（`index.lock`） |
+| `/team sync` | 与云端私有仓库双向同步团队定义（ADR-0008）：首次运行引导配置 `sync.yaml`；无冲突同步零额外确认；冲突逐个决策（TUI 内置可滚动差异视图 / RPC 降级为选项 + 两侧信息）；被放弃的一侧留档到 `sync-conflicts/`；「两边都留」把云端版本导入为新团队。唯一允许的中间态是「本地已提交未推送」（摘要明确标注，重跑收敛）。**创建模式守卫**：create 落盘时目标 `teams/<name>.yaml` 已存在 → 拒绝创建并引导 `/team edit`（防止覆盖同步下载的同名团队）。**进行中反馈**：执行期间底部状态栏（键 `cloud-sync`）显示当前阶段与已用秒数，等待你确认/决策时显示等待态（无秒数），结束自动清除；不新增聊天区输出（`notify` 序列与文案不变，DESIGN.md §33.9） |
+| `/team sync status` | 查看云同步状态（不推送、不改团队文件与工作区；读取云端并更新 `.git` 内对象/远端跟踪引用，**不写 FETCH_HEAD**）：配置/分支/远端落后或领先/本机未提交与未推送/归档计数/非法 YAML/仓库需处理（`index.lock`）。**进行中反馈**：实际发起网络检查时底部状态栏显示「正在检查云端状态…（Ns）」，结束（成功/失败）自动清除；未配置/未启用/尚未接入分支不设置状态 |
 | `/team setting` | Interactive settings menu — 顶层作用域开关（决策 #40）：默认「仅当前会话（临时）」，切换「全局」后直写 settings.yaml。临时作用域写入 overlay（不触碰 settings.yaml），「当前值」恒显示 merge 后生效值，覆盖键带 [临时] 徽标；⑦ 一键清除全部临时设置（内存+快照双清，仅 overlay 非空时显示）。七项子菜单：member default model (follow / fixed；团队 YAML 指定 model 时附注不生效) + member thinking level (成员思考强度三段式：默认 / 跟随 TL（当前：TL 级别，未知时显示「TL 级别未知」）/ 指定级别…二级 7 级别；对象形态 {mode:follow|fixed, level?}，follow = spawn 时快照 TL 思考强度) + auto-compaction (toggle / percent & token thresholds / timeout) + wait budget (等待上限, 0=永不超时 — wait 工具 all-idle deadline 与批屏障共享的顶层通用预算) + message coalescing (消息合并: 开关/批量上限/字符上限，S1 阶段 2；互发禁用态子菜单附 no-op 退化注记) + 成员互发消息 (P4 决策 #41: 「允许 / 仅限回复 TL」标量两段式，● 标记当前值；TL 侧即时生效，成员侧仅影响之后启动的成员) + Agent 自主团队会话 (决策 #42: 「允许 / 禁止」标量两段式，● 标记当前值；仅影响 agent 自主启动相，运行中会话不终止，手动 /team start、/team dynamic 不受影响；下一回合边界即生效，无需重启). 通知按场景附注「（仅当前 pi 会话生效；/team resume 本团队会话时将恢复）」/「（仅当前 pi 会话生效，重启后失效）」；sessionId 不可用时临时入口禁用（fail-open）。Also allowed during a session |
 | `/team help` | Display usage help for all subcommands |
 

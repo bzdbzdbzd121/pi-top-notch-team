@@ -656,64 +656,73 @@ export async function handleSyncStatus(ctx: ExtensionCommandContext, deps?: Sync
   } else if (!repoState.hasRepo) {
     remote = { kind: "unchecked" };
   } else {
-    const statusCtx: SyncContext = {
-      ...syncCtx,
-      networkTimeoutMs: deps?.statusTimeoutMs ?? STATUS_CHECK_TIMEOUT_MS,
-    };
-    const discovery = await discoverRemoteBranch(statusCtx, config.branch);
-    if (!discovery.ok) {
-      remote = { kind: "error", failure: discovery.failure };
-    } else {
-      branch = discovery.branch;
-      branchSourceLabel = discovery.source === "config" ? "配置" : "自动探测";
-      if (discovery.emptyRemote) {
-        remote = { kind: "empty" };
+    // 进行中反馈（阶段 3）：只有这一条分支会发起网络检查（单次上限 15s，最坏整段静默），
+    // 故进度只在此开启——未配置 / 未启用 / 尚未接入等分支不设状态（也就没有残留）。
+    // 出口由本分支的 finally 统一清除（成功与失败两条路径一致）。
+    const progress = createSyncProgress(ctx.ui);
+    try {
+      progress.stage("checking");
+      const statusCtx: SyncContext = {
+        ...syncCtx,
+        networkTimeoutMs: deps?.statusTimeoutMs ?? STATUS_CHECK_TIMEOUT_MS,
+      };
+      const discovery = await discoverRemoteBranch(statusCtx, config.branch);
+      if (!discovery.ok) {
+        remote = { kind: "error", failure: discovery.failure };
       } else {
-        const fetched = await fetchRemote(
-          statusCtx,
-          {
-            branch: discovery.branch,
-            branchSource: discovery.source,
-            emptyRemote: false,
-            remoteSha: discovery.remoteSha,
-            remoteUrlChanged: false,
-            state: repoState,
-          } satisfies PreparedRepository,
-          { noWriteFetchHead: true } // 只读检查：不写 FETCH_HEAD（不与进行中的 sync 干扰）
-        );
-        if (!fetched.ok) {
-          remote = { kind: "error", failure: fetched.failure };
+        branch = discovery.branch;
+        branchSourceLabel = discovery.source === "config" ? "配置" : "自动探测";
+        if (discovery.emptyRemote) {
+          remote = { kind: "empty" };
         } else {
-          const localRef = `refs/heads/${discovery.branch}`;
-          const localExists = await runLocalGit(syncCtx, ["rev-parse", "--verify", "--quiet", localRef]);
-          if (!localExists.ok || localExists.stdout.trim().length === 0) {
-            // 本地尚无分支：远端领先其全部提交（审查 #10）
-            const count = await runLocalGit(syncCtx, ["rev-list", "--count", fetched.remoteSha]);
-            const behind = count.ok ? Number.parseInt(count.stdout.trim(), 10) || 0 : 0;
-            remote = { kind: "behind", behind };
+          const fetched = await fetchRemote(
+            statusCtx,
+            {
+              branch: discovery.branch,
+              branchSource: discovery.source,
+              emptyRemote: false,
+              remoteSha: discovery.remoteSha,
+              remoteUrlChanged: false,
+              state: repoState,
+            } satisfies PreparedRepository,
+            { noWriteFetchHead: true } // 只读检查：不写 FETCH_HEAD（不与进行中的 sync 干扰）
+          );
+          if (!fetched.ok) {
+            remote = { kind: "error", failure: fetched.failure };
           } else {
-            const counts = await runLocalGit(syncCtx, [
-              "rev-list",
-              "--left-right",
-              "--count",
-              `${fetched.remoteSha}...${localRef}`,
-            ]);
-            if (counts.ok) {
-              const [behindStr, aheadStr] = counts.stdout.trim().split(/\s+/);
-              const behind = Number.parseInt(behindStr ?? "0", 10) || 0;
-              const ahead = Number.parseInt(aheadStr ?? "0", 10) || 0;
-              unpushedCommits = ahead;
-              if (behind === 0 && ahead === 0) remote = { kind: "up-to-date" };
-              else if (behind > 0 && ahead === 0) remote = { kind: "behind", behind };
-              else if (ahead > 0 && behind === 0) remote = { kind: "ahead", ahead };
-              else remote = { kind: "diverged", ahead, behind };
+            const localRef = `refs/heads/${discovery.branch}`;
+            const localExists = await runLocalGit(syncCtx, ["rev-parse", "--verify", "--quiet", localRef]);
+            if (!localExists.ok || localExists.stdout.trim().length === 0) {
+              // 本地尚无分支：远端领先其全部提交（审查 #10）
+              const count = await runLocalGit(syncCtx, ["rev-list", "--count", fetched.remoteSha]);
+              const behind = count.ok ? Number.parseInt(count.stdout.trim(), 10) || 0 : 0;
+              remote = { kind: "behind", behind };
+            } else {
+              const counts = await runLocalGit(syncCtx, [
+                "rev-list",
+                "--left-right",
+                "--count",
+                `${fetched.remoteSha}...${localRef}`,
+              ]);
+              if (counts.ok) {
+                const [behindStr, aheadStr] = counts.stdout.trim().split(/\s+/);
+                const behind = Number.parseInt(behindStr ?? "0", 10) || 0;
+                const ahead = Number.parseInt(aheadStr ?? "0", 10) || 0;
+                unpushedCommits = ahead;
+                if (behind === 0 && ahead === 0) remote = { kind: "up-to-date" };
+                else if (behind > 0 && ahead === 0) remote = { kind: "behind", behind };
+                else if (ahead > 0 && behind === 0) remote = { kind: "ahead", ahead };
+                else remote = { kind: "diverged", ahead, behind };
+              }
             }
           }
         }
       }
-    }
-    if (branch) {
-      uncommittedTeams = await countUncommittedTeamChanges(syncCtx, branch);
+      if (branch) {
+        uncommittedTeams = await countUncommittedTeamChanges(syncCtx, branch);
+      }
+    } finally {
+      progress.end();
     }
   }
 
