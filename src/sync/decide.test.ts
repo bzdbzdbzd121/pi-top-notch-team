@@ -19,6 +19,7 @@ import {
   formatFinalPlanSummary,
   loadConflictDiffs,
   nonInteractiveSyncMessage,
+  passthroughOverwritePaths,
   resolveImportNames,
 } from "./decide";
 
@@ -168,6 +169,17 @@ describe("阶段 4 新团队导入", () => {
     expect(taken["refactoring.yaml"]).toBe("refactoring-remote-20261017-2");
   });
 
+  it("导入名避开「远端/基准树已有、本机尚无」的名字（复审必改项 #1）", () => {
+    // 远端已有 a-remote-20261017.yaml（A 机同日 keep-both 推送）、本机磁盘没有该文件
+    const names = resolveImportNames(["a.yaml"], ["a", "a-remote-20261017"], new Date(2026, 9, 17));
+    expect(names["a.yaml"]).toBe("a-remote-20261017-2");
+  });
+
+  it("导入名比较大小写不敏感（大小写不敏感文件系统上不会互相覆盖）", () => {
+    const names = resolveImportNames(["A.yaml"], ["a-REMOTE-20261017"], new Date(2026, 9, 17));
+    expect(names["A.yaml"]).toBe("A-remote-20261017-2");
+  });
+
   it("内部 name 同步改写、其余字段保留、通过 validateTeamDefinition", () => {
     const remote = TEAM_YAML("refactoring", 2);
     const built = buildImportedTeamYaml(remote, "refactoring-remote-20261017");
@@ -205,6 +217,23 @@ describe("阶段 4 计划确认与降级文案", () => {
     { path: "refactoring.yaml", shape: "both-modified" as const, decision: { path: "refactoring.yaml", choice: "take-remote" as const } },
   ];
 
+  it("未跟踪但同名会被覆盖的非团队文件也进入最终清单（复审建议 #8）", () => {
+    const snapshot = snapshotWith({
+      local: ["a.yaml", "README.md"],
+      remote: ["a.yaml", "README.md"],
+      files: { "README.md": { hash: "local-differs", size: 10, mtimeMs: 1 } },
+    });
+    const managedPlan = planWith(["a.yaml"]);
+    const paths = passthroughOverwritePaths(managedPlan, snapshot);
+    expect(paths).toEqual(["README.md"]); // 管理路径（a.yaml）不算透传覆盖
+    const text = formatFinalPlanSummary(
+      managedPlan,
+      [{ path: "a.yaml", shape: "both-modified" as const, decision: { path: "a.yaml", choice: "keep-local" as const } }],
+      { passthroughOverwrites: paths }
+    );
+    expect(text).toContain("非团队文件（云端为准，将覆盖本机版本并留档）：README.md");
+  });
+
   it("最终计划摘要列出完整变更清单（含逐项冲突决策与新团队导入）", () => {
     const text = formatFinalPlanSummary(plan, decided);
     expect(text).toContain("云同步计划（分支 main）");
@@ -232,7 +261,32 @@ describe("阶段 4 计划确认与降级文案", () => {
     expect(text).toContain("refactoring.yaml");
     expect(text).toContain("本机版本：1234 字节");
     expect(text).toContain("云端版本：2345 字节");
-    expect(text).toContain(`git --git-dir /root/teams/.git show ${"a".repeat(40)}:teams/refactoring.yaml`);
+    // 复审必改项 #2：工作区就是 teams/ 本身，树路径不带 teams/ 前缀；路径加引号可直接粘贴
+    expect(text).toContain(`git --git-dir '/root/teams/.git' show '${"a".repeat(40)}:refactoring.yaml'`);
+    expect(text).not.toContain(":teams/refactoring.yaml");
+    expect(text).toContain(`cat '/root/teams/refactoring.yaml'`);
+  });
+
+  it("含空格/引号的路径在人工命令中可安全粘贴（引号转义）", () => {
+    const text = formatConflictRpcOverview({
+      path: "my team's.yaml",
+      shape: "both-modified",
+      localExists: true,
+      localSize: 10,
+      remoteExists: true,
+      remoteSize: 20,
+      diffText: "",
+      gitDir: "/root/teams dir/.git",
+      remoteSha: "b".repeat(40),
+      teamsDir: "/root/teams dir",
+    });
+    expect(text).toContain(`git --git-dir '/root/teams dir/.git' show '${"b".repeat(40)}:my team'\\''s.yaml'`);
+  });
+
+  it("非交互拒绝文案的人工命令同样不带 teams/ 前缀", () => {
+    const text = nonInteractiveSyncMessage();
+    expect(text).toContain("show '<远端提交>:<名字>.yaml'");
+    expect(text).not.toContain(":teams/");
   });
 
   it("无 UI 模式的拒绝文案含人工命令（不静默 no-op）", () => {
@@ -285,6 +339,44 @@ describe("阶段 4 冲突差异生成", () => {
       expect(diffCall).toBeDefined();
       expect(diffCall).toEqual(expect.arrayContaining(["--no-index", "--no-color"]));
       expect(existsSync(join(root, "sync-conflicts"))).toBe(false); // 不写归档目录
+    } finally {
+      cleanupConflictDiffs(loaded);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("云端 blob 读取失败 → 显式 error（不再静默按空内容，把「存在」显示成「已删除」）", async () => {
+    const root = mkdtempSync(join(tmpdir(), "decide-test-"));
+    const runGit: GitRun = async (args) => {
+      if (args.includes("cat-file")) {
+        return {
+          ok: false,
+          stdout: "",
+          stderr: "fatal: bad object (injected)",
+          code: 128,
+          timedOut: false,
+          outputLimitExceeded: false,
+          command: "git cat-file blob <injected>",
+        };
+      }
+      return gitOk("");
+    };
+    const ctx: SyncContext = {
+      rootDir: root,
+      teamsDir: join(root, "teams"),
+      config: { enabled: true, remoteUrl: "/tmp/remote.git", branch: "" },
+      runGit,
+    };
+    const loaded = await loadConflictDiffs({
+      ctx,
+      snapshot: snapshotWith({ base: ["a.yaml"], local: ["a.yaml"], remote: ["a.yaml"] }),
+      paths: ["a.yaml"],
+    });
+    try {
+      const diff = loaded.diffs.get("a.yaml");
+      expect(diff?.remoteExists).toBe(true);
+      expect(diff?.error).toContain("读取云端版本失败");
+      expect(diff?.diffText).toBe("");
     } finally {
       cleanupConflictDiffs(loaded);
       rmSync(root, { recursive: true, force: true });

@@ -1131,7 +1131,7 @@ describe("阶段 2：/team sync 集成（真实 git，裸仓库做云端）", ()
     expect(archiveContent("a.yaml-")).toContain("云端描述"); // 云端版本另存一份归档
     expect(remoteHas(`${imported}.yaml`)).toBe(true); // 已随本次提交推送
     expect(notifyText(notify)).toContain(`新团队导入：${imported}`);
-    expect(notifyText(notify)).toContain("将随下一次同步传播");
+    expect(notifyText(notify)).toContain("已随本次提交推送，其它机器下次同步可见");
 
     // 归档目录不被当团队、不参与下一轮同步
     expect(listTeams(rootDir)).not.toContain("sync-conflicts");
@@ -1330,5 +1330,97 @@ describe("阶段 2：/team sync 集成（真实 git，裸仓库做云端）", ()
     expect(select).not.toHaveBeenCalled();
     expect(notifyText(notify)).not.toContain("冲突决策");
     expect(readLocal("same.yaml")).toBe(same);
+  });
+
+  it("阶段4-15 复审#1：远端已有同名导入团队且本机无 → 生成唯一名、绝不覆盖（端到端）", async () => {
+    const remoteOwn = teamYaml("a-remote-20261017") + "# REMOTE-OWN-TEAM-CONTENT\n";
+    seedRemote({
+      "a.yaml": withDesc(teamYaml("a"), "云端描述"),
+      "a-remote-20261017.yaml": remoteOwn, // 模拟 A 机同日 keep-both 推送的团队
+    });
+    configure();
+    writeLocal("a.yaml", withDesc(teamYaml("a"), "本机描述")); // 本机没有 a-remote-20261017.yaml
+
+    const { ctx, notify } = makeHarness({ mode: "rpc", select: rpcChoice("keep-both") });
+    await sync(ctx, { now: () => new Date(2026, 9, 17) });
+
+    const text = notifyText(notify);
+    // 唯一名避开了远端已有的名字
+    expect(text).toContain("a-remote-20261017-2");
+    expect(existsSync(join(teamsDir, "a-remote-20261017-2.yaml"))).toBe(true);
+    expect(readLocal("a-remote-20261017-2.yaml")).toContain("云端描述");
+    // 刚下载的远端团队文件未被顶掉（本机与远端都保持 A 机的内容）
+    expect(readLocal("a-remote-20261017.yaml")).toContain("REMOTE-OWN-TEAM-CONTENT");
+    expect(remoteFile("a-remote-20261017.yaml")).toContain("REMOTE-OWN-TEAM-CONTENT");
+    // 摘要不再自相矛盾：下载与导入是两个不同的团队名
+    expect(text).toContain("下载：1（a-remote-20261017）");
+    expect(text).toContain("新团队导入：a-remote-20261017-2");
+  });
+
+  it("阶段4-16 复审#2：人工查看命令真实可执行（树路径无 teams/ 前缀 + 引号）", async () => {
+    await setupBothModified();
+    const { ctx, notify } = makeHarness({ mode: "rpc", select: rpcChoice("keep-local") });
+    await sync(ctx);
+
+    const text = notifyText(notify);
+    const cloudLine = text.split("\n").find((l) => l.includes("查看云端版本："));
+    const localLine = text.split("\n").find((l) => l.includes("查看本机版本："));
+    expect(cloudLine).toBeDefined();
+    expect(localLine).toBeDefined();
+    const cloudCmd = String(cloudLine).split("查看云端版本：")[1]!.trim();
+    const localCmd = String(localLine).split("查看本机版本：")[1]!.trim();
+    expect(cloudCmd).not.toContain(":teams/");
+    expect(cloudCmd).toContain("'"); // 路径加引号可直接粘贴
+
+    // 真实执行（照抄用户路径）：云端版本内容与文件内容都能取到
+    expect(execFileSync("/bin/sh", ["-c", cloudCmd], { encoding: "utf-8" })).toContain("云端描述");
+    expect(execFileSync("/bin/sh", ["-c", localCmd], { encoding: "utf-8" })).toContain("本机描述");
+  });
+
+  it("阶段4-17 复审#5：编辑中的团队被普通下载触及时同样先确认（拒绝零改动）", async () => {
+    seedRemote({ "a.yaml": teamYaml("a") });
+    configure();
+    await sync(makeHarness().ctx);
+    remoteCommit({ "a.yaml": withDesc(teamYaml("a"), "云端描述") }, "remote edit");
+
+    const rejected = makeHarness({ confirm: async () => false });
+    await sync(rejected.ctx, { getEditingTeamName: () => "a" });
+    expect(rejected.confirm).toHaveBeenCalled();
+    expect(String(rejected.confirm.mock.calls[0][1])).toContain("正在编辑团队「a」");
+    expect(notifyText(rejected.notify)).toContain("已取消，未做任何改动");
+    expect(readLocal("a.yaml")).not.toContain("云端描述");
+
+    const accepted = makeHarness();
+    await sync(accepted.ctx, { getEditingTeamName: () => "a" });
+    expect(readLocal("a.yaml")).toContain("云端描述");
+
+    // 本机改动（上传）不打断编辑：不额外确认
+    writeLocal("a.yaml", withDesc(teamYaml("a"), "本机再改"));
+    const uploadOnly = makeHarness();
+    await sync(uploadOnly.ctx, { getEditingTeamName: () => "a" });
+    expect(uploadOnly.confirm).not.toHaveBeenCalled();
+  });
+
+  it("阶段4-18 复审#8：未跟踪但同名会被覆盖的非团队文件进入最终清单", async () => {
+    writeLocal("a.yaml", withDesc(teamYaml("a"), "本机描述"));
+    writeLocal("notes.md", "本机未跟踪笔记\n");
+    seedRemote({ "a.yaml": withDesc(teamYaml("a"), "云端描述"), "notes.md": "云端笔记\n" });
+    configure();
+
+    let planMessage = "";
+    const { ctx, notify } = makeHarness({
+      mode: "rpc",
+      select: rpcChoice("keep-local"),
+      confirm: async (_title, message) => {
+        planMessage = message;
+        return true;
+      },
+    });
+    await sync(ctx, { now: () => new Date(2026, 9, 17) });
+
+    expect(planMessage).toContain("非团队文件（云端为准，将覆盖本机版本并留档）：notes.md");
+    expect(readLocal("notes.md")).toBe("云端笔记\n");
+    expect(archiveContent("notes.md-")).toBe("本机未跟踪笔记\n"); // 覆盖前留档
+    expect(notifyText(notify)).toContain("留档：1 个非团队文件的本机版本");
   });
 });

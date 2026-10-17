@@ -30,6 +30,7 @@ import {
   formatFinalPlanSummary,
   loadConflictDiffs,
   nonInteractiveSyncMessage,
+  passthroughOverwritePaths,
   resolveImportNames,
   type ConflictChoice,
   type ConflictDecision,
@@ -155,7 +156,9 @@ export function formatSyncResult(summary: ApplySummary): string {
     }
   }
   if (summary.importedTeams.length > 0) {
-    lines.push(`新团队导入：${summary.importedTeams.map((t) => t.name).join("、")}（将随下一次同步传播）`);
+    lines.push(
+      `新团队导入：${summary.importedTeams.map((t) => t.name).join("、")}（已随本次提交推送，其它机器下次同步可见）`
+    );
   }
   if (summary.keptLocalPaths.length > 0) {
     lines.push(
@@ -453,29 +456,44 @@ export async function handleSyncCommand(
     }
     const { plan, snapshot } = built.result;
 
-    // ── 冲突决策（阶段 4）：TUI 走可滚动差异视图，RPC 退化为选项 + 两侧信息 ──
+    // 编辑模式确认（复审建议 #5）：正在 /team edit X 时，只要本次同步会**改动该团队
+    // 的本机文件**（冲突 / 云端改后下载 / 云端删除），应用前就必须明确确认；拒绝即零改动。
+    // 本机改动的上传（local-modified/local-only）不改动用户正在编辑的文件，不额外打断。
     const conflictPaths = listConflicts(plan).map((c) => c.path);
     let decisions: ConflictDecision[] = [];
-    if (conflictPaths.length > 0) {
-      // 编辑模式确认：正在 /team edit X 时同步触及 X → 应用前明确确认（拒绝则零改动）
-      const editingName = deps?.getEditingTeamName?.();
-      if (editingName) {
-        const touched = conflictPaths.some((path) => path.replace(/\.yaml$/i, "") === editingName);
-        if (touched) {
-          const proceed = await ctx.ui.confirm(
-            "云同步",
-            `正在编辑团队「${editingName}」，本次同步会改动它并需要你做冲突决策。\n继续处理？（选择「否」则整个同步取消，零改动）`
-          );
-          if (!proceed) {
-            ctx.ui.notify("已取消，未做任何改动。", "info");
-            return;
-          }
+    const editingName = deps?.getEditingTeamName?.();
+    if (editingName) {
+      const localTouching = plan.actions
+        .filter((a) => a.kind === "conflict" || a.kind === "remote-modified" || a.kind === "remote-deleted")
+        .map((a) => a.path.replace(/\.yaml$/i, ""));
+      if (localTouching.includes(editingName)) {
+        const hasConflict = conflictPaths.some((path) => path.replace(/\.yaml$/i, "") === editingName);
+        const proceed = await ctx.ui.confirm(
+          "云同步",
+          `正在编辑团队「${editingName}」，本次同步会${
+            hasConflict ? "改动它并需要你做冲突决策" : "改动它的本机文件（云端版本将覆盖/删除本机文件）"
+          }。\n继续处理？（选择「否」则整个同步取消，零改动）`
+        );
+        if (!proceed) {
+          ctx.ui.notify("已取消，未做任何改动。", "info");
+          return;
         }
       }
+    }
+
+    if (conflictPaths.length > 0) {
 
       const loadedDiffs = await loadConflictDiffs({ ctx: syncCtx, snapshot, paths: conflictPaths });
       try {
-        const importNames = resolveImportNames(conflictPaths, listTeams(rootDir), now());
+        // 导入名必须避开「本机磁盘 + 基准树 + 远端树」里已有的全部团队名（复审必改项 #1）：
+        // 只取 listTeams 会漏掉「远端/基准树已有、本机尚未落地」的名字，导致同一轮
+        // keep-both 覆盖掉刚下载的远端团队文件（静默、无留档）。
+        const existingTeamNames = [
+          ...listTeams(rootDir),
+          ...snapshot.baseEntries.map((e) => e.path),
+          ...snapshot.remoteEntries.map((e) => e.path),
+        ];
+        const importNames = resolveImportNames(conflictPaths, existingTeamNames, now());
         for (const [i, path] of conflictPaths.entries()) {
           const diff = loadedDiffs.diffs.get(path);
           if (!diff) continue;
@@ -500,7 +518,9 @@ export async function handleSyncCommand(
         }));
         const confirmed = await ctx.ui.confirm(
           "云同步",
-          `${formatFinalPlanSummary(plan, decided)}\n\n按上述计划执行同步？`
+          `${formatFinalPlanSummary(plan, decided, {
+            passthroughOverwrites: passthroughOverwritePaths(plan, snapshot),
+          })}\n\n按上述计划执行同步？`
         );
         if (!confirmed) {
           ctx.ui.notify("已取消，未做任何改动。", "info");

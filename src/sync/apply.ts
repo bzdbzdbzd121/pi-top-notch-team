@@ -424,27 +424,34 @@ export async function applySync(input: {
         // keep-both：云端版本改名导入为新团队（过校验才写入；否则只留档 + 报告）
         let importedName: string | undefined;
         let importError: string | undefined;
-        if (effect.importRemote && decision.importName) {
+        if (effect.importRemote) {
+          const importName = decision.importName;
           const remoteEntry = remoteMap.get(path);
-          if (remoteEntry) {
+          // 防御（复审建议 #6）：决策缺导入名 / 云端内容不可得时不得静默退化为 keep-local
+          if (importName === undefined) {
+            importError = "缺少导入名（未导入，仅留档）";
+          } else if (!remoteEntry) {
+            importError = "云端版本不可用（未导入，仅留档）";
+          } else {
             const blob = await readRemoteBlob(ctx, remoteEntry.blob, blobCache);
             if (!blob.ok) throw blob.failure;
-            const built = buildImportedTeamYaml(blob.content.toString("utf-8"), decision.importName);
+            const built = buildImportedTeamYaml(blob.content.toString("utf-8"), importName);
             if (!built.ok) {
               importError = built.error;
             } else {
-              const importRel = `${decision.importName}.yaml`;
+              const importRel = `${importName}.yaml`;
               const importAbs = resolveSafeWorktreePath(ctx.teamsDir, importRel);
-              if (importAbs) {
-                journal.push({
-                  absPath: importAbs,
-                  previous: existsSync(importAbs) ? readFileSync(importAbs) : null,
-                });
-                writeFileAtomic(importAbs, Buffer.from(built.content, "utf-8"));
-                importedName = decision.importName;
-                summary.importedTeams.push({ name: decision.importName, path: importRel });
-              } else {
+              if (!importAbs) {
                 importError = "导入名不是安全路径（已跳过导入，仅留档）";
+              } else if (existsSync(importAbs)) {
+                // 防御（复审必改项 #1 第二层）：唯一名由命令层保证，这里再拦一次——
+                // 目标已存在时绝不覆盖（只留档），避免同轮把远端/既有团队文件顶掉。
+                importError = `导入目标已存在（${importRel}），未覆盖（仅留档）`;
+              } else {
+                journal.push({ absPath: importAbs, previous: null });
+                writeFileAtomic(importAbs, Buffer.from(built.content, "utf-8"));
+                importedName = importName;
+                summary.importedTeams.push({ name: importName, path: importRel });
               }
             }
           }

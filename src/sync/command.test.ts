@@ -341,7 +341,7 @@ describe("命令层边界", () => {
     expect(text).toContain("sync-conflicts/a.yaml-1a2b3c4d.20261017-120100");
     expect(text).toContain("采用远端（本机版本归档）");
     expect(text).toContain("⚠️ 未导入（团队校验失败：members 不能为空）");
-    expect(text).toContain("新团队导入：a-remote-20261017（将随下一次同步传播）");
+    expect(text).toContain("新团队导入：a-remote-20261017（已随本次提交推送，其它机器下次同步可见）");
   });
 
   it("未配置 + 无界面 → 引导文案（不写任何文件）", async () => {

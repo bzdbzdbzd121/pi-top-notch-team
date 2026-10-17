@@ -165,20 +165,27 @@ export function resolveImportNames(
   existingNames: string[],
   now: Date
 ): Record<string, string> {
-  const taken = new Set(existingNames);
+  // 大小写不敏感归一（macOS/Windows 的大小写不敏感文件系统上 `X.yaml` 与 `x.yaml` 是同一文件）；
+  // 调用方必须传入「本机 + 基准树 + 远端树 + 同批已定名」的全部名字（见 command.ts 接线）。
+  const taken = new Set(existingNames.map((name) => normalizeImportName(name)));
   const out: Record<string, string> = {};
   for (const path of paths) {
     const base = `${importSlug(path)}-remote-${importStamp(now)}`;
     let candidate = base;
     let n = 2;
-    while (taken.has(candidate)) {
+    while (taken.has(normalizeImportName(candidate))) {
       candidate = `${base}-${n}`;
       n += 1;
     }
-    taken.add(candidate);
+    taken.add(normalizeImportName(candidate));
     out[path] = candidate;
   }
   return out;
+}
+
+/** 导入名与既有团队名比较用归一（去 `.yaml`、去大小写）。 */
+function normalizeImportName(name: string): string {
+  return name.replace(/\.yaml$/i, "").toLowerCase();
 }
 
 export interface ImportedTeam {
@@ -290,12 +297,18 @@ export async function loadConflictDiffs(input: {
 
     // 云端侧内容（cat-file，二进制安全）
     let remoteContent: Buffer = Buffer.alloc(0);
+    let remoteReadError: string | undefined;
     if (remoteEntry) {
       const blob = await runLocalGit(ctx, ["cat-file", "blob", remoteEntry.blob], {
         maxBuffer: 8 * 1024 * 1024,
         binaryStdout: true,
       });
-      if (blob.ok) remoteContent = blob.stdoutBuffer ?? Buffer.from(blob.stdout, "utf-8");
+      if (blob.ok) {
+        remoteContent = blob.stdoutBuffer ?? Buffer.from(blob.stdout, "utf-8");
+      } else {
+        // 静默按空内容参与 diff 会把「云端存在」显示成「已删除」——必须显式降级
+        remoteReadError = blob.stderr.trim() || blob.command;
+      }
     }
 
     const diff: ConflictDiff = {
@@ -307,12 +320,14 @@ export async function loadConflictDiffs(input: {
       remoteExists: remoteEntry !== undefined,
       remoteSize: remoteContent.length,
       diffText: "",
+      error: remoteReadError ? `读取云端版本失败：${remoteReadError}` : undefined,
       gitDir: snapshot.gitDir,
       remoteSha: snapshot.remoteSha,
       teamsDir: ctx.teamsDir,
     };
 
     try {
+      if (remoteReadError) throw new Error(diff.error);
       mkdirSync(caseDir, { recursive: true });
       const localFile = join(caseDir, "local.txt");
       const remoteFile = join(caseDir, "remote.txt");
@@ -364,10 +379,13 @@ export function formatConflictRpcOverview(diff: ConflictDiff): string {
   } else if (diff.error) {
     lines.push(`  ⚠️ 差异生成失败（${diff.error}），请按下方命令自行比较`);
   }
-  const teamFile = diff.path;
+  // 工作区 = teams/ 目录本身，提交树里的路径就是顶层文件名（不要再加 `teams/` 前缀，
+  // 否则用户照抄会得到 `fatal: path 'teams/x.yaml' does not exist`）。路径加引号以便
+  // 含空格/特殊字符的团队名可直接粘贴执行。
+  const showSpec = `${diff.remoteSha}:${diff.path}`;
   const commands = [
-    `  查看云端版本：git --git-dir ${diff.gitDir} show ${diff.remoteSha}:teams/${teamFile}`,
-    `  查看本机版本：cat ${join(diff.teamsDir, teamFile)}`,
+    `  查看云端版本：git --git-dir ${shellQuote(diff.gitDir)} show ${shellQuote(showSpec)}`,
+    `  查看本机版本：cat ${shellQuote(join(diff.teamsDir, diff.path))}`,
   ];
   lines.push("  人工处理命令（可在另一个终端执行）：");
   lines.push(...commands);
@@ -387,6 +405,11 @@ function shapeLabel(shape: ConflictShape): string {
   }
 }
 
+/** 单引号包裹以便直接粘贴执行（内部单引号按 POSIX 规则转义）。 */
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
 function formatTime(ms: number): string {
   const d = new Date(ms);
   const pad = (n: number): string => String(n).padStart(2, "0");
@@ -400,7 +423,10 @@ export function nonInteractiveSyncMessage(): string {
     "当前模式下的替代做法：",
     "  1) 在交互式终端运行 /team sync 完成决策与同步；",
     "  2) 只读查询用 /team sync status（不推送、不改团队文件与工作区；读取云端并更新 .git 内对象/远端跟踪引用，不写 FETCH_HEAD）；",
-    "  3) 人工比较冲突：git --git-dir <teams/.git> show <远端提交>:teams/<名字>.yaml，再用 /team edit 手工改写本机版本。",
+    "  3) 人工比较冲突（工作区就是 teams/ 本身，树路径不带 teams/ 前缀）：",
+    "     git --git-dir <teams/.git> show '<远端提交>:<名字>.yaml'",
+    "     cat '<teams 目录>/<名字>.yaml'",
+    "     再用 /team edit 手工改写本机版本。",
   ].join("\n");
 }
 
@@ -408,9 +434,26 @@ export function nonInteractiveSyncMessage(): string {
  * 最终计划确认（§5 阶段 4：应用前展示完整变更清单）。
  * 含逐项冲突决策、新团队导入、非团队文件覆盖与归档说明。
  */
+/**
+ * 应用阶段会按「云端为准」覆盖、因而需要留档的非团队路径（复审建议 #8）：
+ * 远端树中非管理路径且本机内容与远端不同（含**未跟踪但同名**的文件——
+ * `ignored.nonYamlLocalModified` 只覆盖基准树里已跟踪的文件）。
+ */
+export function passthroughOverwritePaths(plan: SyncPlan, snapshot: PlanSnapshot): string[] {
+  const managed = new Set(plan.actions.map((a) => a.path));
+  const out: string[] = [];
+  for (const entry of snapshot.remoteEntries) {
+    if (managed.has(entry.path)) continue;
+    const local = snapshot.localFiles[entry.path];
+    if (local !== undefined && local.hash !== entry.blob) out.push(entry.path);
+  }
+  return out;
+}
+
 export function formatFinalPlanSummary(
   plan: SyncPlan,
-  decided: { path: string; shape: ConflictShape; decision: ConflictDecision }[]
+  decided: { path: string; shape: ConflictShape; decision: ConflictDecision }[],
+  options?: { passthroughOverwrites?: string[] }
 ): string {
   const decisions = decided.map((d) => d.decision);
   const decisionByPath = new Map(decided.map((d) => [d.path, d]));
@@ -451,8 +494,12 @@ export function formatFinalPlanSummary(
   if (imports.length > 0) {
     lines.push(`  新团队导入：${imports.map((d) => `${d.importName}（来自 ${d.path}）`).join("、")}`);
   }
-  if (plan.ignored.nonYamlLocalModified.length > 0) {
-    lines.push(`  非团队文件（云端为准）：${plan.ignored.nonYamlLocalModified.join("、")}`);
+  // 非团队文件会被云端覆盖（含未跟踪但同名者）——覆盖前留档，清单里如实列出
+  const nonTeamOverwrites = [
+    ...new Set([...(options?.passthroughOverwrites ?? []), ...plan.ignored.nonYamlLocalModified]),
+  ].sort();
+  if (nonTeamOverwrites.length > 0) {
+    lines.push(`  非团队文件（云端为准，将覆盖本机版本并留档）：${nonTeamOverwrites.join("、")}`);
   }
   // 归档目录与 apply.ts 的 syncConflictsDir 同规则（本模块不依赖 apply，避免循环引用）
   lines.push(`  被放弃的一侧留档到：${join("<dataDir>", "sync-conflicts")}`);

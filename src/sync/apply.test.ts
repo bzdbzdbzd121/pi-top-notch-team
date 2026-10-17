@@ -1,6 +1,11 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { archiveFileName, isArchiveFileName, syncConflictsDir } from "./apply";
+import { tmpdir } from "node:os";
+import { stringify as stringifyYaml } from "yaml";
+import { archiveFileName, applySync, isArchiveFileName, syncConflictsDir } from "./apply";
+import type { GitResult } from "./git-runner";
+import type { GitRun, PlanSnapshot, SyncContext, SyncPlan } from "./plan";
 
 const AT = new Date(2026, 9, 17, 12, 1, 0); // 2026-10-17 12:01:00
 const HASH = "[0-9a-f]{8}";
@@ -62,5 +67,112 @@ describe("归档目录与命名（偏差 1：复用阶段 4 的规则）", () =>
     expect(isArchiveFileName("README.md")).toBe(false);
     expect(isArchiveFileName("notes.txt")).toBe(false);
     expect(isArchiveFileName("20261017-1201.yaml")).toBe(false);
+  });
+});
+
+// ── 阶段 4：keep-both 导入的防御分支（复审 #1 第二层 / #6）──────
+
+const okGit = (stdout = ""): GitResult => ({
+  ok: true,
+  stdout,
+  stderr: "",
+  code: 0,
+  timedOut: false,
+  outputLimitExceeded: false,
+  command: "git",
+});
+
+function teamYamlText(name: string, desc: string): string {
+  return stringifyYaml({
+    name,
+    description: desc,
+    members: [{ name: "m1", label: "成员", systemPrompt: "提示" }],
+  });
+}
+
+function conflictFixture(rootDir: string): { ctx: SyncContext; plan: SyncPlan; snapshot: PlanSnapshot } {
+  const teamsDir = join(rootDir, "teams");
+  mkdirSync(teamsDir, { recursive: true });
+  const remoteYaml = teamYamlText("a", "云端描述");
+  const ctx: SyncContext = {
+    rootDir,
+    teamsDir,
+    config: { enabled: true, remoteUrl: "/tmp/remote.git", branch: "" },
+    runGit: (async (args: string[]) => {
+      if (args[0] === "cat-file") return okGit(remoteYaml);
+      // TOCTOU 复核需要与快照一致的引用值（否则会在任何写盘前中止，看不到决策结果）
+      if (args[0] === "rev-parse" && args.includes("FETCH_HEAD")) return okGit(`${"r".repeat(40)}\n`);
+      if (args[0] === "rev-parse" && args.some((a) => a.startsWith("refs/heads/")))
+        return okGit(`${"l".repeat(40)}\n`);
+      if (args[0] === "hash-object") return okGit(`${"hl-a"}\n`);
+      if (args[0] === "read-tree" || args[0] === "add" || args[0] === "write-tree") return okGit("t".repeat(40));
+      return okGit("");
+    }) as GitRun,
+  };
+  const plan: SyncPlan = {
+    flags: { firstAttach: false, emptyRemote: false, remoteUrlChanged: false },
+    actions: [{ kind: "conflict", path: "a.yaml", options: ["keep-local", "take-remote", "keep-both"] }],
+    ignored: { nestedYaml: [], nonYamlLocalModified: [] },
+    invalidLocalTeams: [],
+    remoteSha: "r".repeat(40),
+    branch: "main",
+  };
+  const snapshot: PlanSnapshot = {
+    branch: "main",
+    gitDir: join(teamsDir, ".git"),
+    remoteSha: "r".repeat(40),
+    localSha: "l".repeat(40),
+    baseTree: "b".repeat(40),
+    remoteTree: "rt".repeat(20),
+    localTree: "lt".repeat(20),
+    firstAttach: false,
+    emptyRemote: false,
+    remoteUrlChanged: false,
+    baseEntries: [{ path: "a.yaml", mode: "100644", blob: "bl-a" }],
+    remoteEntries: [{ path: "a.yaml", mode: "100644", blob: "br-a" }],
+    localEntries: [{ path: "a.yaml", mode: "100644", blob: "hl-a" }],
+    localFiles: { "a.yaml": { hash: "hl-a", size: 10, mtimeMs: 1 } },
+    fingerprints: {},
+  };
+  writeFileSync(join(teamsDir, "a.yaml"), teamYamlText("a", "本机描述"), "utf-8");
+  return { ctx, plan, snapshot };
+}
+
+describe("阶段 4 apply 防御：keep-both 导入", () => {
+  it("决策缺导入名 → 明确 importError（不静默退化为 keep-local、不写文件）", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "apply-import-"));
+    const { ctx, plan, snapshot } = conflictFixture(rootDir);
+    const result = await applySync({ ctx, plan, snapshot, decisions: [{ path: "a.yaml", choice: "keep-both" }] });
+    const decision = result.summary.conflictDecisions[0];
+    expect(decision?.importError).toContain("缺少导入名");
+    expect(result.summary.importedTeams).toHaveLength(0);
+    expect(readFileSync(join(rootDir, "teams", "a.yaml"), "utf-8")).toContain("本机描述"); // keep-local 语义
+    rmSync(rootDir, { recursive: true, force: true });
+  });
+
+  it("导入目标已存在 → 不覆盖（仅留档 + importError）", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "apply-import-"));
+    const { ctx, plan, snapshot } = conflictFixture(rootDir);
+    const existing = join(rootDir, "teams", "a-remote-20261017.yaml");
+    writeFileSync(existing, teamYamlText("a-remote-20261017", "既有导入文件"), "utf-8");
+    const result = await applySync({
+      ctx,
+      plan,
+      snapshot,
+      decisions: [{ path: "a.yaml", choice: "keep-both", importName: "a-remote-20261017" }],
+    });
+    expect(result.summary.conflictDecisions[0]?.importError).toContain("导入目标已存在");
+    expect(readFileSync(existing, "utf-8")).toContain("既有导入文件"); // 未被顶掉
+    expect(result.summary.importedTeams).toHaveLength(0);
+    rmSync(rootDir, { recursive: true, force: true });
+  });
+
+  it("缺少决策（冲突未决策）→ 直接中止、零改动", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "apply-import-"));
+    const { ctx, plan, snapshot } = conflictFixture(rootDir);
+    const result = await applySync({ ctx, plan, snapshot });
+    expect(result.ok).toBe(false);
+    expect(result.failure?.classification.message).toContain("尚未决策");
+    rmSync(rootDir, { recursive: true, force: true });
   });
 });

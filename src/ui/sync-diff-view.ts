@@ -103,6 +103,8 @@ export interface SyncDiffViewState {
   index: number;
   total: number;
   summaryLines: string[];
+  /** 逻辑差异行（未包装）——按终端宽度重排时以它为准。 */
+  logicalLines: string[];
   displayLines: string[];
   actions: ConflictChoice[];
   actionIndex: number;
@@ -121,6 +123,7 @@ export function createSyncDiffViewState(input: SyncDiffViewInput): SyncDiffViewS
     index: input.index,
     total: input.total,
     summaryLines: input.summaryLines,
+    logicalLines: input.diffLines,
     displayLines: buildDisplayLines(input.diffLines, width),
     actions: input.actions,
     actionIndex: 0,
@@ -134,6 +137,18 @@ export function createSyncDiffViewState(input: SyncDiffViewInput): SyncDiffViewS
 function clampOffset(state: SyncDiffViewState, offset: number): number {
   const max = Math.max(0, state.displayLines.length - state.height);
   return Math.min(Math.max(0, offset), max);
+}
+
+/**
+ * 按新的展示宽度重排（复审建议 #3）：保留用户当前的高亮动作与滚动位置
+ * （位置按新行数钳制）。用于组件在真实终端宽度变化时重新包装。
+ */
+export function reflowSyncDiffView(state: SyncDiffViewState, width: number): SyncDiffViewState {
+  const reflowed: SyncDiffViewState = {
+    ...state,
+    displayLines: buildDisplayLines(state.logicalLines, Math.max(10, width)),
+  };
+  return { ...reflowed, offset: clampOffset(reflowed, state.offset) };
 }
 
 export function scrollSyncDiffView(state: SyncDiffViewState, delta: number): SyncDiffViewState {
@@ -184,6 +199,7 @@ export function formatSyncDiffHints(): string {
 export class SyncDiffViewComponent extends Container {
   private state: SyncDiffViewState;
   private readonly input: SyncDiffViewInput;
+  private renderWidth: number;
 
   constructor(
     private tui: { requestRender?: () => void },
@@ -194,17 +210,24 @@ export class SyncDiffViewComponent extends Container {
     super();
     this.input = input;
     this.state = createSyncDiffViewState(input);
+    this.renderWidth = input.width ?? 100;
     this.renderAll();
   }
 
-  /** 终端尺寸变化时重算包装宽度（保持滚动位置合理）。 */
-  setWidth(width: number): void {
-    if (width === this.input.width) return;
-    this.input.width = width;
-    const previousOffset = this.state.offset;
-    this.state = createSyncDiffViewState({ ...this.input, width });
-    this.state.offset = Math.min(previousOffset, Math.max(0, this.state.displayLines.length - this.state.height));
-    this.renderAll();
+  /**
+   * pi-tui 组件契约：按真实终端宽度渲染（复审建议 #3）。
+   * 宽度变化时按新宽度重排差异行（此前是固定 100 列预包装 + 死代码 setWidth，
+   * 窄终端下 Text 会二次换行 → 「可见行数 = 屏幕行数」的滚动语义不成立）。
+   * 重排保留滚动位置（钳制）与用户已高亮的动作，避免 resize 后回车提交错动作。
+   */
+  render(width: number): string[] {
+    const inner = Math.max(10, width - 2); // Text 左侧 padding 1
+    if (this.renderWidth !== inner) {
+      this.renderWidth = inner;
+      this.state = reflowSyncDiffView(this.state, inner);
+      this.renderAll();
+    }
+    return super.render(width);
   }
 
   getState(): SyncDiffViewState {

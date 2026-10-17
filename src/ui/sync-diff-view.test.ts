@@ -11,6 +11,7 @@ import {
   formatSyncDiffHints,
   moveSyncDiffAction,
   normalizeDiffLines,
+  reflowSyncDiffView,
   scrollSyncDiffView,
   showSyncDiffView,
   syncDiffVisibleLines,
@@ -89,6 +90,25 @@ describe("阶段 4 差异视图：纯状态（不依赖真实 TUI，验收 7）"
     expect(last[last.length - 1]).toBe(state.displayLines[state.displayLines.length - 1]);
   });
 
+  it("按终端宽度重排：行数变化、offset 钳制、高亮动作保留（复审建议 #3）", () => {
+    const state = createSyncDiffViewState(input({ width: 80, height: 3 }));
+    const scrolled = scrollSyncDiffView(state, 2);
+    const moved = moveSyncDiffAction(scrolled, 2);
+
+    const narrow = reflowSyncDiffView(moved, 12);
+    expect(narrow.displayLines.length).toBeGreaterThan(moved.displayLines.length); // 窄终端行数变多
+    expect(narrow.actionIndex).toBe(2); // 高亮动作保留（resize 后回车不会提交错动作）
+    expect(narrow.offset).toBe(2);
+
+    const wide = reflowSyncDiffView(moved, 200);
+    expect(wide.displayLines.length).toBeLessThanOrEqual(moved.displayLines.length);
+    expect(wide.actionIndex).toBe(2);
+
+    // 大幅收窄导致可达行数变少时，offset 被钳制而非越界
+    const tiny = reflowSyncDiffView(moveSyncDiffAction(scrollSyncDiffView(state, 999), 0), 12);
+    expect(tiny.offset).toBeLessThanOrEqual(Math.max(0, tiny.displayLines.length - tiny.height));
+  });
+
   it("选项集：三选项形态给 3 个、两选项形态给 2 个；移动可环绕", () => {
     const three = createSyncDiffViewState(input());
     expect(three.actions).toHaveLength(3);
@@ -127,6 +147,17 @@ describe("阶段 4 差异视图：纯状态（不依赖真实 TUI，验收 7）"
 describe("阶段 4 差异视图：组件与入口", () => {
   const fakeTui = { requestRender: vi.fn() } as never;
   const fakeTheme = { fg: (_c: string, s: string) => s, bold: (s: string) => s } as never;
+
+  it("组件按 render(width) 重排（pi-tui 契约；无死代码 setWidth）", () => {
+    const done = vi.fn();
+    const component = new SyncDiffViewComponent(fakeTui, fakeTheme, done, input({ width: 80, height: 3 }));
+    const before = component.getState().displayLines.length;
+    component.render(12); // 窄终端（内容宽度 10 → 长行被拆成多行）
+    expect(component.getState().displayLines.length).toBeGreaterThan(before);
+    component.render(200);
+    expect(component.getState().displayLines.length).toBeLessThanOrEqual(before);
+    expect(typeof (component as unknown as { setWidth?: unknown }).setWidth).toBe("undefined"); // 死代码已删
+  });
 
   it("键盘：↑↓/PgUp/PgDn 滚动、数字与 ←→ 选动作、Enter 返回所选、Esc 取消", () => {
     const done = vi.fn();
