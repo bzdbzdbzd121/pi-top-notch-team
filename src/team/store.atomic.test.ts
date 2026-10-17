@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, existsSync, mkdirSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, fsyncSync, mkdirSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { writeFile as writeFileAsync, readFile as readFileAsync } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -16,6 +16,7 @@ vi.mock("node:fs", async (importOriginal) => {
     ...actual,
     renameSync: vi.fn(actual.renameSync),
     writeFileSync: vi.fn(actual.writeFileSync),
+    fsyncSync: vi.fn(actual.fsyncSync),
   };
 });
 
@@ -40,6 +41,8 @@ describe("writeTeam 原子化", () => {
     actualWriteFileSync = actual.writeFileSync;
     vi.mocked(renameSync).mockImplementation(actual.renameSync);
     vi.mocked(writeFileSync).mockImplementation(actual.writeFileSync);
+    vi.mocked(fsyncSync).mockImplementation(actual.fsyncSync);
+    vi.mocked(fsyncSync).mockClear();
 
     rootDir = mkdtempSync(join(tmpdir(), "team-store-atomic-"));
     teamsDir = join(rootDir, "teams");
@@ -108,6 +111,11 @@ describe("writeTeam 原子化", () => {
 
     await expect(readFileAsync(filePath, "utf-8")).resolves.toBe(original);
     expect(readdirSync(teamsDir)).toEqual(["test-team.yaml"]);
+  });
+
+  it("成功写入前对临时文件做 fsync（掉电不留空文件，审查 #10）", () => {
+    writeTeam(team, rootDir);
+    expect(vi.mocked(fsyncSync)).toHaveBeenCalledTimes(1);
   });
 
   it("首次创建失败不产生目标文件（目录存在、文件不存在）", () => {

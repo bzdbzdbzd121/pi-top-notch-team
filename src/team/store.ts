@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, existsSync, unlinkSync, rmSync, readdirSync, mkdirSync, renameSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, unlinkSync, rmSync, readdirSync, mkdirSync, renameSync, openSync, fsyncSync, closeSync } from "node:fs";
 import { join, basename, extname } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import type { TeamDefinition } from "./definition";
@@ -48,6 +48,7 @@ function writeFileAtomic(filePath: string, content: string): void {
   const tmpPath = `${filePath}.tmp-${process.pid}`;
   try {
     writeFileSync(tmpPath, content, "utf-8");
+    syncFileBestEffort(tmpPath); // 掉电时不留下空的团队 YAML（尽力而为）
     renameSync(tmpPath, filePath); // atomic on POSIX
   } catch (err) {
     // 任一步失败都清理临时文件（部分写入/替换失败），旧文件保持不变
@@ -57,6 +58,25 @@ function writeFileAtomic(filePath: string, content: string): void {
       /* 临时文件可能尚未创建；保留原始错误 */
     }
     throw err;
+  }
+}
+
+/** 尽力而为地把文件数据刷到磁盘（fsync 失败不改变写入语义，只影响掉电持久性）。 */
+function syncFileBestEffort(path: string): void {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, "r");
+    fsyncSync(fd);
+  } catch {
+    /* best-effort */
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        /* best-effort */
+      }
+    }
   }
 }
 

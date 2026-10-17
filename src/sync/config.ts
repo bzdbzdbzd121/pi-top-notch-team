@@ -9,7 +9,7 @@
  * 本模块只做数据层：读取/写入/地址校验/展示脱敏，全部纯函数或同步 IO；
  * 不调用 git、不签出任何状态（阶段 2 的命令层负责编排与引导）。
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 
@@ -74,12 +74,13 @@ export function validateRemoteUrl(remoteUrl: unknown): string | null {
       } catch {
         return "仓库地址格式非法";
       }
-      // 只对 https 硬性拒绝内嵌凭据；ssh://git@... 允许（git 不是秘密），
-      // file:// 的 userinfo 没有意义，同样拒绝。
-      if (parsed.username || parsed.password) {
-        if (scheme === "https" || scheme === "file") {
-          return "仓库地址不能内嵌用户名或密码（请改用 SSH 或系统凭据助手）";
-        }
+      // 所有 scheme 一律拒绝内嵌密码（审查 #4）：密码会明文落盘，且会出现在
+      // 诊断命令串里。ssh://git@... 只允许用户名（git 不是秘密）。
+      if (parsed.password) {
+        return "仓库地址不能内嵌密码（请改用 SSH 密钥或系统凭据助手）";
+      }
+      if ((scheme === "https" || scheme === "file") && parsed.username) {
+        return "仓库地址不能内嵌用户名或密码（请改用 SSH 或系统凭据助手）";
       }
       if (scheme === "file") {
         if (parsed.hostname && parsed.hostname !== "localhost") {
@@ -127,25 +128,34 @@ export function isValidRemoteUrl(remoteUrl: unknown): boolean {
  *   （用户名不是秘密，保留可读性；`git@host:path` 形态不变）
  */
 export function maskRemoteUrl(remoteUrl: string): string {
-  const match = /^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/(.*)$/.exec(remoteUrl);
-  if (!match) return remoteUrl;
+  const schemeMatch = /^([a-zA-Z][a-zA-Z0-9+.-]*):\/\//.exec(remoteUrl);
+  if (!schemeMatch) return remoteUrl;
 
-  const scheme = match[1].toLowerCase();
-  const rest = match[2];
-  const at = rest.indexOf("@");
+  const scheme = schemeMatch[1].toLowerCase();
+  // userinfo 只在 authority（`://` 之后、首个 /?# 之前）内查找；
+  // 路径/查询里的 `@` 不属于 userinfo（审查 #5）。
+  const rest = remoteUrl.slice(schemeMatch[0].length);
+  const authorityEnd = rest.search(/[/?#]/);
+  const authority = authorityEnd < 0 ? rest : rest.slice(0, authorityEnd);
+  const tail = authorityEnd < 0 ? "" : rest.slice(authorityEnd);
+
+  const at = authority.lastIndexOf("@");
   if (at < 0) return remoteUrl;
 
-  const userinfo = rest.slice(0, at);
-  const hostPart = rest.slice(at + 1);
+  const userinfo = authority.slice(0, at);
+  const hostPart = authority.slice(at + 1);
   if (scheme === "https" || scheme === "http") {
-    return `${match[1]}://***@${hostPart}`;
+    return `${schemeMatch[1]}://***@${hostPart}${tail}`;
   }
   const colon = userinfo.indexOf(":");
   if (colon >= 0) {
-    return `${match[1]}://${userinfo.slice(0, colon)}:***@${hostPart}`;
+    return `${schemeMatch[1]}://${userinfo.slice(0, colon)}:***@${hostPart}${tail}`;
   }
   return remoteUrl;
 }
+
+/** 非法地址 warn 去重（每文件路径一次；启动检测/状态查询可能高频调用，防刷屏）。 */
+const warnedInvalidRemoteUrl = new Set<string>();
 
 /**
  * 读取 `sync.yaml`。
@@ -184,9 +194,27 @@ export function loadSyncConfig(rootDir: string): SyncConfig | null {
   }
 
   const obj = data as Record<string, unknown>;
+
+  // 地址校验在**读取时**执行（审查 #3）：手工编辑/修复后的 sync.yaml 可能含有
+  // 非法值（如 `--upload-pack=evil`），若原样返回给命令层，非法值会被 git 当作
+  // 命令选项。非法值一律清空并 warn（保留 enabled 等其余字段，仍视为未配置地址）。
+  let remoteUrl = typeof obj.remoteUrl === "string" ? normalizeRemoteUrl(obj.remoteUrl) : "";
+  if (remoteUrl.length > 0) {
+    const error = validateRemoteUrl(remoteUrl);
+    if (error) {
+      if (!warnedInvalidRemoteUrl.has(filePath)) {
+        warnedInvalidRemoteUrl.add(filePath);
+        console.warn(
+          `[top-notch-team] sync.yaml 中的仓库地址非法（已清空，需重新配置）：${error}\n文件：${filePath}`
+        );
+      }
+      remoteUrl = "";
+    }
+  }
+
   return {
     enabled: obj.enabled === true,
-    remoteUrl: typeof obj.remoteUrl === "string" ? obj.remoteUrl : "",
+    remoteUrl,
     branch: typeof obj.branch === "string" ? obj.branch : "",
   };
 }
@@ -198,11 +226,20 @@ export function loadSyncConfig(rootDir: string): SyncConfig | null {
  */
 export function saveSyncConfig(config: SyncConfig, rootDir: string): void {
   const filePath = getSyncConfigPath(rootDir);
+  const remoteUrl = normalizeRemoteUrl(config.remoteUrl);
+  // 写入侧同样拒绝非法地址（写入是用户显式动作，非法值应显式报错而非落盘）
+  if (remoteUrl.length > 0) {
+    const error = validateRemoteUrl(remoteUrl);
+    if (error) {
+      throw new Error(`拒绝写入非法仓库地址：${error}`);
+    }
+  }
+
   const existing = readRawConfigObject(filePath);
   const merged: Record<string, unknown> = {
     ...existing,
     enabled: config.enabled,
-    remoteUrl: normalizeRemoteUrl(config.remoteUrl),
+    remoteUrl,
     branch: config.branch,
   };
 
@@ -212,7 +249,11 @@ export function saveSyncConfig(config: SyncConfig, rootDir: string): void {
 
   const yaml = stringifyYaml(merged, { lineWidth: 120 });
   const tmpPath = `${filePath}.tmp-${process.pid}`;
-  writeFileSync(tmpPath, yaml, "utf-8");
+  // mode 0600（审查 #4）：配置可能含仓库地址等敏感信息，不让同机其他用户可读；
+  // 先清掉可能残留的同 pid 临时文件，保证 mode 生效。
+  rmSync(tmpPath, { force: true });
+  writeFileSync(tmpPath, yaml, { encoding: "utf-8", mode: 0o600 });
+  syncFileBestEffort(tmpPath); // 掉电时不留下空配置文件（尽力而为）
   try {
     renameSync(tmpPath, filePath);
   } catch (err) {
@@ -223,6 +264,25 @@ export function saveSyncConfig(config: SyncConfig, rootDir: string): void {
       /* 保留原始错误 */
     }
     throw err;
+  }
+}
+
+/** 尽力而为地把文件数据刷到磁盘（fsync 失败不改变写入语义，只影响掉电持久性）。 */
+function syncFileBestEffort(path: string): void {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, "r");
+    fsyncSync(fd);
+  } catch {
+    /* best-effort */
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        /* best-effort */
+      }
+    }
   }
 }
 

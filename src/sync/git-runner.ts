@@ -13,8 +13,8 @@
  *
  * 生产代码里除本模块外不得直接使用 child_process（阶段 5 有静态守卫）。
  */
-import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { spawn, type ChildProcess } from "node:child_process";
+import { statSync } from "node:fs";
 
 /** 本地命令默认超时（毫秒）。网络命令（fetch/push/ls-remote）由调用点显式放大。 */
 export const DEFAULT_GIT_TIMEOUT_MS = 30_000;
@@ -29,7 +29,7 @@ const KILL_GRACE_MS = 500;
 const HARD_STOP_MS = 2_000;
 
 /**
- * 需要从继承环境里清除的 git 定位变量（方案 §7.D 清单）。
+ * 需要从继承环境里清除的 git 定位/配置变量（方案 §7.D 清单 + 审查建议 #7）。
  * 顺序无关；我们自己的临时索引在清除**之后**经 `env` 注入。
  */
 export const GIT_ENV_STRIPPED = [
@@ -39,7 +39,17 @@ export const GIT_ENV_STRIPPED = [
   "GIT_OBJECT_DIRECTORY",
   "GIT_COMMON_DIR",
   "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_CONFIG_GLOBAL",
+  "GIT_CONFIG_SYSTEM",
+  "GIT_CEILING_DIRECTORIES",
 ] as const;
+
+/**
+ * 动态注入的 git 配置（`GIT_CONFIG_COUNT` + 配对的 `GIT_CONFIG_KEY_n` /
+ * `GIT_CONFIG_VALUE_n`）——可注入 core.sshCommand、core.hooksPath 等任意配置，
+ * 必须逐键清除。
+ */
+export const GIT_ENV_STRIPPED_PATTERNS = [/^GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+)$/] as const;
 
 export interface GitRunOptions {
   /** 工作区/仓库目录，作为 `git -C <cwd>` 传入。 */
@@ -95,6 +105,11 @@ export function buildGitEnv(
   for (const key of GIT_ENV_STRIPPED) {
     delete env[key];
   }
+  for (const key of Object.keys(env)) {
+    if (GIT_ENV_STRIPPED_PATTERNS.some((pattern) => pattern.test(key))) {
+      delete env[key];
+    }
+  }
 
   // 稳定错误文案（分类依赖英文关键字）+ 禁止任何交互式提示。
   env.LC_ALL = "C";
@@ -142,15 +157,6 @@ export function spawnCapture(
     let killTimer: NodeJS.Timeout | undefined;
     let hardStopTimer: NodeJS.Timeout | undefined;
 
-    const child = spawn(binary, args, {
-      cwd: options.cwd,
-      env: options.env,
-      stdio: [options.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
-      windowsHide: true,
-    });
-    child.stdout?.setEncoding("utf8");
-    child.stderr?.setEncoding("utf8");
-
     const clearTimers = (): void => {
       if (timeoutTimer) clearTimeout(timeoutTimer);
       if (killTimer) clearTimeout(killTimer);
@@ -174,23 +180,43 @@ export function spawnCapture(
 
     const terminate = (): void => {
       try {
-        child.kill("SIGTERM");
+        child?.kill("SIGTERM");
       } catch {
         /* 进程可能已退出 */
       }
       if (killTimer) return;
       killTimer = setTimeout(() => {
         try {
-          child.kill("SIGKILL");
+          child?.kill("SIGKILL");
         } catch {
           /* 已退出 */
         }
-        child.unref();
+        child?.unref();
         if (!hardStopTimer) {
           hardStopTimer = setTimeout(finish, HARD_STOP_MS);
         }
       }, KILL_GRACE_MS);
     };
+
+    // spawn 对部分错误（cwd 不是目录的 ENOTDIR、参数非法等）是**同步抛错**，
+    // 不走 error 事件——必须在此捕获，否则 Promise 会 reject，违反「结构化
+    // 结果」契约（调用点不包 try/catch 就会中断整个同步流程）。
+    let child: ChildProcess | undefined;
+    try {
+      child = spawn(binary, args, {
+        cwd: options.cwd,
+        env: options.env,
+        stdio: [options.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+        windowsHide: true,
+      });
+    } catch (err) {
+      spawnError = (err as NodeJS.ErrnoException).code ?? "SPAWN_ERROR";
+      finish();
+      return;
+    }
+
+    child.stdout?.setEncoding("utf8");
+    child.stderr?.setEncoding("utf8");
 
     const appendChunk = (which: "stdout" | "stderr", chunk: string): void => {
       if (outputLimitExceeded) return;
@@ -249,7 +275,10 @@ export function spawnCapture(
 export async function runGit(args: string[], options: GitRunOptions): Promise<GitResult> {
   const binary = options.binary ?? "git";
   const gitArgs = ["-C", options.cwd, ...args];
-  const spawnCwd = existsSync(options.cwd) ? options.cwd : process.cwd();
+  // 只有真实目录才能作为子进程 cwd：文件/不存在的路径交给 git 的
+  // `cannot change to '<dir>'` 报错（可分类为 workdir-missing），
+  // 避免 spawn 同步抛 ENOTDIR/ENOENT 被误判为「git 未安装」。
+  const spawnCwd = isDirectory(options.cwd) ? options.cwd : process.cwd();
 
   const result = await spawnCapture(binary, gitArgs, {
     cwd: spawnCwd,
@@ -262,14 +291,37 @@ export async function runGit(args: string[], options: GitRunOptions): Promise<Gi
   return { ...result, command: formatGitCommand(binary, gitArgs) };
 }
 
-const SAFE_ARG = /^[A-Za-z0-9_@%+=:,./-]+$/;
+function isDirectory(path: string): boolean {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
 
-/** 可读的调用串（含空白/引号的参数加引号）。 */
+const SAFE_ARG = /^[A-Za-z0-9_@%+=:,./*-]+$/;
+
+/**
+ * 送入诊断/日志的命令串中的 userinfo 脱敏（审查建议 #4）。
+ * 命令参数里可能内嵌 URL（如 `git remote add origin <url>`），一律把所有
+ * `scheme://userinfo@` 遮蔽为 `scheme://***@`（比展示层更严格——诊断串不需要
+ * 可读的用户名，宁多遮不少遮）；路径中的 `@` 不受影响。
+ */
+function maskCommandArg(arg: string): string {
+  return arg.replace(/([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)([^\s/?#]*)/g, (whole, scheme: string, authority: string) => {
+    const at = authority.lastIndexOf("@");
+    if (at < 0) return whole;
+    return `${scheme}***@${authority.slice(at + 1)}`;
+  });
+}
+
+/** 可读的调用串（含空白/引号的参数加引号；URL userinfo 已脱敏）。 */
 export function formatGitCommand(binary: string, args: string[]): string {
   return [binary, ...args]
-    .map((arg) =>
-      SAFE_ARG.test(arg) ? arg : `"${arg.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`
-    )
+    .map((raw) => {
+      const arg = maskCommandArg(raw);
+      return SAFE_ARG.test(arg) ? arg : `"${arg.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+    })
     .join(" ");
 }
 
@@ -285,6 +337,8 @@ export type GitErrorClass = "transient" | "persistent" | "manual" | "unknown";
 
 export type GitErrorReason =
   | "git-missing"
+  | "spawn-denied"
+  | "spawn-failed"
   | "timeout"
   | "output-limit"
   | "network"
@@ -426,12 +480,40 @@ const UNKNOWN_CLASSIFICATION: GitErrorClassification = {
  */
 export function classifyGitError(result: GitResult): GitErrorClassification {
   if (result.spawnError) {
-    return {
-      kind: "persistent",
-      reason: "git-missing",
-      message: "未找到 git 命令或无法启动 git",
-      fix: "安装 git 后重试（Debian/Ubuntu：sudo apt install git）",
-    };
+    // spawn 错误按码分流（审查建议 #6）：ENOENT 才是「没装 git」；ENOTDIR 是
+    // cwd 指向了文件；EACCES/EPERM 是权限问题；其余不冒充 git-missing。
+    switch (result.spawnError) {
+      case "ENOENT":
+        return {
+          kind: "persistent",
+          reason: "git-missing",
+          message: "未找到 git 命令或无法启动 git",
+          fix: "安装 git 后重试（Debian/Ubuntu：sudo apt install git）",
+        };
+      case "ENOTDIR":
+      case "EISDIR":
+        return {
+          kind: "persistent",
+          reason: "workdir-missing",
+          message: "工作目录不存在或不可进入",
+          fix: "确认数据目录存在且可访问（顶层 --teams 目录会被自动创建）",
+        };
+      case "EACCES":
+      case "EPERM":
+        return {
+          kind: "persistent",
+          reason: "spawn-denied",
+          message: "无法启动 git 进程（权限不足）",
+          fix: "检查 git 可执行文件与工作目录的访问权限后重试",
+        };
+      default:
+        return {
+          kind: "persistent",
+          reason: "spawn-failed",
+          message: `无法启动 git 进程（${result.spawnError}）`,
+          fix: "检查 git 安装与运行环境后重试",
+        };
+    }
   }
   if (result.timedOut) {
     return {

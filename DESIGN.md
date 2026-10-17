@@ -2211,3 +2211,40 @@ resolver 矩阵 8（undefined/true/false/getter 异常/null·undefined settings 
 - `src/index.test.ts`：设计/执行两阶段放行；守卫预算不消耗（多次调用后仍恰好 3 次 read 通过）；sticky 期间两工具仍可用而 read 继续被拦；预定义提示词负例（不列举）。
 - `src/session/tl-read-guard.test.ts`：显式豁免用例（sticky 下不拦截、不计数）。
 - `src/prompts/dynamic-mode.test.ts`：两阶段提示词负例（不列举）。
+
+## 32. 云同步（Team Definition Cloud Sync）——阶段 1 基础设施
+
+**目的**：让团队定义（`teams/*.yaml`）多机一致并可云备份。整体机制（见方案定稿）：`teams/` 目录本身作为 git 工作区，与一个手工创建的**私有**远端仓库对应；`/team sync` 一条命令完成双向同步，启动时提醒云端更新，冲突不自动合并。本节只登记**阶段 1（基础设施，用户不可见）**；阶段 2–5（命令编排、启动检测、冲突决策 UI、文档与守卫）待实现。
+
+### 32.1 模块与契约
+
+- `src/sync/config.ts` —— 机器级配置 `<rootDir>/sync.yaml`（独立于 `settings.yaml` 与临时设置/快照机制）。
+  - 形态：`{ enabled: boolean; remoteUrl: string; branch: string }`；`enabled` 严格 `=== true` 才算启用；`branch` 空 = 自动探测。
+  - 地址白名单：`https://`、`ssh://`、`git@host:path`（scp 形态）、`file://`、本地绝对路径（含 Windows 盘符，防御性）。拒绝：以 `-` 开头的值（命令选项注入）、一切内嵌密码、https/file 的 userinfo、其它协议、控制字符。
+  - 读取（fail-open）：文件缺失/不可读/YAML 解析失败/根非对象 → `null`（视为未配置）；**读取时执行地址校验**，非法值清空该字段并 `console.warn`（其余字段保留）；合法值去首尾空白。
+  - 写入：拒绝非法地址（显式报错）；未知键保留（只覆盖本插件管理的三个键）；同目录临时文件 + rename 原子替换，`mode 0600` + 尽力 fsync。
+  - `maskRemoteUrl()` 展示脱敏：https/http 遮蔽全部 userinfo，其它 scheme 只遮蔽密码；userinfo 只在 authority（`://` 到首个 `/?#`）内识别，路径中的 `@` 不误判。
+- `src/sync/git-runner.ts` —— 统一 git 执行器（生产代码中唯一允许直接 `child_process` 的同步模块）。
+  - 环境硬化：`LC_ALL=C`、`GIT_TERMINAL_PROMPT=0`、`GIT_PAGER=cat`、`GIT_EDITOR=true`；清除 `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`/`GIT_OBJECT_DIRECTORY`/`GIT_COMMON_DIR`/`GIT_ALTERNATE_OBJECT_DIRECTORIES`/`GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`/`GIT_CEILING_DIRECTORIES` 与动态注入的 `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`；调用点 `env` 在清除**之后**应用（临时索引）；未显式配置时默认 `GIT_SSH_COMMAND="ssh -o BatchMode=yes"`。
+  - 调用语义：统一 `git -C <dir>`；硬超时（默认 30s）→ SIGTERM → SIGKILL → 兜底 settle；单流输出上限（默认 1 MiB）超限即 kill；`splitNullTerminated()` 解析 `-z`；结果为 `{ ok, stdout, stderr, code, timedOut, outputLimitExceeded, spawnError?, command }`——**spawn 同步抛错（如 cwd 是文件）也走结构化结果，不 reject**；`command` 中的 URL userinfo 已脱敏。
+  - `classifyGitError()`（纯函数）返回 `{ kind: transient|persistent|manual|unknown, reason, message, fix }`；spawn 错误按码分流（ENOENT→git-missing、ENOTDIR/EISDIR→workdir-missing、EACCES/EPERM→spawn-denied、其余→spawn-failed）；文本判据覆盖 git 缺失、鉴权、SSH 主机指纹、仓库不存在、DNS/连接/TLS、超时、`index.lock`、可疑所有权、游离 HEAD、未完成合并/变基/拣选、非仓库目录、工作目录缺失、远端读取兜底。
+- `src/sync/lock.ts` —— 进程级同步锁 `<rootDir>/sync.lock`。
+  - 原子创建：先写候选文件（完整 JSON，`0600`）→ `linkSync` 抢占目标（`EEXIST` 即已被持有）→ 删候选；不支持硬链接时降级 `wx` 直写，并由「不可解析文件新鲜度宽限（2s）」兜底。**锁文件一旦出现即内容完整**，不存在被并发读者误判陈旧的空文件窗口。
+  - 陈旧判定：锁信息不可读 → 陈旧；来自其它主机 → 保守视为不陈旧；本机且 pid 已死 → 陈旧可夺取（rename 抢占 + 重建）。
+  - 释放：幂等；以 `pid + random token` 校验身份，不误删被他人接手的锁。
+- `src/sync/classify.ts` —— 三方比较真值表（纯函数，零 IO）：输入 `{ path, base, local, remote }` 内容令牌（生产用 git blob id），输出 §7.C 全 13 行分类；冲突选项集按真值表顺序（both-modified/add-add 三选项；delete/modify 与 modify/delete 各自两选项）；首次接入 `base=null` 退化为四类。
+- `src/team/store.ts` —— `writeTeam` 改为同目录临时文件（`*.tmp-<pid>`，不匹配 `*.yaml`）+ rename 原子替换 + 尽力 fsync；任一步失败清理临时文件、旧文件内容不变。
+
+### 32.2 边界与未做（阶段 1）
+
+- 不实现阶段 2–5：无 `/team sync` 命令、无 fetch/push、无启动检测、无冲突决策 UI、无归档与新团队导入、无静态 `child_process` 守卫、无 README/ADR。
+- 不写 `settings.yaml`、不进临时设置/`/team resume` 快照（机器级语义，结构性排除）。
+- 阶段 2 调用点须同时用 `--` 终止选项解析（双保险，登记为阶段 2 待办）。
+
+### 32.3 验证
+
+- `src/sync/config.test.ts`：地址校验矩阵（正/反例）、往返、损坏 fail-open、未知键保留、读取时非法值清空、写入拒绝非法值、脱敏矩阵（含路径 `@`）、原子写与 `0600`。
+- `src/sync/git-runner.test.ts`：环境硬化（含动态 `GIT_CONFIG_*`）、超时 kill、maxBuffer、`-z`、真实 git 集成、cwd 为文件/不存在不 reject、失败分类表与 spawn 码分流、命令串脱敏。
+- `src/sync/lock.test.ts`：获取/释放/幂等、陈旧夺取、跨主机保守、空锁新鲜期保守持有与过期夺取、`linkSync` 插桩的原子性回归、token 身份。
+- `src/sync/classify.test.ts`：13 行全覆盖 + 行号防漏守卫 + 首次接入退化。
+- `src/team/store.atomic.test.ts`：注入 fs 失败（rename/写半截/首次创建）原文件不变 + 临时文件清理 + fsync。

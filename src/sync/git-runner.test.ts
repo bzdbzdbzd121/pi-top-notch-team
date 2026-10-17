@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, realpathSync } from "node:fs";
+import { mkdtempSync, rmSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -26,7 +26,7 @@ const failure = (stderr: string, extra: Partial<GitResult> = {}): GitResult => (
 });
 
 describe("buildGitEnv（环境硬化）", () => {
-  it("清除外部注入的 GIT_* 定位变量（允许我们自己重设临时索引）", () => {
+  it("清除外部注入的 GIT_* 定位/配置变量（允许我们自己重设临时索引）", () => {
     const base: NodeJS.ProcessEnv = {
       PATH: "/usr/bin",
       GIT_DIR: "/injected/.git",
@@ -35,11 +35,21 @@ describe("buildGitEnv（环境硬化）", () => {
       GIT_OBJECT_DIRECTORY: "/injected/objects",
       GIT_COMMON_DIR: "/injected/common",
       GIT_ALTERNATE_OBJECT_DIRECTORIES: "/injected/alt",
+      GIT_CONFIG_GLOBAL: "/injected/gitconfig",
+      GIT_CONFIG_SYSTEM: "/injected/system-config",
+      GIT_CEILING_DIRECTORIES: "/injected",
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "core.sshCommand",
+      GIT_CONFIG_VALUE_0: "/injected/evil-ssh",
     };
     const env = buildGitEnv(undefined, base);
     for (const key of GIT_ENV_STRIPPED) {
       expect(env[key], key).toBeUndefined();
     }
+    // 动态注入的 GIT_CONFIG_COUNT/KEY_n/VALUE_n 逐键清除（审查建议 #7）
+    expect(env.GIT_CONFIG_COUNT).toBeUndefined();
+    expect(env.GIT_CONFIG_KEY_0).toBeUndefined();
+    expect(env.GIT_CONFIG_VALUE_0).toBeUndefined();
     expect(env.PATH).toBe("/usr/bin");
   });
 
@@ -87,6 +97,21 @@ describe("formatGitCommand", () => {
   it("含空白/引号的参数加引号", () => {
     expect(formatGitCommand("git", ["-C", "/tmp/a b", "status"])).toBe('git -C "/tmp/a b" status');
     expect(formatGitCommand("git", ["commit-tree", "x", "-m", 'say "hi"'])).toBe('git commit-tree x -m "say \\"hi\\""');
+  });
+
+  it("命令串中的 URL userinfo 被脱敏（审查建议 #4）", () => {
+    expect(formatGitCommand("git", ["fetch", "https://user:secret@github.com/u/r.git"])).toBe(
+      "git fetch https://***@github.com/u/r.git"
+    );
+    expect(formatGitCommand("git", ["ls-remote", "ssh://user:secret@github.com/u/r.git"])).toBe(
+      "git ls-remote ssh://***@github.com/u/r.git"
+    );
+    // 双 @（密码含 @）也能被整体遮蔽（authority 内取最后一个 @）
+    expect(formatGitCommand("git", ["fetch", "https://user:pa@ss@github.com/u/r.git"])).toBe(
+      "git fetch https://***@github.com/u/r.git"
+    );
+    // 非 URL 参数中的 @ 不受影响
+    expect(formatGitCommand("git", ["add", "--", "teams/a@b.yaml"])).toBe("git add -- teams/a@b.yaml");
   });
 });
 
@@ -154,6 +179,26 @@ describe("runGit（真实 git 集成）", () => {
     expect(cls.reason).toBe("git-missing");
     expect(cls.fix).toContain("git");
   });
+
+  it("cwd 指向普通文件 → 不 reject，结构化失败 + 分类 workdir-missing（审查 #1）", async () => {
+    const filePath = join(rootDir, "not-a-directory");
+    writeFileSync(filePath, "x", "utf-8");
+
+    // 旧实现：spawn 同步抛 ENOTDIR → Promise reject（契约破坏）。
+    // 现在必须 resolve 为结构化结果。
+    const res = await runGit(["--version"], { cwd: filePath });
+    expect(res.ok).toBe(false);
+    const cls = classifyGitError(res);
+    expect(cls.kind).toBe("persistent");
+    expect(cls.reason).toBe("workdir-missing");
+  });
+
+  it("cwd 不存在 → 结构化失败 + 分类 workdir-missing（不误报 git-missing）", async () => {
+    const res = await runGit(["--version"], { cwd: join(rootDir, "no-such-dir") });
+    expect(res.ok).toBe(false);
+    expect(res.spawnError).toBeUndefined();
+    expect(classifyGitError(res).reason).toBe("workdir-missing");
+  });
 });
 
 describe("spawnCapture（超时与输出上限）", () => {
@@ -204,6 +249,18 @@ describe("spawnCapture（超时与输出上限）", () => {
     expect(res.stdout).toBe("out\n");
     expect(res.stderr).toBe("err\n");
   });
+
+  it("spawn 同步抛错（cwd 为文件 ENOTDIR）→ 结构化 spawnError，绝不 reject（审查 #1）", async () => {
+    const filePath = join(rootDir, "not-a-directory");
+    writeFileSync(filePath, "x", "utf-8");
+
+    const res = await spawnCapture(process.execPath, ["-e", ""], { cwd: filePath, env: buildGitEnv() });
+    expect(res.ok).toBe(false);
+    expect(res.spawnError).toBe("ENOTDIR");
+
+    const cls = classifyGitError({ ...res, command: "git --version" } as GitResult);
+    expect(cls.reason).toBe("workdir-missing");
+  });
 });
 
 describe("classifyGitError（失败分类表，方案 §7.E）", () => {
@@ -229,6 +286,10 @@ describe("classifyGitError（失败分类表，方案 §7.E）", () => {
     ["游离 HEAD", "fatal: You are not currently on a branch.", "manual", "manual"],
     ["未完成的合并", "fatal: You have not concluded your merge (MERGE_HEAD exists).", "manual", "manual"],
     ["未知失败", "fatal: something nobody has seen before", "unknown", "unknown"],
+    ["workdir 不存在（cannot change to）", "fatal: cannot change to '/x/teams': No such file or directory", "workdir-missing", "persistent"],
+    ["远端读取失败兜底", "fatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights", "auth", "persistent"],
+    ["未完成的变基", "fatal: You have not concluded your rebase (REBASE_HEAD exists).", "manual", "manual"],
+    ["拣选进行中", "fatal: You are in the middle of a cherry-pick", "manual", "manual"],
   ])("%s → %s/%s", (_desc, stderr, reason, kind) => {
     const cls = classifyGitError(failure(stderr as string));
     expect(cls.reason).toBe(reason);
@@ -245,6 +306,19 @@ describe("classifyGitError（失败分类表，方案 §7.E）", () => {
   it("spawn ENOENT 优先于空 stderr", () => {
     const cls = classifyGitError(failure("", { code: null, spawnError: "ENOENT" }));
     expect(cls.reason).toBe("git-missing");
+  });
+
+  it.each([
+    ["ENOTDIR", "workdir-missing"],
+    ["EISDIR", "workdir-missing"],
+    ["EACCES", "spawn-denied"],
+    ["EPERM", "spawn-denied"],
+    ["EAGAIN", "spawn-failed"],
+  ])("spawnError %s → %s（不冒充 git-missing，审查 #6）", (code, reason) => {
+    const cls = classifyGitError(failure("", { code: null, spawnError: code }));
+    expect(cls.reason).toBe(reason);
+    expect(cls.kind).toBe("persistent");
+    expect(cls.fix).toBeTruthy();
   });
 
   it("输出超上限 → 明确诊断（不做文案猜测）", () => {

@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, readdirSync, mkdirSync } from "node:fs";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { parse as parseYaml } from "yaml";
@@ -39,6 +39,8 @@ describe("SyncConfig 地址校验矩阵（方案 §7.B）", () => {
     ["https://user@github.com/u/r.git", "https 内嵌用户名"],
     ["https://user:secret@github.com/u/r.git", "https 内嵌用户名+密码"],
     ["https://ghp_token@github.com/u/r.git", "https 内嵌 token"],
+    ["ssh://user:secret@github.com/u/r.git", "任何 scheme 内嵌密码（审查 #4）"],
+    ["ssh://git:secret@github.com/u/r.git", "ssh 内嵌密码"],
     ["http://github.com/u/r.git", "不支持的协议 http"],
     ["git://github.com/u/r.git", "不支持的协议 git"],
     ["ftp://example.com/x", "不支持的协议 ftp"],
@@ -65,8 +67,9 @@ describe("SyncConfig 地址校验矩阵（方案 §7.B）", () => {
 
   it("https 内嵌凭据的拒绝理由说明原因", () => {
     expect(validateRemoteUrl("https://user:pass@github.com/u/r.git")).toContain("内嵌");
-    // ssh://git@host/path 允许（git 不是秘密）
+    // ssh://git@host/path 允许（git 不是秘密）；带密码一律拒绝
     expect(validateRemoteUrl("ssh://git@github.com/u/r.git")).toBeNull();
+    expect(validateRemoteUrl("ssh://user:secret@github.com/u/r.git")).toContain("密码");
   });
 
   it("normalizeRemoteUrl 只做首尾去空白", () => {
@@ -81,7 +84,11 @@ describe("maskRemoteUrl（展示脱敏）", () => {
     ["https://user:pass@github.com/u/r.git", "https://***@github.com/u/r.git"],
     ["https://token@github.com/u/r.git", "https://***@github.com/u/r.git"],
     ["https://github.com/u/r.git", "https://github.com/u/r.git"],
+    ["https://github.com/u/r@2.git", "https://github.com/u/r@2.git"], // 路径含 @ 不误判（审查 #5）
+    ["https://user@github.com/u/r@2.git", "https://***@github.com/u/r@2.git"],
+    ["https://user:pa@ss@github.com/u/r.git", "https://***@github.com/u/r.git"],
     ["ssh://git@github.com/u/r.git", "ssh://git@github.com/u/r.git"],
+    ["ssh://git@github.com:2222/u/r.git", "ssh://git@github.com:2222/u/r.git"],
     ["ssh://user:pass@github.com/u/r.git", "ssh://user:***@github.com/u/r.git"],
     ["git@github.com:u/r.git", "git@github.com:u/r.git"],
     ["/home/user/repos/team-defs", "/home/user/repos/team-defs"],
@@ -193,6 +200,89 @@ describe("sync.yaml 读写", () => {
     saveSyncConfig({ enabled: true, remoteUrl: "/tmp/repo", branch: "" }, rootDir);
     const leftovers = readdirSync(rootDir).filter((f) => f.includes(".tmp"));
     expect(leftovers).toEqual([]);
+  });
+
+  it("读取时校验地址：非法值被清空并 warn（审查 #3）", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      writeFileSync(
+        getSyncConfigPath(rootDir),
+        ["enabled: true", "remoteUrl: '--upload-pack=evil'", "branch: main", ""].join("\n"),
+        "utf-8"
+      );
+      const loaded = loadSyncConfig(rootDir)!;
+      expect(loaded.remoteUrl).toBe("");
+      expect(loaded.enabled).toBe(true); // 其余字段保留
+      expect(loaded.branch).toBe("main");
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("仓库地址非法"));
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("读取时校验地址：内嵌凭据值被清空（不进入 git 命令）", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      writeFileSync(
+        getSyncConfigPath(rootDir),
+        ["enabled: true", "remoteUrl: 'https://user:secret@github.com/u/r.git'", "branch: ''", ""].join("\n"),
+        "utf-8"
+      );
+      expect(loadSyncConfig(rootDir)!.remoteUrl).toBe("");
+      expect(warnSpy).toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("非法地址重复读取只 warn 一次（防刷屏）", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      writeFileSync(getSyncConfigPath(rootDir), "remoteUrl: '--upload-pack=evil'\n", "utf-8");
+      expect(loadSyncConfig(rootDir)!.remoteUrl).toBe("");
+      expect(loadSyncConfig(rootDir)!.remoteUrl).toBe("");
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("读取时对地址去首尾空白（normalize）", () => {
+    writeFileSync(
+      getSyncConfigPath(rootDir),
+      ['enabled: true', "remoteUrl: '  https://github.com/u/r.git  '", "branch: ''", ""].join("\n"),
+      "utf-8"
+    );
+    expect(loadSyncConfig(rootDir)!.remoteUrl).toBe("https://github.com/u/r.git");
+  });
+
+  it("写入非法地址 → 显式报错且不落盘（审查 #3 双保险）", () => {
+    expect(() =>
+      saveSyncConfig({ enabled: true, remoteUrl: "--upload-pack=evil", branch: "" }, rootDir)
+    ).toThrow(/非法/);
+    expect(existsSync(getSyncConfigPath(rootDir))).toBe(false);
+  });
+
+  it("写入非法地址不会覆盖已有合法配置", () => {
+    const config = { enabled: true, remoteUrl: "https://github.com/u/r.git", branch: "main" };
+    saveSyncConfig(config, rootDir);
+    expect(() =>
+      saveSyncConfig({ enabled: true, remoteUrl: "https://user:secret@github.com/u/r.git", branch: "" }, rootDir)
+    ).toThrow();
+    expect(loadSyncConfig(rootDir)).toEqual(config);
+  });
+
+  it.skipIf(process.platform === "win32")("写入后的 sync.yaml 权限为 0600（审查 #4）", () => {
+    saveSyncConfig({ enabled: true, remoteUrl: "https://github.com/u/r.git", branch: "" }, rootDir);
+    const mode = statSync(getSyncConfigPath(rootDir)).mode & 0o777;
+    expect(mode).toBe(0o600);
+  });
+
+  it.skipIf(process.platform === "win32")("已有 0600 配置被覆盖后仍为 0600（rename 不降权）", () => {
+    saveSyncConfig({ enabled: true, remoteUrl: "https://github.com/u/r.git", branch: "" }, rootDir);
+    chmodSync(getSyncConfigPath(rootDir), 0o600);
+    saveSyncConfig({ enabled: false, remoteUrl: "https://github.com/u/r.git", branch: "dev" }, rootDir);
+    expect(statSync(getSyncConfigPath(rootDir)).mode & 0o777).toBe(0o600);
   });
 
   it("保存失败（目标目录不可写）不吞错、不留半截文件", () => {
