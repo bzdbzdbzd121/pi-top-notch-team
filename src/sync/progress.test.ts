@@ -38,7 +38,7 @@ interface FakeTimers {
   intervalMs: number[];
 }
 
-function fakeTimers(): FakeTimers {
+function fakeTimers(options?: { unrefThrows?: boolean; clearThrows?: boolean }): FakeTimers {
   let nextId = 1;
   const active = new Map<number, { cb: () => void; id: number }>();
   const unrefCounts: number[] = [];
@@ -53,11 +53,13 @@ function fakeTimers(): FakeTimers {
         id,
         unref: () => {
           unrefCounts[id] = (unrefCounts[id] ?? 0) + 1;
+          if (options?.unrefThrows) throw new Error("unref exploded");
         },
       };
       return handle;
     }) as unknown as FakeTimers["setInterval"],
     clearInterval: ((handle: unknown) => {
+      if (options?.clearThrows) throw new Error("clearInterval exploded");
       const id = (handle as { id?: number } | undefined)?.id;
       if (typeof id === "number") active.delete(id);
     }) as unknown as FakeTimers["clearInterval"],
@@ -118,6 +120,30 @@ describe("阶段 1 文案矩阵（§3.3 / §7.B）", () => {
     ];
     for (const [elapsedMs, expected] of cases) {
       expect(formatSyncStageText("fetch", elapsedMs)).toContain(expected);
+    }
+  });
+
+  it("秒数极端入参：NaN / Infinity / 负数一律兜底 0s（不显示 NaNs）", () => {
+    for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, -1, -59_000]) {
+      const text = formatSyncStageText("fetch", bad);
+      expect(text).toBe("☁️ 云同步：获取云端更新…（0s）");
+    }
+  });
+
+  it("决策态计数越界/非法一律退化为无计数形态（不显示自相矛盾进度）", () => {
+    const base = "☁️ 云同步：⏸ 等待你的决策";
+    expect(formatSyncWaitText("decision", 1, 3)).toBe(`${base}（1/3）`);
+    expect(formatSyncWaitText("decision", 3, 3)).toBe(`${base}（3/3）`);
+    for (const [index, total] of [
+      [0, 3],
+      [5, 3],
+      [1, 0],
+      [-1, 3],
+      [1.5, 3],
+      [1, 3.5],
+      [Number.NaN, 3],
+    ] as [number, number][]) {
+      expect(formatSyncWaitText("decision", index, total)).toBe(base);
     }
   });
 
@@ -260,6 +286,51 @@ describe("阶段 1 定时器纪律（§3.5）", () => {
     expect(timers.activeCount()).toBe(1);
   });
 
+  it("setInterval 抛错：stage() 不抛错、状态仍写入、无句柄残留", () => {
+    const fake = fakeUi();
+    const timers = fakeTimers();
+    const progress = createSyncProgress(fake.ui as never, {
+      now: () => 0,
+      setInterval: () => {
+        throw new Error("setInterval exploded");
+      },
+      clearInterval: timers.clearInterval,
+    });
+    expect(() => progress.stage("fetch")).not.toThrow();
+    expect(fake.calls).toHaveLength(1); // 进度可见（只是不刷新秒数）
+    expect(fake.calls[0].text).toContain("获取云端更新…（0s）");
+    expect(() => progress.end()).not.toThrow();
+    // 后续阶段仍可尝试（无句柄 → 每次重新尝试起表）
+    expect(() => progress.stage("apply")).not.toThrow();
+  });
+
+  it("unref 抛错：句柄已登记 → end() 仍能清理（活动定时器归 0，不留未 unref 的 interval）", () => {
+    const fake = fakeUi();
+    const timers = fakeTimers({ unrefThrows: true });
+    const { progress } = makeProgress(fake.ui, { timers });
+
+    expect(() => progress.stage("fetch")).not.toThrow();
+    expect(timers.activeCount()).toBe(1); // 定时器确实创建了
+    expect(timers.unrefCounts[1]).toBe(1); // unref 被调用过（虽然抛错）
+
+    expect(() => progress.end()).not.toThrow();
+    expect(timers.activeCount()).toBe(0); // 回归：句柄先登记，故仍可被清理
+  });
+
+  it("clearInterval 抛错：end() 不抛错，且此后 tick 不再写状态（不回填残影）", () => {
+    const fake = fakeUi();
+    const timers = fakeTimers({ clearThrows: true });
+    const { progress } = makeProgress(fake.ui, { timers });
+    progress.stage("fetch");
+    const callsBeforeEnd = fake.calls.length;
+
+    expect(() => progress.end()).not.toThrow();
+    expect(fake.calls.at(-1)).toEqual({ key: SYNC_PROGRESS_STATUS_KEY, text: undefined });
+
+    timers.tick(); // 假定时器仍在（clear 失败），但内部已 ended/无阶段 → 不得再写
+    expect(fake.calls).toHaveLength(callsBeforeEnd + 1);
+  });
+
   it("定时器回调内的 UI 抛错不会外泄（fail-open）", () => {
     let shouldThrow = false;
     const fake = fakeUi(() => {
@@ -296,7 +367,7 @@ describe("阶段 1 fail-open（§3.7 UI 不可用）", () => {
     expect(timers.activeCount()).toBe(0);
   });
 
-  it("ui 缺失 / setStatus 非函数 / ui 为 undefined 时全部 no-op 且不抛错", () => {
+  it("ui 缺失 / setStatus 非函数时 stage() 短路：不写状态、不起表（无无用定时器）", () => {
     for (const ui of [undefined, {}, { setStatus: null }, { setStatus: "nope" }]) {
       const timers = fakeTimers();
       const progress = createSyncProgress(ui as never, {
@@ -304,10 +375,21 @@ describe("阶段 1 fail-open（§3.7 UI 不可用）", () => {
         clearInterval: timers.clearInterval,
       });
       expect(() => progress.stage("fetch")).not.toThrow();
+      // 语义断言（在 wait/end 之前）：无可用状态栏出口 → 根本不创建定时器
+      expect(timers.activeCount()).toBe(0);
+      expect(timers.intervalMs).toHaveLength(0);
       expect(() => progress.wait("decision", 1, 1)).not.toThrow();
       expect(() => progress.end()).not.toThrow();
-      expect(timers.activeCount()).toBe(0); // 无 UI 就不起表
+      expect(timers.activeCount()).toBe(0);
     }
+  });
+
+  it("有可用 setStatus 时 stage() 才起表（与无 UI 短路形成对照）", () => {
+    const fake = fakeUi();
+    const { progress, timers } = makeProgress(fake.ui);
+    progress.stage("fetch");
+    expect(timers.intervalMs).toEqual([1000]);
+    expect(fake.calls).toHaveLength(1);
   });
 });
 

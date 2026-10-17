@@ -41,8 +41,12 @@ const WAIT_WORDS: Record<SyncWaitKind, string> = {
 const PREFIX = "☁️ 云同步：";
 const TICK_MS = 1000;
 
-/** 秒数格式化：向下取整（0s/1s/59s/120s）。 */
+/**
+ * 秒数格式化：向下取整（0s/1s/59s/120s）。
+ * 非有限值（NaN/Infinity）与负数一律兜底为 0s——注入时钟异常时显示「（0s）」而不是「（NaNs）」。
+ */
 function formatSeconds(elapsedMs: number): string {
+  if (!Number.isFinite(elapsedMs)) return "0s";
   const seconds = Math.max(0, Math.floor(elapsedMs / TICK_MS));
   return `${seconds}s`;
 }
@@ -54,11 +58,19 @@ export function formatSyncStageText(stage: SyncStage, elapsedMs: number): string
 
 /**
  * 等待态文本（纯函数）：**不含秒数**。
- * 决策态在拿到 `index`/`total` 时显示计数 `（i/n）`，让用户知道还要回答几次。
+ * 决策态在拿到合法计数时显示 `（i/n）`，让用户知道还要回答几次；
+ * 计数缺失或越界（`1 ≤ i ≤ n` 之外，如 `0/3`、`5/3`）一律退化为无计数形态——
+ * 宁可不显示，也不显示自相矛盾的进度。
  */
 export function formatSyncWaitText(kind: SyncWaitKind, index?: number, total?: number): string {
   const word = WAIT_WORDS[kind];
-  if (kind === "decision" && Number.isInteger(index) && Number.isInteger(total) && (total ?? 0) > 0) {
+  const validCount =
+    Number.isInteger(index) &&
+    Number.isInteger(total) &&
+    (total as number) > 0 &&
+    (index as number) >= 1 &&
+    (index as number) <= (total as number);
+  if (kind === "decision" && validCount) {
     return `${PREFIX}${word}（${index}/${total}）`;
   }
   return `${PREFIX}${word}`;
@@ -104,6 +116,9 @@ export function createSyncProgress(ui: SyncProgressUi, options?: SyncProgressOpt
   let currentStage: SyncStage | null = null;
   let stageStartedAt = 0;
 
+  /** 是否存在可用的状态栏出口（无 UI 时进度无处可去，不起任何定时器）。 */
+  const hasStatusUi = (): boolean => typeof ui?.setStatus === "function";
+
   const write = (text: string | undefined): void => {
     try {
       const setStatus = ui?.setStatus;
@@ -126,22 +141,31 @@ export function createSyncProgress(ui: SyncProgressUi, options?: SyncProgressOpt
 
   const startTimer = (): void => {
     if (timer !== undefined) return; // 已在计时（重复进入同一阶段不堆定时器）
+    let handle: unknown;
     try {
-      const handle = setIntervalFn(() => {
+      handle = setIntervalFn(() => {
         if (currentStage === null) return;
         // 时间戳差值：阻塞后一次 tick 就跳到真实耗时（不漂移）
         write(formatSyncStageText(currentStage, now() - stageStartedAt));
       }, TICK_MS);
-      (handle as { unref?: () => void } | undefined)?.unref?.();
-      timer = handle;
     } catch {
-      timer = undefined; // 定时器不可用：进度仍可见（只是不刷新秒数）
+      timer = undefined; // setInterval 本身不可用：进度仍可见（只是不刷新秒数）
+      return;
+    }
+    // 句柄先登记再 unref：unref 抛错时定时器仍可被 end()/wait() 清理
+    //（否则未 unref 的 interval 会阻止进程退出，且再无句柄可清）。
+    timer = handle;
+    try {
+      (handle as { unref?: () => void } | undefined)?.unref?.();
+    } catch {
+      /* unref 失败：句柄已登记，clearInterval 仍然有效 */
     }
   };
 
   return {
     stage(stage: SyncStage): void {
       if (ended) return;
+      if (!hasStatusUi()) return; // 无 UI：不写状态、不起表（避免无用定时器）
       currentStage = stage;
       stageStartedAt = now();
       write(formatSyncStageText(stage, 0));
