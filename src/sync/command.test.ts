@@ -130,10 +130,10 @@ describe("阶段 2 输出文案（验收 13）", () => {
       commit: "a1b2c3d",
       pushed: true,
       passthroughUpdated: ["README.md"],
-      archivedFiles: [{ path: "README.md", archivePath: `${homedir()}/.pi/top-notch-team/sync-conflicts/README.md.20261017-120100` }],
+      archivedFiles: [{ path: "README.md", archivePath: `${homedir()}/.pi/top-notch-team/sync-conflicts/README.md-1a2b3c4d.20261017-120100` }],
     });
     expect(text).toContain("非团队文件（云端为准）：1（README.md）");
-    expect(text).toContain("留档：1 个非团队文件的本机版本（README.md → ~/.pi/top-notch-team/sync-conflicts/README.md.20261017-120100）");
+    expect(text).toContain("留档：1 个非团队文件的本机版本（README.md → ~/.pi/top-notch-team/sync-conflicts/README.md-1a2b3c4d.20261017-120100）");
   });
 
   it("非法 YAML 文案写明真实后果（偏差 2）", () => {

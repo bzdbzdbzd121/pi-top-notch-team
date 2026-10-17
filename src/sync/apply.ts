@@ -12,6 +12,7 @@
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync, openSync, fsyncSync, closeSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { createHash } from "node:crypto";
 import type { FileClass } from "./classify";
 import {
   describeSyncFailure,
@@ -134,6 +135,17 @@ function writeFileAtomic(absPath: string, content: string | Buffer): void {
   }
 }
 
+/** 清理本次运行新建的留档（回滚路径专用：已被还原的工作区不再需要冗余留档）。 */
+function cleanupCreatedArchives(archives: string[]): void {
+  for (const abs of archives) {
+    try {
+      rmSync(abs, { force: true });
+    } catch {
+      /* 尽力而为 */
+    }
+  }
+}
+
 function rollback(journal: JournalEntry[]): void {
   for (const entry of [...journal].reverse()) {
     try {
@@ -157,19 +169,68 @@ export function syncConflictsDir(rootDir: string): string {
   return join(rootDir, "sync-conflicts");
 }
 
+/** Windows 保留设备名（含扩展名前的首个点段）——归档名必须规避，否则 Windows 上必失败。 */
+const WINDOWS_RESERVED_NAMES = new Set([
+  "con",
+  "prn",
+  "aux",
+  "nul",
+  ...Array.from({ length: 9 }, (_, i) => `com${i + 1}`),
+  ...Array.from({ length: 9 }, (_, i) => `lpt${i + 1}`),
+]);
+
+/** 路径安全化：只折掉真正的路径/非法字符，保留中文、空格等可读信息。 */
+function sanitizeArchiveName(relPath: string): string {
+  const safe = relPath
+    // 路径分隔符与 Windows 非法字符（含控制字符）→ `_`
+    .replace(/[\\/:*?"<>|\u0000-\u001f]+/g, "_")
+    // 前导 `.`/`_` 折叠（避免 `..`、`.hidden` 形态与隐藏文件）
+    .replace(/^[._]+/, "_")
+    // Windows 不允许文件名以点或空格结尾
+    .replace(/[. ]+$/, "");
+  if (safe.length === 0) return "file";
+  const stem = safe.split(".")[0]?.toLowerCase() ?? "";
+  return WINDOWS_RESERVED_NAMES.has(stem) ? `_${safe}` : safe;
+}
+
 /**
- * 归档文件名：`<路径安全化>.<YYYYMMDD-HHmmss>`。
- * 路径安全化把 `/`、`\` 等路径分隔符与非 ``[A-Za-z0-9._-]`` 字符换成 `_`；
- * 前导 `.` 也换掉（避免 `.hidden` / `..` 形态），空名回退为 `file`。
- * 阶段 4 的团队归档复用同一规则（目录 + 时间戳风格）。
+ * 归档文件名：`<路径安全化>-<原路径短哈希>[-<冲突序号>].<YYYYMMDD-HHmmss>`。
+ *
+ * 短哈希保证**不同路径在同一秒内也绝不撞名**（中文名/特殊字符名折成同一个
+ * 可读名也不互相覆盖）；可读名保留中文等原始信息，不再退化为 `_md` 这类无
+ * 信息名。`suffix > 1` 供同一路径同一秒的极端重复归档追加序号。
+ * 阶段 4 的团队归档复用同一目录与命名规则（见 isArchiveFileName）。
  */
-export function archiveFileName(relPath: string, now: Date): string {
+export function archiveFileName(relPath: string, now: Date, suffix = 0): string {
   const pad = (n: number): string => String(n).padStart(2, "0");
   const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(
     now.getMinutes()
   )}${pad(now.getSeconds())}`;
-  const safe = relPath.replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^[._]+/, "_");
-  return `${safe.length > 0 ? safe : "file"}.${stamp}`;
+  const hash = createHash("sha1").update(relPath).digest("hex").slice(0, 8);
+  const safe = sanitizeArchiveName(relPath);
+  const counter = suffix > 0 ? `-${suffix}` : "";
+  return `${safe}-${hash}${counter}.${stamp}`;
+}
+
+/** 归档文件名识别（status 计数与阶段 4 复用同一规则）。 */
+export function isArchiveFileName(name: string): boolean {
+  return /\.\d{8}-\d{4}(\d{2})?(\.yaml)?$/.test(name);
+}
+
+/**
+ * 取一个当前不存在的归档路径：短哈希已保证不同路径唯一，同路径同一秒重复
+ * 归档（极端情况）用序号兜底，绝不覆盖已有留档。
+ */
+function uniqueArchivePath(dir: string, relPath: string, now: Date): string {
+  for (let i = 0; i < 100; i++) {
+    const name = i === 0 ? archiveFileName(relPath, now) : archiveFileName(relPath, now, i + 1);
+    const abs = join(dir, name);
+    if (!existsSync(abs)) return abs;
+  }
+  throw manualFailure(
+    `归档目录中同名留档过多（${relPath}），已中止（未做任何改动）`,
+    "清理 sync-conflicts 目录后重试"
+  );
 }
 
 /** 云端 blob 内容（按 sha 缓存；二进制安全捕获，非文本文件不被 utf8 解码损坏）。 */
@@ -214,6 +275,8 @@ export async function applySync(input: {
   const { ctx, plan, snapshot } = input;
   const summary = emptySummary(plan);
   const journal: JournalEntry[] = [];
+  /** 本次运行新建的留档文件——回滚时一并清理（工作区已还原，留档变冗余）。 */
+  const createdArchives: string[] = [];
 
   // ── 1. TOCTOU 复核（计划期间文件/引用被改动即中止） ──
   const conflicts = listConflicts(plan);
@@ -298,11 +361,20 @@ export async function applySync(input: {
         // 覆盖前留档本机版本（方案 §4.3/§6.2#2：「云端为准」不等于丢弃本机改动）。
         // 留档失败则中止（宁可同步失败，不让用户改动消失）——回滚后本地文件保持原样。
         if (previous !== null) {
-          const archiveAbs = join(syncConflictsDir(ctx.rootDir), archiveFileName(entry.path, new Date()));
+          const archiveDir = syncConflictsDir(ctx.rootDir);
+          let archiveAbs = "";
           try {
-            mkdirSync(dirname(archiveAbs), { recursive: true });
-            writeFileSync(archiveAbs, previous);
+            mkdirSync(archiveDir, { recursive: true });
+            archiveAbs = uniqueArchivePath(archiveDir, entry.path, new Date());
+            writeFileAtomic(archiveAbs, previous); // 原子写：崩溃不留截断的「完整命名」留档
           } catch (err) {
+            if (archiveAbs.length > 0) {
+              try {
+                rmSync(archiveAbs, { force: true }); // 清掉本次写入的半成品
+              } catch {
+                /* 尽力而为 */
+              }
+            }
             throw manualFailure(
               `非团队文件被云端覆盖前的留档失败（${entry.path}），已中止（未做任何改动）：${
                 err instanceof Error ? err.message : String(err)
@@ -310,6 +382,7 @@ export async function applySync(input: {
               "确认 sync-conflicts 目录可写、磁盘空间充足后重试"
             );
           }
+          createdArchives.push(archiveAbs);
           summary.archivedFiles.push({ path: entry.path, archivePath: archiveAbs });
         }
         const absDir = dirname(abs);
@@ -350,6 +423,7 @@ export async function applySync(input: {
     }
   } catch (err) {
     rollback(journal);
+    cleanupCreatedArchives(createdArchives);
     const failure = typeof err === "object" && err !== null && "classification" in err
       ? (err as SyncFailure)
       : manualFailure(
@@ -367,6 +441,7 @@ export async function applySync(input: {
 
   const failBeforeCommit = (failure: SyncFailure): ApplyResult => {
     rollback(journal);
+    cleanupCreatedArchives(createdArchives);
     return { ok: false, summary, failure, rolledBack: true };
   };
 

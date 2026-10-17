@@ -581,6 +581,7 @@ describe("阶段 2：/team sync 集成（真实 git，裸仓库做云端）", ()
     await sync(ctx, { runGit: failingRunGit });
 
     const text = notifyText(notify);
+    console.log("DEBUG-NOTIFY>>>", JSON.stringify(text));
     expect(text).toContain("云同步失败");
     expect(text).toContain("已回滚，未做任何改动");
     // 第一个（已写盘）文件被回滚删除；引用未动
@@ -903,7 +904,7 @@ describe("阶段 2：/team sync 集成（真实 git，裸仓库做云端）", ()
     const archiveDir = join(rootDir, "sync-conflicts");
     const archived = readdirSync(archiveDir);
     expect(archived.length).toBe(1);
-    expect(archived[0].startsWith("README.md.")).toBe(true);
+    expect(archived[0]).toMatch(/^README\.md-[0-9a-f]{8}\./);
     expect(readFileSync(join(archiveDir, archived[0]), "utf-8")).toBe(localVersion);
     expect(readLocal("README.md")).toBe("cloud v2\n"); // 云端为准仍然成立
 
@@ -911,6 +912,77 @@ describe("阶段 2：/team sync 集成（真实 git，裸仓库做云端）", ()
     expect(text).toContain("留档：1 个非团队文件的本机版本（README.md → ");
     expect(text).toContain(archived[0]);
     expect(text).toContain("sync-conflicts");
+
+    // 建议 #4：status 的归档计数必须看得见这类留档（此前只数 *.yaml）
+    const statusHarness = makeHarness();
+    await handleSyncCommand(statusHarness.ctx, "status", { rootDir, statusTimeoutMs: 15_000 });
+    expect(notifyText(statusHarness.notify)).toContain("归档：1 个冲突留档待清理");
+  });
+
+  it("两条不同路径同一同步内归档 → 不撞名、内容各自正确（归档命名碰撞回归）", async () => {
+    seedRemote({ "说明.md": "cloud 说明 v1\n", "指南.md": "cloud 指南 v1\n" });
+    configure();
+    await sync(makeHarness().ctx);
+
+    // 本机改两个中文名文件；云端同时改（本机改动不上传、覆盖前留档）
+    const localNotes = "本机 说明 原内容\n";
+    const localGuide = "本机 指南 原内容\n";
+    writeLocal("说明.md", localNotes);
+    writeLocal("指南.md", localGuide);
+    remoteCommit({ "说明.md": "cloud 说明 v2\n", "指南.md": "cloud 指南 v2\n" }, "remote both");
+
+    const { ctx, notify } = makeHarness();
+    await sync(ctx);
+
+    const archiveDir = join(rootDir, "sync-conflicts");
+    const archived = readdirSync(archiveDir).sort();
+    expect(archived.length).toBe(2); // 同秒也不再互相覆盖
+    const notesArchive = archived.find((f) => f.startsWith("说明.md-"));
+    const guideArchive = archived.find((f) => f.startsWith("指南.md-"));
+    expect(notesArchive).toBeDefined();
+    expect(guideArchive).toBeDefined();
+    expect(readFileSync(join(archiveDir, notesArchive as string), "utf-8")).toBe(localNotes);
+    expect(readFileSync(join(archiveDir, guideArchive as string), "utf-8")).toBe(localGuide);
+    expect(readLocal("说明.md")).toBe("cloud 说明 v2\n");
+    expect(readLocal("指南.md")).toBe("cloud 指南 v2\n");
+  });
+
+  it("失败回滚同时清掉本次留档（措辞「未做任何改动」属实，建议 #2）", async () => {
+    seedRemote({ "a.yaml": teamYaml("a"), "README.md": "cloud v1\n" });
+    configure();
+    await sync(makeHarness().ctx);
+
+    // 本机改 README（非团队 → 覆盖前留档）+ 改团队 YAML（→ 需要构造提交）
+    writeLocal("README.md", "本机原内容\n");
+    writeLocal("a.yaml", teamYaml("a") + "# local\n");
+    remoteCommit({ "README.md": "cloud v2\n" }, "remote readme v2");
+
+    const failingCommit: typeof runGit = async (args, options) => {
+      if (args.includes("commit-tree")) {
+        return {
+          ok: false,
+          stdout: "",
+          stderr: "fatal: injected commit-tree failure",
+          code: 128,
+          timedOut: false,
+          outputLimitExceeded: false,
+          command: "git commit-tree <injected>",
+        };
+      }
+      return runGit(args, options);
+    };
+
+    const { ctx, notify } = makeHarness();
+    await sync(ctx, { runGit: failingCommit });
+
+    const text = notifyText(notify);
+    expect(text).toContain("云同步失败");
+    expect(text).toContain("已回滚，未做任何改动");
+    // 本机内容被还原（README 与 a.yaml）；本次新建的留档一并清除（不留冗余文件）
+    expect(readLocal("README.md")).toBe("本机原内容\n");
+    expect(readLocal("a.yaml")).toContain("# local");
+    const archiveDir = join(rootDir, "sync-conflicts");
+    expect(existsSync(archiveDir) ? readdirSync(archiveDir).length : 0).toBe(0);
   });
 
   it("keptLocalPaths 只统计仍存在的路径；本机已删除的已跟踪文件不再声称保留（复审建议 #2）", async () => {

@@ -20,7 +20,7 @@ import {
   type SyncConfig,
 } from "./config";
 import { acquireSyncLock, isSyncLockStale, readSyncLock } from "./lock";
-import { applySync, type ApplySummary } from "./apply";
+import { applySync, isArchiveFileName, type ApplySummary } from "./apply";
 import {
   buildSyncPlan,
   cleanupSyncResiduals,
@@ -464,7 +464,8 @@ function collectArchive(rootDir: string): { count: number; latest?: string } {
   const dir = join(rootDir, "sync-conflicts");
   if (!existsSync(dir)) return { count: 0 };
   try {
-    const files = readdirSync(dir).filter((f) => f.endsWith(".yaml")).sort();
+    // 与 archiveFileName 同一规则（海豹：此前只数 *.yaml，非团队文件留档不可见）
+    const files = readdirSync(dir).filter((f) => isArchiveFileName(f)).sort();
     if (files.length === 0) return { count: 0 };
     return { count: files.length, latest: join(dir, files[files.length - 1]) };
   } catch {
