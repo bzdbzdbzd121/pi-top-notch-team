@@ -209,7 +209,12 @@ export function loadSyncConfig(rootDir: string): SyncConfig | null {
         );
       }
       remoteUrl = "";
+    } else {
+      // 地址恢复合法：复位 warn-once，后续再次非法时能重新告警（审查建议 #6）
+      warnedInvalidRemoteUrl.delete(filePath);
     }
+  } else {
+    warnedInvalidRemoteUrl.delete(filePath);
   }
 
   return {
@@ -252,12 +257,13 @@ export function saveSyncConfig(config: SyncConfig, rootDir: string): void {
   // mode 0600（审查 #4）：配置可能含仓库地址等敏感信息，不让同机其他用户可读；
   // 先清掉可能残留的同 pid 临时文件，保证 mode 生效。
   rmSync(tmpPath, { force: true });
-  writeFileSync(tmpPath, yaml, { encoding: "utf-8", mode: 0o600 });
-  syncFileBestEffort(tmpPath); // 掉电时不留下空配置文件（尽力而为）
   try {
+    writeFileSync(tmpPath, yaml, { encoding: "utf-8", mode: 0o600 });
+    syncFileBestEffort(tmpPath); // 掉电时不留下空配置文件（尽力而为）
     renameSync(tmpPath, filePath);
   } catch (err) {
-    // 替换失败：清理临时文件后原样上抛，旧配置保持不变
+    // 任一步失败（含临时文件自身写入失败）都清理临时文件后原样上抛，
+    // 旧配置保持不变（审查建议 #3，与 store.ts 的 writeFileAtomic 同款）。
     try {
       rmSync(tmpPath, { force: true });
     } catch {
@@ -265,6 +271,8 @@ export function saveSyncConfig(config: SyncConfig, rootDir: string): void {
     }
     throw err;
   }
+  // 保存成功：复位 warn-once（审查建议 #6）
+  warnedInvalidRemoteUrl.delete(filePath);
 }
 
 /** 尽力而为地把文件数据刷到磁盘（fsync 失败不改变写入语义，只影响掉电持久性）。 */

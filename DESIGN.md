@@ -2230,8 +2230,10 @@ resolver 矩阵 8（undefined/true/false/getter 异常/null·undefined settings 
   - `classifyGitError()`（纯函数）返回 `{ kind: transient|persistent|manual|unknown, reason, message, fix }`；spawn 错误按码分流（ENOENT→git-missing、ENOTDIR/EISDIR→workdir-missing、EACCES/EPERM→spawn-denied、其余→spawn-failed）；文本判据覆盖 git 缺失、鉴权、SSH 主机指纹、仓库不存在、DNS/连接/TLS、超时、`index.lock`、可疑所有权、游离 HEAD、未完成合并/变基/拣选、非仓库目录、工作目录缺失、远端读取兜底。
 - `src/sync/lock.ts` —— 进程级同步锁 `<rootDir>/sync.lock`。
   - 原子创建：先写候选文件（完整 JSON，`0600`）→ `linkSync` 抢占目标（`EEXIST` 即已被持有）→ 删候选；不支持硬链接时降级 `wx` 直写，并由「不可解析文件新鲜度宽限（2s）」兜底。**锁文件一旦出现即内容完整**，不存在被并发读者误判陈旧的空文件窗口。
-  - 陈旧判定：锁信息不可读 → 陈旧；来自其它主机 → 保守视为不陈旧；本机且 pid 已死 → 陈旧可夺取（rename 抢占 + 重建）。
+  - 陈旧判定：锁信息不可读且**新鲜（2s 宽限内）** → 保守视为被持有（不夺取）；不可读且超过宽限 → 按陈旧夺取；stat 失败 → 保守视为新鲜；来自其它主机 → 保守视为不陈旧；本机且 pid 已死 → 陈旧可夺取（rename 抢占 + 复验身份 + 重建）。
+  - 陈旧夺取**必须复验身份**：rename 抢占后读取 retire 文件，与「判为陈旧的那个 holder」对比（pid+startedAt+token，兼容旧格式只比 pid+startedAt）；不一致（期间已被他人接手为新锁）→ `linkSync` 把活锁挂回原路径（降级复制兼容）并放弃夺取（返回 held），绝不删除他人活锁；极端情况下原路径已被新锁占据（EEXIST）→ 保留 `.stale-*` 残留（内含被误夺锁内容，供恢复/诊断）不删。
   - 释放：幂等；以 `pid + random token` 校验身份，不误删被他人接手的锁。
+  - **残留物（登记阶段 2 恢复清理）**：`*.candidate-*`（kill -9 留下的候选文件，0600）、`.stale-*`（误夺恢复失败的残留）、`sync.yaml.tmp-<other-pid>`（其它进程的临时文件）——均不匹配 `*.yaml`，不影响团队列表，由阶段 2 的「硬杀残留检测与清理」统一处理。
 - `src/sync/classify.ts` —— 三方比较真值表（纯函数，零 IO）：输入 `{ path, base, local, remote }` 内容令牌（生产用 git blob id），输出 §7.C 全 13 行分类；冲突选项集按真值表顺序（both-modified/add-add 三选项；delete/modify 与 modify/delete 各自两选项）；首次接入 `base=null` 退化为四类。
 - `src/team/store.ts` —— `writeTeam` 改为同目录临时文件（`*.tmp-<pid>`，不匹配 `*.yaml`）+ rename 原子替换 + 尽力 fsync；任一步失败清理临时文件、旧文件内容不变。
 
@@ -2240,11 +2242,12 @@ resolver 矩阵 8（undefined/true/false/getter 异常/null·undefined settings 
 - 不实现阶段 2–5：无 `/team sync` 命令、无 fetch/push、无启动检测、无冲突决策 UI、无归档与新团队导入、无静态 `child_process` 守卫、无 README/ADR。
 - 不写 `settings.yaml`、不进临时设置/`/team resume` 快照（机器级语义，结构性排除）。
 - 阶段 2 调用点须同时用 `--` 终止选项解析（双保险，登记为阶段 2 待办）。
+- 阶段 2 恢复清理需覆盖残留物：`*.candidate-*`、`.stale-*`、`sync.yaml.tmp-*`（含其它 pid 的），以及配置临时文件部分写入残留。
 
 ### 32.3 验证
 
-- `src/sync/config.test.ts`：地址校验矩阵（正/反例）、往返、损坏 fail-open、未知键保留、读取时非法值清空、写入拒绝非法值、脱敏矩阵（含路径 `@`）、原子写与 `0600`。
+- `src/sync/config.test.ts`：地址校验矩阵（正/反例）、往返、损坏 fail-open、未知键保留、读取时非法值清空、warn-once 复位、写入拒绝非法值、临时写入失败清理、脱敏矩阵（含路径 `@`）、原子写与 `0600`。
 - `src/sync/git-runner.test.ts`：环境硬化（含动态 `GIT_CONFIG_*`）、超时 kill、maxBuffer、`-z`、真实 git 集成、cwd 为文件/不存在不 reject、失败分类表与 spawn 码分流、命令串脱敏。
-- `src/sync/lock.test.ts`：获取/释放/幂等、陈旧夺取、跨主机保守、空锁新鲜期保守持有与过期夺取、`linkSync` 插桩的原子性回归、token 身份。
+- `src/sync/lock.test.ts`：获取/释放/幂等、陈旧夺取、跨主机保守、空锁新鲜期保守持有与过期夺取、`linkSync` 插桩的原子性回归、**注入式时序回归（读取与 rename 之间锁被接手 → 不抢活锁；EEXIST 极端路径保留残留）**、硬链接降级、旧格式兼容、token 身份。
 - `src/sync/classify.test.ts`：13 行全覆盖 + 行号防漏守卫 + 首次接入退化。
 - `src/team/store.atomic.test.ts`：注入 fs 失败（rename/写半截/首次创建）原文件不变 + 临时文件清理 + fsync。

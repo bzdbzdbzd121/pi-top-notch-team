@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { existsSync, linkSync, mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -11,9 +11,15 @@ import { spawn } from "node:child_process";
  */
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
-  return { ...actual, linkSync: vi.fn(actual.linkSync) };
+  return {
+    ...actual,
+    linkSync: vi.fn(actual.linkSync),
+    renameSync: vi.fn(actual.renameSync),
+    statSync: vi.fn(actual.statSync),
+  };
 });
 
+import { renameSync } from "node:fs";
 import {
   acquireSyncLock,
   getSyncLockPath,
@@ -95,6 +101,8 @@ describe("acquireSyncLock / release", () => {
   beforeEach(async () => {
     const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
     vi.mocked(linkSync).mockImplementation(actual.linkSync);
+    vi.mocked(renameSync).mockImplementation(actual.renameSync);
+    vi.mocked(statSync).mockImplementation(actual.statSync);
 
     rootDir = mkdtempSync(join(tmpdir(), "sync-lock-test-"));
     lockPath = getSyncLockPath(rootDir);
@@ -193,6 +201,116 @@ describe("acquireSyncLock / release", () => {
     expect(info.pid).toBe(process.pid);
     expect(readdirSync(rootDir).filter((f) => f.includes(".stale-") || f.includes(".candidate-"))).toEqual([]);
     if (result.ok) result.lock.release();
+  });
+
+  it("旧格式陈旧锁（无 token）仍可夺取（身份兼容）", async () => {
+    const deadPid = await reapedPid();
+    writeFileSync(
+      lockPath,
+      JSON.stringify({ pid: deadPid, startedAt: new Date().toISOString(), hostname: hostname() }),
+      "utf-8"
+    );
+
+    const result = acquireSyncLock(rootDir);
+    expect(result.ok).toBe(true);
+    expect(readSyncLock(lockPath)?.pid).toBe(process.pid);
+    if (result.ok) result.lock.release();
+  });
+
+  it("陈旧夺取竞态（复审回归）：读取与 rename 之间锁被他人接手 → 不抢活锁", async () => {
+    const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+    const deadPid = await reapedPid();
+    writeLockFile(lockPath, { pid: deadPid, hostname: hostname(), token: "STALE-LOCK" });
+
+    const bLive: SyncLockInfo = {
+      pid: 424242,
+      startedAt: new Date().toISOString(),
+      hostname: hostname(),
+      token: "B-LIVE-LOCK",
+    };
+
+    // 注入真实时序：A 读到陈旧锁后、rename 前，B 完成「移走陈旧锁 + 建立自己的有效锁」
+    vi.mocked(renameSync).mockImplementationOnce((...args: Parameters<typeof actual.renameSync>) => {
+      const [src, dest] = args;
+      const bRetire = `${String(src)}.b-retire`;
+      actual.renameSync(src, bRetire); // B 移走陈旧锁
+      actual.rmSync(bRetire, { force: true }); // B 删除陈旧锁
+      actual.writeFileSync(src, JSON.stringify(bLive), { encoding: "utf-8", mode: 0o600 });
+      actual.renameSync(src, dest); // A 的 rename：实际抢到 B 的活锁
+    });
+
+    const result = acquireSyncLock(rootDir);
+
+    // A 必须放弃夺取（旧实现会 ok=true 并删除 B 的锁 → 双方自认持锁）
+    expect(result.ok).toBe(false);
+    if (result.ok || result.reason !== "held") {
+      throw new Error(`expected held, got ${JSON.stringify(result)}`);
+    }
+    expect(result.holder?.token).toBe("B-LIVE-LOCK");
+    // B 的活锁被恢复回原路径，无 stale/临时残留
+    expect(readSyncLock(lockPath)?.token).toBe("B-LIVE-LOCK");
+    expect(readdirSync(rootDir).filter((f) => f.includes(".stale-") || f.includes(".b-retire"))).toEqual([]);
+  });
+
+  it("陈旧夺取竞态（极端）：恢复时路径又被新锁占据 → 保留被夺锁内容、不误删", async () => {
+    const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+    const deadPid = await reapedPid();
+    writeLockFile(lockPath, { pid: deadPid, hostname: hostname(), token: "STALE-LOCK" });
+
+    const bLive: SyncLockInfo = { pid: 1, startedAt: new Date().toISOString(), hostname: hostname(), token: "B-LIVE-LOCK" };
+    const cLive: SyncLockInfo = { pid: 2, startedAt: new Date().toISOString(), hostname: hostname(), token: "C-LIVE-LOCK" };
+
+    vi.mocked(renameSync).mockImplementationOnce((...args: Parameters<typeof actual.renameSync>) => {
+      const [src, dest] = args;
+      const bRetire = `${String(src)}.b-retire`;
+      actual.renameSync(src, bRetire); // B 移走并删除陈旧锁
+      actual.rmSync(bRetire, { force: true });
+      actual.writeFileSync(src, JSON.stringify(bLive), { encoding: "utf-8", mode: 0o600 });
+      actual.renameSync(src, dest); // A 抢走 B 的锁
+      actual.writeFileSync(src, JSON.stringify(cLive), { encoding: "utf-8", mode: 0o600 }); // C 立即建立新锁
+    });
+
+    const result = acquireSyncLock(rootDir);
+    expect(result.ok).toBe(false);
+    if (result.ok || result.reason !== "held") {
+      throw new Error(`expected held, got ${JSON.stringify(result)}`);
+    }
+    expect(result.holder?.token).toBe("C-LIVE-LOCK");
+    expect(readSyncLock(lockPath)?.token).toBe("C-LIVE-LOCK");
+    // 被误夺的 B 锁内容保留在 .stale- 残留里，未被删除（供人工/阶段 2 恢复）
+    const residues = readdirSync(rootDir).filter((f) => f.includes(".stale-"));
+    expect(residues).toHaveLength(1);
+    expect(JSON.parse(readFileSync(join(rootDir, residues[0]), "utf-8")).token).toBe("B-LIVE-LOCK");
+  });
+
+  it("硬链接不可用（EPERM）→ wx 降级仍能加锁（审查建议 #5）", () => {
+    vi.mocked(linkSync).mockImplementationOnce(() => {
+      const err = new Error("EPERM: operation not permitted") as NodeJS.ErrnoException;
+      err.code = "EPERM";
+      throw err;
+    });
+
+    const result = acquireSyncLock(rootDir);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(readSyncLock(lockPath)?.token).toBe(result.lock.info.token);
+      result.lock.release();
+    }
+  });
+
+  it("不可解析锁 + stat 失败 → 保守视为新鲜（不夺取，审查建议 #5 分支）", () => {
+    writeFileSync(lockPath, "", "utf-8");
+    vi.mocked(statSync).mockImplementationOnce(() => {
+      throw new Error("EACCES: simulated stat failure");
+    });
+
+    const result = acquireSyncLock(rootDir);
+    expect(result.ok).toBe(false);
+    if (result.ok || result.reason !== "held") {
+      throw new Error(`expected held, got ${JSON.stringify(result)}`);
+    }
+    expect(result.holder).toBeNull();
+    expect(readFileSync(lockPath, "utf-8")).toBe("");
   });
 
   it("空锁文件（创建中间态）→ 保守视为被持有，不夺取（审查 #2）", () => {

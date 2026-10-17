@@ -11,9 +11,13 @@
  * 加锁必须**原子且带完整内容**：先把锁信息写进同目录候选文件，再用
  * `linkSync` 抢占目标路径（已存在 → EEXIST）。这样锁文件一旦出现就是完整
  * JSON，不会出现「open 成功但内容未写完」的窗口被读者误判陈旧而夺取
- * （审查 #2 的并发缺陷）。夺取陈旧锁用 rename 抢占（只有一个进程能成功）。
+ * （审查 #2 的并发缺陷）。
+ *
+ * 夺取陈旧锁用 rename 抢占，但**改名后必须复验身份**：读取与改名之间，其它
+ * 进程可能已完成夺取并建立了自己的有效锁；不校验就会把活锁抢走并删除，
+ * 破坏互斥（复审回归）。抢错时把文件 link 回原路径并放弃本次夺取。
  */
-import { linkSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { constants, copyFileSync, linkSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { hostname } from "node:os";
 import { join } from "node:path";
@@ -134,15 +138,59 @@ function createLockFile(path: string, info: SyncLockInfo): boolean {
   }
 }
 
-/** 文件存在且「刚创建不久」（不可解析时的保守判定，防止抢走正在创建的锁）。 */
+/**
+ * 文件「可能刚被创建」判定（仅在锁不可解析时使用）。
+ * stat 失败（非 ENOENT）时**保守返回 true**：宁可暂时拒绝夺取，也不抢活锁。
+ */
 function isFreshlyCreated(path: string): boolean {
   try {
     const stat = statSync(path, { throwIfNoEntry: false });
-    if (!stat) return false;
+    if (!stat) return false; // 文件已不存在（竞态）：无新鲜依据
     return Date.now() - stat.mtimeMs < LOCK_CREATE_GRACE_MS;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * 锁身份一致判定（兼容旧格式：双方都无 token 时只比 pid+startedAt）。
+ * 用于「判为陈旧的锁」与「rename 实际抢到的文件」的对比。
+ */
+function sameLockIdentity(a: SyncLockInfo | null, b: SyncLockInfo | null): boolean {
+  if (a === null || b === null) return a === b;
+  if (a.pid !== b.pid || a.startedAt !== b.startedAt) return false;
+  if (a.token === "" && b.token === "") return true;
+  return a.token === b.token;
+}
+
+/**
+ * 尽力把被误夺的锁挂回原路径（恢复并发窗口中被抢走的活锁）。
+ * 成功 → 删除 retirePath（回到原状）；路径已被新锁占据（EEXIST）→
+ * 保留 retirePath 不删（其中含被误夺锁的内容，供人工/阶段 2 恢复）。
+ */
+function restoreLockFile(retirePath: string, path: string): void {
+  if (linkBack(retirePath, path)) return;
+  // 不支持硬链接的文件系统：退化为独占复制（仅降级路径，有微小窗口）
+  try {
+    copyFileSync(retirePath, path, constants.COPYFILE_EXCL);
+    rmSync(retirePath, { force: true });
+  } catch {
+    /* 保留 retirePath 供恢复/诊断 */
+  }
+}
+
+function linkBack(retirePath: string, path: string): boolean {
+  try {
+    linkSync(retirePath, path);
   } catch {
     return false;
   }
+  try {
+    rmSync(retirePath, { force: true });
+  } catch {
+    /* 多一个硬链接不影响正确性 */
+  }
+  return true;
 }
 
 function makeLock(path: string, info: SyncLockInfo): SyncLock {
@@ -202,14 +250,28 @@ export function acquireSyncLock(rootDir: string): AcquireSyncLockResult {
       return { ok: false, reason: "held", holder };
     }
 
-    // 陈旧锁：先原子改名抢占（只有一个进程能成功），再创建新锁
+    // 陈旧锁：rename 抢占 + **复验身份**。
+    // 读取与改名之间，其它进程可能已完成夺取并建立自己的有效锁；若不复验，
+    // A 的改名会把 B 的活锁抢走并删除，导致双方都自认持锁（复审回归）。
     const retirePath = `${path}.stale-${process.pid}-${Date.now()}`;
+    let retired = false;
     try {
       renameSync(path, retirePath);
+      retired = true;
     } catch {
-      /* 已被其它进程接手：继续尝试创建，失败则如实返回 held */
+      /* 已被其它进程处理（文件已不存在）：继续尝试创建 */
     }
-    rmSync(retirePath, { force: true });
+
+    if (retired) {
+      const retiredInfo = readSyncLock(retirePath);
+      if (!sameLockIdentity(holder, retiredInfo)) {
+        // 抢到的不是刚才判为陈旧的那把锁：挂回原路径并放弃本次夺取。
+        // 双方都不持锁（调用方拿到 held 提示）——安全方向。
+        restoreLockFile(retirePath, path);
+        return { ok: false, reason: "held", holder: readSyncLock(path) };
+      }
+      rmSync(retirePath, { force: true });
+    }
 
     if (createLockFile(path, info)) {
       return { ok: true, lock: makeLock(path, info) };

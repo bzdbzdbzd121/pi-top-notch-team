@@ -3,6 +3,16 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSyn
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { parse as parseYaml } from "yaml";
+
+/**
+ * 审查建议 #3 的注入式回归：mock `writeFileSync` 以模拟临时文件自身写入失败
+ * （ENOSPC/EIO），验证清理路径与「旧配置不变」；默认委托真实实现。
+ */
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return { ...actual, writeFileSync: vi.fn(actual.writeFileSync) };
+});
+
 import {
   DEFAULT_SYNC_CONFIG,
   getSyncConfigPath,
@@ -101,7 +111,9 @@ describe("maskRemoteUrl（展示脱敏）", () => {
 describe("sync.yaml 读写", () => {
   let rootDir: string;
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+    vi.mocked(writeFileSync).mockImplementation(actual.writeFileSync);
     rootDir = mkdtempSync(join(tmpdir(), "sync-config-test-"));
   });
 
@@ -283,6 +295,45 @@ describe("sync.yaml 读写", () => {
     chmodSync(getSyncConfigPath(rootDir), 0o600);
     saveSyncConfig({ enabled: false, remoteUrl: "https://github.com/u/r.git", branch: "dev" }, rootDir);
     expect(statSync(getSyncConfigPath(rootDir)).mode & 0o777).toBe(0o600);
+  });
+
+  it("非法 → 修正 → 再非法：会再次告警（warn-once 复位，审查建议 #6）", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      writeFileSync(getSyncConfigPath(rootDir), "remoteUrl: '--evil'\n", "utf-8");
+      expect(loadSyncConfig(rootDir)!.remoteUrl).toBe("");
+      writeFileSync(getSyncConfigPath(rootDir), "remoteUrl: 'https://github.com/u/r.git'\n", "utf-8");
+      expect(loadSyncConfig(rootDir)!.remoteUrl).toBe("https://github.com/u/r.git");
+      writeFileSync(getSyncConfigPath(rootDir), "remoteUrl: '--evil-again'\n", "utf-8");
+      expect(loadSyncConfig(rootDir)!.remoteUrl).toBe("");
+      expect(warnSpy).toHaveBeenCalledTimes(2);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("临时写入自身失败（ENOSPC）→ 清理临时文件、旧配置不变（审查建议 #3）", () => {
+    const original = { enabled: true, remoteUrl: "https://github.com/u/r.git", branch: "main" };
+    saveSyncConfig(original, rootDir);
+
+    vi.mocked(writeFileSync).mockImplementationOnce(() => {
+      throw new Error("ENOSPC: simulated write failure");
+    });
+    expect(() => saveSyncConfig({ ...original, branch: "dev" }, rootDir)).toThrow("ENOSPC");
+
+    expect(loadSyncConfig(rootDir)).toEqual(original);
+    expect(readdirSync(rootDir).filter((f) => f.includes(".tmp"))).toEqual([]);
+  });
+
+  it("首次保存时临时写入失败 → 不产生半截配置与残留", () => {
+    vi.mocked(writeFileSync).mockImplementationOnce(() => {
+      throw new Error("ENOSPC: simulated write failure");
+    });
+    expect(() =>
+      saveSyncConfig({ enabled: true, remoteUrl: "https://github.com/u/r.git", branch: "" }, rootDir)
+    ).toThrow("ENOSPC");
+    expect(existsSync(getSyncConfigPath(rootDir))).toBe(false);
+    expect(readdirSync(rootDir).filter((f) => f.includes(".tmp"))).toEqual([]);
   });
 
   it("保存失败（目标目录不可写）不吞错、不留半截文件", () => {
