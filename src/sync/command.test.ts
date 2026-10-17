@@ -314,6 +314,8 @@ describe("命令层边界", () => {
       expect(text).toContain("冲突决策");
       expect(text).toContain("/team sync status");
       expect(text).toContain("git --git-dir");
+      // 阶段 2：非交互拒绝在进度开启之前返回 → 该键从未被设置
+      expect((ctx.ui.setStatus as unknown as { mock: { calls: unknown[][] } }).mock.calls).toEqual([]);
     }
   });
 

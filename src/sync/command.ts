@@ -22,6 +22,7 @@ import {
 } from "./config";
 import { acquireSyncLock, isSyncLockStale, readSyncLock } from "./lock";
 import { normalizeDiffLines, showSyncDiffView } from "../ui/sync-diff-view";
+import { createSyncProgress } from "./progress";
 import {
   cleanupConflictDiffs,
   conflictChoices,
@@ -403,7 +404,14 @@ export async function handleSyncCommand(
     return;
   }
 
+  // 进行中反馈（阶段 2）：**取得锁之后**才开启（取锁失败/非交互拒绝等出口不设状态、也就
+  // 不存在残留）；出口由既有 finally 统一清除，终态提示前再显式 end() 一次（幂等）。
+  // 进度只写底部状态栏（键名 cloud-sync），不新增任何聊天区输出。
+  const progress = createSyncProgress(ctx.ui);
+
   try {
+    progress.stage("prepare");
+
     // index.lock 预检（明确报错，不删除别人的锁）
     const repoState = await inspectRepo(syncCtx);
     cleanupSyncResiduals(syncCtx, { now: now().getTime(), gitDir: repoState.gitDir || undefined });
@@ -427,12 +435,17 @@ export async function handleSyncCommand(
     }
 
     // 准备（可能写 .git：init / remote / HEAD 对齐 / fetch）
+    progress.stage("connect");
     const prepared = await ensureRemoteAndBranch(syncCtx, {
-      onRemoteUrlChanged: async (currentUrl, configuredUrl) =>
-        ctx.ui.confirm(
+      onRemoteUrlChanged: async (currentUrl, configuredUrl) => {
+        progress.wait("confirm");
+        const confirmed = await ctx.ui.confirm(
           "云同步",
           `本地仓库的远端地址与配置不一致：\n  当前：${maskRemoteUrl(currentUrl)}\n  配置：${maskRemoteUrl(configuredUrl)}\n是否改用配置中的地址？（换地址会先在本地留一个备份引用；不静默改写）`
-        ),
+        );
+        if (confirmed) progress.stage("connect"); // 对话框关闭后由下一个挂点显式设置新阶段
+        return confirmed;
+      },
     });
     if (!prepared.ok) {
       if (prepared.cancelled) {
@@ -443,12 +456,14 @@ export async function handleSyncCommand(
       return;
     }
 
+    progress.stage("fetch");
     const fetched = await fetchRemote(syncCtx, prepared.prepared);
     if (!fetched.ok) {
       ctx.ui.notify(formatSyncFailure(fetched.failure, { raw: true }), "warning");
       return;
     }
 
+    progress.stage("compare");
     const built = await buildSyncPlan({ ctx: syncCtx, prepared: prepared.prepared, remoteSha: fetched.remoteSha });
     if (!built.ok) {
       ctx.ui.notify(formatSyncFailure(built.failure, { raw: true }), "warning");
@@ -468,6 +483,7 @@ export async function handleSyncCommand(
         .map((a) => a.path.replace(/\.yaml$/i, ""));
       if (localTouching.includes(editingName)) {
         const hasConflict = conflictPaths.some((path) => path.replace(/\.yaml$/i, "") === editingName);
+        progress.wait("confirm");
         const proceed = await ctx.ui.confirm(
           "云同步",
           `正在编辑团队「${editingName}」，本次同步会${
@@ -482,7 +498,7 @@ export async function handleSyncCommand(
     }
 
     if (conflictPaths.length > 0) {
-
+      progress.stage("compare");
       const loadedDiffs = await loadConflictDiffs({ ctx: syncCtx, snapshot, paths: conflictPaths });
       try {
         // 导入名必须避开「本机磁盘 + 基准树 + 远端树」里已有的全部团队名（复审必改项 #1）：
@@ -498,6 +514,7 @@ export async function handleSyncCommand(
           const diff = loadedDiffs.diffs.get(path);
           if (!diff) continue;
           const choices = conflictChoices(diff.shape);
+          progress.wait("decision", i + 1, conflictPaths.length);
           const choice = await pickConflictChoice(ctx, diff, choices, i + 1, conflictPaths.length);
           if (!choice) {
             ctx.ui.notify("已取消，未做任何改动。", "info");
@@ -516,6 +533,7 @@ export async function handleSyncCommand(
           shape: loadedDiffs.diffs.get(decision.path)?.shape ?? ("both-modified" as const),
           decision,
         }));
+        progress.wait("confirm");
         const confirmed = await ctx.ui.confirm(
           "云同步",
           `${formatFinalPlanSummary(plan, decided, {
@@ -535,6 +553,7 @@ export async function handleSyncCommand(
       if (planNeedsConfirmation(plan)) {
         const deletes = [...listRemoteDeletePaths(plan), ...listLocalDeletePaths(plan)];
         const detail = deletes.length > 0 ? `\n将删除：${deletes.join("、")}` : "";
+        progress.wait("confirm");
         const confirmed = await ctx.ui.confirm("云同步", `按上述计划执行同步？${detail}`);
         if (!confirmed) {
           ctx.ui.notify("已取消，未做任何改动。", "info");
@@ -543,15 +562,19 @@ export async function handleSyncCommand(
       }
     }
 
+    progress.stage("apply");
     const applied = await applySync({ ctx: syncCtx, plan, snapshot, decisions });
     if (!applied.ok) {
       const suffix = applied.rolledBack ? "\n已回滚，未做任何改动。" : "";
+      progress.end(); // 终态提示前清除（幂等；finally 再兜底一次）
       ctx.ui.notify(`${formatSyncFailure(applied.failure!, { raw: true })}${suffix}`, "warning");
       return;
     }
 
+    progress.end();
     ctx.ui.notify(formatSyncResult(applied.summary), applied.summary.pushed || applied.summary.noop ? "info" : "warning");
   } finally {
+    progress.end(); // 出口统一清除（覆盖所有 return 与异常）
     lock.lock.release();
   }
 }

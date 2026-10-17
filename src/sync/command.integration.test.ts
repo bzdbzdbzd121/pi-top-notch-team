@@ -17,6 +17,7 @@ import { deflateSync } from "node:zlib";
 import { stringify as stringifyYaml } from "yaml";
 import { createMockContext } from "../test/fixtures/mock-extension-api";
 import { handleSyncCommand } from "./command";
+import { acquireSyncLock } from "./lock";
 import { getSyncConfigPath, saveSyncConfig } from "./config";
 import { getTeamsDir } from "../team/store";
 import { runGit } from "./git-runner";
@@ -182,12 +183,15 @@ describe("阶段 2：/team sync 集成（真实 git，裸仓库做云端）", ()
     input?: () => string | undefined | Promise<string | undefined>;
     select?: (title: string, labels: string[]) => string | undefined | Promise<string | undefined>;
     mode?: "tui" | "rpc";
+    /** 共享事件流（把 cloud-sync 状态写入与 git 调用放进同一条时间线，便于断言先后顺序）。 */
+    events?: { kind: "status" | "git"; detail: string }[];
   }): {
     ctx: ExtensionCommandContext;
     notify: ReturnType<typeof vi.fn>;
     confirm: ReturnType<typeof vi.fn>;
     input: ReturnType<typeof vi.fn>;
     select: ReturnType<typeof vi.fn>;
+    trace: ProgressTrace;
   } {
     const notify = vi.fn();
     const confirm = vi.fn(options?.confirm ?? (async () => true));
@@ -198,7 +202,54 @@ describe("阶段 2：/team sync 集成（真实 git，裸仓库做云端）", ()
     ctx.ui.confirm = confirm as never;
     ctx.ui.input = input as never;
     ctx.ui.select = select as never;
-    return { ctx: ctx as unknown as ExtensionCommandContext, notify, confirm, input, select };
+    const trace = attachProgressTrace(ctx as unknown as ExtensionCommandContext, options?.events);
+    return { ctx: ctx as unknown as ExtensionCommandContext, notify, confirm, input, select, trace };
+  }
+
+  /** 阶段 2：cloud-sync 状态栏写入追踪（含「对话框打开瞬间的状态值」）。 */
+  interface ProgressTrace {
+    writes: (string | undefined)[];
+    dialogs: { kind: string; text: string | undefined }[];
+    current(): string | undefined;
+    nonEmpty(): string[];
+    hadNoWrite(): boolean;
+  }
+
+  function attachProgressTrace(
+    ctx: ExtensionCommandContext,
+    events?: { kind: "status" | "git"; detail: string }[]
+  ): ProgressTrace {
+    const writes: (string | undefined)[] = [];
+    const dialogs: { kind: string; text: string | undefined }[] = [];
+    const trace: ProgressTrace = {
+      writes,
+      dialogs,
+      current: () => (writes.length > 0 ? writes[writes.length - 1] : undefined),
+      nonEmpty: () => writes.filter((w): w is string => typeof w === "string" && w.length > 0),
+      hadNoWrite: () => writes.length === 0,
+    };
+    ctx.ui.setStatus = ((key: string, text: string | undefined) => {
+      if (key !== "cloud-sync") return;
+      writes.push(text);
+      events?.push({ kind: "status", detail: text ?? "(clear)" });
+    }) as never;
+    const wrapDialog = (kind: string, original: unknown): ((...args: unknown[]) => unknown) => async (
+      ...args: unknown[]
+    ) => {
+      dialogs.push({ kind, text: trace.current() });
+      return typeof original === "function" ? (original as (...a: unknown[]) => unknown)(...args) : undefined;
+    };
+    ctx.ui.confirm = wrapDialog("confirm", ctx.ui.confirm) as never;
+    ctx.ui.select = wrapDialog("select", ctx.ui.select) as never;
+    ctx.ui.custom = wrapDialog("custom", ctx.ui.custom) as never;
+    (ctx as unknown as { __progressTrace?: ProgressTrace }).__progressTrace = trace;
+    return trace;
+  }
+
+  /** TUI 路径的对话框记录（installTuiChoice 会替换 ui.custom，需自行记一笔）。 */
+  function recordTuiDialog(ctx: ExtensionCommandContext): void {
+    const trace = (ctx as unknown as { __progressTrace?: ProgressTrace }).__progressTrace;
+    if (trace) trace.dialogs.push({ kind: "custom", text: trace.current() });
   }
 
   /** RPC 降级路径的选项 mock：按动作值选中对应标签。 */
@@ -220,6 +271,7 @@ describe("阶段 2：/team sync 集成（真实 git，裸仓库做云端）", ()
   /** TUI 路径：模拟用户在差异视图里按数字键选动作并 Enter（走真实组件键盘处理）。 */
   function installTuiChoice(ctx: ExtensionCommandContext, choice: ConflictOption | undefined): void {
     (ctx.ui as any).custom = async (factory: any) => {
+      recordTuiDialog(ctx);
       let result: ConflictOption | undefined;
       const done = (value: ConflictOption | undefined): void => {
         result = value;
@@ -1428,5 +1480,233 @@ describe("阶段 2：/team sync 集成（真实 git，裸仓库做云端）", ()
     expect(readLocal("notes.md")).toBe("云端笔记\n");
     expect(archiveContent("notes.md-")).toBe("本机未跟踪笔记\n"); // 覆盖前留档
     expect(notifyText(notify)).toContain("留档：1 个非团队文件的本机版本");
+  });
+
+  // ═══════ 阶段 2：/team sync 进度接线（进行中反馈）═══════
+
+  it("阶段2-1 网络调用之前先写状态；阶段文本与真实步骤对齐（连接→获取→比对→应用）", async () => {
+    const events: { kind: "status" | "git"; detail: string }[] = [];
+    seedRemote({ "a.yaml": teamYaml("a") });
+    configure();
+    const { ctx } = makeHarness({ events });
+    const recordingRunGit: typeof runGit = async (args, options) => {
+      events.push({ kind: "git", detail: args.join(" ") });
+      return runGit(args, options);
+    };
+    await sync(ctx, { runGit: recordingRunGit });
+
+    const firstStatus = events.findIndex((e) => e.kind === "status" && e.detail !== "(clear)");
+    const firstNetwork = events.findIndex((e) => e.kind === "git" && /(^|\s)(ls-remote|fetch)(\s|$)/.test(e.detail));
+    expect(firstStatus).toBeGreaterThanOrEqual(0);
+    expect(firstNetwork).toBeGreaterThan(firstStatus); // ① 首个非空状态在任何网络调用之前
+
+    // ② 阶段词按真实步骤推进（顺序 + 每个网络调用前的那一刻状态）
+    const stageWrites = events
+      .filter((e) => e.kind === "status" && e.detail !== "(clear)")
+      .map((e) => e.detail);
+    const idx = (word: string): number => stageWrites.findIndex((t) => t.includes(word));
+    expect(idx("准备中…")).toBe(0);
+    expect(idx("连接云端…")).toBeGreaterThan(idx("准备中…"));
+    expect(idx("获取云端更新…")).toBeGreaterThan(idx("连接云端…"));
+    expect(idx("比对差异…")).toBeGreaterThan(idx("获取云端更新…"));
+    expect(idx("应用并推送…")).toBeGreaterThan(idx("比对差异…"));
+
+    const statusBefore = (limit: number): string | undefined => {
+      for (let i = limit - 1; i >= 0; i--) {
+        const event = events[i];
+        if (event.kind === "status" && event.detail !== "(clear)") return event.detail;
+      }
+      return undefined;
+    };
+    const lsRemoteAt = events.findIndex((e) => e.kind === "git" && e.detail.includes("ls-remote"));
+    const fetchAt = events.findIndex((e) => e.kind === "git" && e.detail.includes("fetch"));
+    const readTreeAt = events.findIndex((e) => e.kind === "git" && e.detail.includes("read-tree"));
+    expect(statusBefore(lsRemoteAt)).toContain("连接云端…");
+    expect(statusBefore(fetchAt)).toContain("获取云端更新…");
+    expect(statusBefore(readTreeAt)).toContain("应用并推送…");
+  });
+
+  it("阶段2-2 成功路径出口闭合：状态被清除、且曾有非空状态；通知不含进度类文本", async () => {
+    seedRemote({ "a.yaml": teamYaml("a") });
+    configure();
+    await sync(makeHarness().ctx); // 首次接入（建立基线）
+    writeLocal("a.yaml", teamYaml("a") + "# 本机改\n"); // 仅本机改 → 零交互上传
+    const { ctx, notify, trace } = makeHarness();
+    await sync(ctx);
+
+    expect(trace.nonEmpty().length).toBeGreaterThan(0); // ⑥ 回归护栏
+    expect(trace.current()).toBeUndefined(); // ④ 出口闭合
+    expect(trace.writes.at(-1)).toBeUndefined();
+
+    // ⑤ 零新增聊天输出：进度类文本不得进入聊天区
+    const chat = notifyText(notify);
+    expect(chat).toContain("云同步完成");
+    expect(chat).not.toMatch(/准备中|连接云端|获取云端更新|比对差异|应用并推送|等待你的确认|等待你的决策/);
+  });
+
+  it("阶段2-3 无事可做出口闭合（已是最新）", async () => {
+    seedRemote({ "a.yaml": teamYaml("a") });
+    configure();
+    await sync(makeHarness().ctx); // 首次接入
+    const { ctx, notify, trace } = makeHarness();
+    await sync(ctx);
+
+    expect(notifyText(notify)).toContain("已是最新");
+    expect(trace.nonEmpty().length).toBeGreaterThan(0);
+    expect(trace.current()).toBeUndefined();
+  });
+
+  /** 等待态断言助手：对话框打开瞬间必须是「⏸ 等待…」且不含秒数。 */
+  function expectWaiting(dialog: { kind: string; text: string | undefined } | undefined, expected: string): void {
+    expect(dialog?.text).toBe(expected);
+    expect(dialog?.text ?? "").not.toMatch(/\d+s/);
+  }
+
+  it("阶段2-4a 首次接入上传确认：打开时为等待态且无秒数", async () => {
+    writeLocal("local.yaml", teamYaml("local"));
+    seedRemote({ "a.yaml": teamYaml("a") });
+    configure();
+    const { ctx, trace } = makeHarness();
+    await sync(ctx);
+    expectWaiting(trace.dialogs.find((d) => d.kind === "confirm"), "☁️ 云同步：⏸ 等待你的确认");
+  });
+
+  it("阶段2-4b 删除传播确认：打开时为等待态且无秒数", async () => {
+    seedRemote({ "a.yaml": teamYaml("a") });
+    configure();
+    await sync(makeHarness().ctx);
+    const scratch = cloneRemote("main");
+    unlinkSync(join(scratch, "a.yaml"));
+    gitCli(scratch, ["add", "-A"]);
+    gitCli(scratch, [...GIT_ID, "commit", "-qm", "remove a"]);
+    gitCli(scratch, ["push", "-q", "origin", "HEAD:refs/heads/main"]);
+
+    const { ctx, trace } = makeHarness();
+    await sync(ctx);
+    expectWaiting(trace.dialogs.find((d) => d.kind === "confirm"), "☁️ 云同步：⏸ 等待你的确认");
+  });
+
+  it("阶段2-4c 冲突决策（RPC）与最终计划确认：均为等待态且无秒数", async () => {
+    await setupBothModified();
+    const { ctx, trace } = makeHarness({ mode: "rpc", select: rpcChoice("keep-local") });
+    await sync(ctx);
+    expectWaiting(trace.dialogs.find((d) => d.kind === "select"), "☁️ 云同步：⏸ 等待你的决策（1/1）");
+    expectWaiting(trace.dialogs.find((d) => d.kind === "confirm"), "☁️ 云同步：⏸ 等待你的确认");
+  });
+
+  it("阶段2-4d 编辑模式确认：打开时为等待态且无秒数", async () => {
+    await setupBothModified();
+    const { ctx, trace } = makeHarness({ mode: "rpc", select: rpcChoice("keep-local") });
+    await sync(ctx, { getEditingTeamName: () => "a" });
+    expectWaiting(trace.dialogs.find((d) => d.kind === "confirm"), "☁️ 云同步：⏸ 等待你的确认");
+  });
+
+  it("阶段2-5 TUI 差异视图路径：打开对话框时也是等待态且无秒数", async () => {
+    await setupBothModified();
+    const { ctx, trace } = makeHarness();
+    installTuiChoice(ctx, "take-remote");
+    await sync(ctx);
+    const custom = trace.dialogs.find((d) => d.kind === "custom");
+    expect(custom?.text).toBe("☁️ 云同步：⏸ 等待你的决策（1/1）");
+    expect(trace.current()).toBeUndefined();
+  });
+
+  it("阶段2-6 远端地址变更确认：确认前为等待态（回到连接阶段由后续挂点负责）", async () => {
+    seedRemote({ "a.yaml": teamYaml("a") });
+    configure();
+    await sync(makeHarness().ctx); // 建立本机仓库与 origin
+    configure(join(base, "another-remote.git")); // 配置地址与仓库 origin 不一致 → 触发换地址确认
+
+    const { ctx, trace } = makeHarness();
+    await sync(ctx);
+    expect(trace.dialogs.find((d) => d.kind === "confirm")?.text).toBe("☁️ 云同步：⏸ 等待你的确认");
+    expect(trace.current()).toBeUndefined();
+  });
+
+  it("阶段2-7a 出口闭合（应用失败 / index.lock 中止 → 最终为空；锁占用与非交互 → 从未设置）", async () => {
+    // 应用失败（注入 commit-tree 失败）
+    seedRemote({ "a.yaml": teamYaml("a") });
+    configure();
+    await sync(makeHarness().ctx);
+    writeLocal("a.yaml", teamYaml("a") + "# 本机改\n");
+    const applyFail = makeHarness();
+    const failingCommit: typeof runGit = async (args, options) => {
+      if (args.includes("commit-tree")) {
+        return {
+          ok: false,
+          stdout: "",
+          stderr: "fatal: injected",
+          code: 128,
+          timedOut: false,
+          outputLimitExceeded: false,
+          command: "git commit-tree <injected>",
+        };
+      }
+      return runGit(args, options);
+    };
+    await sync(applyFail.ctx, { runGit: failingCommit });
+    expect(notifyText(applyFail.notify)).toContain("云同步失败");
+    expect(applyFail.trace.nonEmpty().length).toBeGreaterThan(0);
+    expect(applyFail.trace.current()).toBeUndefined();
+
+    // index.lock 中止（进度已开启，必须清除）
+    writeFileSync(join(teamsDir, ".git", "index.lock"), "", "utf-8");
+    const lockedIndex = makeHarness();
+    await sync(lockedIndex.ctx);
+    expect(notifyText(lockedIndex.notify)).toContain("index.lock");
+    expect(lockedIndex.trace.nonEmpty().length).toBeGreaterThan(0);
+    expect(lockedIndex.trace.current()).toBeUndefined();
+    rmSync(join(teamsDir, ".git", "index.lock"), { force: true });
+
+    // 锁被占用 → 从未设置
+    const held = makeHarness();
+    const outer = acquireSyncLock(rootDir);
+    expect(outer.ok).toBe(true);
+    try {
+      await sync(held.ctx);
+      expect(notifyText(held.notify)).toContain("另一个同步实例正在运行");
+      expect(held.trace.hadNoWrite()).toBe(true);
+    } finally {
+      if (outer.ok) outer.lock.release();
+    }
+
+    // 非交互模式 → 从未设置
+    const nonInteractive = makeHarness({ mode: "json" as never });
+    await sync(nonInteractive.ctx);
+    expect(notifyText(nonInteractive.notify)).toContain("需要交互式界面");
+    expect(nonInteractive.trace.hadNoWrite()).toBe(true);
+  });
+
+  it("阶段2-7b 取消（首次接入上传确认拒绝）→ 最终为空", async () => {
+    seedRemote({ "a.yaml": teamYaml("a") });
+    writeLocal("a.yaml", teamYaml("a") + "# 本机改\n");
+    configure();
+    const { ctx, notify, trace } = makeHarness({ confirm: async () => false });
+    await sync(ctx);
+    expect(notifyText(notify)).toContain("已取消，未做任何改动");
+    expect(trace.nonEmpty().length).toBeGreaterThan(0);
+    expect(trace.current()).toBeUndefined();
+  });
+
+  it("阶段2-7c 取消（冲突决策时取消）→ 最终为空", async () => {
+    await setupBothModified();
+    const { ctx, trace } = makeHarness({ mode: "rpc", select: async () => undefined });
+    await sync(ctx);
+    expect(trace.nonEmpty().length).toBeGreaterThan(0);
+    expect(trace.current()).toBeUndefined();
+    expect(trace.dialogs.find((d) => d.kind === "select")?.text).toContain("⏸ 等待你的决策（1/1）");
+  });
+
+  it("阶段2-7d 取消（最终计划确认拒绝）→ 最终为空", async () => {
+    await setupBothModified();
+    const { ctx, notify, trace } = makeHarness({
+      mode: "rpc",
+      select: rpcChoice("keep-local"),
+      confirm: async () => false,
+    });
+    await sync(ctx);
+    expect(notifyText(notify)).toContain("已取消，未做任何改动");
+    expect(trace.nonEmpty().length).toBeGreaterThan(0);
+    expect(trace.current()).toBeUndefined();
   });
 });
