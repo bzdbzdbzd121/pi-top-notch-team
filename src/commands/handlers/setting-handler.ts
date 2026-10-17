@@ -40,6 +40,13 @@ import {
 } from "../../settings/session-settings";
 import { getSessionState } from "../../session/state";
 import { scrollSelect } from "../../ui/scroll-select";
+import {
+  loadSyncConfig,
+  maskRemoteUrl,
+  saveSyncConfig,
+  validateRemoteUrl,
+  type SyncConfig,
+} from "../../sync/config";
 
 /** Menu option identifiers (suffix after the emoji prefix is matched loosely). */
 const OPT_SCOPE = "设置作用域";
@@ -50,6 +57,7 @@ const OPT_WAIT_TIMEOUT = "等待上限";
 const OPT_COALESCE = "消息合并";
 const OPT_PEER = "成员互发消息";
 const OPT_AGENT_SESSION = "Agent 自主团队会话";
+const OPT_CLOUD_SYNC = "云同步（机器级）";
 const OPT_CLEAR_ALL = "清除全部临时设置";
 const OPT_FOLLOW = "跟随当前配置";
 const OPT_FIXED = "指定模型";
@@ -156,6 +164,7 @@ export async function handleSetting(
       `${OPT_COALESCE}（当前：${describeMessageCoalescingSetting(effective)}）${badge("messageCoalescing")}`,
       `${OPT_PEER}（当前：${describePeerMessagingSetting(effective)}）${badge("allowPeerMessaging")}`,
       `${OPT_AGENT_SESSION}（当前：${describeAgentSessionSetting(effective)}）${badge("allowAgentInitiatedSessions")}`,
+      `${OPT_CLOUD_SYNC}（当前：${describeCloudSync(loadSyncConfig(rootDir))}）`,
       ...(Object.keys(overlay).length > 0 ? [`${OPT_CLEAR_ALL}（恢复全局）`] : []),
     ];
 
@@ -181,6 +190,12 @@ export async function handleSetting(
       clearAllSessionSettings();
       ctx.ui.notify("已清除全部临时设置，恢复全局设置生效。", "info");
       return;
+    }
+
+    if (topChoice.startsWith(OPT_CLOUD_SYNC)) {
+      // 机器级配置：恒写 sync.yaml，不受作用域开关/临时设置/快照影响（方案 §4.5）
+      await configureCloudSync(ctx, rootDir);
+      continue;
     }
 
     // ── 子菜单：工作对象 + persist 按作用域分流 ──
@@ -689,4 +704,90 @@ async function configureMemberModel(
     `成员默认模型已设为「${formatModel(picked)}」。\n仅对之后启动的成员生效；团队成员 YAML 中的 model/defaults.model 优先级更高。${noticeSuffix}`,
     "info"
   );
+}
+
+/** 云同步（机器级）当前值描述（菜单显示用）。 */
+function describeCloudSync(config: SyncConfig | null): string {
+  if (!config) return "未配置";
+  const address = config.remoteUrl ? maskRemoteUrl(config.remoteUrl) : "未设置地址";
+  const branch = config.branch ? `分支 ${config.branch}` : "分支自动探测";
+  return `${config.enabled ? "已启用" : "已停用"} — ${address}（${branch}）`;
+}
+
+/**
+ * 云同步（机器级）子菜单（方案 §7.A 改动点 / §4.5）：
+ * 读写独立文件 `<rootDir>/sync.yaml`，**不进入作用域分流**（不受临时/全局
+ * 开关影响、不进 `/team resume` 快照），因为仓库地址是机器级配置。
+ */
+async function configureCloudSync(ctx: ExtensionCommandContext, rootDir: string): Promise<void> {
+  for (;;) {
+    const config = loadSyncConfig(rootDir);
+    const base: SyncConfig = config ?? { enabled: false, remoteUrl: "", branch: "" };
+    const choice = await ctx.ui.select(
+      `云同步（机器级；不受「临时/全局」作用域影响、不进团队会话快照）\n当前：${describeCloudSync(config)}`,
+      [
+        base.enabled ? "停用云同步" : "启用云同步",
+        "设置仓库地址",
+        "设置分支（留空 = 自动探测）",
+        "返回",
+      ]
+    );
+    if (choice === undefined || choice.startsWith("返回")) return;
+
+    if (choice.startsWith("启用") || choice.startsWith("停用")) {
+      if (!base.remoteUrl) {
+        ctx.ui.notify("请先设置仓库地址（私有 git 仓库）。", "warning");
+        continue;
+      }
+      persistCloudSync(ctx, { ...base, enabled: !base.enabled }, rootDir);
+      continue;
+    }
+
+    if (choice.startsWith("设置仓库地址")) {
+      ctx.ui.notify(
+        "该仓库必须为私有：团队定义包含 systemPrompt，公开仓库等于公开它们；插件不保存任何凭据。",
+        "info"
+      );
+      const input = await ctx.ui.input(
+        "云同步仓库地址（支持 ssh://、git@host:path、https://（不含凭据）、file:// 或本地绝对路径；Esc 取消）",
+        "git@github.com:me/team-defs.git"
+      );
+      if (input === undefined) continue;
+      const url = input.trim();
+      if (url.length === 0) {
+        ctx.ui.notify("仓库地址不能为空（如需停用请选「停用云同步」）。", "warning");
+        continue;
+      }
+      const error = validateRemoteUrl(url);
+      if (error) {
+        ctx.ui.notify(`仓库地址不可用：${error}`, "warning");
+        continue;
+      }
+      persistCloudSync(ctx, { ...base, remoteUrl: url }, rootDir);
+      continue;
+    }
+
+    if (choice.startsWith("设置分支")) {
+      const input = await ctx.ui.input("同步分支（留空 = 自动探测；Esc 取消）", base.branch || "main");
+      if (input === undefined) continue;
+      persistCloudSync(ctx, { ...base, branch: input.trim() }, rootDir);
+      continue;
+    }
+  }
+}
+
+function persistCloudSync(
+  ctx: ExtensionCommandContext,
+  config: SyncConfig,
+  rootDir: string
+): void {
+  try {
+    saveSyncConfig(config, rootDir);
+    ctx.ui.notify(
+      `云同步设置已保存：${describeCloudSync(config)}。\n该设置为机器级，不受「临时/全局」作用域影响；运行 /team sync 执行同步。`,
+      "info"
+    );
+  } catch (err) {
+    ctx.ui.notify(`保存云同步设置失败：${err instanceof Error ? err.message : String(err)}`, "error");
+  }
 }

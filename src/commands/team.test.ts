@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { stringify as stringifyYaml } from "yaml";
 import { createMockExtensionAPI, createMockContext } from "../test/fixtures/mock-extension-api";
 import { registerTeamCommand } from "./team";
-import { endSession } from "../session/state";
+import { endSession, startSession } from "../session/state";
 import type { TeamContext } from "../session/context";
 import type { TeamDefinition } from "../team/definition";
 
@@ -256,6 +256,27 @@ members:
       expect.stringContaining("用法"),
       "info"
     );
+    // D25：帮助文本包含云同步用法
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("/team sync"),
+      "info"
+    );
+  });
+
+  it("active session allows /team sync (D25) — 不再被会话守卫拦截", async () => {
+    const pi = createMockExtensionAPI();
+    const ctx = createMockContext();
+    ctx.ui.input = vi.fn().mockResolvedValue(undefined) as never;
+    let handler: Function = () => {};
+    pi.registerCommand = vi.fn((_name, opts) => { handler = opts.handler; });
+    registerTeamCommand(pi, createTeamContext());
+    startSession({ name: "sync-session", description: "d", members: [{ name: "m", systemPrompt: "x" }] });
+
+    await handler("sync", ctx);
+    const text = (ctx.ui.notify as any).mock.calls.map((c: unknown[]) => String(c[0])).join("\n");
+    expect(text).not.toContain("团队会话期间仅支持");
+    expect(text).toContain("已取消配置"); // 未配置 → 引导（证明已越过会话守卫）
+    endSession();
   });
 
   // ── create_team_definition tool with workflow tests ──

@@ -19,6 +19,7 @@ import { handleStatus } from "./handlers/status-handler";
 import { handleSetting } from "./handlers/setting-handler";
 import { handleHelp } from "./handlers/help-handler";
 import { handleResume, type ResumeHandlerDeps } from "./handlers/resume-handler";
+import { handleSyncCommand } from "../sync/command";
 
 /**
  * Register a single /team command that dispatches to subcommand handlers.
@@ -35,6 +36,8 @@ import { handleResume, type ResumeHandlerDeps } from "./handlers/resume-handler"
  *   /team show <name>     — 显示团队定义详情
  *   /team delete <name>   — 删除团队定义
  *   /team status          — 查看当前团队会话状态
+ *   /team sync            — 与云端双向同步团队定义（首次运行引导配置）
+ *   /team sync status     — 查看云同步状态
  *   /team setting         — 交互式设置菜单（成员默认模型等）
  *   /team help            — 显示此帮助信息
  */
@@ -52,6 +55,7 @@ export function registerTeamCommand(
         const SESSION_SUBCOMMANDS = [
           { value: "stop", label: "stop — 终止团队会话" },
           { value: "status", label: "status — 查看当前团队状态" },
+          { value: "sync", label: "sync — 与云端同步团队定义" },
           { value: "setting", label: "setting — 团队设置（成员默认模型）" },
           { value: "help", label: "help — 显示帮助信息" },
         ];
@@ -67,7 +71,7 @@ export function registerTeamCommand(
       }
 
       // Outside session: show all subcommands
-      const ALL_SUBCOMMANDS = ["create", "dynamic", "edit", "done", "cancel", "start", "stop", "resume", "list", "show", "delete", "status", "setting", "help"];
+      const ALL_SUBCOMMANDS = ["create", "dynamic", "edit", "done", "cancel", "start", "stop", "resume", "list", "show", "delete", "status", "sync", "setting", "help"];
       const TEAM_NAME_SUBCOMMANDS = ["start", "show", "delete", "edit"];
 
       const parts = prefix.split(/\s+/);
@@ -124,10 +128,11 @@ export function registerTeamCommand(
       const subcommand = parts[0]?.toLowerCase() ?? "";
       const subargs = parts.slice(1).join(" ");
 
-      // During active team session: allow stop, status, setting, help (read-only / session-safe operations)
-      const SESSION_ALLOWED = ["stop", "status", "setting", "help"];
+      // During active team session: allow stop, status, sync, setting, help
+      // （方案 §3.8：团队会话运行中允许同步，定义在会话启动时已快照）
+      const SESSION_ALLOWED = ["stop", "status", "sync", "setting", "help"];
       if (isActive() && !SESSION_ALLOWED.includes(subcommand)) {
-        ctx.ui.notify("团队会话期间仅支持：/team stop、/team status、/team setting、/team help。请先结束会话。", "warning");
+        ctx.ui.notify("团队会话期间仅支持：/team stop、/team status、/team sync、/team setting、/team help。请先结束会话。", "warning");
         return;
       }
 
@@ -169,6 +174,9 @@ export function registerTeamCommand(
           return;
         case "status":
           await handleStatus(ctx, getMemberStatuses);
+          return;
+        case "sync":
+          await handleSyncCommand(ctx, subargs);
           return;
         case "setting":
           await handleSetting(ctx);

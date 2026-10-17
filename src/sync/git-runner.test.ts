@@ -57,6 +57,7 @@ describe("buildGitEnv（环境硬化）", () => {
     const env = buildGitEnv(undefined, { PATH: "/usr/bin" });
     expect(env.LC_ALL).toBe("C");
     expect(env.GIT_TERMINAL_PROMPT).toBe("0");
+    expect(env.GCM_INTERACTIVE).toBe("never");
     expect(env.GIT_PAGER).toBe("cat");
   });
 
@@ -138,16 +139,17 @@ describe("runGit（真实 git 集成）", () => {
     expect(res.stderr).toBe("");
     expect(res.timedOut).toBe(false);
     expect(res.command).toContain(`-C ${rootDir}`);
+    expect(res.command).toContain("credential.interactive=false");
     expect(res.command).toContain("--version");
   });
 
-  it("子进程继承硬化后的环境（LC_ALL=C）", async () => {
+  it("子进程继承硬化后的环境（LC_ALL=C / GCM_INTERACTIVE=never）", async () => {
     const res = await spawnCapture(
       process.execPath,
-      ["-e", "console.log(process.env.LC_ALL); console.log(process.env.GIT_DIR === undefined ? 'no-git-dir' : process.env.GIT_DIR)"],
+      ["-e", "console.log(process.env.LC_ALL); console.log(process.env.GIT_DIR === undefined ? 'no-git-dir' : process.env.GIT_DIR); console.log(process.env.GCM_INTERACTIVE)"],
       { cwd: rootDir, env: buildGitEnv(undefined, { GIT_DIR: "/should-be-stripped" }) }
     );
-    expect(res.stdout).toBe("C\nno-git-dir\n");
+    expect(res.stdout).toBe("C\nno-git-dir\nnever\n");
   });
 
   it("-C 生效：可在仓库外初始化仓库并读回顶层路径", async () => {

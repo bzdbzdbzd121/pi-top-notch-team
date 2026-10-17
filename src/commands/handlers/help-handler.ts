@@ -14,6 +14,8 @@ const USAGE_TEXT = [
   `  /team show <名称>       显示团队定义详情`,
   `  /team delete <名称>     删除团队定义`,
   `  /team status           查看当前团队会话状态`,
+  `  /team sync             与云端双向同步（首次运行会引导配置仓库地址）`,
+  `  /team sync status      查看云同步状态（只读）`,
   `  /team setting          交互式设置菜单（成员默认模型等）`,
   `  /team help             显示此帮助信息`,
 ].join("\n");

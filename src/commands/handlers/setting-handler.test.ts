@@ -6,6 +6,7 @@ import { createMockContext } from "../../test/fixtures/mock-extension-api";
 import { handleSetting } from "./setting-handler";
 import { loadSettings, getSettingsPath } from "../../settings/settings";
 import { endSession, startSession } from "../../session/state";
+import { getSyncConfigPath, loadSyncConfig, saveSyncConfig } from "../../sync/config";
 import {
   getSessionSettings,
   setSessionSetting,
@@ -1054,5 +1055,60 @@ describe("/team setting — Agent 自主团队会话 (阶段④)", () => {
       expect.stringContaining("已清除全部临时设置"),
       "info"
     );
+  });
+});
+
+describe("/team setting — 云同步（机器级，阶段 2）", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "team-setting-sync-test-"));
+    process.env.TOP_NOTCH_TEAM_ROOT = tmpDir;
+    resetSessionSettingsState();
+  });
+
+  afterEach(() => {
+    endSession();
+    resetSessionSettingsState();
+    delete process.env.TOP_NOTCH_TEAM_ROOT;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("顶层菜单含「云同步（机器级）」项并显示当前值", async () => {
+    const ctx = createCtx({ selectImpl: pickContaining("云同步（机器级）") });
+    await handleSetting(ctx as any);
+    const firstCall = (ctx.ui.select as any).mock.calls[0];
+    const items: string[] = firstCall[1];
+    expect(items.some((i) => i.startsWith("云同步（机器级）（当前：未配置）"))).toBe(true);
+  });
+
+  it("设置仓库地址 → 写 sync.yaml，settings.yaml 不受影响（不进作用域分流）", async () => {
+    const ctx = createCtx({ selectImpl: pickContaining("云同步（机器级）", "设置仓库地址", "返回") });
+    ctx.ui.input = vi.fn().mockResolvedValue("git@github.com:me/team-defs.git") as never;
+
+    await handleSetting(ctx as any);
+
+    expect(loadSyncConfig(tmpDir)).toEqual({
+      enabled: false,
+      remoteUrl: "git@github.com:me/team-defs.git",
+      branch: "",
+    });
+    expect(existsSync(getSettingsPath(tmpDir))).toBe(false);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("机器级"), "info");
+  });
+
+  it("启用/停用开关写 sync.yaml", async () => {
+    saveSyncConfig({ enabled: true, remoteUrl: "https://github.com/u/r.git", branch: "main" }, tmpDir);
+    const ctx = createCtx({ selectImpl: pickContaining("云同步（机器级）", "停用云同步", "返回") });
+    await handleSetting(ctx as any);
+    expect(loadSyncConfig(tmpDir)).toMatchObject({ enabled: false, remoteUrl: "https://github.com/u/r.git" });
+  });
+
+  it("非法地址 → 提示且不落盘", async () => {
+    const ctx = createCtx({ selectImpl: pickContaining("云同步（机器级）", "设置仓库地址", "返回") });
+    ctx.ui.input = vi.fn().mockResolvedValue("https://user:pass@github.com/u/r.git") as never;
+    await handleSetting(ctx as any);
+    expect(existsSync(getSyncConfigPath(tmpDir))).toBe(false);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("不能内嵌"), "warning");
   });
 });

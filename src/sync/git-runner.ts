@@ -114,6 +114,7 @@ export function buildGitEnv(
   // 稳定错误文案（分类依赖英文关键字）+ 禁止任何交互式提示。
   env.LC_ALL = "C";
   env.GIT_TERMINAL_PROMPT = "0";
+  env.GCM_INTERACTIVE = "never"; // Git Credential Manager 不弹窗（非交互封堵）
   env.GIT_PAGER = "cat";
   env.GIT_EDITOR = "true";
 
@@ -274,7 +275,9 @@ export function spawnCapture(
 /** 用统一环境与 `git -C <cwd>` 执行 git，返回结构化结果。 */
 export async function runGit(args: string[], options: GitRunOptions): Promise<GitResult> {
   const binary = options.binary ?? "git";
-  const gitArgs = ["-C", options.cwd, ...args];
+  // `-c credential.interactive=false`：git 自身不再向 credential helper 要求
+  // 交互输入（与 GIT_TERMINAL_PROMPT=0 / GCM_INTERACTIVE=never 构成三层封堵）。
+  const gitArgs = ["-C", options.cwd, "-c", "credential.interactive=false", ...args];
   // 只有真实目录才能作为子进程 cwd：文件/不存在的路径交给 git 的
   // `cannot change to '<dir>'` 报错（可分类为 workdir-missing），
   // 避免 spawn 同步抛 ENOTDIR/ENOENT 被误判为「git 未安装」。
@@ -421,7 +424,7 @@ const GIT_ERROR_PATTERNS: GitErrorPattern[] = [
     reason: "lock",
     kind: "manual",
     message: "仓库锁文件冲突（另一个 git/同步进程正在运行，或上次异常退出）",
-    fix: "确认没有其它 git 进程在跑；若确认是上次异常退出的残留，可手动删除 .git/index.lock 后重试",
+    fix: "确认没有其它 git/sync 进程在运行（不要删除正在被使用的锁）；仅当确认是上次异常退出留下的残留时，才手动删除 .git/index.lock 后重试",
   },
   {
     pattern: /detected dubious ownership/i,
