@@ -581,7 +581,6 @@ describe("阶段 2：/team sync 集成（真实 git，裸仓库做云端）", ()
     await sync(ctx, { runGit: failingRunGit });
 
     const text = notifyText(notify);
-    console.log("DEBUG-NOTIFY>>>", JSON.stringify(text));
     expect(text).toContain("云同步失败");
     expect(text).toContain("已回滚，未做任何改动");
     // 第一个（已写盘）文件被回滚删除；引用未动

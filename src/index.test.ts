@@ -1,11 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from "vitest";
-import { mkdtempSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { transitionState } from "./session/state-machine";
 import type { MemberOperationalState } from "./session/context";
 import { createMockContext } from "./test/fixtures/mock-extension-api";
+import { saveSyncConfig } from "./sync/config";
 
 // P2 集成测试：start_member 完整链路需要 mock 成员子进程 spawn（避免真实启动
 // pi 子进程）。其余既有测试不触发 spawn，mock 工厂零副作用。
@@ -1256,13 +1257,151 @@ describe("session-ended banner in before_agent_start", () => {
   });
 });
 
-describe("per-session settings wiring (阶段 2)", () => {
+describe("云同步启动检测挂载（阶段 3）", () => {
   let pi: ExtensionAPI;
-  let sessionSettingsMod: typeof import("./settings/session-settings");
+  let tmpDir: string;
+  let calls: string[][];
+  let fakeRunGit: any;
+
+  const REMOTE_SHA = "2222222222222222222222222222222222222222";
+  const CONFIG_URL = "git@github.com:me/team-defs.git";
+  const okResult = (stdout = ""): any => ({
+    ok: true,
+    stdout,
+    stderr: "",
+    code: 0,
+    timedOut: false,
+    outputLimitExceeded: false,
+    command: "git",
+  });
+
+  function routeHealthy(behind: number): (args: string[]) => any {
+    const teamsDir = join(tmpDir, "teams");
+    return (args) => {
+      if (args[0] === "--version") return okResult("git version 2.43.0\n");
+      if (args[0] === "rev-parse" && args[1] === "--show-toplevel") return okResult(`${teamsDir}\n`);
+      if (args[0] === "rev-parse" && args[1] === "--absolute-git-dir") return okResult(`${join(teamsDir, ".git")}\n`);
+      if (args[0] === "config" && args[1] === "--get") return okResult(`${CONFIG_URL}\n`);
+      if (args[0] === "symbolic-ref") return okResult("main\n");
+      if (args[0] === "ls-remote") return okResult(`${REMOTE_SHA}\trefs/heads/main\n`);
+      if (args[0] === "fetch") return okResult("");
+      if (args[0] === "rev-list") return okResult(`${behind}\t0\n`);
+      return undefined;
+    };
+  }
+
+  function writeEnabledConfig(): void {
+    saveSyncConfig({ enabled: true, remoteUrl: CONFIG_URL, branch: "" }, tmpDir);
+  }
 
   beforeEach(async () => {
     vi.resetModules();
     delete process.env.TEAM_ROLE;
+    tmpDir = mkdtempSync(join(tmpdir(), "index-sync-detect-"));
+    process.env.TOP_NOTCH_TEAM_ROOT = tmpDir;
+    mkdirSync(join(tmpDir, "teams"), { recursive: true });
+    calls = [];
+    fakeRunGit = async (args: string[]) => {
+      calls.push(args);
+      return routeHealthy(3)(args) ?? okResult();
+    };
+    pi = createMockPi();
+    const mod = await import("../index");
+    mod.default(pi);
+    // 注入假执行器：测试零真实 git / 零网络
+    mod.setCloudDetectOptionsForTests({ runGit: fakeRunGit, hardTimeoutMs: 500 });
+  });
+
+  afterEach(() => {
+    delete process.env.TOP_NOTCH_TEAM_ROOT;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function getHandler(name: string): Function {
+    const onCalls = (pi.on as ReturnType<typeof vi.fn>).mock.calls;
+    return onCalls.find((c: any) => c[0] === name)![1];
+  }
+
+  it("session_start 触发一次启动检测并按 §7.F 通知（进程级一次：/new 不重复）", async () => {
+    writeEnabledConfig();
+    const sessionStart = getHandler("session_start");
+    const ctx = createMockContext();
+    await sessionStart({ type: "session_start", reason: "startup" }, ctx);
+    await new Promise((r) => setTimeout(r, 30));
+
+    expect(ctx.ui.notify).toHaveBeenCalledTimes(1);
+    expect(String((ctx.ui.notify as any).mock.calls[0][0])).toBe(
+      "☁️ 云端有 3 个提交尚未同步到本机（运行 /team sync 查看并同步）"
+    );
+    expect(calls.some((a) => a[0] === "ls-remote")).toBe(true);
+    const callsAfterFirst = calls.length;
+
+    // 同进程内 /new、/fork、/resume 不重复检测
+    for (const reason of ["new", "fork", "resume"]) {
+      await sessionStart({ type: "session_start", reason }, createMockContext());
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    expect(calls.length).toBe(callsAfterFirst);
+    expect(ctx.ui.notify).toHaveBeenCalledTimes(1);
+  });
+
+  it("reason === 'reload' 跳过检测（扩展热重载不触发网络）", async () => {
+    writeEnabledConfig();
+    const sessionStart = getHandler("session_start");
+    const ctx = createMockContext();
+    await sessionStart({ type: "session_start", reason: "reload" }, ctx);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(calls.length).toBe(0);
+    expect(ctx.ui.notify).not.toHaveBeenCalled();
+  });
+
+  it("未配置（默认无 sync.yaml）→ 零 git 调用、零通知（测试零真实网络）", async () => {
+    const sessionStart = getHandler("session_start");
+    const ctx = createMockContext();
+    await sessionStart({ type: "session_start", reason: "startup" }, ctx);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(calls.length).toBe(0);
+    expect(ctx.ui.notify).not.toHaveBeenCalled();
+  });
+
+  it("非 TUI 模式静默降级：零调用、不抛错", async () => {
+    writeEnabledConfig();
+    const sessionStart = getHandler("session_start");
+    const ctx = createMockContext({ mode: "rpc", hasUI: false } as any);
+    expect(() => sessionStart({ type: "session_start", reason: "startup" }, ctx)).not.toThrow();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(calls.length).toBe(0);
+    expect(ctx.ui.notify).not.toHaveBeenCalled();
+  });
+
+  it("成员进程（TEAM_ROLE）早退：完全不注册 session_start（结构性零检测）", async () => {
+    process.env.TEAM_ROLE = "worker";
+    try {
+      vi.resetModules();
+      const memberPi = createMockPi();
+      const mod = await import("../index");
+      mod.default(memberPi);
+      const eventNames = (memberPi.on as ReturnType<typeof vi.fn>).mock.calls.map((c: any) => c[0]);
+      expect(eventNames).not.toContain("session_start");
+    } finally {
+      delete process.env.TEAM_ROLE;
+    }
+  });
+});
+
+describe("per-session settings wiring (阶段 2)", () => {
+  let pi: ExtensionAPI;
+  let sessionSettingsMod: typeof import("./settings/session-settings");
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    delete process.env.TEAM_ROLE;
+    // 测试卫生（阶段 3）：本块会触发 session_start（云同步启动检测挂载点），
+    // 必须把数据目录指向临时目录——否则会读真实 ~/.pi/top-notch-team/sync.yaml，
+    // 在开发者机器上可能产生真实网络访问。
+    tmpDir = mkdtempSync(join(tmpdir(), "index-session-settings-"));
+    process.env.TOP_NOTCH_TEAM_ROOT = tmpDir;
     pi = createMockPi();
     const mod = await import("../index");
     mod.default(pi);
@@ -1270,6 +1409,8 @@ describe("per-session settings wiring (阶段 2)", () => {
   });
 
   afterEach(() => {
+    delete process.env.TOP_NOTCH_TEAM_ROOT;
+    rmSync(tmpDir, { recursive: true, force: true });
     sessionSettingsMod.resetSessionSettingsState();
   });
 

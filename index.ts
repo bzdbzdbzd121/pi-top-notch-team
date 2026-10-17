@@ -38,6 +38,7 @@ import {
 } from "./src/setup/member-lifecycle";
 import { splitModelRef } from "./src/settings/resolve-model";
 import { createMessageChannel } from "./src/setup/message-channel";
+import { scheduleCloudDetection, type DetectOptions } from "./src/sync/detect";
 import { buildDynamicModePrompt } from "./src/prompts/dynamic-mode";
 import { FIRST_ACTION_PROTOCOL_PROMPT } from "./src/prompts/tl-first-action";
 import { GOAL_CLOSING_PROTOCOL_PROMPT } from "./src/prompts/goal-closing-protocol";
@@ -104,6 +105,21 @@ function historyHasTeamTraces(ctx: {
       (c: any) => c?.type === "toolCall" && typeof c?.name === "string" && TEAM_TRACE_TOOL_NAMES.has(c.name)
     );
   });
+}
+
+/**
+ * 云同步启动检测（阶段 3）的执行器注入点。
+ *
+ * session_start 挂载点只负责「同步返回 + 游离 promise」（见 src/sync/detect.ts）；
+ * 执行器可替换以便测试禁用真实 git/网络。生产不设置 → 使用统一 git 执行器与真实
+ * `<rootDir>/sync.yaml`。模块级（非闭包局部）以便测试经
+ * `setCloudDetectOptionsForTests` 注入。
+ */
+let cloudDetectOptions: DetectOptions | undefined;
+
+/** 测试用：替换/禁用启动检测的执行器（生产不调用）。 */
+export function setCloudDetectOptionsForTests(options: DetectOptions | undefined): void {
+  cloudDetectOptions = options;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -785,6 +801,20 @@ export default function (pi: ExtensionAPI) {
 
     // Register team mode editor factory (border color change)
     registerTeamEditor(ctx.ui);
+
+    // Part 3: 云同步启动提醒（阶段 3，方案 §7.E）
+    // 成员进程在上方的 TEAM_ROLE 早退已结构性排除（所有 handler 都不注册）；
+    // 此处同步返回，检测在 detect.ts 的游离 promise 中（自捕获 + 硬超时），
+    // 不阻塞会话初始化。进程级一次：/new、/fork、/resume 不重复，reload 跳过。
+    scheduleCloudDetection(
+      {
+        mode: ctx.mode,
+        hasUI: ctx.hasUI,
+        reason: (event as { reason?: string } | undefined)?.reason,
+        notify: (text, level) => ctx.ui.notify(text, level),
+      },
+      cloudDetectOptions
+    );
   });
 
   // ── model_select: keep TL current model up to date ──
