@@ -62,6 +62,8 @@ export interface GitRunOptions {
   maxBuffer?: number;
   /** 写入子进程 stdin 的数据（写完后关闭）；缺省关闭 stdin。 */
   stdin?: string;
+  /** true = stdout 以 Buffer 收集（二进制安全）。 */
+  binaryStdout?: boolean;
   /** git 可执行文件，仅测试注入用；缺省 "git"。 */
   binary?: string;
 }
@@ -69,6 +71,8 @@ export interface GitRunOptions {
 export interface SpawnCaptureResult {
   ok: boolean;
   stdout: string;
+  /** 二进制模式（binary: true）下 stdout 的原始字节（非文本文件不被 utf8 解码损坏）。 */
+  stdoutBuffer?: Buffer;
   stderr: string;
   /** 退出码；被信号杀死或 spawn 失败时为 null。 */
   code: number | null;
@@ -91,6 +95,8 @@ export interface SpawnCaptureOptions {
   timeoutMs?: number;
   maxBuffer?: number;
   stdin?: string;
+  /** true = stdout 以 Buffer 收集（二进制安全；用于 `git cat-file blob`）。 */
+  binary?: boolean;
 }
 
 /**
@@ -143,8 +149,10 @@ export function spawnCapture(
   return new Promise((resolve) => {
     const timeoutMs = options.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS;
     const maxBuffer = options.maxBuffer ?? DEFAULT_MAX_BUFFER_BYTES;
+    const binaryStdout = options.binary === true;
 
     let stdout = "";
+    const stdoutChunks: Buffer[] = [];
     let stderr = "";
     let stdoutBytes = 0;
     let stderrBytes = 0;
@@ -171,6 +179,7 @@ export function spawnCapture(
       resolve({
         ok: !timedOut && !outputLimitExceeded && !spawnError && code === 0,
         stdout,
+        ...(binaryStdout ? { stdoutBuffer: Buffer.concat(stdoutChunks) } : {}),
         stderr,
         code,
         timedOut,
@@ -216,8 +225,23 @@ export function spawnCapture(
       return;
     }
 
-    child.stdout?.setEncoding("utf8");
+    if (!binaryStdout) child.stdout?.setEncoding("utf8");
     child.stderr?.setEncoding("utf8");
+
+    // 二进制 stdout：不做 utf8 解码（`git cat-file blob` 的非文本内容不被损坏）
+    const appendBinaryChunk = (chunk: Buffer): void => {
+      if (outputLimitExceeded) return;
+      if (stdoutBytes + chunk.length > maxBuffer) {
+        const remaining = Math.max(0, maxBuffer - stdoutBytes);
+        if (remaining > 0) stdoutChunks.push(chunk.subarray(0, remaining));
+        stdoutBytes = maxBuffer;
+        outputLimitExceeded = true;
+        terminate();
+        return;
+      }
+      stdoutChunks.push(chunk);
+      stdoutBytes += chunk.length;
+    };
 
     const appendChunk = (which: "stdout" | "stderr", chunk: string): void => {
       if (outputLimitExceeded) return;
@@ -246,7 +270,10 @@ export function spawnCapture(
       }
     };
 
-    child.stdout?.on("data", (chunk: string) => appendChunk("stdout", chunk));
+    child.stdout?.on("data", (chunk: string | Buffer) => {
+      if (binaryStdout) appendBinaryChunk(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      else appendChunk("stdout", String(chunk));
+    });
     child.stderr?.on("data", (chunk: string) => appendChunk("stderr", chunk));
 
     if (child.stdin) {
@@ -289,6 +316,7 @@ export async function runGit(args: string[], options: GitRunOptions): Promise<Gi
     timeoutMs: options.timeoutMs,
     maxBuffer: options.maxBuffer,
     stdin: options.stdin,
+    binary: options.binaryStdout,
   });
 
   return { ...result, command: formatGitCommand(binary, gitArgs) };

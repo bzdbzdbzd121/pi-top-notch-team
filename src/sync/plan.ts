@@ -13,7 +13,7 @@
  * HEAD 对齐 / fetch），绝不写工作区、不改索引、不动分支引用内容。
  */
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { classifyFile, type ConflictOption, type FileClass, type FileVersions } from "./classify";
 import type { SyncConfig } from "./config";
@@ -25,6 +25,7 @@ import {
   type GitRunOptions,
 } from "./git-runner";
 import { validateTeamDefinition } from "../team/schema";
+import { isProcessAlive } from "./lock";
 
 /** 注入式 git 执行器（生产为 git-runner 的 runGit）。 */
 export type GitRun = (args: string[], options: GitRunOptions) => Promise<GitResult>;
@@ -77,7 +78,13 @@ export interface SyncContext {
 export async function runLocalGit(
   ctx: SyncContext,
   args: string[],
-  options?: { env?: Record<string, string>; timeoutMs?: number; stdin?: string; maxBuffer?: number }
+  options?: {
+    env?: Record<string, string>;
+    timeoutMs?: number;
+    stdin?: string;
+    maxBuffer?: number;
+    binaryStdout?: boolean;
+  }
 ): Promise<GitResult> {
   return ctx.runGit(args, {
     cwd: ctx.teamsDir,
@@ -85,6 +92,7 @@ export async function runLocalGit(
     timeoutMs: options?.timeoutMs,
     stdin: options?.stdin,
     maxBuffer: options?.maxBuffer,
+    binaryStdout: options?.binaryStdout,
   });
 }
 
@@ -168,6 +176,8 @@ export interface PreparedRepository {
   branch: string;
   branchSource: BranchSource;
   emptyRemote: boolean;
+  /** 远端分支 tip 的 sha（来自 ls-remote；空远端为空串）——status 只读检查用。 */
+  remoteSha: string;
   /** origin 地址与配置不一致且用户确认改用配置地址。 */
   remoteUrlChanged: boolean;
   state: RepoState;
@@ -186,6 +196,18 @@ export function parseRemoteHeadNames(stdout: string): string[] {
   return names;
 }
 
+/** 从 `ls-remote --heads` 输出取指定分支的 sha（找不到为空）。 */
+export function parseRemoteHeadSha(stdout: string, branch: string): string {
+  for (const line of stdout.split("\n")) {
+    const tab = line.indexOf("\t");
+    if (tab < 0) continue;
+    const sha = line.slice(0, tab).trim();
+    const ref = line.slice(tab + 1).trim();
+    if (ref === `refs/heads/${branch}`) return sha;
+  }
+  return "";
+}
+
 /** 解析 `git ls-remote --symref <remote> HEAD` 的 `ref: refs/heads/X\tHEAD`。 */
 export function parseSymrefHead(stdout: string): string | null {
   const m = /^ref:\s+refs\/heads\/(.+?)\s+HEAD\s*$/m.exec(stdout);
@@ -200,7 +222,7 @@ export async function discoverRemoteBranch(
   ctx: SyncContext,
   configuredBranch: string
 ): Promise<
-  | { ok: true; branch: string; source: BranchSource; emptyRemote: boolean }
+  | { ok: true; branch: string; source: BranchSource; emptyRemote: boolean; remoteSha: string }
   | { ok: false; failure: SyncFailure }
 > {
   const headsResult = await runNetworkGit(ctx, ["ls-remote", "--heads", "origin"]);
@@ -211,21 +233,39 @@ export async function discoverRemoteBranch(
 
   if (headNames.length === 0) {
     const branch = configuredBranch || DEFAULT_BRANCH;
-    return { ok: true, branch, source: configuredBranch ? "config" : "default", emptyRemote: true };
+    return { ok: true, branch, source: configuredBranch ? "config" : "default", emptyRemote: true, remoteSha: "" };
   }
 
   if (configuredBranch) {
-    return { ok: true, branch: configuredBranch, source: "config", emptyRemote: false };
+    return {
+      ok: true,
+      branch: configuredBranch,
+      source: "config",
+      emptyRemote: false,
+      remoteSha: parseRemoteHeadSha(headsResult.stdout, configuredBranch),
+    };
   }
 
   const symrefResult = await runNetworkGit(ctx, ["ls-remote", "--symref", "origin", "HEAD"]);
   const symBranch = symrefResult.ok ? parseSymrefHead(symrefResult.stdout) : null;
   if (symBranch && headNames.includes(symBranch)) {
-    return { ok: true, branch: symBranch, source: "symref", emptyRemote: false };
+    return {
+      ok: true,
+      branch: symBranch,
+      source: "symref",
+      emptyRemote: false,
+      remoteSha: parseRemoteHeadSha(headsResult.stdout, symBranch),
+    };
   }
 
   if (headNames.length === 1) {
-    return { ok: true, branch: headNames[0], source: "single", emptyRemote: false };
+    return {
+      ok: true,
+      branch: headNames[0],
+      source: "single",
+      emptyRemote: false,
+      remoteSha: parseRemoteHeadSha(headsResult.stdout, headNames[0]),
+    };
   }
 
   return {
@@ -235,6 +275,18 @@ export async function discoverRemoteBranch(
       "在 /team setting → 云同步（机器级）中显式设置分支后重试"
     ),
   };
+}
+
+function normalizeRemoteUrlForComparison(url: string): string {
+  const trimmed = url.trim().replace(/\/+$/, "");
+  if (trimmed.startsWith("/")) {
+    try {
+      return normalizePath(realpathSync(trimmed));
+    } catch {
+      return trimmed; // 路径尚不存在：保持字面值
+    }
+  }
+  return trimmed;
 }
 
 /**
@@ -274,7 +326,7 @@ export async function ensureRemoteAndBranch(
   if (!state.originUrl) {
     const add = await runLocalGit(ctx, ["remote", "add", "--", "origin", ctx.config.remoteUrl]);
     if (!add.ok) return { ok: false, failure: failureFromResult(add) };
-  } else if (state.originUrl !== ctx.config.remoteUrl) {
+  } else if (normalizeRemoteUrlForComparison(state.originUrl) !== normalizeRemoteUrlForComparison(ctx.config.remoteUrl)) {
     const confirmed = options?.onRemoteUrlChanged
       ? await options.onRemoteUrlChanged(state.originUrl, ctx.config.remoteUrl)
       : false;
@@ -296,7 +348,7 @@ export async function ensureRemoteAndBranch(
   // 分支发现
   const discovery = await discoverRemoteBranch(ctx, ctx.config.branch);
   if (!discovery.ok) return { ok: false, failure: discovery.failure };
-  const { branch, source, emptyRemote } = discovery;
+  const { branch, source, emptyRemote, remoteSha } = discovery;
 
   // 本地分支对齐：HEAD 必须指向目标分支；目标分支不存在时从当前 tip 创建
   if (state.headBranch !== branch) {
@@ -320,20 +372,31 @@ export async function ensureRemoteAndBranch(
 
   return {
     ok: true,
-    prepared: { branch, branchSource: source, emptyRemote, remoteUrlChanged, state },
+    prepared: { branch, branchSource: source, emptyRemote, remoteSha, remoteUrlChanged, state },
   };
 }
 
-/** fetch 远端分支到 FETCH_HEAD（空远端跳过）。 */
+/** fetch 远端分支（空远端跳过）。
+ * `noWriteFetchHead`：status 只读检查用——`--no-write-fetch-head` 不写 FETCH_HEAD，
+ * 不会与进行中的 sync 互相干扰（旧版 git 不支持该 flag 时降级为普通 fetch）。 */
 export async function fetchRemote(
   ctx: SyncContext,
-  prepared: PreparedRepository
+  prepared: PreparedRepository,
+  options?: { noWriteFetchHead?: boolean }
 ): Promise<{ ok: true; remoteSha: string } | { ok: false; failure: SyncFailure }> {
   if (prepared.emptyRemote) {
     return { ok: true, remoteSha: "" };
   }
 
-  const fetch = await runNetworkGit(ctx, ["fetch", "--no-tags", "origin", "--", prepared.branch]);
+  const fetchArgs = ["fetch", "--no-tags"];
+  if (options?.noWriteFetchHead) fetchArgs.push("--no-write-fetch-head");
+  fetchArgs.push("origin", "--", prepared.branch);
+
+  let fetch = await runNetworkGit(ctx, fetchArgs);
+  if (!fetch.ok && options?.noWriteFetchHead && /unknown option|usage:/i.test(fetch.stderr)) {
+    // 旧版 git 不支持 --no-write-fetch-head：降级（会写 FETCH_HEAD，仅此一处退让）
+    fetch = await runNetworkGit(ctx, ["fetch", "--no-tags", "origin", "--", prepared.branch]);
+  }
   if (!fetch.ok) {
     if (/couldn't find remote ref|does not appear to be a git repository|not found/i.test(fetch.stderr)) {
       return {
@@ -345,6 +408,11 @@ export async function fetchRemote(
       };
     }
     return { ok: false, failure: failureFromResult(fetch) };
+  }
+
+  if (options?.noWriteFetchHead) {
+    // 无 FETCH_HEAD：用 ls-remote 的 sha（调用方保证与 fetch 同源）
+    return { ok: true, remoteSha: prepared.remoteSha };
   }
 
   const head = await runLocalGit(ctx, ["rev-parse", "--verify", "--quiet", "FETCH_HEAD"]);
@@ -401,6 +469,29 @@ export function listWorktreeFiles(teamsDir: string): string[] {
 /** 顶层团队 YAML（本插件管理的唯一路径集合）。 */
 export function isTopLevelTeamYaml(path: string): boolean {
   return !path.includes("/") && path.endsWith(".yaml");
+}
+
+/**
+ * 仓库内路径安全校验（审查 #3）：绝对路径、`..` 段、反斜杠、空段一律拒绝。
+ * 远端树理论上由 git 保证合法，但 fetch 默认不做 fsck，构造出的树可能含
+ * `../` 条目——在**任何落盘之前**必须过滤，不能依赖 read-tree 的报错兜底。
+ */
+export function isSafeRepoPath(path: string): boolean {
+  if (path.length === 0) return false;
+  if (path.startsWith("/") || path.startsWith("\\")) return false;
+  if (path.includes("\\") || path.includes("\0")) return false;
+  const segments = path.split("/");
+  return segments.every((s) => s.length > 0 && s !== ".." && s !== ".");
+}
+
+/** 相对 teamsDir 的安全绝对路径；不安全时返回 null。 */
+export function resolveSafeWorktreePath(teamsDir: string, relPath: string): string | null {
+  if (!isSafeRepoPath(relPath)) return null;
+  const abs = join(teamsDir, relPath);
+  const base = resolve(teamsDir);
+  const target = resolve(abs);
+  if (target !== base && !target.startsWith(base + sep)) return null;
+  return abs;
 }
 
 /** 扫描工作区：每个文件的 blob id（git 语义）+ 大小/时间（TOCTOU 指纹）。 */
@@ -462,6 +553,8 @@ export interface IgnoredSummary {
   nestedYaml: string[];
   /** 本地被改过、但不参与上传的非团队文件。 */
   nonYamlLocalModified: string[];
+  /** 远端树中被拒绝的危险路径（绝对路径/`..`/反斜杠等），不参与任何落盘。 */
+  unsafePaths?: string[];
 }
 
 export interface InvalidTeamFile {
@@ -545,9 +638,26 @@ export async function buildSyncPlan(
   const localEntriesResult = localTree ? await listTree(ctx, localTree) : { ok: true as const, entries: [] };
   if (!localEntriesResult.ok) return { ok: false, failure: localEntriesResult.failure };
 
-  const baseMap = new Map(baseEntries.entries.map((e) => [e.path, e]));
-  const remoteMap = new Map(remoteEntriesResult.entries.map((e) => [e.path, e]));
-  const localTreeMap = new Map(localEntriesResult.entries.map((e) => [e.path, e]));
+  // 危险路径在**任何落盘之前**过滤（审查 #3）：远端树可能含 `../foo`（fetch 默认
+  // 不做 fsck，构造树可绕过 mktree 校验），绝不参与决策/落盘。
+  const unsafeSet = new Set<string>();
+  const filterSafe = (entries: TreeEntry[]): TreeEntry[] =>
+    entries.filter((entry) => {
+      if (isSafeRepoPath(entry.path)) return true;
+      unsafeSet.add(entry.path);
+      return false;
+    });
+  const safeBaseEntries = filterSafe(baseEntries.entries);
+  const safeRemoteEntries = filterSafe(remoteEntriesResult.entries);
+  const safeLocalEntries = filterSafe(localEntriesResult.entries);
+  if (unsafeSet.size > 0) {
+    console.warn(
+      `[top-notch-team] 远端/本地树中存在危险路径，已跳过（不参与同步）：${[...unsafeSet].join("、")}`
+    );
+  }
+
+  const baseMap = new Map(safeBaseEntries.map((e) => [e.path, e]));
+  const remoteMap = new Map(safeRemoteEntries.map((e) => [e.path, e]));
 
   const localFiles = await scanLocalFiles(ctx);
 
@@ -593,7 +703,11 @@ export async function buildSyncPlan(
   const plan: SyncPlan = {
     flags: { firstAttach, emptyRemote: prepared.emptyRemote, remoteUrlChanged: prepared.remoteUrlChanged },
     actions,
-    ignored: { nestedYaml: [...nestedYaml].sort(), nonYamlLocalModified: nonYamlLocalModified.sort() },
+    ignored: {
+      nestedYaml: [...nestedYaml].sort(),
+      nonYamlLocalModified: nonYamlLocalModified.sort(),
+      ...(unsafeSet.size > 0 ? { unsafePaths: [...unsafeSet].sort() } : {}),
+    },
     invalidLocalTeams,
     remoteSha,
     branch,
@@ -610,9 +724,9 @@ export async function buildSyncPlan(
     firstAttach,
     emptyRemote: prepared.emptyRemote,
     remoteUrlChanged: prepared.remoteUrlChanged,
-    baseEntries: baseEntries.entries,
-    remoteEntries: remoteEntriesResult.entries,
-    localEntries: localEntriesResult.entries,
+    baseEntries: safeBaseEntries,
+    remoteEntries: safeRemoteEntries,
+    localEntries: safeLocalEntries,
     localFiles,
     fingerprints,
   };
@@ -669,6 +783,17 @@ export function formatPlanSummary(plan: SyncPlan): string {
   );
   if (plan.flags.firstAttach) lines.push("  ⚠️ 首次接入：将建立与云端的对应关系");
   if (plan.flags.emptyRemote) lines.push("  云端为空仓库：将创建首个提交");
+  if (plan.ignored.unsafePaths && plan.ignored.unsafePaths.length > 0) {
+    lines.push(`  ⚠️ 已跳过危险路径（不落盘）：${plan.ignored.unsafePaths.join("、")}`);
+  }
+  if (plan.ignored.nestedYaml.length > 0) {
+    lines.push(`  子目录 yaml（透传、不决策）：${plan.ignored.nestedYaml.length}（${plan.ignored.nestedYaml.join("、")}）`);
+  }
+  if (plan.ignored.nonYamlLocalModified.length > 0) {
+    lines.push(
+      `  ⚠️ 非团队文件本机改动不会被上传（云端为准）：${plan.ignored.nonYamlLocalModified.join("、")}`
+    );
+  }
   if (plan.invalidLocalTeams.length > 0) {
     lines.push(`  ⚠️ ${plan.invalidLocalTeams.length} 个团队文件校验失败（仍会同步，修复后可用）`);
   }
@@ -710,16 +835,24 @@ export async function verifyPlanFingerprints(
   const tip = await revParse(ctx, [`refs/heads/${snapshot.branch}`]);
   if (tip !== snapshot.localSha) return stale("本地分支引用");
 
-  const current = await scanLocalFiles(ctx);
+  // 只重算指纹涉及的路径（不再全量扫描，降低子进程数）
   for (const [path, expected] of Object.entries(snapshot.fingerprints)) {
-    const actual = current[path];
+    const actual = await hashWorktreeFile(ctx, path);
     if (!expected) {
-      if (actual) return stale(`文件 ${path}（凭空出现）`);
+      if (actual !== null) return stale(`文件 ${path}（凭空出现）`);
       continue;
     }
-    if (!actual || actual.hash !== expected.hash) return stale(`文件 ${path}`);
+    if (actual === null || actual !== expected.hash) return stale(`文件 ${path}`);
   }
   return null;
+}
+
+/** 工作区单文件的 blob id；文件不存在/不可读 → null。 */
+async function hashWorktreeFile(ctx: SyncContext, rel: string): Promise<string | null> {
+  const abs = resolveSafeWorktreePath(ctx.teamsDir, rel);
+  if (!abs || !existsSync(abs)) return null;
+  const res = await runLocalGit(ctx, ["hash-object", `--path=${rel}`, "--", abs]);
+  return res.ok ? res.stdout.trim() : null;
 }
 
 // ── 残留清理（阶段 2 待办：硬杀后的可检测 + 可清理） ──────────
@@ -733,7 +866,34 @@ export async function verifyPlanFingerprints(
  *  - .stale-* 仅在 24h 前保留期后清理（其中可能含被误夺锁的内容）
  * 返回被清理的路径列表（供诊断/测试）。绝不删除 index.lock（可能属于活跃进程）。
  */
-export function cleanupSyncResiduals(ctx: SyncContext, now = Date.now()): string[] {
+/**
+ * 清理上次异常退出的残留（方案 §7.D 第 4 步；审查 #2 修正）：
+ *  - `<gitDir>/sync-index-<pid>-*`（临时索引）
+ *  - `<rootDir>/sync.yaml.tmp-<pid>`（配置临时文件）
+ *  - `<rootDir>/sync.lock.candidate-<pid>-*`（候选锁文件）
+ *  - 工作区/子目录中的 `*.tmp-<pid>`（原子写临时文件）
+ *
+ * 删除条件是**孤儿判定**：写入进程已死，或文件超过宽限期（5 分钟）。
+ * 这样既不会误删合法文件（谓词仅匹配 `.tmp-<数字>` 结尾），也不会删掉其它
+ * 进程（如 /team create）正在写入的临时文件。`.stale-*` 含被误夺锁的内容，
+ * 只在 24h 后清理。绝不删除 `index.lock`（可能属于活跃进程）。
+ */
+const TEMP_AGE_GRACE_MS = 5 * 60_000;
+
+function orphanTemp(absPath: string, pid: number | null, now: number): boolean {
+  if (pid !== null && !isProcessAlive(pid)) return true;
+  try {
+    return now - statSync(absPath).mtimeMs > TEMP_AGE_GRACE_MS;
+  } catch {
+    return false;
+  }
+}
+
+export function cleanupSyncResiduals(
+  ctx: SyncContext,
+  options?: { now?: number; gitDir?: string }
+): string[] {
+  const now = options?.now ?? Date.now();
   const removed: string[] = [];
   const removeFile = (path: string): void => {
     try {
@@ -754,14 +914,25 @@ export function cleanupSyncResiduals(ctx: SyncContext, now = Date.now()): string
     return entries.filter((e) => e.isFile() && predicate(e.name)).map((e) => join(dir, e.name));
   };
 
-  // 临时索引
-  const gitDir = existsSync(join(ctx.teamsDir, ".git")) ? join(ctx.teamsDir, ".git") : ctx.teamsDir;
-  for (const path of collect(gitDir, (name) => name.startsWith("sync-index-"))) removeFile(path);
+  // 临时索引（gitDir 由调用方经 inspectRepo 提供；`.git` 为文件时也能定位）
+  const gitDir = options?.gitDir ?? (existsSync(join(ctx.teamsDir, ".git")) ? join(ctx.teamsDir, ".git") : ctx.teamsDir);
+  for (const path of collect(gitDir, (name) => /sync-index-(\d+)-/.test(name))) {
+    const pid = Number.parseInt(/sync-index-(\d+)-/.exec(path)![1] ?? "", 10);
+    if (orphanTemp(path, Number.isInteger(pid) ? pid : null, now)) removeFile(path);
+  }
 
-  // 配置临时文件 + 锁候选/陈旧残留
-  for (const path of collect(ctx.rootDir, (name) => name.startsWith("sync.yaml.tmp-"))) removeFile(path);
-  for (const path of collect(ctx.rootDir, (name) => name.includes(".candidate-"))) removeFile(path);
-  for (const path of collect(ctx.rootDir, (name) => name.includes(".stale-"))) {
+  // 配置临时文件（严格 `.tmp-<pid>` 后缀 + 孤儿判定）
+  for (const path of collect(ctx.rootDir, (name) => /\.tmp-\d+$/.test(name))) {
+    const pid = Number.parseInt(/\.tmp-(\d+)$/.exec(path)![1] ?? "", 10);
+    if (orphanTemp(path, Number.isInteger(pid) ? pid : null, now)) removeFile(path);
+  }
+  // 锁候选文件（瞬时存在；同一进程不会长期持有）
+  for (const path of collect(ctx.rootDir, (name) => /\.candidate-(\d+)-/.test(name))) {
+    const pid = Number.parseInt(/\.candidate-(\d+)-/.exec(path)![1] ?? "", 10);
+    if (orphanTemp(path, Number.isInteger(pid) ? pid : null, now)) removeFile(path);
+  }
+  // 陈旧锁残留：含被误夺锁的内容，保留 24h 供恢复/诊断
+  for (const path of collect(ctx.rootDir, (name) => /\.stale-/.test(name))) {
     try {
       const st = statSync(path);
       if (now - st.mtimeMs > 24 * 60 * 60 * 1000) removeFile(path);
@@ -770,9 +941,13 @@ export function cleanupSyncResiduals(ctx: SyncContext, now = Date.now()): string
     }
   }
 
-  // 工作区临时文件（原子写残留；不匹配 *.yaml）
+  // 工作区临时文件：仅匹配 `.tmp-<pid>` 结尾，且仅删孤儿（不碰在飞写入）
   for (const rel of listWorktreeFiles(ctx.teamsDir)) {
-    if (rel.includes(".tmp-")) removeFile(join(ctx.teamsDir, rel));
+    const m = /\.tmp-(\d+)$/.exec(rel);
+    if (!m) continue;
+    const pid = Number.parseInt(m[1], 10);
+    const abs = join(ctx.teamsDir, rel);
+    if (orphanTemp(abs, Number.isInteger(pid) ? pid : null, now)) removeFile(abs);
   }
 
   return removed;

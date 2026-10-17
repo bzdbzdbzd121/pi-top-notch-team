@@ -105,6 +105,19 @@ export function formatSyncResult(summary: ApplySummary): string {
   if (summary.passthroughUpdated.length > 0) {
     lines.push(`非团队文件（云端为准）：${summary.passthroughUpdated.length}（${summary.passthroughUpdated.join("、")}）`);
   }
+  if (summary.keptLocalPaths.length > 0) {
+    lines.push(
+      `保留本地独有已跟踪文件：${summary.keptLocalPaths.length}（${summary.keptLocalPaths.join("、")}；不上传、不删除）`
+    );
+  }
+  if (summary.ignored.nonYamlLocalModified.length > 0) {
+    lines.push(
+      `非团队文件的本机改动不会被上传（本机版：${summary.ignored.nonYamlLocalModified.join("、")}）`
+    );
+  }
+  if (summary.ignored.unsafePaths && summary.ignored.unsafePaths.length > 0) {
+    lines.push(`⚠️ 已跳过危险路径（不落盘）：${summary.ignored.unsafePaths.join("、")}`);
+  }
   if (summary.ignored.nestedYaml.length > 0) {
     lines.push(`已忽略子目录 yaml：${summary.ignored.nestedYaml.length}（${summary.ignored.nestedYaml.join("、")}）`);
   }
@@ -113,12 +126,16 @@ export function formatSyncResult(summary: ApplySummary): string {
   if (summary.commit) {
     if (summary.pushed) {
       lines.push(`提交：（本地已推送）${summary.commit.slice(0, 7)}`);
-    } else {
+    } else if (summary.pushFailure) {
       lines.push(`提交：（本地已提交，尚未推送）${summary.commit.slice(0, 7)}`);
-      if (summary.pushFailure) {
-        lines.push(`推送失败：${describeSyncFailure(summary.pushFailure)}`);
-      }
+      lines.push(`推送失败：${describeSyncFailure(summary.pushFailure)}`);
+    } else {
+      lines.push(`提交：${summary.commit.slice(0, 7)}`);
     }
+  }
+  if (summary.indexRefreshFailure) {
+    // 独立于 push 失败（审查 #8）：引用已更新、提交已生效，只是索引未对齐
+    lines.push(`索引刷新失败：${describeSyncFailure(summary.indexRefreshFailure)}（提交已生效，下次运行自动收敛）`);
   }
   if (summary.backupRef) {
     lines.push(`已为换地址前的本地历史保留备份引用：${summary.backupRef}`);
@@ -335,10 +352,9 @@ export async function handleSyncCommand(
   }
 
   try {
-    cleanupSyncResiduals(syncCtx, now().getTime());
-
     // index.lock 预检（明确报错，不删除别人的锁）
     const repoState = await inspectRepo(syncCtx);
+    cleanupSyncResiduals(syncCtx, { now: now().getTime(), gitDir: repoState.gitDir || undefined });
     if (repoState.nestedInsideOtherRepo && !repoState.hasRepo) {
       ctx.ui.notify(
         "⚠️ 检测到 teams/ 目录位于另一个 git 仓库内：同步会把 teams/ 变成嵌入式仓库，外层仓库将不再跟踪团队 YAML（团队定义改由云同步管理）。",
@@ -515,31 +531,45 @@ export async function handleSyncStatus(ctx: ExtensionCommandContext, deps?: Sync
       if (discovery.emptyRemote) {
         remote = { kind: "empty" };
       } else {
-        const fetched = await fetchRemote(statusCtx, {
-          branch: discovery.branch,
-          branchSource: discovery.source,
-          emptyRemote: false,
-          remoteUrlChanged: false,
-          state: repoState,
-        } satisfies PreparedRepository);
+        const fetched = await fetchRemote(
+          statusCtx,
+          {
+            branch: discovery.branch,
+            branchSource: discovery.source,
+            emptyRemote: false,
+            remoteSha: discovery.remoteSha,
+            remoteUrlChanged: false,
+            state: repoState,
+          } satisfies PreparedRepository,
+          { noWriteFetchHead: true } // 只读检查：不写 FETCH_HEAD（不与进行中的 sync 干扰）
+        );
         if (!fetched.ok) {
           remote = { kind: "error", failure: fetched.failure };
         } else {
-          const counts = await runLocalGit(syncCtx, [
-            "rev-list",
-            "--left-right",
-            "--count",
-            `FETCH_HEAD...refs/heads/${discovery.branch}`,
-          ]);
-          if (counts.ok) {
-            const [behindStr, aheadStr] = counts.stdout.trim().split(/\s+/);
-            const behind = Number.parseInt(behindStr ?? "0", 10) || 0;
-            const ahead = Number.parseInt(aheadStr ?? "0", 10) || 0;
-            unpushedCommits = ahead;
-            if (behind === 0 && ahead === 0) remote = { kind: "up-to-date" };
-            else if (behind > 0 && ahead === 0) remote = { kind: "behind", behind };
-            else if (ahead > 0 && behind === 0) remote = { kind: "ahead", ahead };
-            else remote = { kind: "diverged", ahead, behind };
+          const localRef = `refs/heads/${discovery.branch}`;
+          const localExists = await runLocalGit(syncCtx, ["rev-parse", "--verify", "--quiet", localRef]);
+          if (!localExists.ok || localExists.stdout.trim().length === 0) {
+            // 本地尚无分支：远端领先其全部提交（审查 #10）
+            const count = await runLocalGit(syncCtx, ["rev-list", "--count", fetched.remoteSha]);
+            const behind = count.ok ? Number.parseInt(count.stdout.trim(), 10) || 0 : 0;
+            remote = { kind: "behind", behind };
+          } else {
+            const counts = await runLocalGit(syncCtx, [
+              "rev-list",
+              "--left-right",
+              "--count",
+              `${fetched.remoteSha}...${localRef}`,
+            ]);
+            if (counts.ok) {
+              const [behindStr, aheadStr] = counts.stdout.trim().split(/\s+/);
+              const behind = Number.parseInt(behindStr ?? "0", 10) || 0;
+              const ahead = Number.parseInt(aheadStr ?? "0", 10) || 0;
+              unpushedCommits = ahead;
+              if (behind === 0 && ahead === 0) remote = { kind: "up-to-date" };
+              else if (behind > 0 && ahead === 0) remote = { kind: "behind", behind };
+              else if (ahead > 0 && behind === 0) remote = { kind: "ahead", ahead };
+              else remote = { kind: "diverged", ahead, behind };
+            }
           }
         }
       }

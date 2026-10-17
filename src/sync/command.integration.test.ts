@@ -11,6 +11,8 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { hostname, tmpdir } from "node:os";
+import { createHash } from "node:crypto";
+import { deflateSync } from "node:zlib";
 import { stringify as stringifyYaml } from "yaml";
 import { createMockContext } from "../test/fixtures/mock-extension-api";
 import { handleSyncCommand } from "./command";
@@ -33,6 +35,18 @@ function gitCli(cwd: string, args: string[], env?: Record<string, string>): stri
     env: { ...process.env, LC_ALL: "C", ...env },
     stdio: ["ignore", "pipe", "pipe"],
   });
+}
+
+
+/** 手工写入 loose tree 对象（可含 `../` 等 git 拒绝创建的路径；配合 fetch 默认不 fsck 的场景）。 */
+function craftMaliciousTree(repoDir: string, blobSha: string, entryPath: string): string {
+  const body = Buffer.concat([Buffer.from(`100644 ${entryPath}\0`, "utf8"), Buffer.from(blobSha, "hex")]);
+  const store = Buffer.concat([Buffer.from(`tree ${body.length}\0`, "utf8"), body]);
+  const id = createHash("sha1").update(store).digest("hex");
+  const dir = join(repoDir, ".git", "objects", id.slice(0, 2));
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, id.slice(2)), deflateSync(store));
+  return id;
 }
 
 function teamYaml(name: string): string {
@@ -640,5 +654,208 @@ describe("阶段 2：/team sync 集成（真实 git，裸仓库做云端）", ()
     expect(author).toBe("pi-top-notch-team <pi-top-notch-team@localhost>");
     // 未修改用户全局 git 配置
     expect(existsSync(join(emptyHome, ".gitconfig"))).toBe(false);
+  });
+
+  // ── 复审回归（阶段 2 返工） ─────────────────────────────
+
+  it("换远端地址 → 备份引用真实创建、旧历史可从该 ref 检出（审查 #1）", async () => {
+    seedRemote({ "r1.yaml": teamYaml("r1") });
+    configure(remoteDir);
+    writeLocal("mine.yaml", teamYaml("mine"));
+    await sync(makeHarness().ctx);
+    const oldTip = localSha();
+
+    // 第二台「云端」+ 配置改为它 → 需确认 → 同步
+    const remote2 = join(base, "remote2.git");
+    gitCli(base, ["init", "--bare", "-q", remote2]);
+    saveSyncConfig({ enabled: true, remoteUrl: remote2, branch: "" }, rootDir);
+
+    const { ctx, notify, confirm } = makeHarness();
+    await sync(ctx);
+
+    expect(confirm).toHaveBeenCalled(); // 地址不一致 → 明确确认
+    const backups = gitCli(teamsDir, ["for-each-ref", "--format=%(refname)", "refs/sync-backup"])
+      .trim()
+      .split("\n")
+      .filter(Boolean);
+    expect(backups.length).toBeGreaterThan(0);
+    // 旧历史可从备份引用检出（内容与旧 tip 一致）
+    const backupTip = gitCli(teamsDir, ["rev-parse", backups[0]]).trim();
+    expect(backupTip).toBe(oldTip);
+    expect(gitCli(teamsDir, ["show", `${backups[0]}:mine.yaml`])).toContain("name: mine");
+    // 新远端只拿到「本地当前树 + 决策」，旧历史未被推过去
+    expect(gitCli(remote2, ["for-each-ref", "--format=%(refname)", "refs/heads"]).trim()).toBe("refs/heads/main");
+    expect(gitCli(remote2, ["ls-tree", "-r", "--name-only", "main"])).toContain("mine.yaml");
+    // 备份引用也写入摘要
+    expect(notifyText(notify)).toContain("备份引用");
+  });
+
+  it("远端树含危险路径（../escape.yaml）→ 任何落盘前拒绝、零越界写入（审查 #3）", async () => {
+    // 构造恶意树：手工写 loose tree 对象（mktree 会拒绝，fetch 默认不 fsck）
+    const scratch = join(base, `evil-${scratchSeq++}`);
+    mkdirSync(scratch, { recursive: true });
+    gitCli(scratch, ["init", "-q"]);
+    gitCli(scratch, ["symbolic-ref", "HEAD", "refs/heads/main"]);
+    writeFileSync(join(scratch, "safe.txt"), "safe\n", "utf-8");
+    gitCli(scratch, ["add", "-A"]);
+    gitCli(scratch, [...GIT_ID, "commit", "-qm", "seed"]);
+    const blobSha = gitCli(scratch, ["hash-object", "-w", "safe.txt"]).trim();
+    const evilTree = craftMaliciousTree(scratch, blobSha, "../escape.yaml");
+    const evilCommit = gitCli(scratch, [...GIT_ID, "commit-tree", evilTree, "-m", "crafted"]).trim();
+    gitCli(scratch, ["remote", "add", "--", "origin", remoteDir]);
+    gitCli(scratch, ["push", "-q", "origin", `${evilCommit}:refs/heads/main`]);
+    gitCli(remoteDir, ["symbolic-ref", "HEAD", "refs/heads/main"]);
+
+    // 哨兵：rootDir 下的同名文件不得被触碰
+    const sentinel = join(rootDir, "escape.yaml");
+    writeFileSync(sentinel, "SENTINEL-DO-NOT-OVERWRITE", "utf-8");
+    configure();
+
+    const { ctx, notify } = makeHarness();
+    await sync(ctx);
+
+    expect(readFileSync(sentinel, "utf-8")).toBe("SENTINEL-DO-NOT-OVERWRITE");
+    expect(existsSync(join(teamsDir, "escape.yaml"))).toBe(false);
+    expect(existsSync(join(base, "escape.yaml"))).toBe(false);
+    const text = notifyText(notify);
+    expect(text).toContain("危险路径");
+    expect(text).toContain("云同步失败");
+    expect(existsSync(join(teamsDir, "safe.txt"))).toBe(false); // 已回滚
+  });
+
+  it("非文本文件（二进制）passthrough 字节级不损坏（审查 #4）", async () => {
+    const bytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0xff, 0xfe, 0x80, 0x00, 0x01]);
+    const scratch = join(base, `bin-${scratchSeq++}`);
+    mkdirSync(scratch, { recursive: true });
+    gitCli(scratch, ["init", "-q"]);
+    gitCli(scratch, ["symbolic-ref", "HEAD", "refs/heads/main"]);
+    writeFileSync(join(scratch, "logo.bin"), bytes);
+    gitCli(scratch, ["add", "-A"]);
+    gitCli(scratch, [...GIT_ID, "commit", "-qm", "binary"]);
+    gitCli(scratch, ["remote", "add", "--", "origin", remoteDir]);
+    gitCli(scratch, ["push", "-q", "origin", "HEAD:refs/heads/main"]);
+    gitCli(remoteDir, ["symbolic-ref", "HEAD", "refs/heads/main"]);
+
+    configure();
+    await sync(makeHarness().ctx);
+
+    expect(readFileSync(join(teamsDir, "logo.bin"))).toEqual(bytes);
+  });
+
+  it("status 不改写 FETCH_HEAD（审查 #5）", async () => {
+    seedRemote({ "a.yaml": teamYaml("a") });
+    configure();
+    await sync(makeHarness().ctx);
+
+    const fetchHeadPath = join(teamsDir, ".git", "FETCH_HEAD");
+    writeFileSync(fetchHeadPath, "SENTINEL-FETCH-HEAD", "utf-8");
+    const { ctx } = makeHarness();
+    await handleSyncCommand(ctx, "status", { rootDir, statusTimeoutMs: 15_000 });
+
+    expect(readFileSync(fetchHeadPath, "utf-8")).toBe("SENTINEL-FETCH-HEAD");
+  });
+
+  it("本地无分支时 status 显示落后而非「未检查」（审查 #10）", async () => {
+    seedRemote({ "a.yaml": teamYaml("a") });
+    configure();
+    // 只初始化仓库并接入远端，不创建本地分支
+    gitCli(teamsDir, ["init", "-q"]);
+    gitCli(teamsDir, ["remote", "add", "--", "origin", remoteDir]);
+    gitCli(teamsDir, ["symbolic-ref", "HEAD", "refs/heads/main"]);
+
+    const { ctx, notify } = makeHarness();
+    await handleSyncCommand(ctx, "status", { rootDir, statusTimeoutMs: 15_000 });
+    expect(notifyText(notify)).toContain("远端：落后 1 个提交");
+  });
+
+  it("远端地址尾部斜杠视为等价 → 不触发换地址确认（审查 #12）", async () => {
+    seedRemote({ "a.yaml": teamYaml("a") });
+    configure();
+    await sync(makeHarness().ctx);
+
+    saveSyncConfig({ enabled: true, remoteUrl: `${remoteDir}/`, branch: "" }, rootDir);
+    const { ctx, confirm, notify } = makeHarness();
+    await sync(ctx);
+
+    expect(confirm).not.toHaveBeenCalled();
+    expect(notifyText(notify)).toContain("已是最新");
+  });
+
+  it("空远端 + 本地历史已一致 → 直接推现有 tip，不造空内容提交（审查 #9）", async () => {
+    // 本地手工建仓 + 提交
+    gitCli(teamsDir, ["init", "-q"]);
+    writeLocal("a.yaml", teamYaml("a"));
+    gitCli(teamsDir, ["add", "-A"]);
+    gitCli(teamsDir, [...GIT_ID, "commit", "-qm", "local"]);
+    const tipBefore = localSha();
+    configure();
+
+    const { ctx } = makeHarness();
+    await sync(ctx);
+
+    expect(localSha()).toBe(tipBefore); // 未新建提交
+    expect(remoteBranches()).toEqual(["main"]);
+    expect(gitCli(remoteDir, ["rev-parse", "refs/heads/main"]).trim()).toBe(tipBefore);
+  });
+
+  it("索引刷新失败独立于推送失败：仍尝试推送并单独报告（审查 #8）", async () => {
+    seedRemote({ "a.yaml": teamYaml("a") });
+    configure();
+    await sync(makeHarness().ctx);
+    writeLocal("a.yaml", teamYaml("a") + "# local\n");
+
+    let resetFailed = false;
+    const failingReset: typeof runGit = async (args, options) => {
+      if (!resetFailed && args[0] === "reset") {
+        resetFailed = true;
+        return {
+          ok: false,
+          stdout: "",
+          stderr: "fatal: Unable to create '.git/index.lock': File exists (injected)",
+          code: 128,
+          timedOut: false,
+          outputLimitExceeded: false,
+          command: "git reset --mixed --quiet",
+        };
+      }
+      return runGit(args, options);
+    };
+
+    const { ctx, notify } = makeHarness();
+    await sync(ctx, { runGit: failingReset });
+
+    const text = notifyText(notify);
+    expect(resetFailed).toBe(true);
+    expect(text).toContain("索引刷新失败");
+    expect(text).not.toContain("尚未推送"); // 不是推送失败
+    expect(remoteFile("a.yaml")).toContain("# local"); // 仍完成推送
+  });
+
+  it("非团队文件：本机改动被云端覆盖有提示；远端删除时本地版本保留（审查 #6）", async () => {
+    seedRemote({ "README.md": "cloud v1\n" });
+    configure();
+    await sync(makeHarness().ctx);
+
+    // 本机 + 云端同时改 README → 本机改动不上传（云端为准）且有提示
+    writeLocal("README.md", "local edit\n");
+    remoteCommit({ "README.md": "cloud v2\n" }, "remote readme");
+    const first = makeHarness();
+    await sync(first.ctx);
+    const firstText = notifyText(first.notify);
+    expect(readLocal("README.md")).toBe("cloud v2\n");
+    expect(firstText).toContain("非团队文件（云端为准）");
+    expect(firstText).toContain("非团队文件的本机改动不会被上传");
+
+    // 云端删除 README → 本地已跟踪版本保留（不孤儿化）且有提示
+    const scratch = join(base, `rm-readme-${scratchSeq++}`);
+    gitCli(base, ["clone", "-q", "--branch", "main", remoteDir, scratch]);
+    unlinkSync(join(scratch, "README.md"));
+    gitCli(scratch, ["add", "-A"]);
+    gitCli(scratch, [...GIT_ID, "commit", "-qm", "remove readme"]);
+    gitCli(scratch, ["push", "-q", "origin", "HEAD:refs/heads/main"]);
+    const second = makeHarness();
+    await sync(second.ctx);
+    expect(existsSync(join(teamsDir, "README.md"))).toBe(true);
+    expect(notifyText(second.notify)).toContain("保留本地独有已跟踪文件");
   });
 });

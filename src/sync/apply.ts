@@ -16,9 +16,11 @@ import type { FileClass } from "./classify";
 import {
   describeSyncFailure,
   failureFromResult,
+  isSafeRepoPath,
   listConflicts,
   listInvalidTeamFiles,
   manualFailure,
+  resolveSafeWorktreePath,
   runLocalGit,
   runNetworkGit,
   verifyPlanFingerprints,
@@ -52,6 +54,8 @@ export interface ApplySummary {
   commit: string;
   pushed: boolean;
   pushFailure?: SyncFailure;
+  /** 提交后索引刷新（reset --mixed）失败（独立于 push 失败）。 */
+  indexRefreshFailure?: SyncFailure;
   fallbackIdentity: boolean;
   fastForward: boolean;
   backupRef?: string;
@@ -69,7 +73,7 @@ export interface ApplyResult {
 interface JournalEntry {
   absPath: string;
   /** 写入前的原始内容；null = 原本不存在。 */
-  previous: string | null;
+  previous: Buffer | null;
 }
 
 function emptySummary(plan: SyncPlan): ApplySummary {
@@ -110,11 +114,11 @@ function syncFileBestEffort(path: string): void {
   }
 }
 
-/** 原子写（同目录临时文件 + rename）；临时名不匹配 `*.yaml`。 */
-function writeFileAtomic(absPath: string, content: string): void {
+/** 原子写（同目录临时文件 + rename）；临时名不匹配 `*.yaml`；二进制安全。 */
+function writeFileAtomic(absPath: string, content: string | Buffer): void {
   const tmpPath = `${absPath}.tmp-${process.pid}`;
   try {
-    writeFileSync(tmpPath, content, "utf-8");
+    writeFileSync(tmpPath, content);
     syncFileBestEffort(tmpPath);
     renameSync(tmpPath, absPath);
   } catch (err) {
@@ -145,18 +149,27 @@ function toSummaryName(path: string): string {
   return path.endsWith(".yaml") ? path.slice(0, -".yaml".length) : path;
 }
 
-/** 云端 blob 内容（按 sha 缓存）。 */
+/** 云端 blob 内容（按 sha 缓存；二进制安全捕获，非文本文件不被 utf8 解码损坏）。 */
 async function readRemoteBlob(
   ctx: SyncContext,
   blob: string,
-  cache: Map<string, string>
-): Promise<{ ok: true; content: string } | { ok: false; failure: SyncFailure }> {
+  cache: Map<string, Buffer>
+): Promise<{ ok: true; content: Buffer } | { ok: false; failure: SyncFailure }> {
   const cached = cache.get(blob);
   if (cached !== undefined) return { ok: true, content: cached };
-  const res = await runLocalGit(ctx, ["cat-file", "blob", blob], { maxBuffer: 8 * 1024 * 1024 });
+  const res = await runLocalGit(ctx, ["cat-file", "blob", blob], {
+    maxBuffer: 8 * 1024 * 1024,
+    binaryStdout: true,
+  });
   if (!res.ok) return { ok: false, failure: failureFromResult(res) };
-  cache.set(blob, res.stdout);
-  return { ok: true, content: res.stdout };
+  const content = res.stdoutBuffer ?? Buffer.from(res.stdout, "utf8");
+  cache.set(blob, content);
+  return { ok: true, content };
+}
+
+function bufferEquals(a: Buffer | null, b: Buffer | null): boolean {
+  if (a === null || b === null) return a === b;
+  return a.equals(b);
 }
 
 function actionKind(action: FileClass): FileClass["kind"] {
@@ -197,11 +210,19 @@ export async function applySync(input: {
   if (stale) return { ok: false, summary, failure: stale, rolledBack: false };
 
   const remoteMap = new Map(snapshot.remoteEntries.map((e) => [e.path, e]));
-  const localTreeMap = new Map(snapshot.localEntries.map((e) => [e.path, e]));
   const actionMap = new Map(plan.actions.map((a) => [a.path, a]));
-  const blobCache = new Map<string, string>();
+  const blobCache = new Map<string, Buffer>();
 
   // ── 2. 工作区落盘（原子替换 / 删除；失败即回滚） ──
+  // 危险路径（`..`/绝对路径/反斜杠）一律跳过：计划阶段已过滤，这里再作防御。
+  const unsafe: string[] = [];
+  const safeAbs = (rel: string): string | null => {
+    if (!isSafeRepoPath(rel)) {
+      unsafe.push(rel);
+      return null;
+    }
+    return resolveSafeWorktreePath(ctx.teamsDir, rel);
+  };
   try {
     for (const action of plan.actions) {
       const path = action.path;
@@ -212,10 +233,11 @@ export async function applySync(input: {
         continue;
       }
       if (DELETE_KINDS.includes(kind)) {
-        const abs = join(ctx.teamsDir, path);
+        const abs = safeAbs(path);
+        if (!abs) continue;
         if (kind === "remote-deleted" || kind === "both-deleted") {
           if (existsSync(abs)) {
-            journal.push({ absPath: abs, previous: readFileSync(abs, "utf-8") });
+            journal.push({ absPath: abs, previous: readFileSync(abs) });
             unlinkSync(abs);
             summary.deletedOnLocal.push(toSummaryName(path));
           }
@@ -228,11 +250,12 @@ export async function applySync(input: {
       if (kind === "remote-modified" || kind === "remote-only") {
         const entry = remoteMap.get(path);
         if (!entry) continue;
+        const abs = safeAbs(path);
+        if (!abs) continue;
         const blob = await readRemoteBlob(ctx, entry.blob, blobCache);
         if (!blob.ok) throw blob.failure;
-        const abs = join(ctx.teamsDir, path);
-        const previous = existsSync(abs) ? readFileSync(abs, "utf-8") : null;
-        if (blob.content !== previous) {
+        const previous = existsSync(abs) ? readFileSync(abs) : null;
+        if (!bufferEquals(blob.content, previous)) {
           journal.push({ absPath: abs, previous });
           writeFileAtomic(abs, blob.content);
         }
@@ -243,17 +266,25 @@ export async function applySync(input: {
     // 非团队文件「云端为准」：远端树里有、本地内容不同的路径按远端覆盖
     for (const entry of snapshot.remoteEntries) {
       if (actionMap.has(entry.path)) continue;
-      const abs = join(ctx.teamsDir, entry.path);
-      const previous = existsSync(abs) ? readFileSync(abs, "utf-8") : null;
+      const abs = safeAbs(entry.path);
+      if (!abs) continue;
+      const previous = existsSync(abs) ? readFileSync(abs) : null;
       const blob = await readRemoteBlob(ctx, entry.blob, blobCache);
       if (!blob.ok) throw blob.failure;
-      if (blob.content !== previous) {
+      if (!bufferEquals(blob.content, previous)) {
         const absDir = dirname(abs);
         if (!existsSync(absDir)) mkdirSync(absDir, { recursive: true });
         journal.push({ absPath: abs, previous });
         writeFileAtomic(abs, blob.content);
         summary.passthroughUpdated.push(entry.path);
       }
+    }
+
+    if (unsafe.length > 0) {
+      summary.ignored = {
+        ...summary.ignored,
+        unsafePaths: [...new Set([...(summary.ignored.unsafePaths ?? []), ...unsafe])].sort(),
+      };
     }
 
     // 本地已跟踪、云端没有的非管理路径：保留（避免孤儿化）
@@ -303,6 +334,7 @@ export async function applySync(input: {
     if (!readTree.ok) return failBeforeCommit(failureFromResult(readTree));
 
     for (const action of plan.actions) {
+      if (!isSafeRepoPath(action.path)) continue; // 防御：危险路径不进入索引操作
       const kind = actionKind(action);
       if (ADD_KINDS.includes(kind)) {
         const add = await runLocalGit(ctx, ["add", "--", action.path], { env: addEnv });
@@ -316,7 +348,8 @@ export async function applySync(input: {
     // 本地已跟踪但云端没有的非管理路径：保留在提交树中
     for (const entry of snapshot.localEntries) {
       if (remoteMap.has(entry.path) || actionMap.has(entry.path)) continue;
-      if (!existsSync(join(ctx.teamsDir, entry.path))) continue;
+      const abs = resolveSafeWorktreePath(ctx.teamsDir, entry.path);
+      if (!abs || !existsSync(abs)) continue;
       const add = await runLocalGit(ctx, ["add", "--", entry.path], { env: addEnv });
       if (!add.ok) return failBeforeCommit(failureFromResult(add));
     }
@@ -326,11 +359,26 @@ export async function applySync(input: {
     const finalTree = writeTree.stdout.trim();
 
     const oldSha = snapshot.localSha || "0000000000000000000000000000000000000000";
+
     // 换远端地址：先为本地历史保留备份引用，避免旧历史被推到新仓库
+    // （审查 #1：新 ref 必须传全 0 old 值；失败则中止，不静默降级）
     if (snapshot.remoteUrlChanged && snapshot.localSha) {
       const backupRef = `refs/sync-backup/${new Date().toISOString().replace(/[:.]/g, "-")}`;
-      const backup = await runLocalGit(ctx, ["update-ref", backupRef, snapshot.localSha, oldSha]);
-      if (backup.ok) summary.backupRef = backupRef;
+      const backup = await runLocalGit(ctx, [
+        "update-ref",
+        backupRef,
+        snapshot.localSha,
+        "0000000000000000000000000000000000000000",
+      ]);
+      if (!backup.ok) {
+        return failBeforeCommit(
+          manualFailure(
+            "换远端地址前的本地历史备份引用创建失败，已中止（未做任何改动）",
+            "检查仓库可写后重试（备份名 refs/sync-backup/<时间戳>）"
+          )
+        );
+      }
+      summary.backupRef = backupRef;
     }
 
     // 快速路径：最终树 = 云端树且本地是云端的祖先（本次只有下载）→ 直接指向云端提交
@@ -347,6 +395,18 @@ export async function applySync(input: {
       summary.commit = snapshot.remoteSha;
       summary.pushed = true;
       summary.fastForward = true;
+      return { ok: true, summary, rolledBack: false };
+    }
+
+    // 空远端 + 最终树 = 本地已有历史（审查 #9）：直接推现有 tip，不造无意义提交
+    if (snapshot.remoteSha === "" && snapshot.localSha !== "" && finalTree === snapshot.localTree) {
+      const push = await pushBranch(ctx, plan.branch);
+      if (push.ok) {
+        summary.pushed = true;
+      } else {
+        summary.pushFailure = push.failure;
+      }
+      summary.commit = snapshot.localSha;
       return { ok: true, summary, rolledBack: false };
     }
 
@@ -385,11 +445,9 @@ export async function applySync(input: {
 
     const reset = await runLocalGit(ctx, ["reset", "--mixed", "--quiet"]);
     if (!reset.ok) {
-      // 引用已更新：不再回滚文件（提交已生效），报告提交成功但索引未对齐
-      summary.commit = commitSha;
-      summary.pushed = false;
-      summary.pushFailure = failureFromResult(reset);
-      return { ok: true, summary, rolledBack: false };
+      // 引用已更新：不回滚文件（提交已生效），但索引刷新失败要独立报告
+      // （审查 #8：这不是 push 失败）；仍继续尝试推送
+      summary.indexRefreshFailure = failureFromResult(reset);
     }
 
     summary.commit = commitSha;

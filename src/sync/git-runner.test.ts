@@ -252,6 +252,18 @@ describe("spawnCapture（超时与输出上限）", () => {
     expect(res.stderr).toBe("err\n");
   });
 
+  it("binary 模式：stdout 以 Buffer 收集，非文本字节不被损坏（审查 #4）", async () => {
+    const bytes = [0x89, 0x50, 0x4e, 0x47, 0x00, 0xff, 0xfe, 0x80];
+    const res = await spawnCapture(
+      process.execPath,
+      ["-e", `process.stdout.write(Buffer.from([${bytes.join(",")}]))`],
+      { cwd: rootDir, env: buildGitEnv(), binary: true }
+    );
+    expect(res.ok).toBe(true);
+    expect(res.stdoutBuffer).toEqual(Buffer.from(bytes));
+    expect(res.stdout).toBe("");
+  });
+
   it("spawn 同步抛错（cwd 为文件 ENOTDIR）→ 结构化 spawnError，绝不 reject（审查 #1）", async () => {
     const filePath = join(rootDir, "not-a-directory");
     writeFileSync(filePath, "x", "utf-8");

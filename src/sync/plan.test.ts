@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -132,7 +133,7 @@ describe("plan.ts 计划派生", () => {
   });
 });
 
-describe("cleanupSyncResiduals（阶段 2 待办：硬杀残留清理）", () => {
+describe("cleanupSyncResiduals（孤儿残留清理，审查 #2）", () => {
   let rootDir: string;
   let ctx: SyncContext;
 
@@ -146,13 +147,22 @@ describe("cleanupSyncResiduals（阶段 2 待办：硬杀残留清理）", () =>
     rmSync(rootDir, { recursive: true, force: true });
   });
 
-  it("清理临时索引 / 配置临时文件 / 锁候选 / 工作区 tmp；不动 index.lock", () => {
+  /** 已退出并被回收的 pid（写入进程已死的确定性模拟）。 */
+  async function reapedPid(): Promise<number> {
+    const child = spawn(process.execPath, ["-e", "process.exit(0)"], { stdio: "ignore" });
+    const pid = child.pid!;
+    await new Promise<void>((resolve) => child.on("close", () => resolve()));
+    return pid;
+  }
+
+  it("清理孤儿残留（写入进程已死）：临时索引/配置 tmp/候选锁/工作区 tmp；不动 index.lock", async () => {
+    const pid = await reapedPid();
     const gitDir = join(ctx.teamsDir, ".git");
     const files = [
-      join(gitDir, "sync-index-123-1"),
-      join(rootDir, "sync.yaml.tmp-999"),
-      join(rootDir, "sync.lock.candidate-1-abcd"),
-      join(ctx.teamsDir, "a.yaml.tmp-999"),
+      join(gitDir, `sync-index-${pid}-1`),
+      join(rootDir, `sync.yaml.tmp-${pid}`),
+      join(rootDir, `sync.lock.candidate-${pid}-abcd`),
+      join(ctx.teamsDir, `a.yaml.tmp-${pid}`),
     ];
     for (const f of files) writeFileSync(f, "x");
     const indexLock = join(gitDir, "index.lock");
@@ -164,6 +174,46 @@ describe("cleanupSyncResiduals（阶段 2 待办：硬杀残留清理）", () =>
     for (const f of files) expect(() => statSync(f)).toThrow();
     expect(statSync(indexLock).isFile()).toBe(true);
     expect(statSync(join(gitDir, "config")).isFile()).toBe(true);
+  });
+
+  it("保留合法文件：legit.tmp-1.yaml 与 sub/notes.tmp-keep.md（谓词只认 .tmp-<数字> 结尾）", () => {
+    const legitTeam = join(ctx.teamsDir, "legit.tmp-1.yaml");
+    mkdirSync(join(ctx.teamsDir, "sub"), { recursive: true });
+    const legitNested = join(ctx.teamsDir, "sub", "notes.tmp-keep.md");
+    writeFileSync(legitTeam, "name: legit.tmp-1\ndescription: d\nmembers: []\n");
+    writeFileSync(legitNested, "notes");
+
+    const removed = cleanupSyncResiduals(ctx);
+    expect(removed).toEqual([]);
+    expect(statSync(legitTeam).isFile()).toBe(true);
+    expect(statSync(legitNested).isFile()).toBe(true);
+  });
+
+  it("保留在飞临时文件（pid 存活且新鲜）", () => {
+    const inFlight = join(ctx.teamsDir, `a.yaml.tmp-${process.pid}`);
+    writeFileSync(inFlight, "x");
+    const removed = cleanupSyncResiduals(ctx);
+    expect(removed).toEqual([]);
+    expect(statSync(inFlight).isFile()).toBe(true);
+  });
+
+  it("pid 存活但文件超过宽限期 → 仍按孤儿清理（pid 复用场景）", () => {
+    const staleInFlight = join(ctx.teamsDir, `a.yaml.tmp-${process.pid}`);
+    writeFileSync(staleInFlight, "x");
+    const past = new Date(Date.now() - 6 * 60 * 1000);
+    utimesSync(staleInFlight, past, past);
+    const removed = cleanupSyncResiduals(ctx);
+    expect(removed).toEqual([staleInFlight]);
+  });
+
+  it("显式传入 gitDir（.git 为文件时也能清理临时索引，审查 #11）", () => {
+    const fakeGitDir = join(rootDir, "gitdir");
+    mkdirSync(fakeGitDir, { recursive: true });
+    const tmpIndex = join(fakeGitDir, "sync-index-999-1");
+    writeFileSync(tmpIndex, "x");
+
+    const removed = cleanupSyncResiduals(ctx, { gitDir: fakeGitDir });
+    expect(removed).toEqual([tmpIndex]);
   });
 
   it("陈旧锁残留（.stale-*）超过 24h 才清理；新鲜保留", () => {

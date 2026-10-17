@@ -104,6 +104,51 @@ describe("阶段 2 输出文案（验收 13）", () => {
     expect(text).toContain("异常：1 个团队文件校验失败（bad.yaml：members 不能为空");
   });
 
+  it("本地独有已跟踪文件 / 非团队文件本机改动 / 危险路径 均有提示（审查 #6）", () => {
+    const text = formatSyncResult({
+      ...baseSummary,
+      commit: "abcdef1",
+      pushed: true,
+      keptLocalPaths: ["README.md"],
+      ignored: {
+        nestedYaml: ["sub/nested.yaml"],
+        nonYamlLocalModified: ["README.md"],
+        unsafePaths: ["../escape.yaml"],
+      },
+    });
+    expect(text).toContain("保留本地独有已跟踪文件：1（README.md");
+    expect(text).toContain("非团队文件的本机改动不会被上传");
+    expect(text).toContain("已跳过危险路径（不落盘）：../escape.yaml");
+    expect(text).toContain("已忽略子目录 yaml");
+  });
+
+  it("索引刷新失败独立于推送失败（审查 #8）", () => {
+    const text = formatSyncResult({
+      ...baseSummary,
+      commit: "abcdef1",
+      pushed: true,
+      indexRefreshFailure: manualFailure("仓库锁文件冲突", "确认没有其它 git 进程在运行"),
+    });
+    expect(text).toContain("提交：（本地已推送）abcdef1");
+    expect(text).toContain("索引刷新失败：仓库锁文件冲突");
+    expect(text).not.toContain("尚未推送");
+  });
+
+  it("计划摘要含非团队文件本地改动/子目录 yaml/危险路径提示（审查 #6）", () => {
+    const plan = {
+      ...makePlan([{ kind: "local-modified", path: "a.yaml" }]),
+      ignored: {
+        nestedYaml: ["sub/nested.yaml"],
+        nonYamlLocalModified: ["README.md"],
+        unsafePaths: ["../escape.yaml"],
+      },
+    };
+    const text = formatPlanSummary(plan);
+    expect(text).toContain("非团队文件本机改动不会被上传（云端为准）：README.md");
+    expect(text).toContain("子目录 yaml（透传、不决策）：1（sub/nested.yaml）");
+    expect(text).toContain("已跳过危险路径（不落盘）：../escape.yaml");
+  });
+
   it("失败输出：原因 + 修法 + （可选）原始诊断", () => {
     const failure = manualFailure("远端仓库不存在或无权访问", "核对仓库地址与访问权限");
     expect(formatSyncFailure(failure)).toBe("云同步失败：远端仓库不存在或无权访问。修法：核对仓库地址与访问权限");
