@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, existsSync, unlinkSync, rmSync, readdirSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, unlinkSync, rmSync, readdirSync, mkdirSync, renameSync } from "node:fs";
 import { join, basename, extname } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import type { TeamDefinition } from "./definition";
@@ -31,7 +31,33 @@ export function writeTeam(team: TeamDefinition, rootDir: string): void {
   }
 
   const yaml = stringifyYaml(team, { lineWidth: 120 });
-  writeFileSync(filePath, yaml, "utf-8");
+  writeFileAtomic(filePath, yaml);
+}
+
+/**
+ * Write with same-directory temp file + atomic rename (POSIX rename semantics).
+ *
+ * Why: a direct overwrite can expose a half-written YAML to a concurrent
+ * reader (sync staging, another pi instance, `/team list`). A crash or a failed
+ * rename must leave the previous file untouched — the temp name never matches
+ * `*.yaml` (so it is never listed as a team) and is removed when the rename
+ * fails. Residual `.tmp-<pid>` files from a hard kill are ignored by listTeams
+ * and cleaned by the sync recovery path.
+ */
+function writeFileAtomic(filePath: string, content: string): void {
+  const tmpPath = `${filePath}.tmp-${process.pid}`;
+  try {
+    writeFileSync(tmpPath, content, "utf-8");
+    renameSync(tmpPath, filePath); // atomic on POSIX
+  } catch (err) {
+    // 任一步失败都清理临时文件（部分写入/替换失败），旧文件保持不变
+    try {
+      unlinkSync(tmpPath);
+    } catch {
+      /* 临时文件可能尚未创建；保留原始错误 */
+    }
+    throw err;
+  }
 }
 
 /** Read a team definition from a YAML file. Returns null if not found or invalid. */
