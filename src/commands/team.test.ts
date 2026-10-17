@@ -320,6 +320,24 @@ members:
       return { pi, ctx, createTool, cmdHandler };
     }
 
+    it("目标已存在 → 拒绝创建并引导 /team edit（不覆盖同步下载的同名团队）", async () => {
+      const { createTool } = await setupCreateTool();
+      // 预先放入同名文件（模拟刚同步下载的团队；内容是校验失败的 YAML，
+      // 因此守卫必须按「文件存在」判定，而不是 readTeam）
+      mkdirSync(join(tmpDir, "teams"), { recursive: true });
+      writeFileSync(join(tmpDir, "teams", "taken.yaml"), "name: taken\ndescription: x\nmembers: []\n", "utf-8");
+
+      const result = await createTool.execute("id", {
+        name: "taken",
+        description: "本应新建",
+        members: [{ name: "m1", systemPrompt: "提示" }],
+      });
+
+      expect(result.content[0].text).toContain("已存在");
+      expect(result.content[0].text).toContain("/team edit taken");
+      expect(readFileSync(join(tmpDir, "teams", "taken.yaml"), "utf-8")).toContain("members: []");
+    });
+
     it("persists workflow to YAML", async () => {
       const { createTool } = await setupCreateTool();
 

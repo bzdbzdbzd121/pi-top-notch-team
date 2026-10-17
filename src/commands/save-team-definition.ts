@@ -1,5 +1,7 @@
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import type { TeamWorkflow, TeamDefinition, TeamMember } from "../team/definition";
-import { readTeam, writeTeam } from "../team/store";
+import { getTeamsDir, readTeam, writeTeam } from "../team/store";
 import { validateTeamDefinition } from "../team/schema";
 
 export interface TeamSaveParams {
@@ -25,6 +27,31 @@ export async function saveTeamDefinition(
   rootDir: string,
   isUpdate = false
 ): Promise<any> {
+  // Create 模式的「已存在」守卫（阶段 4 收尾裁决）：目标 teams/<name>.yaml 已存在
+  // 时拒绝创建并引导 /team edit —— 绝不静默覆盖同名团队。云同步会把其它机器上的
+  // 同名团队下载到本机，静默覆盖会直接丢掉那份定义。
+  //
+  // 用 existsSync 而不是 readTeam：readTeam 对「文件存在但校验失败」也返回 null，
+  // 而这一类（例如刚同步下来、格式非法的团队）恰恰最需要保护。
+  if (!isUpdate) {
+    const targetPath = join(getTeamsDir(rootDir), `${params.name}.yaml`);
+    if (existsSync(targetPath)) {
+      return {
+        details: {},
+        content: [
+          {
+            type: "text" as const,
+            text:
+              `团队 "${params.name}" 已存在（${targetPath}），已拒绝创建以避免覆盖同名团队。\n` +
+              `如需修改它，请用 /team edit ${params.name}。\n` +
+              `如果它是刚云同步下来的团队，直接用 /team start ${params.name} 即可。\n` +
+              `若要另建一个不同的团队，请换一个名字重新创建。`,
+          },
+        ],
+      };
+    }
+  }
+
   // Read existing team for update merge
   let existingTeam: TeamDefinition | null = null;
   if (isUpdate) {

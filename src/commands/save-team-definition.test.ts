@@ -7,11 +7,13 @@ import { tmpdir } from "node:os";
 
 const mockReadTeam = vi.fn();
 const mockWriteTeam = vi.fn();
+const mockGetTeamsDir = vi.fn((rootDir: string) => join(rootDir, "teams"));
 const mockValidate = vi.fn();
 
 vi.mock("../team/store", () => ({
   readTeam: (...args: any[]) => mockReadTeam(...args),
   writeTeam: (...args: any[]) => mockWriteTeam(...args),
+  getTeamsDir: (...args: any[]) => mockGetTeamsDir(...(args as [string])),
 }));
 
 vi.mock("../team/schema", () => ({
@@ -351,5 +353,75 @@ describe("saveTeamDefinition — merge logic", () => {
     expect(writtenData.members[0].systemPrompt).toBe("分析");
     expect(writtenData.members[0].model).toBe("gpt-4");
     expect(writtenData.members[0].label).toBe("分析员");
+  });
+
+  // ── 阶段 4 收尾裁决：create 落盘的「已存在」守卫 ──────────
+
+  describe("create 已存在守卫（防止静默覆盖同步下载的团队）", () => {
+    let guardRoot: string;
+
+    beforeEach(() => {
+      guardRoot = mkdtempSync(join(tmpdir(), "save-team-guard-"));
+      mockGetTeamsDir.mockImplementation((rootDir: string) => join(rootDir, "teams"));
+    });
+
+    afterEach(() => {
+      rmSync(guardRoot, { recursive: true, force: true });
+    });
+
+    it("目标已存在（即使是校验失败的 YAML）→ 拒绝创建 + 引导 /team edit + 零写盘", async () => {
+      mkdirSync(join(guardRoot, "teams"), { recursive: true });
+      // 模拟同步下载的同名团队：内容非法（readTeam 对非法 YAML 返回 null，故守卫必须用存在性判定）
+      writeFileSync(join(guardRoot, "teams", "dup.yaml"), "name: dup\ndescription: x\nmembers: []\n", "utf-8");
+
+      const { saveTeamDefinition } = await loadModule();
+      const result = await saveTeamDefinition(
+        {
+          name: "dup",
+          description: "本应新建",
+          members: [{ name: "m1", systemPrompt: "提示" }],
+        },
+        guardRoot,
+        false
+      );
+
+      expect(result).not.toBeNull();
+      const text = String(result.content[0].text);
+      expect(text).toContain("已存在");
+      expect(text).toContain("/team edit dup");
+      expect(mockWriteTeam).not.toHaveBeenCalled();
+      expect(readFileSync(join(guardRoot, "teams", "dup.yaml"), "utf-8")).toContain("members: []");
+    });
+
+    it("目标不存在 → 行为不变（正常创建）", async () => {
+      mkdirSync(join(guardRoot, "teams"), { recursive: true });
+      const { saveTeamDefinition } = await loadModule();
+      const result = await saveTeamDefinition(
+        { name: "fresh", description: "新团队", members: [{ name: "m1", systemPrompt: "提示" }] },
+        guardRoot,
+        false
+      );
+      expect(result).toBeNull();
+      expect(mockWriteTeam).toHaveBeenCalledTimes(1);
+    });
+
+    it("update 模式不受守卫影响（同名更新照常写入）", async () => {
+      mkdirSync(join(guardRoot, "teams"), { recursive: true });
+      writeFileSync(join(guardRoot, "teams", "my-team.yaml"), "name: my-team\ndescription: x\nmembers: []\n", "utf-8");
+      mockReadTeam.mockReturnValue({
+        name: "my-team",
+        description: "既有",
+        members: [{ name: "m1", systemPrompt: "旧提示" }],
+      });
+
+      const { saveTeamDefinition } = await loadModule();
+      const result = await saveTeamDefinition(
+        { name: "my-team", members: [{ name: "m1" }] },
+        guardRoot,
+        true
+      );
+      expect(result).toBeNull();
+      expect(mockWriteTeam).toHaveBeenCalledTimes(1);
+    });
   });
 });
