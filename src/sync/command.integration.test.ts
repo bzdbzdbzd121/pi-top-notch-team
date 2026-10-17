@@ -858,4 +858,67 @@ describe("阶段 2：/team sync 集成（真实 git，裸仓库做云端）", ()
     expect(existsSync(join(teamsDir, "README.md"))).toBe(true);
     expect(notifyText(second.notify)).toContain("保留本地独有已跟踪文件");
   });
+
+  it("本机文件名含反斜杠 → 跳过 + 危险路径提示，两次同步均成功（复审回归 #1）", async () => {
+    seedRemote({ "remote.yaml": teamYaml("remote") });
+    configure();
+    writeLocal("a.yaml", teamYaml("a"));
+    writeLocal("weird\\name.yaml", teamYaml("weird")); // POSIX 合法文件名（含反斜杠）
+
+    const first = makeHarness();
+    await sync(first.ctx);
+    const firstText = notifyText(first.notify);
+    expect(firstText).toContain("云同步完成");
+    expect(firstText).toContain("危险路径");
+    expect(firstText).toContain("weird\\name.yaml");
+    expect(remoteHas("a.yaml")).toBe(true);
+    expect(remoteHas("remote.yaml")).toBe(true);
+    expect(remoteHas("weird\\name.yaml")).toBe(false); // 跳过，不上传
+    expect(existsSync(join(teamsDir, "weird\\name.yaml"))).toBe(true); // 本机文件不动
+
+    // 第二次运行：不得再报「计划期间文件发生变化」而永久失败
+    const second = makeHarness();
+    await sync(second.ctx);
+    const secondText = notifyText(second.notify);
+    expect(secondText).toContain("危险路径");
+    expect(secondText).not.toContain("云同步失败");
+    expect(secondText).toContain("已是最新");
+  });
+
+  it("keptLocalPaths 只统计仍存在的路径；本机已删除的已跟踪文件不再声称保留（复审建议 #2）", async () => {
+    // notes.md 从远端下发并被本地分支跟踪（非团队文件：本机新增的散落文件不会上传）
+    seedRemote({ "a.yaml": teamYaml("a"), "notes.md": "notes v1\n" });
+    configure();
+    await sync(makeHarness().ctx);
+    expect(existsSync(join(teamsDir, "notes.md"))).toBe(true);
+
+    // 远端删除 notes.md，本机仍保留 → 同步保留并提示
+    const scratch = cloneRemote("main");
+    unlinkSync(join(scratch, "notes.md"));
+    gitCli(scratch, ["add", "-A"]);
+    gitCli(scratch, [...GIT_ID, "commit", "-qm", "remove notes"]);
+    gitCli(scratch, ["push", "-q", "origin", "HEAD:refs/heads/main"]);
+    const kept = makeHarness();
+    await sync(kept.ctx);
+    expect(notifyText(kept.notify)).toContain("保留本地独有已跟踪文件：1（notes.md");
+    expect(existsSync(join(teamsDir, "notes.md"))).toBe(true);
+
+    // 远端再次删除 + 本机也删除 → 不得再声称「保留」，且本地树移除该路径
+    const scratch2 = cloneRemote("main");
+    unlinkSync(join(scratch2, "notes.md"));
+    gitCli(scratch2, ["add", "-A"]);
+    gitCli(scratch2, [...GIT_ID, "commit", "-qm", "remove notes again"]);
+    gitCli(scratch2, ["push", "-q", "origin", "HEAD:refs/heads/main"]);
+    unlinkSync(join(teamsDir, "notes.md"));
+
+    const dropped = makeHarness();
+    await sync(dropped.ctx);
+    expect(notifyText(dropped.notify)).not.toContain("保留本地独有已跟踪文件");
+    expect(remoteHas("notes.md")).toBe(false);
+    const tracked = gitCli(teamsDir, ["ls-tree", "-r", "--name-only", "HEAD"])
+      .trim()
+      .split("\n")
+      .filter(Boolean);
+    expect(tracked).not.toContain("notes.md");
+  });
 });

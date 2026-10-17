@@ -661,9 +661,19 @@ export async function buildSyncPlan(
 
   const localFiles = await scanLocalFiles(ctx);
 
-  // 管理路径 = 三方顶层 *.yaml 的并集
+  // 本机文件名也可能是危险路径（POSIX 下 `\` 是合法文件名字符；`..` 不可能出现
+  // 在顶层文件名里）。这些**本机**输入同样要过滤并报告：否则 managedPaths 会把
+  // 它当成 managed 动作，而指纹校验侧又拒绝解析该名 → 永久「计划期间发生变化」
+  // 而失败（复审回归 #1）。
+  const safeLocalPaths = new Set<string>();
+  for (const path of Object.keys(localFiles)) {
+    if (isSafeRepoPath(path)) safeLocalPaths.add(path);
+    else unsafeSet.add(path);
+  }
+
+  // 管理路径 = 三方顶层 *.yaml 的并集（均限安全路径）
   const managedPaths = new Set<string>();
-  for (const path of [...baseMap.keys(), ...remoteMap.keys(), ...Object.keys(localFiles)]) {
+  for (const path of [...baseMap.keys(), ...remoteMap.keys(), ...safeLocalPaths]) {
     if (isTopLevelTeamYaml(path)) managedPaths.add(path);
   }
 
@@ -680,7 +690,7 @@ export async function buildSyncPlan(
 
   // ignored：子目录 yaml + 本地被改过的非团队文件（tracked，内容或存在性变化）
   const nestedYaml = new Set<string>();
-  for (const path of [...baseMap.keys(), ...remoteMap.keys(), ...Object.keys(localFiles)]) {
+  for (const path of [...baseMap.keys(), ...remoteMap.keys(), ...safeLocalPaths]) {
     if (path.includes("/") && path.endsWith(".yaml")) nestedYaml.add(path);
   }
   const nonYamlLocalModified: string[] = [];
@@ -743,6 +753,7 @@ export async function listInvalidTeamFiles(
   const invalid: InvalidTeamFile[] = [];
   for (const rel of Object.keys(files)) {
     if (!isTopLevelTeamYaml(rel)) continue;
+    if (!isSafeRepoPath(rel)) continue; // 不参与同步的危险路径不作为「团队文件」校验
     const name = rel.slice(0, -".yaml".length);
     try {
       const raw = readFileSync(join(ctx.teamsDir, rel), "utf-8");
@@ -966,7 +977,9 @@ export async function countUncommittedTeamChanges(
 
   const paths = new Set<string>();
   for (const path of [...tipMap.keys(), ...Object.keys(localFiles)]) {
-    if (isTopLevelTeamYaml(path)) paths.add(path);
+    if (!isTopLevelTeamYaml(path)) continue;
+    if (!isSafeRepoPath(path)) continue; // 该文件不参与同步，不计入未提交改动
+    paths.add(path);
   }
   let changed = 0;
   for (const path of paths) {

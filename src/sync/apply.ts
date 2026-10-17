@@ -287,10 +287,13 @@ export async function applySync(input: {
       };
     }
 
-    // 本地已跟踪、云端没有的非管理路径：保留（避免孤儿化）
+    // 本地已跟踪、云端没有的非管理路径：仍存在→保留（避免孤儿化）；
+    // 已在本机删除的已跟踪文件会被下方索引循环一并移除（不再跟踪），
+    // 不得声称「保留/不删除」（复审建议 #2）。
     for (const entry of snapshot.localEntries) {
       if (remoteMap.has(entry.path) || actionMap.has(entry.path)) continue;
-      summary.keptLocalPaths.push(entry.path);
+      const abs = resolveSafeWorktreePath(ctx.teamsDir, entry.path);
+      if (abs && existsSync(abs)) summary.keptLocalPaths.push(entry.path);
     }
 
     // 落盘后重新扫描：本地原有 + 刚下载的非法 YAML 都如实报告（真实后果见文案）
