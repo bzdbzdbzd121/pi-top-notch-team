@@ -766,6 +766,14 @@ describe("P2 结构共享 + 滚动实时性护栏", () => {
     comp.handleInput("\x1b[D");
     comp.handleInput("\x1b[D"); // 切回 a（active）
     for (const n of names) expect(state.tabs.find((t) => t.name === n)!.lines.length).toBeGreaterThan(0);
+    // 基线：上面的 tab 切换会 scheduleFlush()（REFRESH_THROTTLE_MS=500ms 节流），
+    // 先等这条遗留定时器落地，再开始 RPC 计数与采样。否则末端的「无定时器泄漏」
+    // 断言观测到的是它、而不是 toggle —— 结果取决于「同步的 toggle 采样块是否
+    // 跑满 500ms」，机器越快越必红（CI run 39097240692 即在更快的 runner 上失败）。
+    for (let i = 0; i < 100 && (comp as any).refreshTimer !== null; i++) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    expect((comp as any).refreshTimer).toBeNull();
     const rpcBefore = names.reduce((s, n) => s + handles[n].sendCommandAndWait.mock.calls.length, 0);
 
     // 预热 3 次 toggle（让 V8 完成该热路径编译 + 主题化缓存就绪；并行测试
@@ -795,8 +803,9 @@ describe("P2 结构共享 + 滚动实时性护栏", () => {
     // 零 RPC：toggle 期间无新增 get_messages
     const rpcAfter = names.reduce((s, n) => s + handles[n].sendCommandAndWait.mock.calls.length, 0);
     expect(rpcAfter).toBe(rpcBefore);
-    // 无定时器泄漏：toggle 本地重建后不应残留定时器（无 pending flush）
-    await new Promise((r) => setTimeout(r, 20));
+    // 无定时器泄漏（确定性断言）：上面的 toggle 采样是纯同步块，其间不可能有
+    // 定时器到期，故此刻立即断言——基线已清空，只要 toggle 自身没排 flush
+    // （正常路径零 RPC、零定时器）就必然为 null，不再与机器速度赛跑。
     expect((comp as any).refreshTimer).toBeNull();
     expect((comp as any).streamTimer).toBeNull();
   });
