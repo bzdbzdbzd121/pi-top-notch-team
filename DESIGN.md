@@ -1518,11 +1518,16 @@ tracker 生命周期随 widget install/uninstall（onSessionStart / onSessionEnd
 
 ### 显示方案（team-status-widget）——v2 最终矩阵（用户确认）
 
-每成员段 = `图标 + label + 百分比`，**无任何文字细节**（无耗时、无工具名、无省略号）。
+每成员段 = `图标 + label + 百分比`，无耗时、无工具名。布局改为**固定单行**，去掉外框与英文横幅，保留来源徽标和团队名称；不显示总人数或状态人数统计。
 
+```text
+👤 开发团队 │ 💥 测试员 —  💭 分析员 45%  🔧 编码员 30%  … 另5人
 ```
-│ 💭 分析员甲 45% │ 🔧 编码员 30% │ ✏️ 审查员 12% │ ✅ 汇总员 8% │
-```
+
+- 成员用三个 O(N) 稳定桶排列：`crashed` → `working/compacting` → `idle/stopped`。同桶沿用团队名册顺序，细粒度流阶段切换不改变同桶顺序，不自动轮播。
+- `setWidget` 改传组件工厂；`render(width)` 用真实可见列宽排版。完整成员条目之间用两个空格，不拆开条目换行；放不下的尾部用 `… 另N人` 表示，计数精确对应隐藏成员。完整名单仍通过 `alt+t` Inspector 查看。
+- 团队名最多 20 列（且不超过可用宽度的四分之一），成员名最多 12 列，使用 pi-tui `truncateToWidth(..., "…")` 处理中文、emoji 与组合字符。名称中的换行和 tab 转为空格。窄屏先让出团队标题空间，再按需缩短首位成员名称，保留图标与百分比；极窄到连首位成员与溢出提示都放不下时，仅截短显示溢出提示。零成员设计态也只占一行。
+- 组件工厂携带完整成员显示快照；终端缩放时本地重排，无需新 RPC/成员事件，也不新增定时器。渲染时按工厂提供的 theme 着色，`invalidate()` 无样式缓存可清。N1 渲染闸门比较完整快照的 styled 段（包含隐藏成员），不把某一宽度下的截断结果当作权威数据；原有 N1 调度闸门、节流、轮询与进程死亡强制调度不变。
 
 | 显示态 | 图标 | 文案 | 颜色 |
 |--------|------|------|------|
@@ -1536,7 +1541,7 @@ tracker 生命周期随 widget install/uninstall（onSessionStart / onSessionEnd
 
 - **渲染优先级**：`compacting > crashed/stopped > 细粒度 phase > working 兜底 > idle`
 - 不显示思考/输出内容与工具参数（隐私 + 单行放不下；内容查看走 alt+t Inspector）
-- 整行重建（O(N) μs 级，N≤8），不做段级局部重绘（D8）
+- 整行重建（O(N)，不做段级局部重绘，D8）；单行布局测试覆盖 0–160 列、中文/emoji/ANSI/组合字符、resize-only 重排、稳定排序、隐藏成员崩溃提升与精确溢出计数。
 - **v2 同图标同色语义**：tool-calling ↔ executing 切换 styled 输出完全相同 → 渲染闸门正确跳过 setWidget（视觉无差异 = 无需重绘，恰是 N1 语义）；两 phase 保持结构独立（多流优先级 D5 与签名区分），未来恢复显示差异时结构无需重建
 - **v2.2 同图标异色语义**：working 💭（默认色）与 thinking 💭（accent）同图标——颜色是唯一区分；渲染闸门键为 styled 行（含颜色），正确捕获 working↔thinking 双向切换（B1 颜色盲区守卫测试锁定，见 §20 N1 行）
 - **浮窗同步（R3）**：Member Inspector `stateIcon()` working → 💭（footer 消费点，v2.2 同步；与 thinking 同 💭 靠颜色区分）；toolCall 摘要行 🔧 与 thinking 💭 标签语义一致不改

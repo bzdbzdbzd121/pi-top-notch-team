@@ -3,12 +3,6 @@ import type { MemberOperationalState } from "../session/context";
 import type { TeamMember } from "../team/definition";
 import { createActivityTracker } from "../channel/activity-tracker";
 
-// ── Mock pi-tui ────────────────────────────────────────────
-
-vi.mock("@earendil-works/pi-tui", () => ({
-  visibleWidth: (text: string) => text.length,
-}));
-
 // ── Helpers ────────────────────────────────────────────────
 
 function createMockTheme() {
@@ -62,7 +56,7 @@ describe("createTeamStatusWidget", () => {
     const setWidget = vi.fn();
     let lastLines: string[] | null = null;
     setWidget.mockImplementation((key: string, content: any) => {
-      if (key === "team-status") lastLines = content;
+      if (key === "team-status") lastLines = typeof content === "function" ? content({}, theme).render(2000) : content;
     });
     const ui = { setWidget };
     const theme = createMockTheme();
@@ -83,7 +77,7 @@ describe("createTeamStatusWidget", () => {
       ui,
       theme,
       memberOpsStates,
-      middle: () => lastLines?.[1] ?? "",
+      middle: () => lastLines?.[0] ?? "",
       lines: () => lastLines,
     };
   }
@@ -109,10 +103,10 @@ describe("createTeamStatusWidget", () => {
       opsStates: { analyzer: "idle", worker: "working" },
     });
     h.widget.install(h.ui, h.theme);
-    expect(h.setWidget).toHaveBeenCalledWith("team-status", expect.any(Array));
+    expect(h.setWidget).toHaveBeenCalledWith("team-status", expect.any(Function));
     const lines = h.lines()!;
-    expect(lines.length).toBe(3); // top border, middle, bottom border
-    expect(lines[0]).toContain("TEAM MODE");
+    expect(lines.length).toBe(1); // Compact single-line widget, no borders
+    expect(lines[0]).not.toContain("TEAM MODE");
     expect(lines[0]).toContain("test-team");
   });
 
@@ -120,10 +114,9 @@ describe("createTeamStatusWidget", () => {
     const h = build({ members: [], opsStates: {} });
     h.widget.install(h.ui, h.theme);
     const lines = h.lines()!;
-    expect(lines.length).toBe(3);
-    expect(lines[0]).toContain("DYNAMIC TEAM");
+    expect(lines.length).toBe(1);
     expect(lines[0]).toContain("设计阶段");
-    expect(lines[1]).toContain("设计团队中");
+    expect(lines[0]).toContain("设计团队中");
   });
 
   it("should uninstall widget and clear state", async () => {
@@ -168,7 +161,7 @@ describe("createTeamStatusWidget", () => {
     h.memberOpsStates.set("analyzer", "working");
     h.widget.refresh();
     expect(h.setWidget).toHaveBeenCalledTimes(1);
-    expect(h.setWidget).toHaveBeenCalledWith("team-status", expect.any(Array));
+    expect(h.setWidget).toHaveBeenCalledWith("team-status", expect.any(Function));
   });
 
   it("should not throw when uninstall is called without install", async () => {
@@ -188,13 +181,13 @@ describe("createTeamStatusWidget", () => {
     const members: TeamMember[] = [];
     const h = build({ members, opsStates: {} });
     h.widget.install(h.ui, h.theme);
-    expect(h.lines()![0]).toContain("DYNAMIC TEAM");
+    expect(h.lines()![0]).toContain("设计阶段");
     // Add a member
     members.push(createTeamMember("new-member", "新成员"));
     h.memberOpsStates.set("new-member", "idle");
     h.setWidget.mockClear();
     h.widget.refresh();
-    expect(h.lines()![1]).toContain("新成员");
+    expect(h.lines()![0]).toContain("新成员");
   });
 
   describe("session origin marker (ADR-0003)", () => {

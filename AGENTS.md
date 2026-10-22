@@ -181,8 +181,9 @@ src/
 │   ├── resolve-agent-session.ts ← 纯函数：agent 自主会话开关解析（决策 #42：===false→禁止，fail-open 异常→允许；不对称论证入注释）+ 菜单标签；DEFAULT 显式 true；late-evaluation 纪律（消费点 per-call 求值）
 │   └── resolve-agent-session.test.ts ← resolver fail-open 矩阵（undefined/true/false/异常/null settings）+ describe 两态用例
 ├── ui/               ← TUI components for team mode
-│   ├── team-status-widget.ts  ← Bordered widget: live member status + context %；阶段 2 实时化 + v2 简化：细粒度阶段渲染（💭×2/🔧×2/✏️/✅——working 与 thinking 同 💭 靠颜色区分（默认 vs accent），无耗时无工具名）+ N1 双层渲染去重（调度侧签名 logical|phase + 渲染侧 styled 行比较闸门）+ N2 轮询完成保留 refresh + N3 轮询并行化 + 合并节流（120ms + nextStreamFlushDelay 自适应退避，上限 1s）
-│   ├── team-status-widget.test.ts ← widget 单测：徽标/截断/overlay 优先级/时长格式/N1 双闸门（颜色盲区 B1）/S1 进程死亡强制调度/定时器清理
+│   ├── team-status-widget.ts  ← 单行自适应 widget（无外框/总人数，异常→运行中→空闲/停止稳定排序，溢出「… 另 N 人」，render(width) 缩放重排）：live member status + context %；阶段 2 实时化 + v2 简化：细粒度阶段渲染（💭×2/🔧×2/✏️/✅——working 与 thinking 同 💭 靠颜色区分（默认 vs accent），无耗时无工具名）+ N1 双层渲染去重（调度侧签名 logical|phase + 渲染侧 styled 行比较闸门）+ N2 轮询完成保留 refresh + N3 轮询并行化 + 合并节流（120ms + nextStreamFlushDelay 自适应退避，上限 1s）
+│   ├── team-status-widget.test.ts ← widget 单测：单行/来源徽标/overlay 优先级/N1 双闸门（颜色盲区 B1）/S1 进程死亡强制调度/定时器清理
+│   ├── team-status-widget.layout.test.ts ← 真实终端列宽测试：稳定优先排序/精确溢出计数/resize 重排/隐藏成员崩溃提升/长名称/CJK+emoji+ANSI/零宽与窄屏
 │   ├── team-status-widget.integration.test.ts ← 集成测试：mock 成员 RPC 事件注入断言 setWidget 内容；N2 轮询闭环/N3 并行化/N6 风暴护栏 + P3 + 单帧成本实测留档
 │   ├── edit-mode-widget.ts   ← Bordered widget: ✏️ EDIT MODE — <team name>
 │   ├── create-mode-widget.ts ← Bordered widget: 🆕 CREATE MODE

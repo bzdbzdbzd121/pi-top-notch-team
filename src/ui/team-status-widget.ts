@@ -1,4 +1,4 @@
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { TeamContext, MemberOperationalState } from "../session/context";
 import type { TeamMember } from "../team/definition";
 import type { ActivityTracker } from "../channel/activity-tracker";
@@ -17,10 +17,74 @@ export interface MemberContextInfo {
 
 // ── Helpers ───────────────────────────────────────────────
 
-/** Repeat a character n times. */
-function repeat(ch: string, n: number): string {
-  if (n <= 0) return "";
-  return ch.repeat(n);
+type WidgetTheme = { fg: (...args: any[]) => string };
+
+interface StatusSegment {
+  icon: string;
+  label: string;
+  extra: string;
+  color: string | null;
+}
+
+/** Names must never introduce physical lines or tab-dependent widths. */
+function singleLine(text: string): string {
+  return text.replace(/[\r\n\t]/g, " ");
+}
+
+/** Layout is width-driven, including resize-only renders (no RPC or timers). */
+function renderStatusLine(
+  originMarker: string,
+  teamName: string,
+  segments: StatusSegment[],
+  width: number,
+  theme: WidgetTheme,
+): string[] {
+  width = Math.max(0, Math.floor(width));
+  if (width === 0) return [""];
+  if (segments.length === 0) {
+    return [theme.fg("muted", truncateToWidth(`${originMarker} 设计阶段 · 设计团队中`, width, "…"))];
+  }
+
+  const rawSegment = (s: StatusSegment, labelWidth = 12) =>
+    `${s.icon} ${truncateToWidth(s.label, labelWidth, "…")}${s.extra}`;
+  const styleSegment = (s: StatusSegment, raw: string) => s.color ? theme.fg(s.color, raw) : raw;
+  const entries = segments.map(s => rawSegment(s));
+  const suffix = (hidden: number) => hidden > 0 ? `  … 另${hidden}人` : "";
+  let prefix = `${originMarker} ${truncateToWidth(singleLine(teamName), Math.min(20, Math.floor(width / 4)), "…")}`;
+  // On very narrow terminals, member identity/status take priority over title.
+  const firstMinimum = rawSegment(segments[0], Math.min(4, visibleWidth(segments[0].label)));
+  if (visibleWidth(prefix) + 3 + visibleWidth(firstMinimum + suffix(segments.length - 1)) > width) {
+    prefix = "";
+  }
+
+  const prefixRaw = prefix ? `${prefix} │ ` : "";
+  const prefixStyled = prefix ? theme.fg("muted", prefixRaw) : "";
+  // Check the all-visible case first: the overflow marker itself needs space.
+  if (visibleWidth(prefixRaw + entries.join("  ")) <= width) {
+    return [prefixStyled + entries.map((raw, i) => styleSegment(segments[i], raw)).join("  ")];
+  }
+
+  const shown: string[] = [];
+  let used = visibleWidth(prefixRaw);
+  for (let i = 0; i < entries.length; i++) {
+    const gap = i > 0 ? 2 : 0;
+    const tailWidth = visibleWidth(suffix(entries.length - i - 1));
+    let raw = entries[i];
+    if (used + gap + visibleWidth(raw) + tailWidth > width) {
+      if (i > 0) break; // Whole entries only; never skip a higher-priority member.
+      const s = segments[i];
+      const labelBudget = width - used - tailWidth - visibleWidth(`${s.icon} ${s.extra}`);
+      if (labelBudget < 1) break;
+      raw = rawSegment(s, labelBudget);
+    }
+    shown.push(styleSegment(segments[i], raw));
+    used += gap + visibleWidth(raw);
+  }
+  if (shown.length === 0) {
+    // Extreme widths cannot fit even an icon/name and overflow count together.
+    return [theme.fg("muted", truncateToWidth(`… 另${segments.length}人`, width, "…"))];
+  }
+  return [prefixStyled + shown.join("  ") + theme.fg("dim", suffix(entries.length - shown.length))];
 }
 
 // ── Widget Factory ────────────────────────────────────────
@@ -95,49 +159,21 @@ export function createTeamStatusWidget(options: {
    */
   let lastRenderKey: string | null = null;
 
-  // ── Build display lines (with border) ──────────────────
-  // Returns BOTH raw (unstyled, for width computation + N1 render gate) and
-  // styled lines (for display). Raw/styled dual-track is the existing pattern.
-  function buildDisplay(theme: { fg: (...args: any[]) => string }): { raw: string[]; styled: string[] } {
-    const currentMembers = getMembers();
-
-    // Handle design phase (0 members)
-    if (currentMembers.length === 0) {
-      const title = `● DYNAMIC TEAM ${originMarker} — 设计阶段`;
-      const statusText = "✅ 设计团队中（尚无成员）";
-      const titleVw = visibleWidth(title);
-      const statusVw = visibleWidth(statusText);
-      const lineWidth = Math.max(titleVw + 4, statusVw + 2) + 4;
-      const titleFill = repeat("─", Math.max(0, lineWidth - titleVw - 4));
-      const statusPad = repeat(" ", Math.max(0, lineWidth - statusVw - 2));
-      const bottomFill = repeat("─", Math.max(0, lineWidth - 1));
-      return {
-        raw: [
-          `┌─ ${title} ${titleFill}`,
-          `│ ${statusText}${statusPad}`,
-          `└${bottomFill}`,
-        ],
-        styled: [
-          `┌─ ${theme.fg("accent", title)} ${titleFill}`,
-          `│ ${statusText}${statusPad}`,
-          `└${theme.fg("dim", bottomFill)}`,
-        ],
-      };
+  // ── Build a display snapshot; lay it out at render(width) time ──
+  function buildDisplay(theme: WidgetTheme) {
+    // Stable O(N) priority buckets: crashed → working/compacting → idle/stopped.
+    // Stream phases never reorder peers within a bucket.
+    const buckets: TeamMember[][] = [[], [], []];
+    for (const m of getMembers()) {
+      const state = memberOpsStates.get(m.name) ?? "stopped";
+      buckets[state === "crashed" ? 0 : state === "working" || state === "compacting" ? 1 : 2].push(m);
     }
+    const segments: StatusSegment[] = [];
 
-    // Build status segments (raw for width, styled for display)
-    interface Segment {
-      raw: string;
-      styled: string;
-      separatorRaw: string;
-      separatorStyled: string;
-    }
-    const segments: Segment[] = [];
-
-    for (const m of currentMembers) {
+    for (const m of buckets.flat()) {
       const logicalState = memberOpsStates.get(m.name) ?? "stopped";
       const info = contextUsageMap.get(m.name);
-      const label = m.label ?? m.name;
+      const label = singleLine(m.label ?? m.name);
 
       // Render priority: compacting > crashed/stopped > fine-grained phase >
       // working fallback > idle. Process-level states (memberOpsStates) are the
@@ -209,48 +245,18 @@ export function createTeamStatusWidget(options: {
         extraRaw += info.percent === null ? " ?" : ` ${Math.round(info.percent)}%`;
       }
 
-      const raw = ` ${icon} ${label}${extraRaw}`;
-      const styled = color ? theme.fg(color, raw) : raw;
-
-      const separatorRaw = "  │  ";
-      const separatorStyled = theme.fg("dim", separatorRaw);
-      segments.push({ raw, styled, separatorRaw, separatorStyled });
+      segments.push({ icon, label, extra: extraRaw, color });
     }
 
-    // Build the full raw status line for width calculation
-    const sepRaw = "  │  ";
-    const sepStyled = theme.fg("dim", sepRaw);
-    const rawStatus = segments.map((s) => s.raw).join(sepRaw);
-    const styledStatus = segments.map((s) => s.styled).join(sepStyled);
-
-    // Title text
-    const title = `● TEAM MODE ${originMarker} — ${teamName}`;
-
-    // Compute total visible width for all lines.
-    // Each line has different left-border prefix width:
-    //   top:   ┌─   (3 cols) + content + filler
-    //   mid:   │    (2 cols) + content + padding
-    //   bot:   └    (1 col)  + filler
-    // We choose lineWidth so that ALL three lines land at the same column.
-    const titleVw = visibleWidth(title);
-    const statusVw = visibleWidth(rawStatus);
-    const lineWidth = Math.max(titleVw + 4, statusVw + 2) + 4;
-
-    const titleFill = repeat("─", Math.max(0, lineWidth - titleVw - 4));
-    const statusPad  = repeat(" ", Math.max(0, lineWidth - statusVw - 2));
-    const bottomFill = repeat("─", Math.max(0, lineWidth - 1));
-
-    // Build lines with left-only border (no right-side vertical bar)
-    const topBorderRaw    = `┌─ ${title} ${titleFill}`;
-    const middleLineRaw   = `│ ${rawStatus}${statusPad}`;
-    const bottomBorderRaw = `└${bottomFill}`;
-    const topBorder    = `┌─ ${theme.fg("accent", title)} ${titleFill}`;
-    const middleLine   = `│ ${styledStatus}${statusPad}`;
-    const bottomBorder = `└${theme.fg("dim", bottomFill)}`;
-
     return {
-      raw: [topBorderRaw, middleLineRaw, bottomBorderRaw],
-      styled: [topBorder, middleLine, bottomBorder],
+      // Include every member, even currently hidden ones: a later resize can
+      // reveal them without another event. Keep the N1 gate color-aware (B1).
+      styled: segments.map(s => {
+        const raw = `${s.icon} ${s.label}${s.extra}`;
+        return s.color ? theme.fg(s.color, raw) : raw;
+      }),
+      render: (width: number, renderTheme: WidgetTheme) =>
+        renderStatusLine(originMarker, teamName, segments, width, renderTheme),
     };
   }
 
@@ -274,7 +280,11 @@ export function createTeamStatusWidget(options: {
     if (renderKey === lastRenderKey) return;
     lastRenderKey = renderKey;
     try {
-      currentUi.setWidget("team-status", display.styled);
+      currentUi.setWidget("team-status", (_tui: unknown, theme: WidgetTheme) => ({
+        render: (width: number) => display.render(width, theme),
+        // No styled layout cache: resize and theme invalidation reflow locally.
+        invalidate() {},
+      }));
     } catch {
       // UI may be gone
     }

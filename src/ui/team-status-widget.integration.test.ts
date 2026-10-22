@@ -3,12 +3,6 @@ import type { MemberOperationalState } from "../session/context";
 import type { TeamMember } from "../team/definition";
 import { createActivityTracker } from "../channel/activity-tracker";
 
-// ── Mock pi-tui ────────────────────────────────────────────
-
-vi.mock("@earendil-works/pi-tui", () => ({
-  visibleWidth: (text: string) => text.length,
-}));
-
 // ── Helpers ────────────────────────────────────────────────
 
 function createMockTheme() {
@@ -48,7 +42,7 @@ function createHarness(options: {
   const setWidget = vi.fn();
   let lastLines: string[] | null = null;
   setWidget.mockImplementation((key: string, content: any) => {
-    if (key === "team-status") lastLines = content;
+    if (key === "team-status") lastLines = typeof content === "function" ? content({}, theme).render(2000) : content;
   });
   const ui = { setWidget };
   const theme = createMockTheme();
@@ -88,7 +82,7 @@ function createHarness(options: {
     memberOpsStates,
     emit,
     getWidget,
-    middle: () => lastLines?.[1] ?? "",
+    middle: () => lastLines?.[0] ?? "",
   };
 }
 
