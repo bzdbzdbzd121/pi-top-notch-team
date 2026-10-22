@@ -389,6 +389,8 @@ export interface InspectorTab {
   /** Dirty flag set by member activity events; cleared after refetch. */
   dirty: boolean;
   contextInfo: MemberContextInfo | null;
+  /** Last stats query failed; keep the cached percentage as approximate. */
+  contextStale?: boolean;
   /**
    * Assembled in-progress assistant message (built from the member's
    * message_start / message_update deltas). Rendered as the streaming tail;
@@ -427,7 +429,7 @@ export const EXPANDED_RESULT_MAX_LINES = 60;
 export function buildNavHints(expanded: boolean, showThinking: boolean): string {
   const expandHint = expanded ? "e 隐藏工具详情" : "e 展开工具详情";
   const thinkingHint = showThinking ? "t 隐藏思考" : "t 显示思考";
-  return `←→ 切换成员 ↑↓ 三行滚动 End 跳至底部 i 输入消息 ${expandHint} ${thinkingHint}`;
+  return `←→ 切页 ↑↓ 三行滚动 End 跳至底部 i 输入消息 ${expandHint} ${thinkingHint}`;
 }
 export const KEY_HINTS_ACTION =
   "ctrl+a 中断  ctrl+b/ctrl+shift+a 全中断  ctrl+o 压缩  Esc 关闭";
@@ -1639,32 +1641,6 @@ export function stateIcon(state: MemberOpState): string {
   return state === "working" ? "💭" : state === "compacting" ? "🗜️" : state === "idle" ? "✅" : state === "crashed" ? "💥" : "⏹️";
 }
 
-export function buildFooterStatusLine(
-  tabs: InspectorTab[],
-  opsStates: ReadonlyMap<string, MemberOpState>,
-  width: number,
-  theme: InspectorTheme = IDENTITY_THEME
-): string {
-  const segs: string[] = [];
-  for (const t of tabs) {
-    const state = opsStates.get(t.name) ?? "stopped";
-    const icon = stateIcon(state);
-    let seg = `${icon} ${t.label}`;
-    if (state === "compacting") {
-      seg += "（压缩中）";
-    }
-    if (t.contextInfo != null && state !== "stopped" && state !== "crashed") {
-      // percent:null = 压缩后合法「未知」→ "?"（Math.round(null)===0 的
-      // "0%" 误导，问题二 Phase 2）。
-      seg += t.contextInfo.percent === null ? " ?" : ` ${Math.round(t.contextInfo.percent)}%`;
-    } else if (state === "stopped" || state === "crashed") {
-      seg += " —";
-    }
-    segs.push(seg);
-  }
-  return truncateLine(" " + segs.join("  │  "), width);
-}
-
 // ── Inspector State ────────────────────────────────────────
 
 /**
@@ -1672,9 +1648,19 @@ export function buildFooterStatusLine(
  * All methods are synchronous and side-effect free (they only mutate
  * this object's fields), so the TUI layer can call requestRender after.
  */
+export type InspectorView = { kind: "overview" } | { kind: "member"; name: string };
+
 export class MemberInspectorState {
   tabs: InspectorTab[] = [];
-  activeIndex = 0;
+  view: InspectorView = { kind: "overview" };
+  selectedName: string | undefined;
+  overviewOffset = 0;
+
+  /** Derived compatibility accessor; page identity is always the member name. */
+  get activeIndex(): number {
+    const view = this.view;
+    return view.kind === "member" ? this.tabs.findIndex(t => t.name === view.name) : -1;
+  }
   inputOpen = false;
   inputBuffer = "";
   /**
@@ -1712,6 +1698,7 @@ export class MemberInspectorState {
 
   /** Reconcile tabs with the current member list (adds new, keeps state). */
   syncMembers(members: { name: string; label: string }[]): void {
+    const selectedIndex = Math.max(0, this.tabs.findIndex(t => t.name === this.selectedName));
     const existing = new Map(this.tabs.map((t) => [t.name, t]));
     const next: InspectorTab[] = [];
     for (const m of members) {
@@ -1735,19 +1722,47 @@ export class MemberInspectorState {
       }
     }
     this.tabs = next;
-    if (this.activeIndex >= this.tabs.length) {
-      this.activeIndex = Math.max(0, this.tabs.length - 1);
+    if (!next.some(t => t.name === this.selectedName)) {
+      this.selectedName = next[Math.min(selectedIndex, next.length - 1)]?.name;
     }
+    const view = this.view;
+    if (view.kind === "member" && !next.some(t => t.name === view.name)) {
+      this.view = { kind: "overview" };
+      this.closeInput();
+    }
+    this.overviewOffset = Math.min(this.overviewOffset, Math.max(0, next.length - 1));
   }
 
   get activeTab(): InspectorTab | undefined {
     return this.tabs[this.activeIndex];
   }
 
+  openMember(name: string | undefined = this.selectedName): void {
+    if (name === undefined || !this.tabs.some(t => t.name === name)) return;
+    this.view = { kind: "member", name };
+    this.selectedName = name;
+  }
+
   switchTab(delta: number): void {
-    if (this.tabs.length === 0) return;
-    const n = this.tabs.length;
-    this.activeIndex = ((this.activeIndex + delta) % n + n) % n;
+    const n = this.tabs.length + 1;
+    const next = ((this.activeIndex + 1 + delta) % n + n) % n;
+    this.view = next === 0 ? { kind: "overview" } : { kind: "member", name: this.tabs[next - 1].name };
+    if (this.view.kind === "member") this.selectedName = this.view.name;
+  }
+
+  ensureOverviewVisible(height: number): void {
+    const index = Math.max(0, this.tabs.findIndex(t => t.name === this.selectedName));
+    const capacity = Math.max(1, height);
+    this.overviewOffset = Math.max(0, Math.min(this.overviewOffset, Math.max(0, this.tabs.length - capacity)));
+    if (index < this.overviewOffset) this.overviewOffset = index;
+    if (index >= this.overviewOffset + capacity) this.overviewOffset = index - capacity + 1;
+  }
+
+  moveOverviewSelection(delta: number, height: number): void {
+    if (!this.tabs.length) return;
+    const index = Math.max(0, this.tabs.findIndex(t => t.name === this.selectedName));
+    this.selectedName = this.tabs[Math.max(0, Math.min(this.tabs.length - 1, index + delta))].name;
+    this.ensureOverviewVisible(height);
   }
 
   /**

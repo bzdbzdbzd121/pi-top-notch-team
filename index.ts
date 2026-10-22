@@ -7,6 +7,8 @@ import {
   setManifestRuntimeContext,
   syncActiveManifest,
   resetManifestRuntimeContext,
+  getManifestPath,
+  readManifestFile,
 } from "./src/session/manifest";
 import type { TeamContext } from "./src/session/context";
 import { getRootDir } from "./src/config";
@@ -27,7 +29,7 @@ import { registerGoalTools, registerGoalAgentHandler, resetGoal, GOAL_TOOL_NAMES
 import { registerSharedContextTool, SHARED_CONTEXT_TOOL_NAME } from "./src/tools/shared-context-tool";
 import { ensureToolRegistered } from "./src/commands/shared/ensure-tool";
 import { createProcessManager } from "./src/process/manager";
-import type { MemberProcessHandle } from "./src/process/member-process";
+import type { MemberProcessHandle, MemberProcessConfig } from "./src/process/member-process";
 import { createTeamStatusWidget } from "./src/ui/team-status-widget";
 import { createEditModeWidget } from "./src/ui/edit-mode-widget";
 import { createCreateModeWidget } from "./src/ui/create-mode-widget";
@@ -48,6 +50,7 @@ import { createTlReadGuard, createDesignReadGuard } from "./src/session/tl-read-
 import { enforceSessionToolVisibility, SESSION_TOOL_NAMES } from "./src/session/session-tool-visibility";
 import { getSharedContextPath } from "./src/session/shared-context";
 import { openMemberInspector, type MemberInspectorHandle } from "./src/ui/member-inspector";
+import { createMemberOverviewStore, type MemberOverviewStore } from "./src/ui/member-overview-store";
 import {
   registerStartTeamSessionTool,
   registerStopTeamSessionTool,
@@ -195,6 +198,44 @@ export default function (pi: ExtensionAPI) {
   let activityTracker: ActivityTracker | null = null;
 
   // ── Member Inspector (成员检视浮窗) ───────────────────────
+  // Semantic traces live for a team session, including while the overlay is closed.
+  let overviewStore: MemberOverviewStore | null = null;
+  let overviewSessionId: string | null = null;
+  const overviewStarted = new Set<string>();
+  const overviewCompacting = new Set<string>();
+  const clearOverview = () => {
+    overviewStore?.clear();
+    overviewStore = null;
+    overviewSessionId = null;
+    overviewStarted.clear();
+    overviewCompacting.clear();
+  };
+  const syncOverviewSession = () => {
+    const session = getSessionState();
+    if (!session.active || !session.teamDefinition) return;
+    if (!overviewStore || overviewSessionId !== session.sessionId) {
+      clearOverview();
+      overviewStore = createMemberOverviewStore();
+      overviewSessionId = session.sessionId;
+      if (session.sessionId) {
+        const manifest = readManifestFile(getManifestPath(getRootDir(), session.teamDefinition.name, session.sessionId));
+        for (const name of manifest?.startedMembers ?? []) overviewStarted.add(name);
+      }
+    }
+    const names = session.teamDefinition.members.map(member => member.name);
+    overviewStore.syncMembers(names);
+    const keep = new Set(names);
+    for (const name of overviewStarted) if (!keep.has(name)) overviewStarted.delete(name);
+    for (const name of overviewCompacting) if (!keep.has(name)) overviewCompacting.delete(name);
+  };
+  const sampleOverviewCompaction = (name: string) => {
+    if (!overviewStore) return;
+    const active = memberOpsStates.get(name) === "compacting";
+    if (active === overviewCompacting.has(name)) return;
+    if (active) overviewCompacting.add(name);
+    else overviewCompacting.delete(name);
+    overviewStore.markCompacting(name, active);
+  };
   // Handle for the currently-open inspector overlay; null when closed.
   let inspectorHandle: MemberInspectorHandle | null = null;
 
@@ -220,10 +261,20 @@ export default function (pi: ExtensionAPI) {
       // Only during an active team session (decision #7: no reaction otherwise)
       if (!getSessionState().active) return;
       if (inspectorHandle?.isOpen()) return;
+      syncOverviewSession();
       inspectorHandle = openMemberInspector(ctx, {
-        getMembers: () => getSessionState().teamDefinition?.members ?? [],
+        getMembers: () => {
+          syncOverviewSession();
+          return getSessionState().teamDefinition?.members ?? [];
+        },
         getHandle: (name: string) => teamCtx.getHandle(name),
         memberOpsStates,
+        getActivity: (name) => activityTracker?.getActivity(name),
+        getRecentActions: (name) => {
+          sampleOverviewCompaction(name);
+          return overviewStore?.getRecentActions(name) ?? [];
+        },
+        getStartedMembers: () => [...overviewStarted],
       });
     },
   });
@@ -291,11 +342,6 @@ export default function (pi: ExtensionAPI) {
       // follow (belt and suspenders). Order matters: tracker first, then the
       // widget signature (which reads tracker state), P3 delete in between.
       try {
-        inspectorHandle?.onMemberEvent(memberName, event);
-      } catch {
-        /* isolate */
-      }
-      try {
         activityTracker?.onEvent(memberName, event);
       } catch {
         /* isolate */
@@ -312,11 +358,59 @@ export default function (pi: ExtensionAPI) {
         }
       }
       try {
+        if (overviewStore) {
+          sampleOverviewCompaction(memberName);
+          overviewStore.onEvent(memberName, event);
+          if (event?.type === "agent_start" || memberHandles.get(memberName)?.getState().status === "running") {
+            overviewStarted.add(memberName);
+          }
+        }
+      } catch {
+        /* isolate */
+      }
+      try {
+        inspectorHandle?.onMemberEvent(memberName, event);
+      } catch {
+        /* isolate */
+      }
+      try {
         teamStatusWidget?.onMemberEvent(memberName, event);
       } catch {
         /* isolate */
       }
     },
+  };
+
+  // Scope display observers to the originating session and handle. Old child
+  // callbacks can outlive stopAll() during session shutdown or manual restart.
+  const createTrackedMember = (config: MemberProcessConfig): MemberProcessHandle => {
+    const sessionId = getSessionState().sessionId;
+    let handle: MemberProcessHandle;
+    const isCurrent = () => {
+      const session = getSessionState();
+      return session.active && session.sessionId === sessionId && memberHandles.get(config.name) === handle;
+    };
+    handle = createAndRegisterMember(pi, config, {
+      ...memberLifecycleDeps,
+      onMemberActivity: (name, event) => {
+        if (isCurrent()) memberLifecycleDeps.onMemberActivity(name, event);
+      },
+    });
+    const start = handle.start.bind(handle);
+    let started = false;
+    handle.start = async () => {
+      const alreadyRunning = started && handle.getState().status === "running";
+      await start();
+      started = true;
+      if (!alreadyRunning && isCurrent()) {
+        // pi does not emit process_started. Reset display gates after a real
+        // successful start, including manager-driven auto-restarts of this handle.
+        overviewStore?.onEvent(config.name, { type: "process_started" });
+        overviewStarted.add(config.name);
+        overviewCompacting.delete(config.name);
+      }
+    };
+    return handle;
   };
 
   // ── TL current model tracking (for /team setting "follow" mode) ──────
@@ -380,7 +474,7 @@ export default function (pi: ExtensionAPI) {
     // all-idle 门控打开时经 steer 即时注入（同一回合、工具结果之后）。
     tlWaitGate,
     createMember: (config) => {
-      const handle = createAndRegisterMember(pi, config, memberLifecycleDeps);
+      const handle = createTrackedMember(config);
       teamCtx.setHandle(config.name, handle);
       return handle;
     },
@@ -707,6 +801,7 @@ export default function (pi: ExtensionAPI) {
     // 保留供 /team resume）。必须无条件执行——不得包进下方 if (_session.active)
     // 团队会话条件内（无团队会话时同样要清，防止跨 /new 泄漏）。
     clearSessionSettingsMemory();
+    clearOverview();
     const _session = getSessionState();
     if (_session.active) {
       const isDynamic = teamCtx.isDynamicSession;
@@ -850,7 +945,7 @@ export default function (pi: ExtensionAPI) {
         if (!config) {
           throw new Error(`无法为成员 "${name}" 构建配置`);
         }
-        const handle = createAndRegisterMember(pi, config, memberLifecycleDeps);
+        const handle = createTrackedMember(config);
         teamCtx.setHandle(name, handle);
         await handle.start();
         // Record the fresh pid into the manifest
@@ -898,6 +993,8 @@ export default function (pi: ExtensionAPI) {
     // (with session now active) reliably restores the colored border.
     registerTeamEditor(ui);
 
+    // A repeated UI install must preserve traces for the same session identity.
+    syncOverviewSession();
     // If already installed, skip
     if (teamStatusWidget) return;
     const session = getSessionState();
@@ -936,6 +1033,8 @@ export default function (pi: ExtensionAPI) {
       activityTracker.clear();
       activityTracker = null;
     }
+
+    clearOverview();
 
     // Close the Member Inspector if open
     inspectorHandle?.close();
@@ -1017,6 +1116,10 @@ export default function (pi: ExtensionAPI) {
       registerTools: ensureSessionToolsRegistered,
       setActiveTools: (names) => pi.setActiveTools(names),
     });
+
+    // Trace lifecycle must not depend on whether a UI widget is installed.
+    if (session.active) syncOverviewSession();
+    else clearOverview();
 
     // Safety net: if widget wasn't installed by /team start (e.g., session resume),
     // install it here. Also clean up if session ended without /team stop.

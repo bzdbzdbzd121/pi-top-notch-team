@@ -199,6 +199,7 @@ describe("P4 R5: content hashing", () => {
 
   it("reconcilePending 哈希化后行为等价：同内容确认 / 交错容忍 / 未确认保留", () => {
     const s = new MemberInspectorState([{ name: "a", label: "分析员" }]);
+    s.openMember(s.tabs[0]?.name); // Explicit conversation fixture.
     // 两个 pending 完成，历史含交错 toolResult
     const p1 = { role: "assistant", content: [{ type: "text", text: "完成1" }] };
     const p2 = { role: "assistant", content: [{ type: "text", text: "完成2" }] };
@@ -220,6 +221,7 @@ describe("P4 R5: content hashing", () => {
 
   it("reconcilePending 重复内容：两条相同 pending 只有一条落地 → 保留未落地的那条", () => {
     const s = new MemberInspectorState([{ name: "a", label: "分析员" }]);
+    s.openMember(s.tabs[0]?.name); // Explicit conversation fixture.
     const same = { role: "assistant", content: [{ type: "text", text: "相同" }] };
     s.completeLiveMessage("a", same);
     s.completeLiveMessage("a", { ...same, content: [{ type: "text", text: "相同" }] });
@@ -230,6 +232,7 @@ describe("P4 R5: content hashing", () => {
 
   it("reconcilePending 哈希路径与内容比较语义一致（content 不同 role 相同的 pending 不确认）", () => {
     const s = new MemberInspectorState([{ name: "a", label: "分析员" }]);
+    s.openMember(s.tabs[0]?.name); // Explicit conversation fixture.
     s.completeLiveMessage("a", { role: "assistant", content: [{ type: "text", text: "A" }] });
     s.reconcilePending("a", [{ role: "assistant", content: [{ type: "text", text: "B" }] }]);
     expect(s.tabs[0].pendingCompletions).toHaveLength(1); // B ≠ A，不确认

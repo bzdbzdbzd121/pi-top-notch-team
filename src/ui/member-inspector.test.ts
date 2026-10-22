@@ -113,6 +113,7 @@ function makeComponent(deps: any) {
     { name: "a", label: "分析员" },
     { name: "b", label: "编码员" },
   ]);
+  state.openMember(state.tabs[0]?.name); // Conversation regression: enter a member explicitly.
   const comp = new MemberInspectorComponent(tui, makeTheme(), done, deps, state);
   return { comp, tui, done, state };
 }
@@ -367,8 +368,8 @@ describe("MemberInspectorComponent — 场景 L：legacy 终端 steer 可用 + �
     const tui = makeTui();
     const done = vi.fn();
     const state = new MemberInspectorState([]);
-    const comp = new MemberInspectorComponent(tui, makeTheme(), done, deps, state);
-    comp.handleInput("i");
+    const comp = new MemberInspectorComponent(tui, makeTheme(), done, { ...deps, getMembers: () => [] }, state);
+    state.openInput(); // Defensive send path: no UI input can be opened on overview.
     expect(state.inputOpen).toBe(true);
     typeText(comp, "hello");
     comp.handleInput(K.enter);
@@ -382,8 +383,8 @@ describe("MemberInspectorComponent — 场景 L：legacy 终端 steer 可用 + �
     const tui = makeTui();
     const done = vi.fn();
     const state = new MemberInspectorState([]);
-    const comp = new MemberInspectorComponent(tui, makeTheme(), done, deps, state);
-    comp.handleInput("i");
+    const comp = new MemberInspectorComponent(tui, makeTheme(), done, { ...deps, getMembers: () => [] }, state);
+    state.openInput(); // Defensive send path: no UI input can be opened on overview.
     typeText(comp, "hello");
     comp.handleInput(K.ctrlEnter);
     expect(handleA.sendCommand).not.toHaveBeenCalled();
@@ -394,8 +395,8 @@ describe("MemberInspectorComponent — 场景 L：legacy 终端 steer 可用 + �
     const tui = makeTui();
     const done = vi.fn();
     const state = new MemberInspectorState([]);
-    const comp = new MemberInspectorComponent(tui, makeTheme(), done, deps, state);
-    comp.handleInput("i");
+    const comp = new MemberInspectorComponent(tui, makeTheme(), done, { ...deps, getMembers: () => [] }, state);
+    state.openInput(); // Defensive send path: no UI input can be opened on overview.
     typeText(comp, "hello");
     comp.handleInput(K.altEnterKitty);
     expect(handleA.sendCommand).not.toHaveBeenCalled();
@@ -574,10 +575,10 @@ describe("MemberInspectorComponent — 场景 M：输入模式左右键与光标
     if (tail.length > 0) for (const g of seg.segment(tail)) expect(g.segment).toBe(FAMILY);
   });
 
-  it("M11: 导航模式（输入框关闭）左右键仍切换成员标签", () => {
+  it("M11: 导航模式左右键包含总览，输入模式不受影响", () => {
     const { comp, state } = makeComponent(deps);
     comp.handleInput(K.left);
-    expect(state.activeIndex).toBe(1);
+    expect(state.view).toEqual({ kind: "overview" });
     comp.handleInput(K.right);
     expect(state.activeIndex).toBe(0);
   });
@@ -776,7 +777,7 @@ describe("MemberInspectorComponent — 场景 O：输入模式 Home/End（功能
     state.scrollBy(-20, 12);
     expect(state.tabs[0].followTail).toBe(false);
     comp.handleInput(K.end);
-    expect(state.tabs[0].scrollOffset).toBe(38); // 50 行 - bodyHeight 12（测试环境）
+    expect(state.tabs[0].scrollOffset).toBe(37); // 50 行 - bodyHeight 13（7 行 chrome）
     expect(state.tabs[0].followTail).toBe(true);
   });
 
@@ -1269,7 +1270,7 @@ describe("MemberInspectorComponent — render", () => {
     expect(joined).toContain("编码员");
     expect(joined).toContain("hello body");
     // Clear footer hints: every action names its target, full key names
-    expect(joined).toContain("切换成员");
+    expect(joined).toContain("切页");
     expect(joined).toContain("三行滚动");
     expect(joined).toContain("跳至底部");
     expect(joined).toContain("e 展开工具详情");
@@ -1278,7 +1279,7 @@ describe("MemberInspectorComponent — render", () => {
     expect(joined).toContain("ctrl+b/ctrl+shift+a 全中断");
     expect(joined).toContain("ctrl+o 压缩");
     expect(joined).toContain("Esc 关闭");
-    // Frame shape: top + header + sep + body + sep + footer×3 + bottom
+    // Frame shape: top + header + sep + body + sep + footer×2 + bottom
     expect(lines[0]).toMatch(/^╭/);
     expect(lines[0]).toMatch(/╮$/); // rounded top-right corner
     expect(lines[lines.length - 1]).toMatch(/^╰/);
@@ -1497,6 +1498,7 @@ describe("MemberInspectorComponent — render", () => {
         { name: "a", label: "分析员" },
         { name: "b", label: "编码员" },
       ]);
+      state.openMember("a"); // Theme regression belongs to a conversation page.
       // Simulate pi's live theme mechanism: a Proxy whose reads forward to a
       // swappable target (pi replaces the theme object under a global key).
       let themeTarget: any = { fg: (_c: string, t: string) => `\x1b[31m${t}\x1b[0m`, bold: (t: string) => t };
@@ -1617,7 +1619,7 @@ describe("MemberInspectorComponent — render", () => {
     const joined = comp.render(80).join("\n");
     expect(joined).toContain("> abc");
     // Navigation hints replaced by the input box…
-    expect(joined).not.toContain("切换成员");
+    expect(joined).not.toContain("切页");
     // …and action hints replaced by input-mode hints（阶段 2：Home/End 在前段）
     expect(joined).toContain("Enter 发送");
     expect(joined).toContain("Home/End 首尾");

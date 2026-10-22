@@ -55,6 +55,7 @@ function makeComponent(deps: any) {
   const tui = makeTui();
   const done = vi.fn();
   const state = new MemberInspectorState([{ name: "a", label: "分析员" }]);
+    state.openMember(state.tabs[0]?.name); // Explicit conversation fixture.
   const comp = new MemberInspectorComponent(tui, makeTheme(), done, deps, state);
   return { comp, tui, done, state };
 }
@@ -461,6 +462,7 @@ describe("P2 结构共享 + 滚动实时性护栏", () => {
     vi.useRealTimers();
     const history = buildThinkingMsgs(3000, 10);
     const state = new MemberInspectorState([{ name: "a", label: "分析员" }]);
+    state.openMember(state.tabs[0]?.name); // Explicit conversation fixture.
     // 预热：等价于一次已完成的冷构建（3000 条历史 + 30KB thinking）
     const { buildBodyLinesIncremental, fitLinesIncremental, createBodyBuildCache } = await import("./member-inspector-state");
     const cache = createBodyBuildCache();
@@ -548,6 +550,7 @@ describe("P2 结构共享 + 滚动实时性护栏", () => {
     const tui = makeTui();
     const done = vi.fn();
     const state = new MemberInspectorState([{ name: "a", label: "分析员" }]);
+    state.openMember(state.tabs[0]?.name); // Explicit conversation fixture.
     state.showThinking = true;
     const comp = new MemberInspectorComponent(tui, themeA, done, deps, state);
     comp.render(80);
@@ -653,6 +656,7 @@ describe("P2 结构共享 + 滚动实时性护栏", () => {
       { name: "a", label: "分析员" },
       { name: "b", label: "编码员" },
     ]);
+    state.openMember(state.tabs[0]?.name); // Explicit conversation fixture.
     const comp = new MemberInspectorComponent(tui, makeTheme(), done, deps, state);
     comp.render(80);
 
@@ -695,6 +699,7 @@ describe("P2 结构共享 + 滚动实时性护栏", () => {
       { name: "a", label: "分析员" },
       { name: "b", label: "编码员" },
     ]);
+    state.openMember(state.tabs[0]?.name); // Explicit conversation fixture.
     const comp = new MemberInspectorComponent(tui, makeTheme(), done, deps, state);
     comp.render(80);
     // 预热：两 tab 都有缓存
@@ -737,6 +742,7 @@ describe("P2 结构共享 + 滚动实时性护栏", () => {
     deps.getMembers = () => names.map((n) => ({ name: n, label: n }));
     deps.memberOpsStates = new Map(names.map((n) => [n, "working"]));
     const state = new MemberInspectorState(names.map((n) => ({ name: n, label: n })));
+    state.openMember(state.tabs[0]?.name); // Explicit conversation fixture.
     const comp = new MemberInspectorComponent(makeTui(), makeTheme(), vi.fn(), deps, state);
     comp.render(80);
 

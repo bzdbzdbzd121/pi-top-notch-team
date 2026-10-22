@@ -12,7 +12,6 @@ import {
   MemberInspectorState,
   buildBodyLines,
   buildHeaderLine,
-  buildFooterStatusLine,
   wrapText,
   truncateLine,
   fitLinesToWidth,
@@ -399,33 +398,7 @@ describe("buildHeaderLine", () => {
   });
 });
 
-describe("buildFooterStatusLine", () => {
-  it("shows status icons and context percent", () => {
-    const state = new MemberInspectorState([
-      { name: "a", label: "分析员" },
-      { name: "b", label: "编码员" },
-    ]);
-    state.tabs[0].contextInfo = { percent: 42, tokens: 42000, contextWindow: 100000 };
-    const ops = new Map([
-      ["a", "working" as const],
-      ["b", "crashed" as const],
-    ]);
-    const line = buildFooterStatusLine(state.tabs, ops, 120);
-    expect(line).toContain("💭 分析员 42%");
-    expect(line).toContain("💥 编码员 —");
-  });
-
-  it("renders '?' for a null context percent (post-compaction unknown — no misleading 0%)", () => {
-    // 压缩完成后 get_session_stats 返回 percent:null（合法「未知」）——
-    // Math.round(null)===0 的 "0%" 是误导（问题二 Phase 2，gamma 发现）。
-    const state = new MemberInspectorState([{ name: "a", label: "分析员" }]);
-    state.tabs[0].contextInfo = { percent: null, tokens: null, contextWindow: 100000 };
-    const ops = new Map([["a", "working" as const]]);
-    const line = buildFooterStatusLine(state.tabs, ops, 120);
-    expect(line).toContain("💭 分析员 ?");
-    expect(line).not.toContain("0%");
-  });
-});
+// Status percentages now live in the overview; covered by overview integration.
 
 // ── MemberInspectorState ───────────────────────────────────
 
@@ -523,7 +496,9 @@ describe("applyAssistantDelta (live streaming assembly)", () => {
 
 describe("MemberInspectorState live streaming", () => {
   function makeState() {
-    return new MemberInspectorState([{ name: "a", label: "A" }]);
+    const state = new MemberInspectorState([{ name: "a", label: "A" }]);
+    state.openMember(state.tabs[0]?.name);
+    return state;
   }
 
   it("setLiveMessage resets the live buffer; applyLiveDelta appends", () => {
@@ -620,18 +595,25 @@ describe("MemberInspectorState live streaming", () => {
 
 describe("MemberInspectorState", () => {
   function makeState() {
-    return new MemberInspectorState([
+    const state = new MemberInspectorState([
       { name: "a", label: "A" },
       { name: "b", label: "B" },
       { name: "c", label: "C" },
     ]);
+    state.openMember(state.tabs[0]?.name);
+    return state;
   }
 
   it("switchTab wraps around both directions", () => {
     const s = makeState();
     expect(s.activeIndex).toBe(0);
     s.switchTab(-1);
+    expect(s.view).toEqual({ kind: "overview" });
+    expect(s.activeTab).toBeUndefined();
+    s.switchTab(-1);
     expect(s.activeIndex).toBe(2);
+    s.switchTab(1);
+    expect(s.view).toEqual({ kind: "overview" });
     s.switchTab(1);
     expect(s.activeIndex).toBe(0);
     s.switchTab(1);
@@ -771,10 +753,12 @@ function graphemeBoundaries(text: string): Set<number> {
 
 describe("MemberInspectorState — 阶段 1：输入编辑内核（光标与按位编辑）", () => {
   function makeState() {
-    return new MemberInspectorState([
+    const state = new MemberInspectorState([
       { name: "a", label: "A" },
       { name: "b", label: "B" },
     ]);
+    state.openMember(state.tabs[0]?.name);
+    return state;
   }
 
   it("inputCursor 默认 0，打开/关闭/清空时归零", () => {
@@ -1086,10 +1070,12 @@ describe("MemberInspectorState — 阶段 1：输入编辑内核（光标与按�
 // ── Home / End：光标一步跳到输入首/尾 ────────────────────────
 describe("MemberInspectorState — moveInputCursorTo(\"start\" | \"end\")", () => {
   function makeState() {
-    return new MemberInspectorState([
+    const state = new MemberInspectorState([
       { name: "a", label: "A" },
       { name: "b", label: "B" },
     ]);
+    state.openMember(state.tabs[0]?.name);
+    return state;
   }
 
   it("中段跳到开头 / 末尾，内容不变", () => {

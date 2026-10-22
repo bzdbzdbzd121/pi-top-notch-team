@@ -58,6 +58,7 @@ function makeComponent(deps: any) {
   const tui = makeTui();
   const done = vi.fn();
   const state = new MemberInspectorState([{ name: "a", label: "分析员" }]);
+    state.openMember(state.tabs[0]?.name); // Explicit conversation fixture.
   const comp = new MemberInspectorComponent(tui, makeTheme(), done, deps, state);
   return { comp, tui, done, state };
 }

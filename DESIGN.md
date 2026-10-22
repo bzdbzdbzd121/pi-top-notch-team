@@ -1185,44 +1185,58 @@ A full-keyboard overlay that lets the **user** inspect each Member's live conver
 
 ### Layout
 
+每次打开默认显示总览。以下为结构示意，实际布局按终端可见列宽计算：
+
+```text
+╭─ Member Inspector ──────────────────────────────────────╮
+│ ❰总览❱  分析员  编码员  测试员                           │
+├────────────────────────────────────────────────────────┤
+│ 成员 1–3 / 3   当前状态  上下文  最近操作（新→右）        │
+│ › 分析员       💭 思考中   12%   📖 💭 📖 💭             │
+│   编码员       🔧 执行工具 45%   💭 📖 📝 🔧              │
+│   测试员       ✅ 空闲     18%   🔧 ✏️ ✅                 │
+├────────────────────────────────────────────────────────┤
+│ ←→ 切页  ↑↓ 选择成员  Enter 查看会话  Esc 关闭           │
+│ 📖读取 💭思考 ✏️输出 📝修改 🔧工具  ctrl+b 全部中断       │
+╰────────────────────────────────────────────────────────╯
 ```
-╭─ Member Inspector ─────────────────────────╮
-│ ❰分析员❱  编码员  测试员                    │  ← horizontal member tabs
-├────────────────────────────────────────────┤
-│  ● user                                    │
-│  任务内容...                                │
-│  ● assistant                               │
-│  回复内容...                                │
-│  🔧 read src/index.ts                       │  ← tool call one-line summary
-│  ✓ read file contents...                   │  ← tool result one-line summary
-│  💭 思考（默认隐藏，t 切换）                 │  ← thinking block (toggled with `t`)
-├────────────────────────────────────────────┤
-│  ✅ 分析员 12%  │  🔧 编码员 45%            │  ← ops state + context %
-│  ←→ 切换成员 ↑↓ 滚动会话 End 跳至底部 …    │  ← navigation hints / input box
-│  ctrl+a 中断 ctrl+shift+a 全中断 ctrl+o 压缩 │  ← action hints / input hints
-╰────────────────────────────────────────────┘
-```
+
+成员会话正文和输入框继续使用原有实现。浮窗内部不再显示全员状态汇总行，底栏只保留两行提示/输入。notice 临时替换导航提示，向上翻会话时的「↓ 有更新」也保留在提示行。浮窗外的 team-status-widget 不变。
+
+### Overview data and lifecycle
+
+- `MemberInspectorState.view` 为显式 `overview | member(name)` 页面，成员身份用 name 保存。总览不产生伪成员 tab，也不发送成员 RPC 控制命令。
+- 每成员一行，按名册稳定排序。表头固定，选择行跟随窗口滚动。轨迹最新图标在右，宽度不足时取完整图标的最长后缀。标签栏固定总览并展示当前成员附近的水平窗口。
+- 状态列优先采用 compacting/crashed/stopped，再读取 activity-tracker 的阶段。占用正常显示百分比，null/未知为 `?`，失败旧值为 `~42%`，停止/崩溃为 `—`。选中标记在窄布局中也保留。
+- `member-overview-store.ts` 每成员保存最近64个语义动作。思考/输出按内容块去重，工具按 toolCallId 关联，从参数生成到执行结果原位更新。两次 read 保留两个 📖，不按 delta 追加记录。活动和失败图标加下划线，颜色只作辅助。✅ 仅表示回合结束，不断言任务验收成功。
+- 存储由 index.ts 按团队 sessionId 管理，关闭浮窗期间仍采集。同一 sessionId 的重复 UI 安装不清空，stop/shutdown 清空，resume/重载不从磁盘重建轨迹。不保存正文、参数、工具结果或完整 RPC 事件。环形缓冲与关联索引均有界。
+- 活动分发顺序：tracker 更新 → 进程死亡时清 tracker → 总览存储 → inspector → widget。每个消费者独立捕获异常。创建成员时捕获 sessionId 和 handle 身份，过期来源不更新显示观察者。成功 start（包括同一 handle 的自动重启）重置显示专用 process_started 门，不依赖首次 agent_start。
+- 总览只渲染可见成员，不拉完整会话。复用100ms–1s合并刷新与显示签名去重，进入成员页时补齐既有增量会话与流式内容。
+- stats 打开时立即查询，此后每轮结束5秒再排下一轮，最多四路并发、单次3秒超时。关闭、成员删除或句柄更换后不写回在飞结果。
+- 常规 chrome 为7行（原8行）。总览正文至少需要表头和1个成员行，否则使用紧凑布局，显示选中成员的状态/占用和退出提示。
+
+`MemberInspectorDeps` 在既有 getMembers/getHandle/memberOpsStates 外增加三个可选只读依赖：`getActivity(name): MemberActivity | undefined`、`getRecentActions(name): readonly OverviewAction[]`、`getStartedMembers(): readonly string[]`。可选性用于无追踪器的旧调用方安全降级。布局纯函数位于 `member-overview-state.ts`。完整设计与验证记录见 [成员浮窗总览设计](docs/design-member-inspector-overview.md)。
 
 Overlay: `ctx.ui.custom(component, { overlay: true, overlayOptions: { width: "90%", maxHeight: "85%", anchor: "center" } })`.
 
-**Input line** (footer 2 while the input box is open): `✎ ` + `buildInputBoxLine(buffer, cursor, inner - 4)`. The pure function assembles `> ` + text before the cursor + `▌` + text after the cursor, scrolls a horizontal window that keeps the cursor visible (centered, edge-sticky — same feel as pi's main editor), takes whole graphemes only (CJK / emoji ZWJ / combining sequences are never split), and returns exactly the requested visible width. The exact-width contract is what fixes the long-input defect: the old assembly over-budgeted by one column, so once the text reached `inner - 6` columns the outer fallback ellipsis replaced the `▌` (cursor invisible); with the contract holding, the fallback truncate/pad never fires. Short input renders unchanged. **Stage 3 (IME hardware cursor)**: while the input box is open the component passes pi-tui's `CURSOR_MARKER` (zero-width APC) as `cursorMarker` — the TUI strips it at render time and moves the hardware cursor to that column, anchoring the IME candidate window to the real cursor position. The block `▌` stays; real-machine IME validation is deferred to end-user acceptance, and rolling back is a one-line revert (drop the argument).
+**Input line** (first of the two footer lines while the input box is open): `✎ ` + `buildInputBoxLine(buffer, cursor, inner - 4)`. The pure function assembles `> ` + text before the cursor + `▌` + text after the cursor, scrolls a horizontal window that keeps the cursor visible (centered, edge-sticky — same feel as pi's main editor), takes whole graphemes only (CJK / emoji ZWJ / combining sequences are never split), and returns exactly the requested visible width. The exact-width contract is what fixes the long-input defect: the old assembly over-budgeted by one column, so once the text reached `inner - 6` columns the outer fallback ellipsis replaced the `▌` (cursor invisible); with the contract holding, the fallback truncate/pad never fires. Short input renders unchanged. **Stage 3 (IME hardware cursor)**: while the input box is open the component passes pi-tui's `CURSOR_MARKER` (zero-width APC) as `cursorMarker` — the TUI strips it at render time and moves the hardware cursor to that column, anchoring the IME candidate window to the real cursor position. The block `▌` stays; real-machine IME validation is deferred to end-user acceptance, and rolling back is a one-line revert (drop the argument).
 
 ### Key Map
 
 | Key | Action |
 |-----|--------|
-| `←` / `→` | Switch member tab (wraps around). **In the input box** they move the cursor by one visible character instead (grapheme — a Chinese character, emoji ZWJ family or combining sequence counts as one; stops at the ends, no wrap; branches sit after backspace and before the character fallback, so arrows are never inserted as text) |
-| `Home` / `End` | **In the input box**: jump the text cursor to the start / end of the input (one step, idempotent at the ends; matched after `←`/`→` and before the clear/character fallback). **Outside the input box**: `Home` is unbound, `End` keeps its original meaning (jump the conversation to the bottom + resume tail-following). Plain keys only — `Shift`/`Alt`/`Ctrl` combinations are no-ops (the editor keybinding manager is deliberately not used: its line-start default includes `Ctrl+A`, which is “abort member” here, and its defaults drift across pi-tui versions); the xterm modifyOtherKeys keycodes 72/70 are NOT Home/End — level 2 reports printable keys by their result character (`CSI 27;2;72~` = Shift+`H`), so these forms MUST keep flowing to the printable decoder and must not be intercepted (plain/shift insert `H`/`F`; alt/ctrl variants are rejected by the decoder itself) |
-| `↑` / `↓` / `PgUp` / `PgDn` | Scroll conversation |
+| `←` / `→` | Switch overview/member page (wraps around). **In the input box** they move the cursor by one visible character instead (grapheme — a Chinese character, emoji ZWJ family or combining sequence counts as one; stops at the ends, no wrap; branches sit after backspace and before the character fallback, so arrows are never inserted as text) |
+| `Home` / `End` | **In the input box**: jump the text cursor to the start / end of the input (one step, idempotent at the ends; matched after `←`/`→` and before the clear/character fallback). **Outside the input box on a member page**: `Home` is unbound, `End` keeps its original meaning (jump the conversation to the bottom + resume tail-following). Plain keys only — `Shift`/`Alt`/`Ctrl` combinations are no-ops (the editor keybinding manager is deliberately not used: its line-start default includes `Ctrl+A`, which is “abort member” here, and its defaults drift across pi-tui versions); the xterm modifyOtherKeys keycodes 72/70 are NOT Home/End — level 2 reports printable keys by their result character (`CSI 27;2;72~` = Shift+`H`), so these forms MUST keep flowing to the printable decoder and must not be intercepted (plain/shift insert `H`/`F`; alt/ctrl variants are rejected by the decoder itself) |
+| `↑` / `↓` / `PgUp` / `PgDn` | 总览选择成员并滚动窗口；成员页滚动会话。总览 Home/End 选择首位/末位成员 |
 | `End` | See the `Home`/`End` row above — outside the input box: jump to bottom + resume tail-following |
-| `i` / `Enter` | Open input box. Editing inside the input box: characters insert at the cursor, backspace deletes the visible character before it (emoji/combining sequences delete whole — intentional fix vs. the old codepoint delete), `←`/`→` move the cursor, `Home`/`End` jump to the input start/end |
+| `i` / `Enter` | 总览 Enter 进入选中成员会话，i 提示先进入会话；成员页打开输入框。 Editing inside the input box: characters insert at the cursor, backspace deletes the visible character before it (emoji/combining sequences delete whole — intentional fix vs. the old codepoint delete), `←`/`→` move the cursor, `Home`/`End` jump to the input start/end |
 | `Enter` (in input) | Send: `prompt` when idle, `follow_up` when busy（含字面 `\n` 兜底——kitty 协议激活时 pi-tui 不再将 `\n` 识别为 enter，LF 编码混合终端靠此放行；兜底必须位于任何未来 ctrl+j 分支之后） |
 | `Ctrl+Enter` / `Alt+Enter` (in input) | Send `steer` (immediate redirect). **Ctrl+Enter 依赖终端协议**（kitty CSI-u `\x1b[13;5u` / modifyOtherKeys `\x1b[27;5;13~`）；legacy 终端两者同字节 `\r` 无法区分，**Alt+Enter 是协议无关的 steer 路径**（legacy `\x1b\r` / kitty `\x1b[13;3u`）。空文本或无成员时显式 notice，不再静默 |
-| `e` | Toggle tool call/result detail expansion — **GLOBAL**: flips ALL member tabs (P3-①: 全 tab 本地重建零 RPC——running/stopped/crashed 同样适用，lastMessages 为空的 tab 保留 refetch 兜底) |
-| `t` | Toggle thinking block visibility (hidden by default) — **GLOBAL**: flips ALL member tabs (P3-①: 同 `e`——本地重建零 RPC) |
-| `ctrl+a` | `abort` the active tab's member |
+| `e` | 成员页切换工具详情；总览无操作。Toggle tool call/result detail expansion — **GLOBAL**: flips ALL member tabs (P3-①: 全 tab 本地重建零 RPC——running/stopped/crashed 同样适用，lastMessages 为空的 tab 保留 refetch 兜底) |
+| `t` | 成员页切换思考显示；总览无操作。Toggle thinking block visibility (hidden by default) — **GLOBAL**: flips ALL member tabs (P3-①: 同 `e`——本地重建零 RPC) |
+| `ctrl+a` | 成员页 `abort` 当前成员；总览只提示先进入成员会话 |
 | `ctrl+b` / `ctrl+shift+a` | `abort` ALL executing members (working/compacting) in one shot; idle/stopped/crashed are skipped. `ctrl+shift+a` requires Kitty keyboard protocol — legacy terminals send the same byte as `ctrl+a` (single abort), so `ctrl+b` remains the all-terminal key |
-| `ctrl+o` | `compact` the active tab's member (NOT ctrl+m — indistinguishable from Enter in terminals) |
+| `ctrl+o` | 成员页 `compact` 当前成员；总览只提示先进入成员会话。NOT ctrl+m — indistinguishable from Enter in terminals |
 | `Esc` | Layered exit: input box → overlay |
 
 ### Rendering Granularity
@@ -1288,7 +1302,7 @@ Member RPC event (tool_execution_end / message_end / ...)
   → setTabLines (tail-follow or scroll-preserve + "↓ 有更新")
   → tui.requestRender()
 
-Context usage (footer %): separate 5s poll via RPC get_session_stats.
+Context usage (overview %): immediate first query, then a separate get_session_stats poll 5s after each completed round, with at most four concurrent queries. Numeric null stays unknown (`?`); a failed refresh marks the previous numeric value with `~`.
 ```
 
 **P4 游标增量拉取（阶段 4，spike: docs/spike-get-entries-incremental.md）**：

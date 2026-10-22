@@ -8,6 +8,9 @@ import { matchesKey, Key, visibleWidth, CURSOR_MARKER } from "@earendil-works/pi
 import { decodePrintableKey } from "./pi-key-decode";
 import type { MemberProcessHandle } from "../process/member-process";
 import type { MemberOperationalState } from "../session/context";
+import { derivePhase, type MemberActivity } from "../channel/activity-tracker";
+import type { OverviewAction } from "./member-overview-store";
+import { buildInspectorHeader, buildOverviewLines, type OverviewRow } from "./member-overview-state";
 import {
   MemberInspectorState,
   buildBodyLinesIncremental,
@@ -18,15 +21,12 @@ import {
   clearAppendWrapCache,
   isSinceOnMainChain,
   mainChainEntries,
-  buildHeaderLine,
-  buildFooterStatusLine,
   truncateLine,
   buildInputBoxLine,
   nextStreamFlushDelay,
   KEY_HINTS_ACTION,
   INPUT_HINTS,
   buildNavHints,
-  IDENTITY_THEME,
   type BodyBuildCache,
   type BuildBodyOptions,
   type InspectorTab,
@@ -49,6 +49,9 @@ export interface MemberInspectorDeps {
   getMembers: () => { name: string; label?: string }[];
   getHandle: (name: string) => MemberProcessHandle | undefined;
   memberOpsStates: Map<string, MemberOperationalState>;
+  getActivity?: (name: string) => MemberActivity | undefined;
+  getRecentActions?: (name: string) => readonly OverviewAction[];
+  getStartedMembers?: () => readonly string[];
 }
 
 /** Handle exposed to index.ts for event-hook + lifecycle integration. */
@@ -107,13 +110,13 @@ const MAX_IN_FLIGHT_REFETCH = 2;
 const CHUNK_SIZE = 100;
 /**
  * Chrome lines around the body: top border(1) + header(1) + separator(1)
- * + separator(1) + footer×3(3) + bottom border(1) = 8.
+ * + separator(1) + footer×2(2) + bottom border(1) = 7.
  * CRITICAL: pi-tui clips overlays with slice(0, maxHeight) — it keeps the
  * TOP lines and drops the BOTTOM ones. If total lines = maxHeight + 1,
  * the bottom border is silently sliced off every render. This count must
  * exactly match the number of non-body lines emitted by render().
  */
-const CHROME_LINES = 8;
+const CHROME_LINES = 7;
 /** Overlay height fraction of the terminal. */
 const OVERLAY_HEIGHT_RATIO = 0.85;
 
@@ -126,10 +129,13 @@ function repeat(ch: string, n: number): string {
   return n > 0 ? ch.repeat(n) : "";
 }
 
-function bodyHeight(): number {
+function overlayHeight(): number {
   const rows = process.stdout.rows ?? 24;
-  const overlayH = Math.min(rows, Math.floor(rows * OVERLAY_HEIGHT_RATIO));
-  return Math.max(3, overlayH - CHROME_LINES);
+  return Math.max(0, Math.min(rows, Math.floor(rows * OVERLAY_HEIGHT_RATIO)));
+}
+
+function bodyHeight(): number {
+  return Math.max(0, overlayHeight() - CHROME_LINES);
 }
 
 // ── openMemberInspector ────────────────────────────────────
@@ -286,9 +292,9 @@ export class MemberInspectorComponent {
   // ── Lifecycle ──────────────────────────────────────────
 
   start(): void {
-    // Initial fetch for all tabs (all start dirty)
+    // Overview never loads histories. Context usage is sampled immediately.
     this.flushDirty();
-    this.scheduleStatsPoll();
+    void this.pollStats().finally(() => this.scheduleStatsPoll());
   }
 
   close(): void {
@@ -327,6 +333,7 @@ export class MemberInspectorComponent {
     // 旧主题色、仅新增行用新主题（混合主题）。
     if (this.disposed) return;
     this.bodyCaches.clear();
+    this.lastOverviewSignature = null;
     clearAppendWrapCache();
     for (const tab of this.state.tabs) tab.dirty = true;
     this.scheduleFlush();
@@ -342,7 +349,11 @@ export class MemberInspectorComponent {
    */
   onMemberEvent(memberName: string, event: any): void {
     if (this.disposed) return;
-    const tab = this.state.tabs.find((t) => t.name === memberName);
+    let tab = this.state.tabs.find((t) => t.name === memberName);
+    if (!tab) {
+      this.syncMembers();
+      tab = this.state.tabs.find((t) => t.name === memberName);
+    }
     if (!tab) return;
     switch (event?.type) {
       case "message_start":
@@ -383,7 +394,46 @@ export class MemberInspectorComponent {
     const tab = this.state.tabs.find((t) => t.name === memberName);
     if (!tab) return;
     tab.dirty = true;
+    if (this.state.view.kind === "overview") this.scheduleStreamFlush();
     this.scheduleFlush();
+  }
+
+  private syncMembers(): void {
+    this.state.syncMembers(this.deps.getMembers().map(m => ({ name: m.name, label: m.label ?? m.name })));
+  }
+
+  private lastOverviewSignature: string | null = null;
+
+  private overviewRows(height: number): OverviewRow[] {
+    this.state.ensureOverviewVisible(Math.max(1, height - 1));
+    const offset = this.state.overviewOffset;
+    const started = this.deps.getStartedMembers?.();
+    const now = Date.now();
+    return this.state.tabs.map((tab, index) => {
+      const activity = this.deps.getActivity?.(tab.name);
+      return {
+        name: tab.name, label: tab.label,
+        state: this.deps.memberOpsStates.get(tab.name) ?? "stopped",
+        phase: activity ? derivePhase(activity, now) : undefined,
+        percent: tab.contextInfo?.percent,
+        contextStale: tab.contextStale,
+        started: started ? started.includes(tab.name) : undefined,
+        actions: index >= offset && index < offset + Math.max(0, height - 1)
+          ? this.deps.getRecentActions?.(tab.name) ?? [] : [],
+      };
+    });
+  }
+
+  private refreshOverview(): void {
+    if (this.state.view.kind !== "overview") return;
+    const started = Date.now();
+    const signature = JSON.stringify(this.overviewRows(bodyHeight()));
+    this.streamFlushDelayMs = nextStreamFlushDelay(
+      this.streamFlushDelayMs, Date.now() - started, STREAM_FLUSH_MS, STREAM_FLUSH_MAX_MS
+    );
+    if (signature === this.lastOverviewSignature) return;
+    this.lastOverviewSignature = signature;
+    this.requestRenderSafe();
   }
 
   private scheduleFlush(delay: number = REFRESH_THROTTLE_MS): void {
@@ -481,6 +531,10 @@ export class MemberInspectorComponent {
     }
 
     const bh = bodyHeight();
+    if (this.state.view.kind === "overview") {
+      this.refreshOverview();
+      return;
+    }
     // P3-③: 只急切刷活跃 tab。非活跃 tab 仅置 dirty（switchTab 时补刷），
     // 窗口关闭补偿因此天然串行（活跃优先、不并行齐发）。
     const activeName = this.state.activeTab?.name;
@@ -682,6 +736,10 @@ export class MemberInspectorComponent {
       return;
     }
     const bh = bodyHeight();
+    if (this.state.view.kind === "overview") {
+      this.refreshOverview();
+      return;
+    }
     // P2: only the ACTIVE tab's live tail is rebuilt. Inactive tabs are not
     // visible — their deltas keep accumulating in state and their lines catch
     // up on tab switch (handleInput calls flushStreaming) or via the refetch
@@ -808,6 +866,7 @@ export class MemberInspectorComponent {
   private scheduleStatsPoll(): void {
     if (this.disposed) return;
     this.statsTimer = setTimeout(async () => {
+      this.statsTimer = null;
       await this.pollStats();
       this.scheduleStatsPoll();
     }, STATS_POLL_MS);
@@ -815,30 +874,43 @@ export class MemberInspectorComponent {
 
   private async pollStats(): Promise<void> {
     if (this.disposed) return;
-    for (const tab of this.state.tabs) {
-      if (this.disposed) return;
-      const handle = this.deps.getHandle(tab.name);
-      const opState = this.deps.memberOpsStates.get(tab.name);
-      if (!handle || opState === "stopped" || opState === "crashed") continue;
-      try {
-        const response: any = await handle.sendCommandAndWait(
-          { type: "get_session_stats" },
-          (event: any) =>
-            event.type === "response" && event.command === "get_session_stats",
-          RPC_TIMEOUT_MS
-        );
-        if (response?.data?.contextUsage) {
-          tab.contextInfo = {
-            percent: response.data.contextUsage.percent,
-            tokens: response.data.contextUsage.tokens,
-            contextWindow: response.data.contextUsage.contextWindow,
-          };
+    this.syncMembers();
+    const tabs = [...this.state.tabs];
+    let next = 0;
+    const worker = async () => {
+      while (!this.disposed && next < tabs.length) {
+        const tab = tabs[next++];
+        const handle = this.deps.getHandle(tab.name);
+        const opState = this.deps.memberOpsStates.get(tab.name);
+        if (!handle || opState === "stopped" || opState === "crashed") continue;
+        const current = () => !this.disposed && this.state.tabs.includes(tab)
+          && this.deps.getMembers().some(m => m.name === tab.name)
+          && this.deps.getHandle(tab.name) === handle
+          && !["stopped", "crashed"].includes(this.deps.memberOpsStates.get(tab.name) ?? "");
+        try {
+          const response: any = await handle.sendCommandAndWait(
+            { type: "get_session_stats" },
+            (event: any) => event.type === "response" && event.command === "get_session_stats",
+            RPC_TIMEOUT_MS
+          );
+          if (!current()) continue;
+          const usage = response?.data?.contextUsage;
+          if (response?.success === false || !usage || !(usage.percent === null || (typeof usage.percent === "number" && Number.isFinite(usage.percent)))) {
+            tab.contextStale = true;
+            continue;
+          }
+          tab.contextInfo = { percent: usage.percent, tokens: usage.tokens, contextWindow: usage.contextWindow };
+          tab.contextStale = false;
+        } catch {
+          if (current()) tab.contextStale = true;
         }
-      } catch {
-        // keep previous value
       }
-    }
-    this.requestRenderSafe();
+    };
+    await Promise.allSettled(Array.from({ length: Math.min(4, tabs.length) }, () => worker()));
+    if (this.disposed) return;
+    this.syncMembers(); // Membership may change while stats RPCs are in flight.
+    if (this.state.view.kind === "overview") this.refreshOverview();
+    else this.requestRenderSafe();
   }
 
   private requestRenderSafe(interactive = false): void {
@@ -882,6 +954,7 @@ export class MemberInspectorComponent {
       // 静默早退显式化（边界 D）：动态模式 0 成员时浮窗可打开但无成员可发。
       // 原实现纯 return 零提示——notice 必须配 render 才可见。
       this.state.notice = "✗ 无成员可发送";
+      this.state.closeInput();
       this.requestRenderSafe(true);
       return;
     }
@@ -990,6 +1063,7 @@ export class MemberInspectorComponent {
   // ── Input handling ─────────────────────────────────────
 
   handleInput(data: string): void {
+    this.syncMembers(); // A removed member must not remain a send/control target.
     const bh = bodyHeight();
     // P1-④: browsing (scrolling) and typing open the interaction window —
     // their flushes/renders are suspended so rebuilds never fight the user
@@ -1076,7 +1150,33 @@ export class MemberInspectorComponent {
       this.close();
       return;
     }
+    if (this.state.view.kind === "overview" && !matchesKey(data, Key.left) && !matchesKey(data, Key.right)) {
+      const capacity = Math.max(1, bh - 1);
+      if (matchesKey(data, Key.up)) this.state.moveOverviewSelection(-1, capacity);
+      else if (matchesKey(data, Key.down)) this.state.moveOverviewSelection(1, capacity);
+      else if (matchesKey(data, Key.pageUp)) this.state.moveOverviewSelection(-capacity, capacity);
+      else if (matchesKey(data, Key.pageDown)) this.state.moveOverviewSelection(capacity, capacity);
+      else if (matchesKey(data, Key.home)) this.state.moveOverviewSelection(-this.state.tabs.length, capacity);
+      else if (matchesKey(data, Key.end)) this.state.moveOverviewSelection(this.state.tabs.length, capacity);
+      else if (matchesKey(data, Key.enter) || data === "\n") {
+        this.state.openMember();
+        this.lastInteractionAt = 0;
+        this.flushStreaming();
+        this.scheduleFlush(0);
+      } else if (matchesKey(data, "ctrl+b") || matchesKey(data, "ctrl+shift+a")) {
+        this.sendAbortAll();
+        return;
+      } else if (matchesKey(data, "i") || matchesKey(data, "ctrl+a") || matchesKey(data, "ctrl+o")) {
+        this.state.notice = "进入成员会话后操作或发送消息";
+        this.requestRenderSafe(true);
+        return;
+      } else return; // e/t belong only to conversation pages
+      this.state.notice = null;
+      this.requestRenderSafe(true);
+      return;
+    }
     if (matchesKey(data, Key.left)) {
+      this.lastInteractionAt = 0;
       this.state.switchTab(-1);
       // P2: inactive tabs skip streaming rebuilds — catch up the newly
       // active tab's live tail immediately (O(Δ) via the wrap cache).
@@ -1085,6 +1185,7 @@ export class MemberInspectorComponent {
       // markDirty）则急切 refetch；只刷它，不并行齐发。
       this.scheduleFlush();
     } else if (matchesKey(data, Key.right)) {
+      this.lastInteractionAt = 0;
       this.state.switchTab(1);
       this.flushStreaming();
       this.scheduleFlush();
@@ -1169,10 +1270,14 @@ export class MemberInspectorComponent {
     } else {
       this.lastWidth = width;
     }
+    this.syncMembers();
     const theme = this.inspectorTheme;
-    const inner = Math.max(20, width - 2);
+    const inner = Math.max(0, width - 2);
     const bh = bodyHeight();
     const tab = this.state.activeTab;
+    const overview = this.state.view.kind === "overview";
+    const contentWidth = Math.max(0, inner - 2);
+    const fit = (text: string, cols: number) => padVisible(truncateLine(text, cols), cols);
 
     const border = (s: string) => {
       try {
@@ -1187,12 +1292,14 @@ export class MemberInspectorComponent {
     // (╭─ = 2 cols, ╮ = 1 col → fill = inner - 1 - titleWidth).
     // A wider line gets truncated/wrapped by the overlay, which drops the
     // rounded corner and pushes the bottom border out of view.
-    const title = " Member Inspector ";
+    const title = truncateLine(" Member Inspector ", Math.max(0, inner - 1));
     const topFill = repeat("─", Math.max(0, inner - 1 - visibleWidth(title)));
-    const top = border("╭─") + theme.fg("accent", theme.bold?.(title) ?? title) + border(topFill + "╮");
+    const top = inner === 0 ? border("╭╮") : border("╭─") + theme.fg("accent", theme.bold?.(title) ?? title) + border(topFill + "╮");
+    const frame = (line: string) => border("│") + fit(line, inner) + border("│");
+    const hintFrame = (line: string) => frame(inner >= 2 ? " " + fit(line, contentWidth) + " " : line);
 
-    // ── Header: tabs ──
-    const header = border("│ ") + padVisible(buildHeaderLine(this.state.tabs, this.state.activeIndex, inner - 2, theme), inner - 2) + border(" │");
+    // ── Header: the overview is a real page, never a pseudo member ──
+    const header = hintFrame(buildInspectorHeader(this.state.tabs, this.state.view, this.state.selectedName, contentWidth, theme));
 
     // ── Separator ──
     const sep = border("├" + repeat("─", inner) + "┤");
@@ -1202,28 +1309,30 @@ export class MemberInspectorComponent {
     // (fitLinesToWidth) so the right border stays aligned; no truncateLine /
     // padVisible here — the scroll hot path does ZERO width computation.
     const body: string[] = [];
-    if (!tab) {
-      body.push(padVisible("（无成员）", inner));
-    } else {
+    if (overview) {
+      body.push(...buildOverviewLines(this.overviewRows(bh), this.state.selectedName, this.state.overviewOffset, bh, inner, theme));
+    } else if (tab) {
       const visible = tab.lines.slice(tab.scrollOffset, tab.scrollOffset + bh);
-      body.push(...visible);
+      // A resize may precede the deferred rebuild. Clip just the visible
+      // stale-width slice; steady-state scrolling still emits cached lines
+      // verbatim with zero per-line width work.
+      const fittedWidth = this.bodyCaches.get(tab.name)?.fitWidth;
+      const staleWidth = fittedWidth !== undefined && fittedWidth !== inner;
+      body.push(...(width < 24 || staleWidth ? visible.map(line => fit(line, inner)) : visible));
     }
     while (body.length < bh) body.push(repeat(" ", inner));
     const bodyLines = body.map((l) => border("│") + l + border("│"));
 
-    // ── Footer line 1: member statuses / notice / new-below hint ──
-    let footer1: string;
-    if (this.state.notice) {
-      footer1 = " " + this.state.notice;
-    } else {
-      footer1 = buildFooterStatusLine(this.state.tabs, this.deps.memberOpsStates, inner, theme);
-    }
-    if (tab?.newBelow) {
-      footer1 = footer1 + "  ↓ 有更新";
-    }
-    const footer1Line = border("│ ") + padVisible(truncateLine(footer1, inner - 2), inner - 2) + border(" │");
+    // Two footer lines only: notices replace navigation hints, never disappear
+    // with the removed status summary. Reserve the new-below hint FIRST.
+    const navHints = overview
+      ? "←→ 切页  ↑↓ 选择成员  Enter 查看会话  Esc 关闭"
+      : buildNavHints(this.state.expanded, this.state.showThinking);
+    const newBelow = tab?.newBelow ? "  ↓ 有更新" : "";
+    const navigation = this.state.notice ?? navHints;
+    const feedback = truncateLine(navigation, Math.max(0, contentWidth - visibleWidth(newBelow))) + newBelow;
 
-    // ── Footer line 2: navigation key hints, or the input box ──
+    // ── Footer line 1: navigation/notice, or the input box ──
     let footer2: string;
     if (this.state.inputOpen) {
       // 阶段 2：`> ` + 光标前文字 + ▌ + 光标后文字，长输入横向窗口保证光标
@@ -1234,20 +1343,40 @@ export class MemberInspectorComponent {
       // 块状 ▌ 保留，标记仅输入框打开时发射。
       footer2 =
         theme.fg("accent", "✎ ") +
-        buildInputBoxLine(this.state.inputBuffer, this.state.inputCursor, inner - 4, CURSOR_MARKER);
+        buildInputBoxLine(this.state.inputBuffer, this.state.inputCursor, Math.max(0, inner - 4), CURSOR_MARKER);
     } else {
-      footer2 = " " + buildNavHints(this.state.expanded, this.state.showThinking);
+      footer2 = feedback;
     }
-    const footer2Line = border("│ ") + padVisible(truncateLine(footer2, inner - 2), inner - 2) + border(" │");
+    const footer2Line = hintFrame(footer2);
 
-    // ── Footer line 3: action key hints, or input-mode hints ──
-    const footer3 = this.state.inputOpen ? " " + INPUT_HINTS : " " + KEY_HINTS_ACTION;
-    const footer3Line = border("│ ") + padVisible(truncateLine(footer3, inner - 2), inner - 2) + border(" │");
+    // ── Footer line 2: action key hints, or input-mode hints ──
+    const footer3 = this.state.inputOpen ? (this.state.notice || newBelow ? feedback : INPUT_HINTS) : overview
+      ? "📖读取 💭思考 ✏️输出 📝修改 🔧工具  ctrl+b 全部中断"
+      : KEY_HINTS_ACTION;
+    const footer3Line = hintFrame(footer3);
 
     // ── Bottom border ──
     const bottom = border("╰" + repeat("─", inner) + "╯");
 
-    return [top, header, sep, ...bodyLines, sep, footer1Line, footer2Line, footer3Line, bottom];
+    const height = overlayHeight();
+    if (width < 2) return Array.from({ length: height }, (_, index) => fit(index === height - 1 ? "Esc" : "", Math.max(0, width)));
+    // Overview needs its table header AND one member row; a conversation
+    // needs one content row. Chrome fitting alone can leave the page empty.
+    const minimumBodyHeight = overview ? 2 : 1;
+    if (height < CHROME_LINES + minimumBodyHeight) {
+      if (height === 0) return [];
+      if (height === 1) return [hintFrame("Esc 关闭")];
+      if (height === 2) return [hintFrame("Esc 关闭"), bottom];
+      const compact = [top];
+      const slots = height - 2;
+      if (slots > 1) compact.push(overview
+        ? frame(buildOverviewLines(this.overviewRows(2), this.state.selectedName, this.state.overviewOffset, 2, inner, theme)[1] ?? "总览")
+        : frame(tab?.lines[tab.scrollOffset] ?? ""));
+      while (compact.length < height - 2) compact.push(frame(""));
+      if (slots > 0) compact.push(hintFrame("Esc 关闭" + (this.state.notice ? "  " + this.state.notice : "")));
+      return [...compact, bottom];
+    }
+    return [top, header, sep, ...bodyLines, sep, footer2Line, footer3Line, bottom];
   }
 }
 
