@@ -1191,13 +1191,12 @@ A full-keyboard overlay that lets the **user** inspect each Member's live conver
 ╭─ Member Inspector ──────────────────────────────────────╮
 │ ❰总览❱  分析员  编码员  测试员                           │
 ├────────────────────────────────────────────────────────┤
-│ 成员 1–3 / 3   当前状态  上下文  最近操作（新→右）        │
-│ › 分析员       💭 思考中   12%   📖 💭 📖 💭             │
-│   编码员       🔧 执行工具 45%   💭 📖 📝 🔧              │
-│   测试员       ✅ 空闲     18%   🔧 ✏️ ✅                 │
+│ › 分析员   [█░░░░░░░░░] 12%   💭 📖 💭 📖             │
+│   编码员   [█████░░░░░] 45%   📖 📝 🔧 💭 (12)          │
+│   测试员   [██░░░░░░░░] 18%   ✅ ✏️ 🔧                 │
 ├────────────────────────────────────────────────────────┤
 │ ←→ 切页  ↑↓ 选择成员  Enter 查看会话  Esc 关闭           │
-│ 📖读取 💭思考 ✏️输出 📝修改 🔧工具  ctrl+b 全部中断       │
+│ ctrl+b 全部中断                                        │
 ╰────────────────────────────────────────────────────────╯
 ```
 
@@ -1206,14 +1205,15 @@ A full-keyboard overlay that lets the **user** inspect each Member's live conver
 ### Overview data and lifecycle
 
 - `MemberInspectorState.view` 为显式 `overview | member(name)` 页面，成员身份用 name 保存。总览不产生伪成员 tab，也不发送成员 RPC 控制命令。
-- 每成员一行，按名册稳定排序。表头固定，选择行跟随窗口滚动。轨迹最新图标在右，宽度不足时取完整图标的最长后缀。标签栏固定总览并展示当前成员附近的水平窗口。
-- 状态列优先采用 compacting/crashed/stopped，再读取 activity-tracker 的阶段。占用正常显示百分比，null/未知为 `?`，失败旧值为 `~42%`，停止/崩溃为 `—`。选中标记在窄布局中也保留。
+- 每成员一行，按名册稳定排序。无表头、无状态文字列、无底部图例。所有正文行均用于成员，选择行跟随窗口滚动。标签栏固定总览并展示当前成员附近的水平窗口。
+- 轨迹最左图标表示当前状态。最新活动记录匹配当前状态时复用该记录，否则补充一个显示位置，不写入历史。新操作从左插入，历史向右移动。含当前状态最多20个图标，宽度不足时显示更少，尾部完整显示 `(N)`，N为缓冲区内未显示的真实记录数。
+- 当前状态优先采用控制面的 compacting/crashed/stopped/idle，再读取 working 的 activity-tracker 阶段。活动和错误图标通过下划线和语义色强调。占用使用水平条加百分比，如 `[████░░░░░░] 42%`；null/未知为中性点条加 `?`，失败旧值为 `~42%`，停止/崩溃为 `—`。窄屏缩短占用条和成员名，优先保留当前图标、百分比与隐藏计数。
 - `member-overview-store.ts` 每成员保存最近64个语义动作。思考/输出按内容块去重，工具按 toolCallId 关联，从参数生成到执行结果原位更新。两次 read 保留两个 📖，不按 delta 追加记录。活动和失败图标加下划线，颜色只作辅助。✅ 仅表示回合结束，不断言任务验收成功。
 - 存储由 index.ts 按团队 sessionId 管理，关闭浮窗期间仍采集。同一 sessionId 的重复 UI 安装不清空，stop/shutdown 清空，resume/重载不从磁盘重建轨迹。不保存正文、参数、工具结果或完整 RPC 事件。环形缓冲与关联索引均有界。
 - 活动分发顺序：tracker 更新 → 进程死亡时清 tracker → 总览存储 → inspector → widget。每个消费者独立捕获异常。创建成员时捕获 sessionId 和 handle 身份，过期来源不更新显示观察者。成功 start（包括同一 handle 的自动重启）重置显示专用 process_started 门，不依赖首次 agent_start。
 - 总览只渲染可见成员，不拉完整会话。复用100ms–1s合并刷新与显示签名去重，进入成员页时补齐既有增量会话与流式内容。
 - stats 打开时立即查询，此后每轮结束5秒再排下一轮，最多四路并发、单次3秒超时。关闭、成员删除或句柄更换后不写回在飞结果。
-- 常规 chrome 为7行（原8行）。总览正文至少需要表头和1个成员行，否则使用紧凑布局，显示选中成员的状态/占用和退出提示。
+- 常规 chrome 为7行（原8行）。无表头总览正文只需1个成员行，正文窗口与 PgUp/PgDn 使用完整 bodyHeight。更矮时使用紧凑布局，显示选中成员的状态/占用和退出提示。
 
 `MemberInspectorDeps` 在既有 getMembers/getHandle/memberOpsStates 外增加三个可选只读依赖：`getActivity(name): MemberActivity | undefined`、`getRecentActions(name): readonly OverviewAction[]`、`getStartedMembers(): readonly string[]`。可选性用于无追踪器的旧调用方安全降级。布局纯函数位于 `member-overview-state.ts`。完整设计与验证记录见 [成员浮窗总览设计](docs/design-member-inspector-overview.md)。
 

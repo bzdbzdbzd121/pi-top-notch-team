@@ -194,7 +194,7 @@ src/
 │   ├── member-inspector.ts   ← Member Inspector overlay (alt+t): 默认总览、成员会话、输入框、两行提示（不再汇总成员状态）；stats 立即查询 + 5s 轮询，最多四路并发
 │   ├── member-inspector-state.ts  ← Inspector pure display state + line building（显式 overview/member 页面、总览选中行与窗口、buildInputBoxLine 输入行纯函数）
 │   ├── member-overview-store.ts / .test.ts ← 会话级语义操作轨迹：每成员64条环形缓冲、块/工具去重与结果原位更新、关闭浮窗仍采集、重启重置和有界关联索引
-│   ├── member-overview-state.ts / .test.ts ← 总览表格与标签窗口纯函数：状态/占用/图标轨迹、稳定名册、窄屏/CJK/emoji精确列宽
+│   ├── member-overview-state.ts / .test.ts ← 无表头总览与标签窗口纯函数：占用条+百分比、轨迹左侧当前状态、最新在左最多20图标与(N)隐藏计数、稳定名册、窄屏/CJK/emoji精确列宽
 │   ├── member-inspector.overview.test.ts ← 默认总览、页面导航、stats并发与陈旧值、风暴、小高度、关闭清理回归
 │   ├── pi-key-decode.ts      ← decodePrintableKey 本地实现（decodeKittyPrintable 主入口导入 + modifyOtherKeys 回退按上游 keys.js 复刻；不能深导入 pi-tui/dist/keys.js——loader jiti alias 前缀替换会拼坏子路径，见 DESIGN.md §17）
 │   └── pi-key-decode.test.ts ← 本地解码器单元测试（kitty CSI-u / modifyOtherKeys / legacy 三协议 + 修饰拒绝 + Caps Lock 掩码）
@@ -446,7 +446,7 @@ src/
     - **启动提醒**：`session_start`（成员进程早退之后）挂载 `detect.ts`——进程级一次 latch、`reload` 跳过、处理器同步返回（网络在自捕获游离 promise + 硬超时；pi 0.83.0 确实 `await` 该处理链）、只报「云端有 N 个提交」、暂态静默 / 持久缺陷提示一次、非 TUI 静默降级。
     - **静态守卫**：`src/static-scan-child-process.test.ts` 白名单（`sync/git-runner.ts`、`process/member-process.ts`、`setup/member-lifecycle.ts`、`tools/tl-tools.ts`）——同步模块必须经统一 git 执行器；既有 `loadSettings` 守卫保持绿（同步模块零 `loadSettings` 调用）。
 
-46. **成员浮窗总览页（每成员一行图标轨迹）** — `alt+t` 每次打开默认总览，显式 `overview/member(name)` 页面身份，不伪造成员 tab。总览按名册稳定排序，↑↓/PgUp/PgDn/Home/End 选择成员、Enter 进入会话，←→ 在总览与成员页间循环；总览不执行单成员发送/中断/压缩，ctrl+b 全员中断仍可用。状态列复用控制面覆盖与 activity-tracker 细粒度活动，百分比正常显示数值、null/未知显示 `?`、失败旧值加 `~`、停止/崩溃显示 `—`。轨迹使用 💭思考/✏️输出/📖读取/📝修改/🔧其他工具，最新在右，活动/错误图标加下划线与语义色。每块/每工具调用一条，不逐 delta 追加。`member-overview-store.ts` 每成员64条环形缓冲，关联索引同步淘汰，不保留正文/参数；`index.ts` 在会话期持续采集，浮窗关闭不清空，stop/shutdown 清空，resume 不重建旧轨迹。创建成员捕获 sessionId 与 handle 身份，旧来源显示事件不进入新总览；包装成功 start（含 auto-restart）发出显示专用 process_started，避免等待首个 agent_start 才解除旧进程死亡门。总览渲染只读取可见成员轨迹，固定总览标签+当前成员水平窗口，窄屏保留选择反馈。stats 打开时立即查询，轮询结束5秒后再排，最多四路，关闭/换句柄后不写回。删除浮窗全员状态汇总行，notice/newBelow 迁到提示行，常规 chrome 8→7，小高度退化为选中成员摘要+退出提示。外部 team-status-widget、控制面与派发规则不改。详见 `docs/design-member-inspector-overview.md` 与 DESIGN.md §17；`src/index-overview.test.ts` 覆盖会话级接线。
+46. **成员浮窗总览页（每成员一行图标轨迹）** — `alt+t` 每次打开默认总览，显式 `overview/member(name)` 页面身份，不伪造成员 tab。总览按名册稳定排序，↑↓/PgUp/PgDn/Home/End 选择成员、Enter 进入会话，←→ 在总览与成员页间循环；总览不执行单成员发送/中断/压缩，ctrl+b 全员中断仍可用。总览不显示表头、状态文字列和底部图例；轨迹最左图标复用控制面覆盖与 activity-tracker 细粒度活动表示当前状态。上下文用水平占用条和百分比显示，null/未知显示中性点条加 `?`、失败旧值加 `~`、停止/崩溃显示 `—`。轨迹使用 💭思考/✏️输出/📖读取/📝修改/🔧其他工具，新操作从左插入、旧记录向右移，含当前状态最多20个图标，窄屏显示更少并在尾部用完整 `(N)` 表示未显示的真实记录数。当前活动匹配最新记录时原位复用，否则补充显示位置但不写历史；活动/错误图标加下划线与语义色。每块/每工具调用一条，不逐 delta 追加。`member-overview-store.ts` 每成员64条环形缓冲，关联索引同步淘汰，不保留正文/参数；`index.ts` 在会话期持续采集，浮窗关闭不清空，stop/shutdown 清空，resume 不重建旧轨迹。创建成员捕获 sessionId 与 handle 身份，旧来源显示事件不进入新总览；包装成功 start（含 auto-restart）发出显示专用 process_started，避免等待首个 agent_start 才解除旧进程死亡门。总览渲染只读取可见成员轨迹，固定总览标签+当前成员水平窗口，窄屏保留选择反馈。stats 打开时立即查询，轮询结束5秒后再排，最多四路，关闭/换句柄后不写回。删除浮窗全员状态汇总行，notice/newBelow 迁到提示行，常规 chrome 8→7，小高度退化为选中成员摘要+退出提示。外部 team-status-widget、控制面与派发规则不改。详见 `docs/design-member-inspector-overview.md` 与 DESIGN.md §17；`src/index-overview.test.ts` 覆盖会话级接线。
 
 ## Dependency Injection Pattern
 

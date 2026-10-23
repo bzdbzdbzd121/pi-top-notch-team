@@ -405,7 +405,7 @@ export class MemberInspectorComponent {
   private lastOverviewSignature: string | null = null;
 
   private overviewRows(height: number): OverviewRow[] {
-    this.state.ensureOverviewVisible(Math.max(1, height - 1));
+    this.state.ensureOverviewVisible(Math.max(1, height));
     const offset = this.state.overviewOffset;
     const started = this.deps.getStartedMembers?.();
     const now = Date.now();
@@ -418,7 +418,7 @@ export class MemberInspectorComponent {
         percent: tab.contextInfo?.percent,
         contextStale: tab.contextStale,
         started: started ? started.includes(tab.name) : undefined,
-        actions: index >= offset && index < offset + Math.max(0, height - 1)
+        actions: index >= offset && index < offset + Math.max(0, height)
           ? this.deps.getRecentActions?.(tab.name) ?? [] : [],
       };
     });
@@ -1151,7 +1151,7 @@ export class MemberInspectorComponent {
       return;
     }
     if (this.state.view.kind === "overview" && !matchesKey(data, Key.left) && !matchesKey(data, Key.right)) {
-      const capacity = Math.max(1, bh - 1);
+      const capacity = Math.max(1, bh);
       if (matchesKey(data, Key.up)) this.state.moveOverviewSelection(-1, capacity);
       else if (matchesKey(data, Key.down)) this.state.moveOverviewSelection(1, capacity);
       else if (matchesKey(data, Key.pageUp)) this.state.moveOverviewSelection(-capacity, capacity);
@@ -1351,7 +1351,7 @@ export class MemberInspectorComponent {
 
     // ── Footer line 2: action key hints, or input-mode hints ──
     const footer3 = this.state.inputOpen ? (this.state.notice || newBelow ? feedback : INPUT_HINTS) : overview
-      ? "📖读取 💭思考 ✏️输出 📝修改 🔧工具  ctrl+b 全部中断"
+      ? "ctrl+b 全部中断"
       : KEY_HINTS_ACTION;
     const footer3Line = hintFrame(footer3);
 
@@ -1360,9 +1360,8 @@ export class MemberInspectorComponent {
 
     const height = overlayHeight();
     if (width < 2) return Array.from({ length: height }, (_, index) => fit(index === height - 1 ? "Esc" : "", Math.max(0, width)));
-    // Overview needs its table header AND one member row; a conversation
-    // needs one content row. Chrome fitting alone can leave the page empty.
-    const minimumBodyHeight = overview ? 2 : 1;
+    // The headerless overview and conversation both need at least one body row.
+    const minimumBodyHeight = 1;
     if (height < CHROME_LINES + minimumBodyHeight) {
       if (height === 0) return [];
       if (height === 1) return [hintFrame("Esc 关闭")];
@@ -1370,7 +1369,7 @@ export class MemberInspectorComponent {
       const compact = [top];
       const slots = height - 2;
       if (slots > 1) compact.push(overview
-        ? frame(buildOverviewLines(this.overviewRows(2), this.state.selectedName, this.state.overviewOffset, 2, inner, theme)[1] ?? "总览")
+        ? frame(buildOverviewLines(this.overviewRows(1), this.state.selectedName, this.state.overviewOffset, 1, inner, theme)[0] ?? "总览")
         : frame(tab?.lines[tab.scrollOffset] ?? ""));
       while (compact.length < height - 2) compact.push(frame(""));
       if (slots > 0) compact.push(hintFrame("Esc 关闭" + (this.state.notice ? "  " + this.state.notice : "")));
