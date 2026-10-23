@@ -202,13 +202,11 @@ export default function (pi: ExtensionAPI) {
   let overviewStore: MemberOverviewStore | null = null;
   let overviewSessionId: string | null = null;
   const overviewStarted = new Set<string>();
-  const overviewCompacting = new Set<string>();
   const clearOverview = () => {
     overviewStore?.clear();
     overviewStore = null;
     overviewSessionId = null;
     overviewStarted.clear();
-    overviewCompacting.clear();
   };
   const syncOverviewSession = () => {
     const session = getSessionState();
@@ -226,15 +224,6 @@ export default function (pi: ExtensionAPI) {
     overviewStore.syncMembers(names);
     const keep = new Set(names);
     for (const name of overviewStarted) if (!keep.has(name)) overviewStarted.delete(name);
-    for (const name of overviewCompacting) if (!keep.has(name)) overviewCompacting.delete(name);
-  };
-  const sampleOverviewCompaction = (name: string) => {
-    if (!overviewStore) return;
-    const active = memberOpsStates.get(name) === "compacting";
-    if (active === overviewCompacting.has(name)) return;
-    if (active) overviewCompacting.add(name);
-    else overviewCompacting.delete(name);
-    overviewStore.markCompacting(name, active);
   };
   // Handle for the currently-open inspector overlay; null when closed.
   let inspectorHandle: MemberInspectorHandle | null = null;
@@ -270,10 +259,8 @@ export default function (pi: ExtensionAPI) {
         getHandle: (name: string) => teamCtx.getHandle(name),
         memberOpsStates,
         getActivity: (name) => activityTracker?.getActivity(name),
-        getRecentActions: (name) => {
-          sampleOverviewCompaction(name);
-          return overviewStore?.getRecentActions(name) ?? [];
-        },
+        getRecentActions: (name) => overviewStore?.getRecentActions(name) ?? [],
+        isCompacting: (name) => overviewStore?.isCompacting(name) ?? false,
         getStartedMembers: () => [...overviewStarted],
       });
     },
@@ -359,7 +346,6 @@ export default function (pi: ExtensionAPI) {
       }
       try {
         if (overviewStore) {
-          sampleOverviewCompaction(memberName);
           overviewStore.onEvent(memberName, event);
           if (event?.type === "agent_start" || memberHandles.get(memberName)?.getState().status === "running") {
             overviewStarted.add(memberName);
@@ -407,7 +393,6 @@ export default function (pi: ExtensionAPI) {
         // successful start, including manager-driven auto-restarts of this handle.
         overviewStore?.onEvent(config.name, { type: "process_started" });
         overviewStarted.add(config.name);
-        overviewCompacting.delete(config.name);
       }
     };
     return handle;

@@ -1207,16 +1207,16 @@ A full-keyboard overlay that lets the **user** inspect each Member's live conver
 - `MemberInspectorState.view` 为显式 `overview | member(name)` 页面，成员身份用 name 保存。总览不产生伪成员 tab，也不发送成员 RPC 控制命令。
 - 每成员一行，按名册稳定排序。无表头、无状态文字列、无底部图例。所有正文行均用于成员，选择行跟随窗口滚动。标签栏固定总览并展示当前成员附近的水平窗口。
 - 轨迹最左图标表示当前状态。最新活动记录匹配当前状态时复用该记录，否则补充一个显示位置，不写入历史。新操作从左插入，历史向右移动。含当前状态最多20个图标，宽度不足时显示更少，尾部完整显示 `(N)`，N为缓冲区内未显示的真实记录数。
-- 当前状态优先采用控制面的 compacting/crashed/stopped/idle，再读取 working 的 activity-tracker 阶段。活动和错误图标通过下划线和语义色强调。占用使用水平条加百分比，如 `[████░░░░░░] 42%`；null/未知为中性点条加 `?`，失败旧值为 `~42%`，停止/崩溃为 `—`。窄屏缩短占用条和成员名，优先保留当前图标、百分比与隐藏计数。
+- 当前状态先采用控制面的 crashed/stopped，再采用成员侧确认的压缩，最后读取 working 的 activity-tracker 阶段。控制面 compacting 也用于派发前 stats 查询占位，不代表实际压缩；注入的 isCompacting=false 时，该占位在总览显示为空闲，不出现 🗜️。手动压缩即使控制面仍 idle，也能由成员侧事件显示 🗜️。活动和错误图标通过下划线和语义色强调。占用使用水平条加百分比，如 `[████░░░░░░] 42%`；null/未知为中性点条加 `?`，失败旧值为 `~42%`，停止/崩溃为 `—`。窄屏缩短占用条和成员名，优先保留当前图标、百分比与隐藏计数。
 - `member-overview-store.ts` 每成员保存最近64个语义动作。思考/输出按内容块去重，工具按 toolCallId 关联，从参数生成到执行结果原位更新。两次 read 保留两个 📖，不按 delta 追加记录。活动和失败图标加下划线，颜色只作辅助。✅ 仅表示回合结束，不断言任务验收成功。
-- 压缩历史需要开始事件、控制面开始边沿，或结束事件带成功的 `result.summary`。缺少开始依据且无成功结果的孤立 compaction_end 不创建 🗜️，以免把无实际压缩证据的结束通知误记为成员首个操作。真实已开始的压缩与失败结果仍保留；不改变控制面的压缩心跳处理。
+- 压缩历史只认成员侧开始事件、成功 get_state.isCompacting=true，或结束事件带成功的 `result.summary`，不再采样控制面的 compacting 边沿。缺少开始依据且无成功结果的孤立 compaction_end 不创建 🗜️，以免把无实际压缩证据的结束通知误记为成员首个操作。真实已开始的压缩与失败结果仍保留；不改变控制面的压缩心跳处理。
 - 存储由 index.ts 按团队 sessionId 管理，关闭浮窗期间仍采集。同一 sessionId 的重复 UI 安装不清空，stop/shutdown 清空，resume/重载不从磁盘重建轨迹。不保存正文、参数、工具结果或完整 RPC 事件。环形缓冲与关联索引均有界。
 - 活动分发顺序：tracker 更新 → 进程死亡时清 tracker → 总览存储 → inspector → widget。每个消费者独立捕获异常。创建成员时捕获 sessionId 和 handle 身份，过期来源不更新显示观察者。成功 start（包括同一 handle 的自动重启）重置显示专用 process_started 门，不依赖首次 agent_start。
 - 总览只渲染可见成员，不拉完整会话。复用100ms–1s合并刷新与显示签名去重，进入成员页时补齐既有增量会话与流式内容。
 - stats 打开时立即查询，此后每轮结束5秒再排下一轮，最多四路并发、单次3秒超时。关闭、成员删除或句柄更换后不写回在飞结果。
 - 常规 chrome 为7行（原8行）。无表头总览正文只需1个成员行，正文窗口与 PgUp/PgDn 使用完整 bodyHeight。更矮时使用紧凑布局，显示选中成员的状态/占用和退出提示。
 
-`MemberInspectorDeps` 在既有 getMembers/getHandle/memberOpsStates 外增加三个可选只读依赖：`getActivity(name): MemberActivity | undefined`、`getRecentActions(name): readonly OverviewAction[]`、`getStartedMembers(): readonly string[]`。可选性用于无追踪器的旧调用方安全降级。布局纯函数位于 `member-overview-state.ts`。完整设计与验证记录见 [成员浮窗总览设计](docs/design-member-inspector-overview.md)。
+`MemberInspectorDeps` 在既有 getMembers/getHandle/memberOpsStates 外增加四个可选只读依赖：`getActivity(name): MemberActivity | undefined`、`getRecentActions(name): readonly OverviewAction[]`、`isCompacting(name): boolean`、`getStartedMembers(): readonly string[]`。isCompacting 由总览存储的成员侧确认状态提供，独立于轨迹容量和控制面的预检占位；进程重启/退出清除，轨迹条目被淘汰也不丢失正在压缩的事实。可选性用于无追踪器的旧调用方安全降级。布局纯函数位于 `member-overview-state.ts`。完整设计与验证记录见 [成员浮窗总览设计](docs/design-member-inspector-overview.md)。
 
 Overlay: `ctx.ui.custom(component, { overlay: true, overlayOptions: { width: "90%", maxHeight: "85%", anchor: "center" } })`.
 

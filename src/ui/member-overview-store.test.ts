@@ -231,6 +231,41 @@ describe("member overview store", () => {
     expect(s.getRecentActions("a").map(action => [action.kind, action.status])).toEqual([["compacting", "error"]]);
   });
 
+  it("tracks real compaction independently of stats and validates get_state confirmation", () => {
+    const s = createMemberOverviewStore();
+    expect(s.isCompacting("a")).toBe(false);
+    s.onEvent("a", { type: "response", command: "get_session_stats", success: true, data: { isCompacting: true } });
+    s.onEvent("a", { type: "response", command: "get_state", success: false, data: { isCompacting: true } });
+    s.onEvent("a", { type: "response", command: "get_state", success: true, data: { isCompacting: "true" } });
+    expect(s.getRecentActions("a")).toEqual([]);
+    const state = (isCompacting: boolean) => ({ type: "response", command: "get_state", success: true, data: { isCompacting } });
+    expect(s.onEvent("a", state(true))).toBe(true);
+    expect(s.isCompacting("a")).toBe(true);
+    expect(s.onEvent("a", state(true))).toBe(false);
+    expect(s.onEvent("a", state(false))).toBe(true);
+    expect(s.isCompacting("a")).toBe(false);
+    expect(s.getRecentActions("a").map(action => [action.kind, action.status])).toEqual([["compacting", "done"]]);
+    s.onEvent("a", { type: "compaction_start" });
+    s.onEvent("a", { type: "process_started" });
+    expect(s.isCompacting("a")).toBe(false);
+    expect(s.getRecentActions("a").every(action => action.status !== "active")).toBe(true);
+  });
+
+  it("keeps confirmed compaction state after its trail entry is evicted and clears on exit", () => {
+    const s = createMemberOverviewStore();
+    s.onEvent("a", { type: "compaction_start" });
+    for (let i = 0; i < 65; i++) s.onEvent("a", tool("start", `parallel-${i}`));
+    expect(s.getRecentActions("a").some(action => action.kind === "compacting")).toBe(false);
+    expect(s.isCompacting("a")).toBe(true);
+    expect(s.onEvent("a", { type: "compaction_end" })).toBe(true);
+    expect(s.isCompacting("a")).toBe(false);
+    s.onEvent("a", { type: "compaction_start" });
+    s.onEvent("a", { type: "process_exit", exitCode: 0 });
+    expect(s.isCompacting("a")).toBe(false);
+    s.clear();
+    expect(s.isCompacting("a")).toBe(false);
+  });
+
   it("syncMembers removes deleted members, keeps retained history; clear resets all", () => {
     const s = createMemberOverviewStore();
     s.onEvent("a", delta("text_start"));

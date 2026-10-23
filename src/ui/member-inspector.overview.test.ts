@@ -5,13 +5,13 @@ import { MemberInspectorComponent } from "./member-inspector";
 
 const members = [{ name: "a", label: "分析员" }, { name: "b", label: "编码员" }];
 const keys = { left: "\x1b[D", right: "\x1b[C", down: "\x1b[B", enter: "\r" };
-function setup(names = members) {
+function setup(names = members, isCompacting?: (name: string) => boolean) {
   const handles = new Map(names.map(m => [m.name, {
     sendCommand: vi.fn(),
     sendCommandAndWait: vi.fn(async (cmd: any) => ({ success: true, data: cmd.type === "get_session_stats" ? { contextUsage: { percent: 42, tokens: 420, contextWindow: 1000 } } : { entries: [], leafId: null } })),
   }]));
   const state = new MemberInspectorState(names);
-  const deps = { getMembers: () => names, getHandle: (name: string) => handles.get(name) as any, memberOpsStates: new Map(names.map(m => [m.name, "working" as const])), getRecentActions: () => [{ id: 1, kind: "read" as const, status: "done" as const }] };
+  const deps = { getMembers: () => names, getHandle: (name: string) => handles.get(name) as any, memberOpsStates: new Map(names.map(m => [m.name, "working" as const])), getRecentActions: () => [{ id: 1, kind: "read" as const, status: "done" as const }], isCompacting };
   const tui = { requestRender: vi.fn() };
   const comp = new MemberInspectorComponent(tui, { fg: (_: string, s: string) => s, bold: (s: string) => s }, vi.fn(), deps, state);
   return { comp, state, handles, deps, tui };
@@ -54,6 +54,27 @@ describe("Member Inspector overview integration", () => {
     expect(joined).toContain("[████░░░░░░] 42%");
     expect(joined).toContain("ctrl+b 全部中断");
     expect(joined).not.toMatch(/当前状态|上下文|最近操作|工作中|📖读取|💭思考|✏️输出|📝修改|🔧工具/);
+    comp.close();
+  });
+
+  it("shows confirmed compaction only, not the dispatch preflight reservation", () => {
+    let compacting = false;
+    const { comp, deps } = setup(members, () => compacting);
+    deps.memberOpsStates.set("a", "compacting" as any);
+    expect(comp.render(100)[3]).not.toContain("🗜️");
+    expect(comp.render(100)[3]).toContain("✅");
+    compacting = true;
+    expect(comp.render(100)[3]).toContain("🗜️");
+    // Manual/member-side compaction may be real while the control map is idle.
+    deps.memberOpsStates.set("a", "idle" as any);
+    expect(comp.render(100)[3]).toContain("🗜️");
+    // Process death remains authoritative over a late compaction observation.
+    deps.memberOpsStates.set("a", "crashed" as any);
+    expect(comp.render(100)[3]).toContain("💥");
+    expect(comp.render(100)[3]).not.toContain("🗜️");
+    compacting = false;
+    deps.memberOpsStates.set("a", "idle" as any);
+    expect(comp.render(100)[3]).not.toContain("🗜️");
     comp.close();
   });
 

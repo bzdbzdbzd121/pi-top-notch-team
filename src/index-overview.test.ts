@@ -85,6 +85,56 @@ describe("index overview session wiring", () => {
     expect(deps.getActivity?.("coder")?.phase).toBe("output");
   });
 
+  it.each([100, 600000])("distinguishes stats preflight from real compaction at %i tokens", async (tokens) => {
+    vi.useFakeTimers();
+    try {
+      const { setSessionSetting } = await import("./settings/session-settings");
+      setSessionSetting("autoCompact", { enabled: true, thresholdTokens: 524288, timeoutMinutes: 30 });
+      await open();
+      const handle = createProcess.mock.results.at(-1)!.value;
+      const preflightStates: string[] = [];
+      const displayCompacting: (boolean | undefined)[] = [];
+      const confirmedStates: (boolean | undefined)[] = [];
+      handle.sendCommandAndWait.mockImplementation(async (command: any) => {
+        if (command.type === "compact") {
+          emit({ type: "compaction_start", reason: "manual" });
+          confirmedStates.push(deps.isCompacting?.("coder"));
+          emit({ type: "compaction_end", reason: "manual", result: { summary: "compacted", firstKeptEntryId: "kept", tokensBefore: tokens }, aborted: false });
+          confirmedStates.push(deps.isCompacting?.("coder"));
+          const response = { type: "response", command: "compact", success: true };
+          emit(response);
+          return response;
+        }
+        if (command.type !== "get_session_stats") return {};
+        preflightStates.push(deps.memberOpsStates.get("coder")!);
+        const response = { type: "response", command: "get_session_stats", success: true, data: { contextUsage: { percent: 1, tokens } } };
+        // The real RPC observer sees this before the await resolves and before
+        // the dispatch path releases its temporary compacting reservation.
+        emit(response);
+        displayCompacting.push(deps.isCompacting?.("coder"));
+        return response;
+      });
+      handle.sendCommand.mockImplementation((command: any) => {
+        if (command.type !== "prompt") return;
+        emit({ type: "agent_start" });
+        emit({ type: "message_update", assistantMessageEvent: { type: "thinking_start", contentIndex: 0 } });
+        emit({ type: "agent_end", messages: [] });
+      });
+      const pending = tool("team_send_and_wait").execute("dispatch", { tasks: [{ to: "coder", content: "目标：检查。非目标：修改。范围：只读。验收：返回结果。" }], nextSteps: "检查总览历史" });
+      await vi.advanceTimersByTimeAsync(15000);
+      await pending;
+      expect(preflightStates).toEqual(["compacting"]); // Preserve the scheduling lock.
+      expect(displayCompacting).toEqual([false]);
+      const shouldCompact = tokens >= 524288;
+      expect(handle.sendCommandAndWait.mock.calls.filter(([command]: any[]) => command.type === "compact")).toHaveLength(shouldCompact ? 1 : 0);
+      expect(confirmedStates).toEqual(shouldCompact ? [true, false] : []);
+      expect(deps.getRecentActions?.("coder").map(action => action.kind)).toEqual(shouldCompact ? ["compacting", "thinking", "complete"] : ["thinking", "complete"]);
+      expect(deps.isCompacting?.("coder")).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("does not prepend a compaction to a fresh member's real first operation", async () => {
     await open();
     expect(deps.memberOpsStates.get("coder")).toBe("idle");
@@ -114,9 +164,13 @@ describe("index overview session wiring", () => {
     expect(deps.getRecentActions?.("coder").at(-1)?.kind).toBe("stopped");
   });
 
-  it("samples compaction edges without duplicating the heartbeat lifecycle", async () => {
+  it("records real compaction events without interpreting the preflight lock as a start", async () => {
     await open();
     deps.memberOpsStates.set("coder", "compacting");
+    expect(deps.getRecentActions?.("coder")).toEqual([]);
+    expect(deps.isCompacting?.("coder")).toBe(false);
+    emit({ type: "compaction_start", reason: "manual" });
+    expect(deps.isCompacting?.("coder")).toBe(true);
     emit({ type: "agent_start" });
     emit({ type: "message_start", message: { role: "assistant" } });
     emit({ type: "compaction_end" });
@@ -124,6 +178,7 @@ describe("index overview session wiring", () => {
     const kinds = deps.getRecentActions?.("coder").map(action => action.kind);
     expect(kinds).toEqual(["compacting"]);
     expect(deps.getRecentActions?.("coder")[0].status).toBe("done");
+    expect(deps.isCompacting?.("coder")).toBe(false);
   });
 
   it("records compaction and another stop after restarting without an agent turn", async () => {

@@ -12,8 +12,11 @@ export interface OverviewAction {
 export interface MemberOverviewStore {
   onEvent(name: string, event: any): boolean;
   getRecentActions(name: string): readonly OverviewAction[];
+  /** Confirmed member-side compaction, independent of dispatch reservations. */
+  isCompacting(name: string): boolean;
   syncMembers(names: readonly string[]): void;
   clear(): void;
+  /** Only confirmed physical compaction; never the dispatch reservation. */
   markCompacting(name: string, active: boolean): boolean;
 }
 
@@ -147,9 +150,10 @@ export function createMemberOverviewStore(): MemberOverviewStore {
     }
     m.compacting = false;
     m.compactionEnded = true;
-    const changed = update(m.compaction, { status: error ? "error" : "done" });
+    update(m.compaction, { status: error ? "error" : "done" });
     m.compaction = undefined;
-    return changed;
+    // The live compaction flag changed even if its old trail entry was evicted.
+    return true;
   }
   function execution(m: Member, event: any, end: boolean): boolean {
     const id = toolId(event.toolCallId);
@@ -169,6 +173,12 @@ export function createMemberOverviewStore(): MemberOverviewStore {
     onEvent(name, event) {
       if (!event || typeof event !== "object" || typeof event.type !== "string") return false;
       const type = event.type;
+      // get_state is member-side evidence. get_session_stats is not: its query
+      // runs while dispatch temporarily reserves the logical compacting state.
+      if (type === "response" && event.command === "get_state" && event.success !== false &&
+        typeof event.data?.isCompacting === "boolean") {
+        return compaction(member(name), event.data.isCompacting);
+      }
       // Avoid allocating member state for unrecognized or malformed events.
       if (!["agent_start", "agent_end", "message_start", "message_update", "message_end",
         "tool_execution_start", "tool_execution_end", "process_exit", "process_error",
@@ -199,8 +209,11 @@ export function createMemberOverviewStore(): MemberOverviewStore {
         return true;
       }
       if (type === "process_start" || type === "process_started") {
+        const changed = close(m, "done", true);
         resetProcess(m);
-        return false;
+        m.compacting = m.compactionEnded = m.compactionTurn = false;
+        m.compaction = undefined;
+        return changed;
       }
       if (type === "agent_start") {
         const changed = close(m, "done");
@@ -267,6 +280,7 @@ export function createMemberOverviewStore(): MemberOverviewStore {
       const m = members.get(name);
       return m ? Object.freeze(entries(m).map(entry => entry.action)) : EMPTY;
     },
+    isCompacting(name) { return members.get(name)?.compacting ?? false; },
     syncMembers(names) {
       const keep = new Set(names);
       for (const name of members.keys()) if (!keep.has(name)) members.delete(name);

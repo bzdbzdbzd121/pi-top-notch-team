@@ -51,6 +51,8 @@ export interface MemberInspectorDeps {
   memberOpsStates: Map<string, MemberOperationalState>;
   getActivity?: (name: string) => MemberActivity | undefined;
   getRecentActions?: (name: string) => readonly OverviewAction[];
+  /** Real member-side compaction, not the stats-preflight reservation. */
+  isCompacting?: (name: string) => boolean;
   getStartedMembers?: () => readonly string[];
 }
 
@@ -411,9 +413,18 @@ export class MemberInspectorComponent {
     const now = Date.now();
     return this.state.tabs.map((tab, index) => {
       const activity = this.deps.getActivity?.(tab.name);
+      const logicalState = this.deps.memberOpsStates.get(tab.name) ?? "stopped";
+      const compacting = this.deps.isCompacting?.(tab.name);
+      // Dispatch reserves compacting before its stats query, even when no
+      // compression is needed. Only member-side evidence gets the clamp icon.
+      // A real manual compaction can also run while the control map is idle.
+      const state = logicalState === "crashed" || logicalState === "stopped" ? logicalState
+        : compacting === true ? "compacting"
+        : compacting === false && logicalState === "compacting" ? "idle"
+        : logicalState;
       return {
         name: tab.name, label: tab.label,
-        state: this.deps.memberOpsStates.get(tab.name) ?? "stopped",
+        state,
         phase: activity ? derivePhase(activity, now) : undefined,
         percent: tab.contextInfo?.percent,
         contextStale: tab.contextStale,
