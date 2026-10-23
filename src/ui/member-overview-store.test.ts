@@ -200,11 +200,35 @@ describe("member overview store", () => {
     expect(s.getRecentActions("a").map(a => a.kind)).toEqual(["compacting", "complete"]);
   });
 
-  it("missing compaction start records one observed end, not a fabricated active interval", () => {
+  it.each([
+    {}, { result: undefined }, { result: null }, { result: {} },
+    { aborted: true }, { errorMessage: "Nothing to compact" },
+    { result: { summary: "not committed" }, aborted: true },
+  ])("does not invent an initial compaction from an unconfirmed end %j", fields => {
     const s = createMemberOverviewStore();
-    expect(s.onEvent("a", { type: "compaction_end" })).toBe(true);
+    s.onEvent("a", { type: "process_started" });
+    expect(s.onEvent("a", { type: "compaction_end", ...fields })).toBe(false);
+    expect(s.onEvent("a", { type: "auto_compaction_end", ...fields })).toBe(false);
+    expect(s.getRecentActions("a")).toEqual([]);
+    s.onEvent("a", { type: "agent_start" });
+    s.onEvent("a", delta("thinking_start"));
+    expect(s.getRecentActions("a").map(action => action.kind)).toEqual(["thinking"]);
+  });
+
+  it("a successful result repairs a missed compaction start without inventing an active interval", () => {
+    const s = createMemberOverviewStore();
+    const event = { type: "compaction_end", result: { summary: "compacted", firstKeptEntryId: "entry-1", tokensBefore: 5000 }, aborted: false };
     expect(s.onEvent("a", { type: "compaction_end" })).toBe(false);
+    expect(s.onEvent("a", event)).toBe(true);
+    expect(s.onEvent("a", event)).toBe(false);
     expect(s.getRecentActions("a")[0]).toMatchObject({ kind: "compacting", status: "done" });
+  });
+
+  it("keeps real started compactions and their failures even when the end has no result", () => {
+    const s = createMemberOverviewStore();
+    s.onEvent("a", { type: "compaction_start" });
+    s.onEvent("a", { type: "compaction_end", aborted: true });
+    expect(s.getRecentActions("a").map(action => [action.kind, action.status])).toEqual([["compacting", "error"]]);
   });
 
   it("syncMembers removes deleted members, keeps retained history; clear resets all", () => {

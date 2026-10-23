@@ -1209,6 +1209,7 @@ A full-keyboard overlay that lets the **user** inspect each Member's live conver
 - 轨迹最左图标表示当前状态。最新活动记录匹配当前状态时复用该记录，否则补充一个显示位置，不写入历史。新操作从左插入，历史向右移动。含当前状态最多20个图标，宽度不足时显示更少，尾部完整显示 `(N)`，N为缓冲区内未显示的真实记录数。
 - 当前状态优先采用控制面的 compacting/crashed/stopped/idle，再读取 working 的 activity-tracker 阶段。活动和错误图标通过下划线和语义色强调。占用使用水平条加百分比，如 `[████░░░░░░] 42%`；null/未知为中性点条加 `?`，失败旧值为 `~42%`，停止/崩溃为 `—`。窄屏缩短占用条和成员名，优先保留当前图标、百分比与隐藏计数。
 - `member-overview-store.ts` 每成员保存最近64个语义动作。思考/输出按内容块去重，工具按 toolCallId 关联，从参数生成到执行结果原位更新。两次 read 保留两个 📖，不按 delta 追加记录。活动和失败图标加下划线，颜色只作辅助。✅ 仅表示回合结束，不断言任务验收成功。
+- 压缩历史需要开始事件、控制面开始边沿，或结束事件带成功的 `result.summary`。缺少开始依据且无成功结果的孤立 compaction_end 不创建 🗜️，以免把无实际压缩证据的结束通知误记为成员首个操作。真实已开始的压缩与失败结果仍保留；不改变控制面的压缩心跳处理。
 - 存储由 index.ts 按团队 sessionId 管理，关闭浮窗期间仍采集。同一 sessionId 的重复 UI 安装不清空，stop/shutdown 清空，resume/重载不从磁盘重建轨迹。不保存正文、参数、工具结果或完整 RPC 事件。环形缓冲与关联索引均有界。
 - 活动分发顺序：tracker 更新 → 进程死亡时清 tracker → 总览存储 → inspector → widget。每个消费者独立捕获异常。创建成员时捕获 sessionId 和 handle 身份，过期来源不更新显示观察者。成功 start（包括同一 handle 的自动重启）重置显示专用 process_started 门，不依赖首次 agent_start。
 - 总览只渲染可见成员，不拉完整会话。复用100ms–1s合并刷新与显示签名去重，进入成员页时补齐既有增量会话与流式内容。

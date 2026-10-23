@@ -85,6 +85,18 @@ describe("index overview session wiring", () => {
     expect(deps.getActivity?.("coder")?.phase).toBe("output");
   });
 
+  it("does not prepend a compaction to a fresh member's real first operation", async () => {
+    await open();
+    expect(deps.memberOpsStates.get("coder")).toBe("idle");
+    expect(deps.getRecentActions?.("coder")).toEqual([]);
+    emit({ type: "compaction_end", reason: "manual", result: undefined, aborted: false, errorMessage: "Nothing to compact" });
+    emit({ type: "agent_start" });
+    emit({ type: "message_start", message: { role: "assistant" } });
+    emit({ type: "message_update", assistantMessageEvent: { type: "thinking_start", contentIndex: 0 } });
+    emit({ type: "tool_execution_start", toolCallId: "first-read", toolName: "read" });
+    expect(deps.getRecentActions?.("coder").map(action => action.kind)).toEqual(["thinking", "read"]);
+  });
+
   it("updates tracker and actions before notifying an observer that throws", async () => {
     await open();
     let activitySeen = "";

@@ -131,7 +131,7 @@ export function createMemberOverviewStore(): MemberOverviewStore {
     m.dead = false;
     m.ended = false;
   }
-  function compaction(m: Member, active: boolean, error = false, observedEnd = false): boolean {
+  function compaction(m: Member, active: boolean, error = false, confirmedEnd = false): boolean {
     if (active) {
       if (m.compacting || m.dead) return false;
       m.compacting = true;
@@ -140,7 +140,7 @@ export function createMemberOverviewStore(): MemberOverviewStore {
       return true;
     }
     if (!m.compacting) {
-      if (!observedEnd || m.compactionEnded || m.dead) return false;
+      if (!confirmedEnd || m.compactionEnded || m.dead) return false;
       m.compactionEnded = true;
       append(m, "compacting", error ? "error" : "done");
       return true;
@@ -176,7 +176,14 @@ export function createMemberOverviewStore(): MemberOverviewStore {
         "auto_compaction_start", "auto_compaction_end"].includes(type)) return false;
       const m = member(name);
       if (type === "compaction_start" || type === "auto_compaction_start") return compaction(m, true);
-      if (type === "compaction_end" || type === "auto_compaction_end") return compaction(m, false, failed(event), true);
+      if (type === "compaction_end" || type === "auto_compaction_end") {
+        const error = failed(event);
+        // An end notification alone does not prove compaction ran. pi can emit
+        // failure-only ends without a start; only a committed summary repairs a
+        // missed start. Observed starts/operational edges still close normally.
+        const confirmedEnd = !error && typeof event.result?.summary === "string";
+        return compaction(m, false, error, confirmedEnd);
+      }
       if (type === "process_exit" || type === "process_error") {
         if (m.dead) return false;
         const normal = type === "process_exit" && [0, 143, null].includes(event.exitCode);
