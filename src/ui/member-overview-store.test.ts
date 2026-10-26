@@ -111,6 +111,50 @@ describe("member overview store", () => {
     expect(s.getRecentActions("a")[0].toolName!.length).toBeLessThanOrEqual(80);
   });
 
+  it("continues the cumulative count after history eviction without unbounded storage", () => {
+    const s = createMemberOverviewStore();
+    expect(s.getActionCount("a")).toBe(0);
+    for (let i = 0; i < 1000; i++) {
+      s.onEvent("a", tool("start", `read-${i}`));
+      s.onEvent("a", tool("end", `read-${i}`));
+    }
+    expect(s.getRecentActions("a")).toHaveLength(64);
+    expect(s.getActionCount("a")).toBe(1000);
+    expect(s.getActionCount("b")).toBe(0);
+  });
+
+  it("counts semantic appends, not streaming deltas or result updates", () => {
+    const s = createMemberOverviewStore();
+    s.onEvent("a", { type: "agent_start" });
+    s.onEvent("a", delta("thinking_start"));
+    for (let i = 0; i < 1000; i++) s.onEvent("a", delta("thinking_delta"));
+    s.onEvent("a", delta("thinking_end"));
+    expect(s.getActionCount("a")).toBe(1);
+    s.onEvent("a", tool("start", "read"));
+    s.onEvent("a", tool("start", "read"));
+    s.onEvent("a", tool("end", "read", "read", { isError: true }));
+    expect(s.getActionCount("a")).toBe(2);
+    s.onEvent("a", { type: "compaction_start" });
+    s.onEvent("a", { type: "compaction_end" });
+    expect(s.getActionCount("a")).toBe(3);
+  });
+
+  it("preserves member totals across restart, but clears them on removal or session clear", () => {
+    const s = createMemberOverviewStore();
+    s.onEvent("a", tool("start", "first"));
+    s.onEvent("a", { type: "process_exit", exitCode: 0 });
+    s.onEvent("a", { type: "process_started" });
+    s.onEvent("a", tool("start", "second"));
+    s.onEvent("b", tool("start", "independent"));
+    expect(s.getActionCount("a")).toBe(3);
+    expect(s.getActionCount("b")).toBe(1);
+    s.syncMembers(["a"]);
+    expect(s.getActionCount("a")).toBe(3);
+    expect(s.getActionCount("b")).toBe(0);
+    s.clear();
+    expect(s.getActionCount("a")).toBe(0);
+  });
+
   it("stores at most 64 actions and bounds every correlation Map with eviction", () => {
     const s = createMemberOverviewStore();
     const set = Map.prototype.set;

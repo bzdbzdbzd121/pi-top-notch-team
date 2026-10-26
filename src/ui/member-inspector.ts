@@ -51,6 +51,7 @@ export interface MemberInspectorDeps {
   memberOpsStates: Map<string, MemberOperationalState>;
   getActivity?: (name: string) => MemberActivity | undefined;
   getRecentActions?: (name: string) => readonly OverviewAction[];
+  getActionCount?: (name: string) => number;
   /** Real member-side compaction, not the stats-preflight reservation. */
   isCompacting?: (name: string) => boolean;
   getStartedMembers?: () => readonly string[];
@@ -412,6 +413,7 @@ export class MemberInspectorComponent {
     const started = this.deps.getStartedMembers?.();
     const now = Date.now();
     return this.state.tabs.map((tab, index) => {
+      const visible = index >= offset && index < offset + Math.max(0, height);
       const activity = this.deps.getActivity?.(tab.name);
       const logicalState = this.deps.memberOpsStates.get(tab.name) ?? "stopped";
       const compacting = this.deps.isCompacting?.(tab.name);
@@ -429,8 +431,8 @@ export class MemberInspectorComponent {
         percent: tab.contextInfo?.percent,
         contextStale: tab.contextStale,
         started: started ? started.includes(tab.name) : undefined,
-        actions: index >= offset && index < offset + Math.max(0, height)
-          ? this.deps.getRecentActions?.(tab.name) ?? [] : [],
+        actions: visible ? this.deps.getRecentActions?.(tab.name) ?? [] : [],
+        actionCount: visible ? this.deps.getActionCount?.(tab.name) : undefined,
       };
     });
   }

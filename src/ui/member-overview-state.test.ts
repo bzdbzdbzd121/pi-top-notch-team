@@ -174,6 +174,34 @@ describe("overview rows", () => {
     expect(narrow).toContain(`(${64 - visibleHistory})`);
   });
 
+  it("still hides the counter when all cumulatively counted records are visible", () => {
+    const history = actions("read", "read", "modify", "tool", "output");
+    const line = plain([row("开发员", { phase: "thinking", actions: history, actionCount: 5 })], 200)[0];
+    expect(icons(line)).toHaveLength(6); // The synthetic current icon is not a record.
+    expect(line).not.toMatch(/\(\d+\)/);
+  });
+
+  it.each([64, 65, 120, 1000])("uses cumulative action count %i rather than the 64 retained entries", actionCount => {
+    const history = actions(...Array.from({ length: 64 }, () => "read" as const));
+    const line = plain([row("开发员", { phase: "thinking", actions: history, actionCount })], 200)[0];
+    expect(icons(line)).toHaveLength(20);
+    expect(line).toContain(`(${actionCount - 19})`);
+  });
+
+  it.each([24, 32, 64, 100])("keeps a complete cumulative counter at width %i", width => {
+    const history = actions(...Array.from({ length: 64 }, () => "read" as const));
+    const line = plain([row("开发员", { phase: "thinking", actions: history, actionCount: 1000000 })], width)[0];
+    const visibleRecords = icons(line).length - 1;
+    expect(line).toContain(`(${1000000 - visibleRecords})`);
+    expect(visibleWidth(line)).toBe(width);
+  });
+
+  it.each([undefined, NaN, -1, 1, Infinity])("falls back safely when cumulative count is invalid: %s", actionCount => {
+    const history = actions(...Array.from({ length: 64 }, () => "read" as const));
+    const line = plain([row("开发员", { phase: "thinking", actions: history, actionCount })], 200)[0];
+    expect(line).toContain("(45)");
+  });
+
   it.each([16, 18, 24, 32, 48, 64, 100])("reserves the overflow count instead of losing it at width %i", width => {
     const history = actions(...Array.from({ length: 64 }, () => "read" as const));
     const line = plain([row("开发员", { phase: "thinking", actions: history })], width)[0];
@@ -219,6 +247,18 @@ describe("newest-first action icons", () => {
     expect(icons(narrow).length).toBeLessThan(20);
     expect(narrow).toMatch(new RegExp(`\\(${25 - icons(narrow).length}\\)$`));
     expect(stripAnsi(buildOverviewTrail(actions(...Array.from({ length: 20 }, () => "read" as const)), 200))).not.toMatch(/\(0\)/);
+  });
+
+  it("subtracts visible real records, including a reused current record, from the cumulative total", () => {
+    const history = actions(...Array.from({ length: 64 }, () => "read" as const));
+    const trail = stripAnsi(buildOverviewTrail(history, 200, undefined, undefined, 120));
+    expect(icons(trail)).toHaveLength(20);
+    expect(trail).toContain("(100)");
+    const active = [...history.slice(0, -1), { id: 100, kind: "read" as const, status: "active" as const }];
+    const line = plain([row("开发员", { phase: "executing", actions: active, actionCount: 120 })], 200)[0];
+    expect(icons(line)).toHaveLength(20);
+    expect(icons(line)[0]).toBe("📖");
+    expect(line).toContain("(100)");
   });
 
   it("never splits an icon or overflow counter", () => {

@@ -11,7 +11,7 @@ function setup(names = members, isCompacting?: (name: string) => boolean) {
     sendCommandAndWait: vi.fn(async (cmd: any) => ({ success: true, data: cmd.type === "get_session_stats" ? { contextUsage: { percent: 42, tokens: 420, contextWindow: 1000 } } : { entries: [], leafId: null } })),
   }]));
   const state = new MemberInspectorState(names);
-  const deps = { getMembers: () => names, getHandle: (name: string) => handles.get(name) as any, memberOpsStates: new Map(names.map(m => [m.name, "working" as const])), getRecentActions: () => [{ id: 1, kind: "read" as const, status: "done" as const }], isCompacting };
+  const deps = { getMembers: () => names, getHandle: (name: string) => handles.get(name) as any, memberOpsStates: new Map(names.map(m => [m.name, "working" as const])), getRecentActions: () => [{ id: 1, kind: "read" as const, status: "done" as const }], getActionCount: undefined as ((name: string) => number) | undefined, isCompacting };
   const tui = { requestRender: vi.fn() };
   const comp = new MemberInspectorComponent(tui, { fg: (_: string, s: string) => s, bold: (s: string) => s }, vi.fn(), deps, state);
   return { comp, state, handles, deps, tui };
@@ -54,6 +54,25 @@ describe("Member Inspector overview integration", () => {
     expect(joined).toContain("[████░░░░░░] 42%");
     expect(joined).toContain("ctrl+b 全部中断");
     expect(joined).not.toMatch(/当前状态|上下文|最近操作|工作中|📖读取|💭思考|✏️输出|📝修改|🔧工具/);
+    comp.close();
+  });
+
+  it("keeps the hidden counter growing beyond 45 with a bounded 64-entry history", async () => {
+    const { comp, deps, tui } = setup();
+    deps.getRecentActions = () => Array.from({ length: 64 }, (_, id) => ({ id, kind: "read" as const, status: "done" as const }));
+    let total = 64;
+    deps.getActionCount = () => total;
+    expect(comp.render(200)[3]).toContain("(45)");
+    comp.onMemberEvent("a", { type: "tool_execution_end" });
+    await vi.advanceTimersByTimeAsync(600);
+    const rendered = tui.requestRender.mock.calls.length;
+    total = 65;
+    comp.onMemberEvent("a", { type: "tool_execution_end" });
+    await vi.advanceTimersByTimeAsync(600);
+    expect(tui.requestRender.mock.calls.length).toBeGreaterThan(rendered);
+    expect(comp.render(200)[3]).toContain("(46)");
+    total = 120;
+    expect(comp.render(200)[3]).toContain("(101)");
     comp.close();
   });
 

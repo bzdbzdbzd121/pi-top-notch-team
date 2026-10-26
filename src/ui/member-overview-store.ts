@@ -12,6 +12,8 @@ export interface OverviewAction {
 export interface MemberOverviewStore {
   onEvent(name: string, event: any): boolean;
   getRecentActions(name: string): readonly OverviewAction[];
+  /** Session total, including records already evicted from the bounded ring. */
+  getActionCount(name: string): number;
   /** Confirmed member-side compaction, independent of dispatch reservations. */
   isCompacting(name: string): boolean;
   syncMembers(names: readonly string[]): void;
@@ -37,6 +39,7 @@ interface Member {
   ring: (Entry | undefined)[];
   head: number;
   count: number;
+  totalCount: number;
   blocks: Map<string, Entry>;
   tools: Map<string, Entry>;
   // Fixed-size watermarks prevent an evicted block's late delta resurrecting it.
@@ -73,7 +76,7 @@ export function createMemberOverviewStore(): MemberOverviewStore {
     let m = members.get(name);
     if (!m) {
       m = {
-        ring: new Array(CAPACITY), head: 0, count: 0,
+        ring: new Array(CAPACITY), head: 0, count: 0, totalCount: 0,
         blocks: new Map(), tools: new Map(), evicted: { thinking: -1, output: -1, tool: -1 },
         ended: false, messageClosed: false, dead: false,
         compacting: false, compactionEnded: false, compactionTurn: false,
@@ -88,6 +91,7 @@ export function createMemberOverviewStore(): MemberOverviewStore {
     return out;
   }
   function append(m: Member, kind: OverviewActionKind, status: OverviewAction["status"], name?: string): Entry {
+    m.totalCount++;
     const entry: Entry = {
       action: Object.freeze({ id: nextId++, kind, status, ...(name ? { toolName: name } : {}) }),
       live: true,
@@ -280,6 +284,7 @@ export function createMemberOverviewStore(): MemberOverviewStore {
       const m = members.get(name);
       return m ? Object.freeze(entries(m).map(entry => entry.action)) : EMPTY;
     },
+    getActionCount(name) { return members.get(name)?.totalCount ?? 0; },
     isCompacting(name) { return members.get(name)?.compacting ?? false; },
     syncMembers(names) {
       const keep = new Set(names);

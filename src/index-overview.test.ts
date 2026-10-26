@@ -85,6 +85,21 @@ describe("index overview session wiring", () => {
     expect(deps.getActivity?.("coder")?.phase).toBe("output");
   });
 
+  it("exposes cumulative per-member action totals beyond the retained history", async () => {
+    emit({ type: "agent_start" });
+    for (let i = 0; i < 100; i++) {
+      emit({ type: "tool_execution_start", toolCallId: `read-${i}`, toolName: "read" });
+      emit({ type: "tool_execution_end", toolCallId: `read-${i}`, toolName: "read" });
+    }
+    await open();
+    expect(deps.getRecentActions?.("coder")).toHaveLength(64);
+    expect(deps.getActionCount?.("coder")).toBe(100);
+    await open();
+    expect(deps.getActionCount?.("coder")).toBe(100);
+    await command.handler("stop", ctx);
+    expect(deps.getActionCount?.("coder")).toBe(0);
+  });
+
   it.each([100, 600000])("distinguishes stats preflight from real compaction at %i tokens", async (tokens) => {
     vi.useFakeTimers();
     try {

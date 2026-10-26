@@ -13,6 +13,8 @@ export interface OverviewRow {
   percent: number | null | undefined;
   contextStale?: boolean;
   actions: readonly OverviewAction[];
+  /** Session total, including evicted records; omitted by legacy callers. */
+  actionCount?: number;
   started?: boolean;
 }
 
@@ -26,6 +28,9 @@ const ICONS: Record<OverviewActionKind, string> = {
 };
 
 const size = (value: number) => Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
+function actionTotal(actions: readonly OverviewAction[], count?: number): number {
+  return typeof count === "number" && Number.isSafeInteger(count) && count >= actions.length ? count : actions.length;
+}
 // Names are untrusted display text; do not allow terminal commands or newlines.
 const clean = (value: string) => stripVTControlCharacters(value).replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
 function fit(text: string, width: number): string {
@@ -108,11 +113,12 @@ function contextBar(row: OverviewRow, cells: number, theme: InspectorTheme): str
 /** Newest first; at most 20 complete icons, reserving space for the hidden count. */
 export function buildOverviewTrail(
   actions: readonly OverviewAction[], width: number, theme: InspectorTheme = identity,
-  current?: CurrentAction,
+  current?: CurrentAction, totalActionCount?: number,
 ): string {
   width = size(width);
   if (!width) return "";
-  if (!actions.length && !current) return "—";
+  const total = actionTotal(actions, totalActionCount);
+  if (!actions.length && !current && !total) return "—";
   const historyEnd = actions.length - (current?.reuseLatest ? 1 : 0);
   const entries: { action: Pick<OverviewAction, "kind" | "status">; record: boolean; current: boolean }[] = [];
   if (current) entries.push({ action: current, record: current.reuseLatest, current: true });
@@ -128,7 +134,7 @@ export function buildOverviewTrail(
   const minimum = current ? 1 : 0;
   for (let count = Math.min(MAX_TRAIL_ICONS, entries.length); count >= minimum; count--) {
     const shown = entries.slice(0, count);
-    const hidden = actions.length - shown.filter(entry => entry.record).length;
+    const hidden = total - shown.filter(entry => entry.record).length;
     const suffix = hidden > 0 ? `(${hidden})` : "";
     const iconColumns = shown.reduce((sum, entry) => sum + visibleWidth(ICONS[entry.action.kind]), 0) + Math.max(0, count - 1);
     if (iconColumns + (suffix && count ? 1 : 0) + suffix.length > width) continue;
@@ -151,12 +157,14 @@ export function buildOverviewLines(
   const start = getOverviewWindowOffset(rows, selectedName, offset, height);
   const lines: string[] = [];
   const duplicates = duplicateLabels(rows);
-  const barCells = width >= 72 ? 10 : width >= 42 ? 8 : width >= 30 ? 5 : width >= 26 ? 3 : width >= 24 ? 2 : 0;
+  let barCells = width >= 72 ? 10 : width >= 42 ? 8 : width >= 30 ? 5 : width >= 26 ? 3 : width >= 24 ? 2 : 0;
   const valueWidth = width < 24 ? rows.reduce((max, row) => Math.max(max, contextValue(row).length), 1) : 5;
-  const contextWidth = valueWidth + (barCells ? barCells + 3 : 0);
-  const recordCount = rows.reduce((max, row) => Math.max(max, row.actions.length), 0);
-  // Preserve a complete live icon + overflow count before spending space on names.
+  const recordCount = rows.reduce((max, row) => Math.max(max, actionTotal(row.actions, row.actionCount)), 0);
+  // Preserve the complete growing counter plus a live icon and two name columns.
   const minimumTrail = recordCount ? 3 + `(${recordCount})`.length : 2;
+  while (barCells && width < 2 + 2 + 2 + valueWidth + barCells + 3 + minimumTrail)
+    barCells = barCells > 2 ? barCells - 1 : 0;
+  const contextWidth = valueWidth + (barCells ? barCells + 3 : 0);
   const nameWidth = Math.max(0, Math.min(18, Math.max(4, Math.floor(width / 6)), width - 2 - contextWidth - 2 - minimumTrail));
   for (const row of rows.slice(start, start + height)) {
     const current = currentAction(row);
@@ -173,7 +181,7 @@ export function buildOverviewLines(
       label = shorten(label, nameWidth);
       if (selected && theme.bold) label = theme.bold(label);
       line = marker + fit(label, nameWidth) + " " + fit(contextBar(row, barCells, theme), contextWidth) + " ";
-      line += buildOverviewTrail(row.actions, Math.max(0, width - visibleWidth(line)), theme, current);
+      line += buildOverviewTrail(row.actions, Math.max(0, width - visibleWidth(line)), theme, current, row.actionCount);
     }
     lines.push(fit(line, width));
   }

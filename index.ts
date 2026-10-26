@@ -260,6 +260,7 @@ export default function (pi: ExtensionAPI) {
         memberOpsStates,
         getActivity: (name) => activityTracker?.getActivity(name),
         getRecentActions: (name) => overviewStore?.getRecentActions(name) ?? [],
+        getActionCount: (name) => overviewStore?.getActionCount(name) ?? 0,
         isCompacting: (name) => overviewStore?.isCompacting(name) ?? false,
         getStartedMembers: () => [...overviewStarted],
       });
