@@ -84,4 +84,27 @@ describe("teardownTeamSession — sessionEndedNotice", () => {
     // next before_agent_start will consume it.
     expect(teamCtx.sessionEndedNotice).toBe(true);
   });
+
+  describe("entry notice counter", () => {
+    it("clears the armed entry notice so it cannot leak past the session", async () => {
+      startSession({
+        name: "test-team",
+        description: "Test",
+        members: [{ name: "worker", systemPrompt: "do work" }],
+      });
+      // /team start arms the bounded entry notice
+      teamCtx.entryNoticeTurnsRemaining = 2;
+
+      await teardownTeamSession(pi, teamCtx);
+
+      // A residual "you just entered" notice must not survive into the next
+      // conversation (the exit banner owns that turn).
+      expect(teamCtx.entryNoticeTurnsRemaining).toBe(0);
+    });
+
+    it("never arms the counter by itself (bare /team stop stays silent)", async () => {
+      await teardownTeamSession(pi, teamCtx);
+      expect(teamCtx.entryNoticeTurnsRemaining ?? 0).toBe(0);
+    });
+  });
 });

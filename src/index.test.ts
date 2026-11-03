@@ -18,6 +18,13 @@ vi.mock("./process/member-process", () => ({
   hasSessionFiles: () => false,
 }));
 
+// Anchor on the protocol BLOCK HEADING, never the bare phrase "第一动作协议":
+// the persistent state declaration legitimately mentions the protocol earlier
+// in the same prompt (execution variant: "先按第一动作协议派发"), so a bare
+// phrase indexOf matches the wrong occurrence and makes ordering assertions
+// vacuously true.
+const PROTOCOL_HEADING = "### 🚨 最高优先级：第一动作协议";
+
 // ── Helpers ────────────────────────────────────────────────
 
 function createMockUi() {
@@ -513,7 +520,7 @@ describe("team session state declaration", () => {
 
     const idxHeading = prompt.indexOf("## 当前任务：Team Lead");
     const idxDecl = prompt.indexOf("状态：你正在团队会话中（Team Lead）");
-    const idxProtocol = prompt.indexOf("第一动作协议");
+    const idxProtocol = prompt.indexOf(PROTOCOL_HEADING);
 
     expect(idxHeading).toBeGreaterThan(-1);
     expect(idxDecl).toBeGreaterThan(idxHeading);
@@ -569,7 +576,7 @@ describe("TL first-action protocol prompt injection", () => {
     expect(result.systemPrompt).toContain("第一动作协议");
 
     // protocol must appear before the detailed 铁律 section
-    const idxProtocol = result.systemPrompt.indexOf("第一动作协议");
+    const idxProtocol = result.systemPrompt.indexOf(PROTOCOL_HEADING);
     const idxIronRule = result.systemPrompt.indexOf("铁律：你绝不能自己做");
     expect(idxProtocol).toBeGreaterThan(-1);
     expect(idxIronRule).toBeGreaterThan(-1);
@@ -1133,6 +1140,310 @@ describe("agent-initiated session tool_call guard (ADR-0003 revision)", () => {
     expect(blockedDesign).toEqual(expect.objectContaining({ block: true }));
     expect(blockedDesign.reason).toContain("代码文件");
     expect(toolCall({ toolName: "bash", input: { command: "ls" } })).toEqual(expect.objectContaining({ block: true }));
+  });
+});
+
+// ── Session entry notice (stage 1) ────────────────────────────────
+
+// The persistent state declaration (stage 0) states the role on every turn but
+// carries no event. This layer adds the event: after entering a team session,
+// the next turn(s) get one extra message (customType team-session-notice) that
+// says "the switch just happened" and gives the ordered next step. It rides a
+// user-initiated turn (never starts one), is bounded to 2 turns, and stops
+// early once the team is operational (shared context written + a member
+// started). Delivery is pi's `before_agent_start` message return: mapped to the
+// user role right after the user's message, persisted as a custom entry.
+
+describe("session entry notice", () => {
+  let pi: ExtensionAPI;
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    delete process.env.TEAM_ROLE;
+    mockCreateMemberProcess.mockReset();
+    tmpDir = mkdtempSync(join(tmpdir(), "entry-notice-"));
+    process.env.TOP_NOTCH_TEAM_ROOT = tmpDir;
+    pi = createMockPi();
+    const mod = await import("../index");
+    mod.default(pi);
+  });
+
+  afterEach(async () => {
+    const { endSession } = await import("./session/state");
+    endSession();
+    delete process.env.TOP_NOTCH_TEAM_ROOT;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function getHandler(name: string): Function {
+    const onCalls = (pi.on as ReturnType<typeof vi.fn>).mock.calls;
+    return onCalls.find((c: any) => c[0] === name)![1];
+  }
+
+  function getToolDef(name: string): any {
+    const toolCalls = (pi.registerTool as ReturnType<typeof vi.fn>).mock.calls;
+    return toolCalls.find((c: any) => c[0].name === name)![0];
+  }
+
+  function getTeamCommand() {
+    const calls = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls;
+    return calls.find((c: any) => c[0] === "team")![1].handler;
+  }
+
+  function mockHandle(name = "worker") {
+    return {
+      name,
+      start: vi.fn().mockResolvedValue(undefined),
+      getState: vi.fn().mockReturnValue({ name, pid: 12345, status: "running" }),
+      stop: vi.fn(),
+      onEvent: vi.fn(),
+      sendCommand: vi.fn(),
+      sendCommandAndWait: vi.fn(),
+    };
+  }
+
+  /** Turn boundary as pi would call it (system prompt in, prompt out). */
+  function runTurn(ctx: any = createMockContext()) {
+    return getHandler("before_agent_start")({ systemPrompt: "BASE" }, ctx);
+  }
+
+  /** Enter a REAL pre-defined session through /team start (the production path). */
+  async function startPredefined(teamName = "entry-team") {
+    const { writeTeam } = await import("./team/store");
+    writeTeam(
+      {
+        name: teamName,
+        description: "Test",
+        members: [{ name: "worker", systemPrompt: "do work" }],
+      } as any,
+      tmpDir,
+    );
+    await getTeamCommand()(`start ${teamName}`, createMockContext({ cwd: process.cwd() }));
+  }
+
+  async function startDynamic() {
+    await getTeamCommand()("dynamic", createMockContext({ cwd: process.cwd() }));
+  }
+
+  /** Dynamic design phase: register a member + write the shared context via the REAL tools. */
+  async function prepareDynamicMember() {
+    await getToolDef("add_dynamic_member").execute("id-1", {
+      name: "worker",
+      label: "执行员",
+      systemPrompt: "do work",
+    });
+    await getToolDef("write_shared_context").execute("id-2", { content: "# 团队上下文" });
+  }
+
+  it("acceptance 1: /team start → the first turn returns the dispatch notice alongside the team prompt", async () => {
+    await startPredefined("entry-team");
+    const result = await runTurn();
+
+    expect(result.message).toBeDefined();
+    expect(result.message.customType).toBe("team-session-notice");
+    expect(result.message.display).toBe(true);
+    expect(result.message.details).toEqual({
+      kind: "session-entry",
+      teamName: "entry-team",
+      sessionId: expect.any(String),
+      variant: "dispatch",
+    });
+    for (const fragment of [
+      "不要回复本条",
+      "本提示优先于对话历史",
+      "write_shared_context",
+      "start_member",
+      "team_send_and_wait",
+    ]) {
+      expect(result.message.content).toContain(fragment);
+    }
+
+    // Both coexist: the team prompt is still injected for this turn…
+    expect(result.systemPrompt).toContain("当前任务：Team Lead");
+    expect(result.systemPrompt).toContain("状态：你正在团队会话中（Team Lead）");
+    // …and the notice is a separate message, not system-prompt text.
+    expect(result.systemPrompt).not.toContain("本条不是用户输入");
+  });
+
+  it("acceptance 2: repeats on the second turn, then stops (bounded to 2 turns)", async () => {
+    await startPredefined();
+
+    const first = await runTurn();
+    expect(first.message).toBeDefined();
+    expect(first.message.content).toContain("前两个回合");
+
+    const second = await runTurn();
+    expect(second.message).toBeDefined();
+
+    const third = await runTurn();
+    expect(third.message).toBeUndefined();
+    // The session is still active — only the notice window closed.
+    expect(third.systemPrompt).toContain("当前任务：Team Lead");
+  });
+
+  it("acceptance 3: stops early once the team is operational (shared context + a started member)", async () => {
+    await startPredefined();
+    const { markSharedContextWritten } = await import("./session/state");
+    markSharedContextWritten();
+    mockCreateMemberProcess.mockReturnValue(mockHandle());
+    await getToolDef("start_member").execute("id-3", { name: "worker" });
+
+    const result = await runTurn();
+    // Not "inject" — decideEntryNotice cleared the counter instead.
+    expect(result.message).toBeUndefined();
+    expect(result.systemPrompt).toContain("当前任务：Team Lead");
+  });
+
+  it("acceptance 4: after /team stop the next turn carries only the exit banner", async () => {
+    await startPredefined();
+    await getTeamCommand()("stop", createMockContext({ cwd: process.cwd() }));
+
+    // History contains a team trace → the exit banner is allowed to fire.
+    const tracedCtx = {
+      ...createMockContext(),
+      sessionManager: {
+        getEntries: () => [
+          {
+            type: "message",
+            message: {
+              role: "assistant",
+              content: [{ type: "toolCall", id: "t1", name: "team_send_and_wait", arguments: {} }],
+            },
+          },
+        ],
+      },
+    };
+    const result = await runTurn(tracedCtx);
+    expect(result.message).toBeUndefined();
+    expect(result.systemPrompt).toContain("团队会话已结束");
+  });
+
+  it("acceptance 5: session_start(reason:new) drops the armed notice", async () => {
+    await startPredefined();
+
+    // /new with a non-empty history → the stale-session cleanup does not fire,
+    // so only the reason:"new" clearing can drop the notice (isolated check).
+    await getHandler("session_start")({ type: "session_start", reason: "new" }, {
+      ...createMockContext(),
+      sessionManager: {
+        getEntries: () => [
+          { type: "message", message: { role: "user", content: "hi" } },
+          { type: "message", message: { role: "assistant", content: [{ type: "text", text: "ok" }] } },
+        ],
+      },
+    });
+
+    const result = await runTurn();
+    expect(result.message).toBeUndefined();
+    // Session still active (proves the assertion isn't passing via teardown)
+    expect(result.systemPrompt).toContain("当前任务：Team Lead");
+  });
+
+  it("acceptance 6: /team resume does not inject (the resume banner is more specific)", async () => {
+    await startPredefined();
+    await getTeamCommand()("stop", createMockContext({ cwd: process.cwd() }));
+    await getTeamCommand()("resume entry-team", createMockContext({ cwd: process.cwd() }));
+
+    const result = await runTurn();
+    expect(result.message).toBeUndefined();
+    expect(result.systemPrompt).toContain("团队会话已从中断中恢复");
+  });
+
+  it("acceptance 7: agent-initiated sessions never get the notice", async () => {
+    await getToolDef("start_team_session").execute(
+      "id-9",
+      { task: "测试使命：验证自主会话不注入进入通知" },
+      undefined,
+      undefined,
+      createMockContext(),
+    );
+
+    const result = await runTurn();
+    expect(result.message).toBeUndefined();
+    expect(result.systemPrompt).toContain("agent 自主团队会话");
+  });
+
+  it("acceptance 8: the dynamic design phase gets the design variant (no dispatch chain)", async () => {
+    await startDynamic();
+    const result = await runTurn();
+
+    expect(result.message).toBeDefined();
+    expect(result.message.details.variant).toBe("design");
+    expect(result.message.content).toContain("设计阶段");
+    expect(result.message.content).toContain("明确确认");
+    expect(result.message.content).not.toContain("这一回合的动作顺序");
+  });
+
+  it("clears the armed notice on stale-session cleanup (the second entry point)", async () => {
+    await startDynamic();
+
+    // A fresh pi session was detected (<=1 entry) while the team session was
+    // still marked active: the stale cleanup ends the session and must drop the
+    // armed entry notice with the rest of the stale state. `reason` is not
+    // "new" here, so only the cleanup path can clear it.
+    await getHandler("session_start")({ type: "session_start", reason: "resume" }, {
+      ...createMockContext(),
+      sessionManager: { getEntries: () => [] },
+    });
+
+    const result = await runTurn();
+    expect(result).toBeUndefined();
+  });
+
+  it("acceptance 9: never injects while the session is inactive", async () => {
+    const result = await runTurn();
+    expect(result).toBeUndefined();
+  });
+
+  it("acceptance 11: a failing notice builder degrades locally — the team prompt still lands, counter untouched", async () => {
+    vi.resetModules();
+    let buildAttempts = 0;
+    vi.doMock("./prompts/session-transition-notice", async () => {
+      const actual = await vi.importActual<
+        typeof import("./prompts/session-transition-notice")
+      >("./prompts/session-transition-notice");
+      return {
+        ...actual,
+        buildSessionEntryNotice: (input: Parameters<typeof actual.buildSessionEntryNotice>[0]) => {
+          buildAttempts += 1;
+          // Fail only the first attempt, so the counter's behaviour on failure
+          // is observable: an un-decremented counter still yields two later
+          // injections (2 → 1 → 0), a decremented one only yields one.
+          if (buildAttempts === 1) throw new Error("builder boom");
+          return actual.buildSessionEntryNotice(input);
+        },
+      };
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const freshPi = createMockPi();
+      const mod = await import("../index");
+      mod.default(freshPi);
+
+      const cmdCalls = (freshPi.registerCommand as ReturnType<typeof vi.fn>).mock.calls;
+      const cmd = cmdCalls.find((c: any) => c[0] === "team")![1].handler;
+      await cmd("dynamic", createMockContext({ cwd: process.cwd() }));
+
+      const handler = (freshPi.on as ReturnType<typeof vi.fn>).mock.calls.find(
+        (c: any) => c[0] === "before_agent_start",
+      )![1];
+
+      // Turn 1: builder throws → no message, the team prompt still lands.
+      const failed = await handler({ systemPrompt: "BASE" }, createMockContext());
+      expect(failed.systemPrompt).toContain("当前任务：Team Lead（动态团队模式");
+      expect(failed.message).toBeUndefined();
+      expect(warn).toHaveBeenCalledTimes(1);
+
+      // Failure did not consume a turn: turns 2 and 3 still inject, turn 4 stops.
+      expect((await handler({ systemPrompt: "BASE" }, createMockContext())).message).toBeDefined();
+      expect((await handler({ systemPrompt: "BASE" }, createMockContext())).message).toBeDefined();
+      expect((await handler({ systemPrompt: "BASE" }, createMockContext())).message).toBeUndefined();
+    } finally {
+      warn.mockRestore();
+      vi.doUnmock("./prompts/session-transition-notice");
+      vi.resetModules();
+    }
   });
 });
 

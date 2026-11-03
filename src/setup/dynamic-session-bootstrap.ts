@@ -8,6 +8,7 @@ import { getRootDir } from "../config";
 import type { TeamDefinition, TeamMember } from "../team/definition";
 import { ensureToolRegistered } from "../commands/shared/ensure-tool";
 import { STOP_TEAM_SESSION_TOOL_NAME } from "../tools/agent-session-tool-names";
+import { SESSION_ENTRY_NOTICE_MAX_TURNS } from "../prompts/session-transition-notice";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 
@@ -105,6 +106,13 @@ export function bootstrapDynamicSession(
   };
 
   startSession(emptyTeam, { origin });
+  // Arm the bounded entry notice for USER-origin sessions only: `/team dynamic`
+  // is a conversation switch the TL must notice. Agent-initiated sessions
+  // (start_team_session) are started by the agent itself — telling it "you just
+  // entered" would only duplicate the autonomous-mode prompt.
+  if (origin === "user") {
+    teamCtx.entryNoticeTurnsRemaining = SESSION_ENTRY_NOTICE_MAX_TURNS;
+  }
   // Create the shared context stub up front (0 members for now). Guarantees
   // members always find a valid file; the TL overwrites it via
   // write_shared_context before starting members (gated).

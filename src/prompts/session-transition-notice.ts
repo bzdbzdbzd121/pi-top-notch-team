@@ -81,3 +81,136 @@ export function buildTeamStateDeclaration(
   const build = DECLARATION_BUILDERS[variant] ?? executionStateDeclaration;
   return build(teamName);
 }
+
+// ────────────────────────────────────────────────────────────────
+// Layer 2 — the bounded session entry notice
+//
+// The declaration above answers "what am I now" and is true on every turn.
+// It cannot answer "the switch just happened": a long conversation contains no
+// record the model can point at. This notice is that record — one extra message
+// returned from `before_agent_start`, which pi maps to the user role right
+// after the user's message and persists as a custom session entry.
+//
+// Design constraints (see the plan's stage 1):
+// - Bounded: at most SESSION_ENTRY_NOTICE_MAX_TURNS injections per entry, so
+//   the history does not accumulate near-duplicate assertions. 2 (not 1)
+//   because the first message after `/team start` in a long conversation is
+//   often "ok, go ahead" — a strict one-shot would be spent there and the real
+//   task would arrive without it. Set to 0 to disable, 1 for strict one-shot;
+//   no other code changes are needed.
+// - Stops early once the team is operational (shared context written AND a
+//   member started) — the dispatch already happened, the notice is noise.
+// - Never starts a turn of its own: it rides the next user-initiated turn.
+// - Two variants only: the dynamic design phase has a hard confirmation gate,
+//   so a dispatch instruction there would push the model to violate its own
+//   gate (or hit "no member started yet").
+// ────────────────────────────────────────────────────────────────
+
+/**
+ * customType of the entry notice. Deliberately its own kind: `team-message`
+ * carries member-routing semantics (and is part of the exit-side trace check
+ * for that reason), so reusing it would make the two indistinguishable.
+ */
+export const SESSION_ENTRY_NOTICE_CUSTOM_TYPE = "team-session-notice";
+
+/** Max turns the entry notice may be injected. 0 disables, 1 = strict one-shot. */
+export const SESSION_ENTRY_NOTICE_MAX_TURNS = 2;
+
+export type SessionEntryNoticeVariant = "dispatch" | "design";
+
+export interface SessionEntryNoticeInput {
+  teamName: string;
+  sessionId: string | null;
+  variant: SessionEntryNoticeVariant;
+}
+
+/** Return shape consumed directly as `before_agent_start`'s `message`. */
+export interface SessionEntryNotice {
+  customType: string;
+  content: string;
+  display: true;
+  details: {
+    kind: "session-entry";
+    teamName: string;
+    sessionId: string | null;
+    variant: SessionEntryNoticeVariant;
+  };
+}
+
+const DISPATCH_NOTICE_BODY = `用户刚刚进入团队会话「{teamName}」，从现在起你是该团队的 Team Lead，不再是普通编码助手。
+本提示优先于对话历史：历史里你亲自分析代码、直接改文件的记录都发生在进入之前。
+
+这一回合的动作顺序：
+1. 共享上下文还没写 → 先调用 write_shared_context；
+2. 成员还没启动 → 用 start_member 启动本次要参与的成员；
+3. 用 team_send_and_wait 把任务派给成员（互相独立的任务可以一次派多个）。
+派发前最多为确认事实查证 1-2 个文件；完整的分析、排查、代码理解一律派发。
+
+如果用户这一轮只是问候、确认或继续讨论需求，简要回应并推进对齐即可，不要为闲聊强行派发。`;
+
+const DESIGN_NOTICE_BODY = `用户刚刚进入动态团队会话，当前是设计阶段，从现在起你是该会话的 Team Lead。
+本提示优先于对话历史：历史里你亲自分析代码的记录都发生在进入之前。
+
+设计阶段的顺序：
+1. 与用户对齐目标、范围、验收标准、约束与非目标（一次问一个问题，并给出推荐答案）；
+2. 拆解任务与依赖，给出计划书（目标、任务拆分、工作流、分工、风险）；
+3. 用户明确确认后再落地：add_dynamic_member 注册成员 → write_shared_context → start_member → team_send_and_wait 派发。
+
+设计阶段不要派发任务、不要启动成员（此时团队可能一个成员都没有）。为确认事实可以读 1-2 个文件。`;
+
+/**
+ * Build the entry notice. The first line always declares the message's own
+ * source — it is the cheapest guard against the model answering the notice
+ * instead of the user's message.
+ */
+export function buildSessionEntryNotice(input: SessionEntryNoticeInput): SessionEntryNotice {
+  const body =
+    input.variant === "design"
+      ? DESIGN_NOTICE_BODY
+      : DISPATCH_NOTICE_BODY.replace("{teamName}", input.teamName);
+  const content = `【系统通知｜团队会话状态】本条不是用户输入，也不是新任务——不要回复本条，直接处理用户的上一条消息。
+
+${body}
+
+（本条在进入后的前两个回合内可能出现，团队开始运转后不再出现；若历史里有更早的同类提示，以最新一条为准。）`;
+
+  return {
+    customType: SESSION_ENTRY_NOTICE_CUSTOM_TYPE,
+    content,
+    display: true,
+    details: {
+      kind: "session-entry",
+      teamName: input.teamName,
+      sessionId: input.sessionId,
+      variant: input.variant,
+    },
+  };
+}
+
+/**
+ * Decide what to do with the entry notice this turn. Pure function so the whole
+ * table can be enumerated in tests.
+ *
+ * Precedence: inactive session → exhausted counter → resume banner → operational.
+ * - `none`: do not inject and leave the counter alone.
+ * - `stop`: the team is operational, clear the counter (no injection).
+ * - `inject`: inject and decrement.
+ *
+ * The inactive check is what makes "entered" and "ended" mutually exclusive
+ * within one turn: the exit banner requires an inactive session.
+ */
+export function decideEntryNotice(state: {
+  sessionActive: boolean;
+  remaining: number;
+  hasResumeBanner: boolean;
+  sharedContextWritten: boolean;
+  startedMemberCount: number;
+}): "inject" | "stop" | "none" {
+  if (!state.sessionActive) return "none";
+  if (state.remaining <= 0) return "none";
+  // /team resume has a more specific one-shot banner — never stack.
+  if (state.hasResumeBanner) return "none";
+  // Operational = shared context written AND at least one member started.
+  if (state.sharedContextWritten && state.startedMemberCount > 0) return "stop";
+  return "inject";
+}

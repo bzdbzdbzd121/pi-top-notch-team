@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { buildTeamStateDeclaration } from "./session-transition-notice";
+import {
+  buildTeamStateDeclaration,
+  buildSessionEntryNotice,
+  decideEntryNotice,
+  SESSION_ENTRY_NOTICE_CUSTOM_TYPE,
+  SESSION_ENTRY_NOTICE_MAX_TURNS,
+} from "./session-transition-notice";
 
 /**
  * Stage 0 of the session-transition work: the persistent state declaration.
@@ -101,5 +107,175 @@ describe("buildTeamStateDeclaration — 变体关系", () => {
   it("团队名按传入值渲染，不硬编码", () => {
     expect(buildTeamStateDeclaration("predefined", "alpha")).toContain("alpha");
     expect(buildTeamStateDeclaration("predefined", "alpha")).not.toContain("beta");
+  });
+});
+
+// ────────────────────────────────────────────────────────────────
+// Stage 1 — the bounded session entry notice
+//
+// Layer 2 answers "the switch just happened", which the persistent
+// declaration cannot: the declaration is true every turn, the notice is true
+// only for a bounded window. It is returned as a `message` from
+// before_agent_start, so pi maps it to the user role right after the user's
+// message (closest position to generation) and persists it as a custom
+// session entry the later turns can point at. It never starts a turn itself.
+// ────────────────────────────────────────────────────────────────
+
+describe("session entry notice constants", () => {
+  it("customType is its own kind, never reused from member messaging", () => {
+    // "team-message" carries member-routing semantics and is part of the
+    // exit-side team-trace check for a different reason; reusing it would
+    // make the two mechanisms indistinguishable.
+    expect(SESSION_ENTRY_NOTICE_CUSTOM_TYPE).toBe("team-session-notice");
+    expect(SESSION_ENTRY_NOTICE_CUSTOM_TYPE).not.toBe("team-message");
+  });
+
+  it("is bounded to at most 2 turns (0 disables, 1 = strict one-shot)", () => {
+    expect(SESSION_ENTRY_NOTICE_MAX_TURNS).toBe(2);
+  });
+});
+
+describe("decideEntryNotice — decision table", () => {
+  const base = {
+    sessionActive: true,
+    remaining: 2,
+    hasResumeBanner: false,
+    sharedContextWritten: false,
+    startedMemberCount: 0,
+  };
+
+  it("an inactive session NEVER injects (mutual exclusion with the exit banner)", () => {
+    for (const remaining of [0, 1, 2]) {
+      expect(
+        decideEntryNotice({ ...base, sessionActive: false, remaining, startedMemberCount: 2 }),
+      ).toBe("none");
+    }
+  });
+
+  it("an exhausted counter never injects", () => {
+    for (const remaining of [0, -1]) {
+      expect(decideEntryNotice({ ...base, remaining })).toBe("none");
+    }
+    expect(decideEntryNotice({ ...base, remaining: 0, startedMemberCount: 0 })).toBe("none");
+  });
+
+  it("injects while the team has not started working (1 and 2 turns left)", () => {
+    expect(decideEntryNotice({ ...base, remaining: 1 })).toBe("inject");
+    expect(decideEntryNotice({ ...base, remaining: 2 })).toBe("inject");
+  });
+
+  it("a resume banner wins: no stacking on the more specific one-shot banner", () => {
+    for (const remaining of [1, 2]) {
+      expect(decideEntryNotice({ ...base, remaining, hasResumeBanner: true })).toBe("none");
+    }
+  });
+
+  it("stops early (clears the counter) once the team is operational", () => {
+    for (const remaining of [1, 2]) {
+      expect(
+        decideEntryNotice({
+          ...base,
+          remaining,
+          sharedContextWritten: true,
+          startedMemberCount: 1,
+        }),
+      ).toBe("stop");
+    }
+  });
+
+  it("a written shared context alone, or a started member alone, is not yet operational", () => {
+    expect(decideEntryNotice({ ...base, sharedContextWritten: true })).toBe("inject");
+    expect(decideEntryNotice({ ...base, startedMemberCount: 1 })).toBe("inject");
+  });
+});
+
+describe("buildSessionEntryNotice — dispatch variant (predefined / dynamic execution)", () => {
+  const notice = buildSessionEntryNotice({
+    teamName: "研发队",
+    sessionId: "sess-1",
+    variant: "dispatch",
+  });
+
+  it("returns the shape before_agent_start needs (customType/display/details)", () => {
+    expect(notice.customType).toBe(SESSION_ENTRY_NOTICE_CUSTOM_TYPE);
+    expect(notice.display).toBe(true);
+    expect(notice.details).toEqual({
+      kind: "session-entry",
+      teamName: "研发队",
+      sessionId: "sess-1",
+      variant: "dispatch",
+    });
+  });
+
+  it("declares its own source first: system notice, not user input, do not answer it", () => {
+    expect(notice.content).toContain("系统通知");
+    expect(notice.content).toContain("本条不是用户输入");
+    expect(notice.content).toContain("不要回复本条");
+  });
+
+  it("claims authority over history and handles repeated entries", () => {
+    expect(notice.content).toContain("本提示优先于对话历史");
+    expect(notice.content).toContain("以最新一条为准");
+  });
+
+  it("names the team and the bounded window", () => {
+    expect(notice.content).toContain("研发队");
+    expect(notice.content).toContain("前两个回合");
+  });
+
+  it("gives an ordered action chain instead of a slogan", () => {
+    const write = notice.content.indexOf("共享上下文还没写");
+    const start = notice.content.indexOf("成员还没启动");
+    const dispatch = notice.content.indexOf("把任务派给成员");
+    expect(write).toBeGreaterThan(-1);
+    expect(start).toBeGreaterThan(write);
+    expect(dispatch).toBeGreaterThan(start);
+    expect(notice.content).toContain("write_shared_context");
+    expect(notice.content).toContain("start_member");
+    expect(notice.content).toContain("team_send_and_wait");
+  });
+
+  it("keeps the 1-2 file exception and the anti-over-dispatch clause", () => {
+    expect(notice.content).toContain("1-2 个文件");
+    expect(notice.content).toContain("不要为闲聊强行派发");
+  });
+});
+
+describe("buildSessionEntryNotice — design variant (dynamic design phase)", () => {
+  const notice = buildSessionEntryNotice({
+    teamName: "_dynamic_1750000000000",
+    sessionId: null,
+    variant: "design",
+  });
+
+  it("carries the variant in details (and tolerates a null session id)", () => {
+    expect(notice.details.variant).toBe("design");
+    expect(notice.details.sessionId).toBeNull();
+  });
+
+  it("declares its own source and authority like the dispatch variant", () => {
+    expect(notice.content).toContain("本条不是用户输入");
+    expect(notice.content).toContain("不要回复本条");
+    expect(notice.content).toContain("本提示优先于对话历史");
+    expect(notice.content).toContain("以最新一条为准");
+  });
+
+  it("points at the design phase and its confirmation gate", () => {
+    expect(notice.content).toContain("设计阶段");
+    expect(notice.content).toContain("明确确认");
+    expect(notice.content).toContain("不要启动成员");
+    expect(notice.content).toContain("不要派发任务");
+  });
+
+  it("does NOT carry the execution dispatch chain (that would break the gate)", () => {
+    expect(notice.content).not.toContain("这一回合的动作顺序");
+    expect(notice.content).not.toContain("先调用 `write_shared_context`");
+    expect(notice.content).not.toContain("不要为闲聊强行派发");
+  });
+
+  it("does not render the synthetic dynamic team name", () => {
+    // `add_dynamic_member` legitimately contains "_dynamic_", so match the
+    // synthetic session name pattern, not the bare substring.
+    expect(notice.content).not.toMatch(/_dynamic_\d+/);
   });
 });

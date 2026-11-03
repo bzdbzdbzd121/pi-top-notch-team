@@ -2,6 +2,14 @@ import { describe, it, expect } from "vitest";
 import { buildDynamicModePrompt } from "./dynamic-mode";
 import type { TeamDefinition } from "../team/definition";
 
+// Anchor on the protocol BLOCK HEADING, never the bare phrase "第一动作协议":
+// the persistent state declaration legitimately mentions the protocol earlier
+// in the same prompt (execution variant: "先按第一动作协议派发"), so a bare
+// phrase indexOf matches the wrong occurrence and makes ordering assertions
+// vacuously true.
+const PROTOCOL_HEADING = "### 🚨 最高优先级：第一动作协议";
+
+
 const emptyTeam: TeamDefinition = {
   name: "_dynamic_test",
   description: "测试动态团队",
@@ -96,7 +104,7 @@ describe("buildDynamicModePrompt — 常驻状态声明（阶段 0）", () => {
   it("执行阶段：注入执行态声明，位置在第一动作协议之前", () => {
     const prompt = buildDynamicModePrompt(teamWithMembers, "execution");
     const idxDecl = prompt.indexOf("状态：你正在团队会话中（Team Lead）");
-    const idxProtocol = prompt.indexOf("第一动作协议");
+    const idxProtocol = prompt.indexOf(PROTOCOL_HEADING);
     expect(idxDecl).toBeGreaterThan(-1);
     expect(idxProtocol).toBeGreaterThan(-1);
     expect(idxDecl).toBeLessThan(idxProtocol);
@@ -148,7 +156,7 @@ describe("buildDynamicModePrompt — execution phase", () => {
     expect(prompt).toContain("**还没写共享上下文**");
     expect(prompt).toContain("**需要的成员还没启动**");
     expect(prompt).toContain("**派发任务**");
-    const idxProtocol = prompt.indexOf("第一动作协议");
+    const idxProtocol = prompt.indexOf(PROTOCOL_HEADING);
     const idxIronRule = prompt.indexOf("铁律：你绝不能自己做");
     expect(idxProtocol).toBeGreaterThan(-1);
     expect(idxIronRule).toBeGreaterThan(-1);

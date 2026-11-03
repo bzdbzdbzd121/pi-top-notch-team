@@ -44,6 +44,7 @@ import { scheduleCloudDetection, type DetectOptions } from "./src/sync/detect";
 import { buildDynamicModePrompt } from "./src/prompts/dynamic-mode";
 import { FIRST_ACTION_PROTOCOL_PROMPT } from "./src/prompts/tl-first-action";
 import { buildTeamStateDeclaration } from "./src/prompts/session-transition-notice";
+import { buildSessionEntryNotice, decideEntryNotice } from "./src/prompts/session-transition-notice";
 import { GOAL_CLOSING_PROTOCOL_PROMPT } from "./src/prompts/goal-closing-protocol";
 import { TASK_DISPATCH_PROTOCOL_PROMPT } from "./src/prompts/task-dispatch-protocol";
 import { buildWorkflowPrompt, WORKFLOW_ACTIVATION_BANNER } from "./src/prompts/workflow-prompt";
@@ -838,6 +839,9 @@ export default function (pi: ExtensionAPI) {
     // teardownTeamSession; startup sessions never have it.)
     if ((event as { reason?: string } | undefined)?.reason === "new") {
       teamCtx.sessionEndedNotice = false;
+      // Same reason for the entry notice: a brand-new conversation must not
+      // receive "you just entered a team session" from a previous one.
+      teamCtx.entryNoticeTurnsRemaining = 0;
     }
 
     // Part 1: Clean up stale team state when fresh session detected
@@ -865,6 +869,9 @@ export default function (pi: ExtensionAPI) {
         teamCtx.dynamicPhase = "design";
         teamCtx.agentInitiatedTask = null;
         teamCtx.resumedFrom = null;
+        // Second entry point for the same invariant: fresh session detected →
+        // drop any armed entry notice with the rest of the stale state.
+        teamCtx.entryNoticeTurnsRemaining = 0;
         resetManifestRuntimeContext();
       }
     }
@@ -1409,8 +1416,56 @@ ${TASK_DISPATCH_PROTOCOL_PROMPT}
 `;
     }
 
-    if (extraPrompt || resumeBanner || sessionEndedBanner) {
-      return { systemPrompt: event.systemPrompt + sessionEndedBanner + resumeBanner + extraPrompt };
+    // ── Bounded "session entry" notice ──
+    // The persistent declaration (top of the team block) says what the TL is
+    // *now*; it cannot say that the switch just *happened* — a long conversation
+    // has no record the model can point at. This notice is that record: one
+    // extra message returned from before_agent_start (pi maps it to the user
+    // role right after the user's message and persists it as a custom entry),
+    // bounded to SESSION_ENTRY_NOTICE_MAX_TURNS injections per entry and stopped
+    // early once the team is operational. It rides a user-initiated turn — it
+    // never starts one, never rewrites the user's text.
+    //
+    // Local try/catch: a builder failure must not drop the whole team prompt for
+    // the turn (prompt assembly has no outer guard). Failure = no injection, the
+    // counter is left untouched, one console.warn.
+    let entryNotice: ReturnType<typeof buildSessionEntryNotice> | undefined;
+    const entryTurnsRemaining = teamCtx.entryNoticeTurnsRemaining ?? 0;
+    if (session.active && entryTurnsRemaining > 0) {
+      const decision = decideEntryNotice({
+        sessionActive: session.active,
+        remaining: entryTurnsRemaining,
+        hasResumeBanner: resumeBanner.length > 0,
+        sharedContextWritten: session.sharedContextWritten,
+        startedMemberCount: teamCtx.memberHandles.size,
+      });
+      if (decision === "stop") {
+        teamCtx.entryNoticeTurnsRemaining = 0;
+      } else if (decision === "inject") {
+        try {
+          entryNotice = buildSessionEntryNotice({
+            teamName: session.teamDefinition?.name ?? "unknown",
+            sessionId: session.sessionId,
+            // Evaluated at injection time, not at arming time: a dynamic session
+            // may leave the design phase mid-window. Agent-initiated sessions
+            // never arm the counter, so they never reach this branch.
+            variant:
+              teamCtx.isDynamicSession && teamCtx.dynamicPhase === "design"
+                ? "design"
+                : "dispatch",
+          });
+          teamCtx.entryNoticeTurnsRemaining = entryTurnsRemaining - 1;
+        } catch (err) {
+          console.warn("[top-notch-team] failed to build session entry notice", err);
+        }
+      }
+    }
+
+    if (entryNotice || extraPrompt || resumeBanner || sessionEndedBanner) {
+      return {
+        ...(entryNotice ? { message: entryNotice } : {}),
+        systemPrompt: event.systemPrompt + sessionEndedBanner + resumeBanner + extraPrompt,
+      };
     }
   });
 

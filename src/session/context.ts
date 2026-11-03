@@ -55,6 +55,21 @@ export interface TeamContext {
    * new session starts before the notice was consumed.
    */
   sessionEndedNotice: boolean;
+  /**
+   * Turns left for the bounded "session entry" notice (see
+   * src/prompts/session-transition-notice.ts).
+   *
+   * Armed by /team start and by the user-origin dynamic bootstrap (value =
+   * SESSION_ENTRY_NOTICE_MAX_TURNS), decremented on each injection, and zeroed by
+   * teardownTeamSession plus the session_start "new"/stale-session cleanup — a
+   * leftover must never surface in a later conversation.
+   *
+   * Optional so existing fixtures that construct a TeamContext (and predate this
+   * field) keep compiling; consumers read `?? 0`. Not armed for /team resume
+   * (its own banner is more specific) nor for agent-initiated sessions (the
+   * agent started the session itself).
+   */
+  entryNoticeTurnsRemaining?: number;
   processManager: ProcessManager | null;
   /** Direct Map access (read-only view). Prefer getHandle/setHandle for writes. */
   memberHandles: ReadonlyMap<string, MemberProcessHandle>;

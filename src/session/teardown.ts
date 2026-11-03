@@ -34,6 +34,11 @@ export async function teardownTeamSession(
     teamCtx.sessionEndedNotice = true;
   }
 
+  // Clear any armed "session entry" notice: leaving the session must not leave
+  // a "you just entered" message behind. Zeroed unconditionally so a bare
+  // /team stop cannot inherit a stale counter either.
+  teamCtx.entryNoticeTurnsRemaining = 0;
+
   if (teamCtx.processManager) {
     await teamCtx.processManager.stopAll();
   }

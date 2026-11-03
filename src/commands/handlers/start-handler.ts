@@ -3,6 +3,7 @@ import type { TeamContext, SessionUI } from "../../session/context";
 import { startSession, getSessionState } from "../../session/state";
 import { ensureSharedContextFile } from "../../session/shared-context";
 import { setManifestRuntimeContext, syncActiveManifest } from "../../session/manifest";
+import { SESSION_ENTRY_NOTICE_MAX_TURNS } from "../../prompts/session-transition-notice";
 import { readTeam } from "../../team/store";
 import { getRootDir } from "../../config";
 
@@ -32,6 +33,9 @@ export async function handleStart(
   teamCtx.onCreateEnd?.();
 
   startSession(team);
+  // Arm the bounded entry notice: the TL's next turn(s) get one extra message
+  // stating that the switch just happened (see session-transition-notice.ts).
+  teamCtx.entryNoticeTurnsRemaining = SESSION_ENTRY_NOTICE_MAX_TURNS;
   // Persist the session manifest immediately (the /team resume anchor).
   setManifestRuntimeContext({ isDynamic: false, dynamicPhase: "design", agentInitiatedTask: null });
   syncActiveManifest({ status: "active" });

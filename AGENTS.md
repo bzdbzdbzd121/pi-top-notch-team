@@ -456,7 +456,10 @@ src/
    - **文案纪律（审查修订）**：历史断言必须双重限定——只针对 ①**进入本会话之前**的记录，②**与本提示冲突**的做法；不得声称「历史里所有自分析记录都发生在进入之前」（同一团队会话内有设计阶段合法 read、`.md` 写入、resume 恢复的历史，绝对化断言为假，会导致模型整段折扣提示）。它是授权声明，不是事实断言；并去掉「一律」等绝对量词。
    - **第一动作协议改写为一条有序链**：`write_shared_context` → `start_member`（`/team start` 只写定义不启动进程）→ `team_send_and_wait` 派发。旧版同一条规则里出现两个「你的第一个工具调用必须是…」（共享上下文 vs 派发）且完全漏掉 `start_member`，直接派发必命中「目标成员不存在或未启动」，等于让模型先吃一次错误。保留 1-2 文件例外与运行时威慑说明。
    - **`write_shared_context` 加入 `tl-read-guard.ts` 的 `MANAGEMENT_TOOLS`**（正确性修复）：它曾是非管理工具，粘滞态下会被拦截，而 `start_member` 在共享上下文写入前被硬门控——协议的三个步骤会互相锁死，TL 唯一出路只剩回复用户。现在不消耗派发前预算、sticky 期间仍可用（测试锁定）。
-   - **本阶段未做**（后续阶段）：进场消息级通知（`before_agent_start` 返回 `message`，customType `team-session-notice`，最多 2 回合 + 运转即停）；退场侧痕迹集合计入 `team-session-notice` 与横幅交叉引用；流式窗口（M1）覆盖。
+   - **阶段 1（已交付）：进场消息级通知** — `src/prompts/session-transition-notice.ts` 新增 `buildSessionEntryNotice`（dispatch/design 两变体文案）+ `decideEntryNotice`（纯判定：`inject`/`stop`/`none`）+ 常量 `SESSION_ENTRY_NOTICE_CUSTOM_TYPE = "team-session-notice"`、`SESSION_ENTRY_NOTICE_MAX_TURNS = 2`。`before_agent_start` 命中时把通知作为 `message` 返回，与团队提示词**共同**返回（不是替换）；pi 将其映射为 user 角色、位置在用户消息**之后**（不重写用户原话），并持久化为 `custom_message` 会话条目（请求级断言：`src/index-session-entry.agent-session.test.ts`，真实 pi AgentSession 夹具，同时锁定「`/team start` 本身零模型请求」）。判定顺序：会话不活跃 → `none`（与退场横幅结构性互斥）；计数耗尽 → `none`；`/team resume` 恢复横幅在场 → `none`（不叠加更具体的一次性横幅）；已运转（共享上下文已写 **且** 至少一个成员已启动）→ `stop`（清零提前停止）；否则 `inject` 并递减。
+   - **生命周期六条清理**：`/team start` 置 2（`start-handler`）；用户来源的 `bootstrapDynamicSession` 置 2（`origin === "agent"` 不置位——自主会话由 agent 自己发起，告知「你刚进入」是噪音）；`teardownTeamSession` 无条件清零；`session_start(reason:"new")` 清零；陈旧会话清理（`entries.length <= 1` 且会话活跃）清零。`/team resume` 刻意不置位（恢复横幅已覆盖且更具体）。通知构建包**局部** try/catch：失败 → 本次不注入、计数不减、一次 `console.warn`（团队提示词照常注入，不因通知失败整体丢失）。
+   - **文案纪律**：首行声明来源（「不是用户输入 / 不要回复本条」）；声明权威并按「进入之前」+「与本提示冲突」限定历史；给出有序动作链（dispatch）或确认门（design，不含执行态派发链）；保留 1-2 文件例外与「闲聊不强行派发」例外。`decideEntryNotice` 按阶段在**注入时**求值变体。
+   - **仍未做**（后续阶段）：退场侧痕迹集合计入 `team-session-notice` 与横幅交叉引用（决策 #47 阶段 2）；流式窗口（M1）覆盖（阶段 3，默认不做）；完整文档章节（阶段 4）。
    - **附带修订**：AGENTS.md 决策 #17 与 DESIGN.md §10 的管理工具清单同步补充 `write_shared_context`（与守卫实现一致，防后人按旧说明改回去）。
 
 ## Dependency Injection Pattern
