@@ -1271,7 +1271,7 @@ describe("session entry notice", () => {
 
     const first = await runTurn();
     expect(first.message).toBeDefined();
-    expect(first.message.content).toContain("前两个回合");
+    expect(first.message.content).toContain("前 2 个回合");
 
     const second = await runTurn();
     expect(second.message).toBeDefined();
@@ -1609,6 +1609,35 @@ describe("session-ended banner in before_agent_start", () => {
     // Consumed exactly once.
     const again = await runBeforeAgentStart(undefined, tracedCtx);
     expect(again).toBeUndefined();
+  });
+
+  it("banner fires when the ONLY trace is the entry notice (no team tool call at all)", async () => {
+    // The most common shape of this feature: the user enters a team session,
+    // discusses a few turns without ever calling a team tool, then /team stop.
+    // Before the entry notice counted as a trace, this history looked
+    // trace-free and the exit banner was suppressed — exactly when the TL still
+    // believes it is the Team Lead.
+    const cmdDef = getTeamCommandHandler();
+    await cmdDef.handler("dynamic", createMockContext());
+    await runBeforeAgentStart(); // injects the entry notice (session still active)
+    await runStop();
+
+    const noticeOnlyCtx = {
+      ui: createMockUi(),
+      sessionManager: {
+        getEntries: () => [
+          { type: "message", message: { role: "user", content: "我们聊聊方案" } },
+          {
+            type: "custom_message",
+            customType: "team-session-notice",
+            display: true,
+            content: "【系统通知｜团队会话状态】…",
+          },
+        ],
+      },
+    };
+    const result = await runBeforeAgentStart(undefined, noticeOnlyCtx);
+    expect(result.systemPrompt).toContain("团队会话已结束");
   });
 
   it("banner fires on routed member messages too (custom_message team-message trace)", async () => {

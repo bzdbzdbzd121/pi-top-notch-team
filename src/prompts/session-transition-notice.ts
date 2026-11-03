@@ -138,7 +138,7 @@ export interface SessionEntryNotice {
 }
 
 const DISPATCH_NOTICE_BODY = `用户刚刚进入团队会话「{teamName}」，从现在起你是该团队的 Team Lead，不再是普通编码助手。
-本提示优先于对话历史：历史里你亲自分析代码、直接改文件的记录都发生在进入之前。
+本提示优先于对话历史：**进入本会话之前**留下的做法（你自己分析代码、直接改文件、直接下结论）属于普通模式，不构成本回合的授权；**与本提示冲突**的做法以本提示为准。
 
 这一回合的动作顺序：
 1. 共享上下文还没写 → 先调用 write_shared_context；
@@ -149,7 +149,7 @@ const DISPATCH_NOTICE_BODY = `用户刚刚进入团队会话「{teamName}」，�
 如果用户这一轮只是问候、确认或继续讨论需求，简要回应并推进对齐即可，不要为闲聊强行派发。`;
 
 const DESIGN_NOTICE_BODY = `用户刚刚进入动态团队会话，当前是设计阶段，从现在起你是该会话的 Team Lead。
-本提示优先于对话历史：历史里你亲自分析代码的记录都发生在进入之前。
+本提示优先于对话历史：**进入本会话之前**留下的做法（你自己分析代码、直接改文件、直接给结论）属于普通模式，不构成本阶段的授权；**与本提示冲突**的做法以本提示为准。
 
 设计阶段的顺序：
 1. 与用户对齐目标、范围、验收标准、约束与非目标（一次问一个问题，并给出推荐答案）；
@@ -157,6 +157,21 @@ const DESIGN_NOTICE_BODY = `用户刚刚进入动态团队会话，当前是设�
 3. 用户明确确认后再落地：add_dynamic_member 注册成员 → write_shared_context → start_member → team_send_and_wait 派发。
 
 设计阶段不要派发任务、不要启动成员（此时团队可能一个成员都没有）。为确认事实可以读 1-2 个文件。`;
+
+/**
+ * Footer stating how long the notice may repeat. Derived from
+ * SESSION_ENTRY_NOTICE_MAX_TURNS so the number in the text can never drift from
+ * the counter that enforces it (a hardcoded "two turns" would silently lie
+ * after the constant is tuned to 1 or 0).
+ */
+function entryWindowPhrase(): string {
+  const turns = SESSION_ENTRY_NOTICE_MAX_TURNS;
+  const window =
+    turns <= 1
+      ? "（本条只在进入后的这一回合出现，之后不再出现"
+      : `（本条在进入后的前 ${turns} 个回合内可能出现，团队开始运转后不再出现`;
+  return `${window}；若历史里有更早的同类提示，以最新一条为准。）`;
+}
 
 /**
  * Build the entry notice. The first line always declares the message's own
@@ -172,7 +187,7 @@ export function buildSessionEntryNotice(input: SessionEntryNoticeInput): Session
 
 ${body}
 
-（本条在进入后的前两个回合内可能出现，团队开始运转后不再出现；若历史里有更早的同类提示，以最新一条为准。）`;
+${entryWindowPhrase()}`;
 
   return {
     customType: SESSION_ENTRY_NOTICE_CUSTOM_TYPE,

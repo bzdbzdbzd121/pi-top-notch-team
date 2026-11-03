@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
 import {
   buildTeamStateDeclaration,
   buildSessionEntryNotice,
@@ -218,9 +219,22 @@ describe("buildSessionEntryNotice — dispatch variant (predefined / dynamic exe
     expect(notice.content).toContain("以最新一条为准");
   });
 
-  it("names the team and the bounded window", () => {
+  it("scopes the history claim twice: before this session AND conflicting behaviour", () => {
+    // Same discipline as the declaration: an absolute "every record predates
+    // the entry" is false inside a team session and gets the whole prompt
+    // discounted.
+    expect(notice.content).toContain("进入本会话之前");
+    expect(notice.content).toContain("属于普通模式");
+    expect(notice.content).toContain("不构成本回合的授权");
+    expect(notice.content).toContain("与本提示冲突");
+    expect(notice.content).not.toContain("都发生在进入之前");
+  });
+
+  it("names the team and states the window from the constant (no drift)", () => {
     expect(notice.content).toContain("研发队");
-    expect(notice.content).toContain("前两个回合");
+    expect(notice.content).toContain(`前 ${SESSION_ENTRY_NOTICE_MAX_TURNS} 个回合`);
+    // the number in the text is the number the counter enforces
+    expect(notice.content).not.toContain("前两个回合");
   });
 
   it("gives an ordered action chain instead of a slogan", () => {
@@ -260,6 +274,13 @@ describe("buildSessionEntryNotice — design variant (dynamic design phase)", ()
     expect(notice.content).toContain("以最新一条为准");
   });
 
+  it("scopes the history claim twice (design phase reads are legitimate)", () => {
+    expect(notice.content).toContain("进入本会话之前");
+    expect(notice.content).toContain("不构成本阶段的授权");
+    expect(notice.content).toContain("与本提示冲突");
+    expect(notice.content).not.toContain("都发生在进入之前");
+  });
+
   it("points at the design phase and its confirmation gate", () => {
     expect(notice.content).toContain("设计阶段");
     expect(notice.content).toContain("明确确认");
@@ -277,5 +298,98 @@ describe("buildSessionEntryNotice — design variant (dynamic design phase)", ()
     // `add_dynamic_member` legitimately contains "_dynamic_", so match the
     // synthetic session name pattern, not the bare substring.
     expect(notice.content).not.toMatch(/_dynamic_\d+/);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────
+// Discipline matrix + static guard
+//
+// Both variants must carry the same three speech acts every time the text is
+// edited: declare the message's own source, claim authority with a SCOPED
+// history statement, and give a concrete next step. The static guard reads the
+// module source so a future edit anywhere in the file (not just the two texts
+// asserted above) trips the test.
+// ────────────────────────────────────────────────────────────────
+
+describe("both notice variants — discipline matrix", () => {
+  const variants = [
+    { variant: "dispatch" as const, teamName: "研发队" },
+    { variant: "design" as const, teamName: "_dynamic_1750000000000" },
+  ];
+
+  for (const { variant, teamName } of variants) {
+    const content = buildSessionEntryNotice({ teamName, sessionId: "s", variant }).content;
+
+    it(`${variant}: first line declares the source (not user input, do not answer)`, () => {
+      const firstLine = content.split("\n")[0];
+      expect(firstLine).toContain("系统通知");
+      expect(firstLine).toContain("本条不是用户输入");
+      expect(firstLine).toContain("不要回复本条");
+    });
+
+    it(`${variant}: authority is scoped, never absolute`, () => {
+      expect(content).toContain("进入本会话之前");
+      expect(content).toContain("与本提示冲突");
+      expect(content).not.toMatch(/都发生在进入/);
+      // "一律" is only acceptable about dispatch scope, never about the
+      // authority claim over history.
+      expect(content).not.toMatch(/一律以本提示为准/);
+    });
+
+    it(`${variant}: states the bounded window from the constant`, () => {
+      expect(content).toContain("以最新一条为准");
+      if (SESSION_ENTRY_NOTICE_MAX_TURNS > 1) {
+        expect(content).toContain(`前 ${SESSION_ENTRY_NOTICE_MAX_TURNS} 个回合`);
+      }
+    });
+
+    it(`${variant}: gives a concrete next step (not a slogan)`, () => {
+      if (variant === "dispatch") {
+        expect(content).toContain("write_shared_context");
+        expect(content).toContain("start_member");
+        expect(content).toContain("team_send_and_wait");
+      } else {
+        expect(content).toContain("明确确认");
+        expect(content).toContain("不要启动成员");
+      }
+    });
+  }
+});
+
+describe("static guard — absolute quantifiers in transition prompts", () => {
+  const source = readFileSync(
+    new URL("./session-transition-notice.ts", import.meta.url),
+    "utf-8",
+  );
+
+  it("never claims that every history record predates the entry", () => {
+    for (const forbidden of [
+      "都发生在进入之前",
+      "都发生在进入团队会话",
+      "所有记录都发生在",
+      "均发生在进入之前",
+    ]) {
+      expect(source).not.toContain(forbidden);
+    }
+  });
+
+  it("never applies an absolute quantifier to the authority claim", () => {
+    // "一律" was removed in the stage-0 review round; keep it out of both layers.
+    expect(source).not.toContain("一律以本提示为准");
+    expect(source).not.toMatch(/(所有|全部|一切)[^。\n]{0,12}(历史|记录)/);
+  });
+
+  it("keeps the dual scoping in every prompt text of the module", () => {
+    // Guard the shape, not just the two current strings: each declaration and
+    // each notice body must scope by pre-session records AND by conflict.
+    const matches = source.match(/进入本会话之前/g) ?? [];
+    expect(matches.length).toBeGreaterThanOrEqual(4); // 2 declarations + 2 notices
+    const conflicts = source.match(/与本提示冲突/g) ?? [];
+    expect(conflicts.length).toBeGreaterThanOrEqual(4);
+  });
+
+  it("derives the window text from the constant instead of hardcoding a numeral", () => {
+    expect(source).toContain("${turns} 个回合");
+    expect(source).not.toContain("前两个回合");
   });
 });

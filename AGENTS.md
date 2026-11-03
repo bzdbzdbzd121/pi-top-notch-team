@@ -459,7 +459,8 @@ src/
    - **阶段 1（已交付）：进场消息级通知** — `src/prompts/session-transition-notice.ts` 新增 `buildSessionEntryNotice`（dispatch/design 两变体文案）+ `decideEntryNotice`（纯判定：`inject`/`stop`/`none`）+ 常量 `SESSION_ENTRY_NOTICE_CUSTOM_TYPE = "team-session-notice"`、`SESSION_ENTRY_NOTICE_MAX_TURNS = 2`。`before_agent_start` 命中时把通知作为 `message` 返回，与团队提示词**共同**返回（不是替换）；pi 将其映射为 user 角色、位置在用户消息**之后**（不重写用户原话），并持久化为 `custom_message` 会话条目（请求级断言：`src/index-session-entry.agent-session.test.ts`，真实 pi AgentSession 夹具，同时锁定「`/team start` 本身零模型请求」）。判定顺序：会话不活跃 → `none`（与退场横幅结构性互斥）；计数耗尽 → `none`；`/team resume` 恢复横幅在场 → `none`（不叠加更具体的一次性横幅）；已运转（共享上下文已写 **且** 至少一个成员已启动）→ `stop`（清零提前停止）；否则 `inject` 并递减。
    - **生命周期六条清理**：`/team start` 置 2（`start-handler`）；用户来源的 `bootstrapDynamicSession` 置 2（`origin === "agent"` 不置位——自主会话由 agent 自己发起，告知「你刚进入」是噪音）；`teardownTeamSession` 无条件清零；`session_start(reason:"new")` 清零；陈旧会话清理（`entries.length <= 1` 且会话活跃）清零。`/team resume` 刻意不置位（恢复横幅已覆盖且更具体）。通知构建包**局部** try/catch：失败 → 本次不注入、计数不减、一次 `console.warn`（团队提示词照常注入，不因通知失败整体丢失）。
    - **文案纪律**：首行声明来源（「不是用户输入 / 不要回复本条」）；声明权威并按「进入之前」+「与本提示冲突」限定历史；给出有序动作链（dispatch）或确认门（design，不含执行态派发链）；保留 1-2 文件例外与「闲聊不强行派发」例外。`decideEntryNotice` 按阶段在**注入时**求值变体。
-   - **仍未做**（后续阶段）：退场侧痕迹集合计入 `team-session-notice` 与横幅交叉引用（决策 #47 阶段 2）；流式窗口（M1）覆盖（阶段 3，默认不做）；完整文档章节（阶段 4）。
+   - **退场侧痕迹判定已计入通知（最小修复，从阶段 2 前拉）**：`index.ts` 的 `historyHasTeamTraces` 改用 `TEAM_TRACE_CUSTOM_TYPES = {team-message, SESSION_ENTRY_NOTICE_CUSTOM_TYPE}`（常量从 prompt 模块导入，不硬编码——硬编码字符串会静默失效）。理由：「进入 → 只讨论、一次团队工具都没调 → /team stop」是本需求最典型的会话形态，若不认通知，退场横幅会在这最需要它的场景被抑制。
+   - **仍未做**（后续阶段）：退场横幅正文交叉引用「进入提示同样失效」与互斥不变式测试（阶段 2 剩余项）；流式窗口（M1）覆盖（阶段 3，默认不做）；完整文档章节（阶段 4）。
    - **附带修订**：AGENTS.md 决策 #17 与 DESIGN.md §10 的管理工具清单同步补充 `write_shared_context`（与守卫实现一致，防后人按旧说明改回去）。
 
 ## Dependency Injection Pattern

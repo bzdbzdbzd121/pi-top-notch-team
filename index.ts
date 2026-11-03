@@ -43,8 +43,12 @@ import { createMessageChannel } from "./src/setup/message-channel";
 import { scheduleCloudDetection, type DetectOptions } from "./src/sync/detect";
 import { buildDynamicModePrompt } from "./src/prompts/dynamic-mode";
 import { FIRST_ACTION_PROTOCOL_PROMPT } from "./src/prompts/tl-first-action";
-import { buildTeamStateDeclaration } from "./src/prompts/session-transition-notice";
-import { buildSessionEntryNotice, decideEntryNotice } from "./src/prompts/session-transition-notice";
+import {
+  buildSessionEntryNotice,
+  buildTeamStateDeclaration,
+  decideEntryNotice,
+  SESSION_ENTRY_NOTICE_CUSTOM_TYPE,
+} from "./src/prompts/session-transition-notice";
 import { GOAL_CLOSING_PROTOCOL_PROMPT } from "./src/prompts/goal-closing-protocol";
 import { TASK_DISPATCH_PROTOCOL_PROMPT } from "./src/prompts/task-dispatch-protocol";
 import { buildWorkflowPrompt, WORKFLOW_ACTIVATION_BANNER } from "./src/prompts/workflow-prompt";
@@ -81,6 +85,16 @@ const TEAM_TRACE_TOOL_NAMES: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * custom_message types that count as team traces (see historyHasTeamTraces).
+ * The entry-notice type is imported from the prompt module so the two can never
+ * drift apart (a hardcoded string would silently disable the trace check).
+ */
+const TEAM_TRACE_CUSTOM_TYPES: ReadonlySet<string> = new Set([
+  "team-message",
+  SESSION_ENTRY_NOTICE_CUSTOM_TYPE,
+]);
+
+/**
  * Whether the current conversation history contains team-session traces.
  *
  * Signals (any one suffices):
@@ -88,6 +102,12 @@ const TEAM_TRACE_TOOL_NAMES: ReadonlySet<string> = new Set([
  *    (start_member, team_send_and_wait, …) — the TL actively orchestrated.
  * 2. A custom_message entry with customType "team-message" — member replies
  *    routed to the TL via the message channel.
+ * 3. A custom_message entry with customType "team-session-notice" — the entry
+ *    notice injected right after entering. This is the ONLY trace in the most
+ *    common shape of this feature: the user enters, discusses for a while
+ *    without ever calling a team tool, then exits. Without it the exit banner
+ *    would be suppressed exactly when the conversation still looks like a team
+ *    session to the model.
  *
  * Fail-open: when the session manager is unavailable (RPC mode, tests) the
  * check cannot be performed — treat as traced so the primary /team stop
@@ -103,7 +123,7 @@ function historyHasTeamTraces(ctx: {
   return entries.some((e: any) => {
     if (!e) return false;
     if (e.type === "custom_message") {
-      return e.customType === "team-message";
+      return TEAM_TRACE_CUSTOM_TYPES.has(e.customType);
     }
     if (e.type !== "message" || e.message?.role !== "assistant") return false;
     return Array.isArray(e.message.content) && e.message.content.some(
@@ -150,6 +170,10 @@ export default function (pi: ExtensionAPI) {
     agentInitiatedTask: null,
     resumedFrom: null,
     sessionEndedNotice: false,
+    // Explicit zero: the counter is armed only by /team start and the
+    // user-origin dynamic bootstrap, so "not armed" is a real state, not an
+    // accidentally-missing field.
+    entryNoticeTurnsRemaining: 0,
     processManager: null,
     memberHandles: memberHandlesRO,
     getHandle: (name) => memberHandles.get(name),
