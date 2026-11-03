@@ -18,11 +18,12 @@ vi.mock("./process/member-process", () => ({
   hasSessionFiles: () => false,
 }));
 
-// Anchor on the protocol BLOCK HEADING, never the bare phrase "第一动作协议":
-// the persistent state declaration legitimately mentions the protocol earlier
-// in the same prompt (execution variant: "先按第一动作协议派发"), so a bare
-// phrase indexOf matches the wrong occurrence and makes ordering assertions
-// vacuously true.
+// Ordering assertions anchor on the protocol BLOCK HEADING, not the bare phrase
+// "第一动作协议": since decision #47 the state declaration at the top of the
+// team block also names the protocol ("收到任务型诉求时先按第一动作协议派发"),
+// so a bare-phrase indexOf hits that mention instead. The assertion would still
+// pass — but it would measure the declaration, not the protocol block, and stay
+// green even if the block moved below the 铁律 section.
 const PROTOCOL_HEADING = "### 🚨 最高优先级：第一动作协议";
 
 // ── Helpers ────────────────────────────────────────────────
@@ -1638,6 +1639,58 @@ describe("session-ended banner in before_agent_start", () => {
     };
     const result = await runBeforeAgentStart(undefined, noticeOnlyCtx);
     expect(result.systemPrompt).toContain("团队会话已结束");
+  });
+
+  it("acceptance 3: the exit banner names the entry notice as equally invalid", async () => {
+    // The entry notice is a NEW user-role text that says "you are the Team
+    // Lead". Without naming it, the banner and the notice would tie in the
+    // history; the banner must win explicitly.
+    const cmdDef = getTeamCommandHandler();
+    await cmdDef.handler("dynamic", createMockContext());
+    await runStop();
+
+    const result = await runBeforeAgentStart(undefined, {
+      ui: createMockUi(),
+      sessionManager: {
+        getEntries: () => [
+          { type: "custom_message", customType: "team-session-notice", content: "【系统通知…】" },
+        ],
+      },
+    });
+    expect(result.systemPrompt).toContain("团队会话已结束");
+    expect(result.systemPrompt).toContain("已进入团队会话");
+    expect(result.systemPrompt).toContain("team-session-notice");
+    expect(result.systemPrompt).toContain("同样已失效");
+  });
+
+  it("acceptance 4: entry notice and exit banner are mutually exclusive within one turn", async () => {
+    // Structural invariant, not just wording: the notice requires
+    // session.active, the banner requires !session.active, and they are
+    // evaluated in the same before_agent_start call. If someone ever moves the
+    // notice decision out of the active branch, this test fails.
+    const cmdDef = getTeamCommandHandler();
+    await cmdDef.handler("dynamic", createMockContext());
+
+    // Turn while active: the notice fires, the banner cannot.
+    const active = await runBeforeAgentStart();
+    expect(active.message).toBeDefined();
+    expect(active.message.customType).toBe("team-session-notice");
+    expect(active.systemPrompt).not.toContain("团队会话已结束");
+
+    // start → stop → first turn: only the banner, never both.
+    await runStop();
+    const after = await runBeforeAgentStart(undefined, {
+      ui: createMockUi(),
+      sessionManager: {
+        getEntries: () => [
+          { type: "custom_message", customType: "team-session-notice", content: "【系统通知…】" },
+        ],
+      },
+    });
+    expect(after.message).toBeUndefined();
+    expect(after.systemPrompt).toContain("团队会话已结束");
+    // …and the notice text itself is not resurrected inside the prompt.
+    expect(after.systemPrompt).not.toContain("本条不是用户输入");
   });
 
   it("banner fires on routed member messages too (custom_message team-message trace)", async () => {

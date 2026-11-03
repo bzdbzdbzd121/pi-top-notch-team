@@ -2,11 +2,12 @@ import { describe, it, expect } from "vitest";
 import { buildDynamicModePrompt } from "./dynamic-mode";
 import type { TeamDefinition } from "../team/definition";
 
-// Anchor on the protocol BLOCK HEADING, never the bare phrase "第一动作协议":
-// the persistent state declaration legitimately mentions the protocol earlier
-// in the same prompt (execution variant: "先按第一动作协议派发"), so a bare
-// phrase indexOf matches the wrong occurrence and makes ordering assertions
-// vacuously true.
+// Ordering assertions anchor on the protocol BLOCK HEADING, not the bare phrase
+// "第一动作协议": since decision #47 the state declaration at the top of the
+// team block also names the protocol ("收到任务型诉求时先按第一动作协议派发"),
+// so a bare-phrase indexOf hits that mention instead. The assertion would still
+// pass — but it would measure the declaration, not the protocol block, and stay
+// green even if the block moved below the 铁律 section.
 const PROTOCOL_HEADING = "### 🚨 最高优先级：第一动作协议";
 
 
