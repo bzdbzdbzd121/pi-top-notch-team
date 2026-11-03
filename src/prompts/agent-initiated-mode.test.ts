@@ -41,6 +41,12 @@ describe("buildAgentInitiatedPrompt (ADR-0003)", () => {
       expect(prompt).not.toContain("第一动作协议");
     });
 
+    it("does NOT contain the persistent state declaration (agent started the session itself)", () => {
+      // 自主会话由 agent 自己发起，它已经知情——再告诉它「你刚进入」是噪音。
+      expect(prompt).not.toContain("状态：你正在团队会话中");
+      expect(prompt).not.toContain("当前唯一有效的状态");
+    });
+
     it("allows free reading for reconnaissance", () => {
       expect(prompt).toContain("自由读取");
       expect(prompt).toContain("无读取频率限制");
@@ -87,6 +93,11 @@ describe("buildAgentInitiatedPrompt (ADR-0003)", () => {
 
     it("does NOT contain the first-action protocol", () => {
       expect(prompt).not.toContain("第一动作协议");
+    });
+
+    it("does NOT contain the persistent state declaration", () => {
+      expect(prompt).not.toContain("状态：你正在团队会话中");
+      expect(prompt).not.toContain("当前唯一有效的状态");
     });
 
     it("states read/analysis freedom without dispatch policing", () => {

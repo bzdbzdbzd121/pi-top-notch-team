@@ -75,6 +75,36 @@ describe("buildDynamicModePrompt — design phase", () => {
   });
 });
 
+describe("buildDynamicModePrompt — 常驻状态声明（阶段 0）", () => {
+  it("设计阶段：注入设计态声明，位置在设计阶段正文之前", () => {
+    const prompt = buildDynamicModePrompt(emptyTeam, "design", "sess-1");
+    const idxDecl = prompt.indexOf("状态：你正在团队会话中（动态团队 — 设计阶段）");
+    const idxPhase = prompt.indexOf("═══ 设计阶段 — 你的角色 ═══");
+    expect(idxDecl).toBeGreaterThan(-1);
+    expect(idxPhase).toBeGreaterThan(-1);
+    expect(idxDecl).toBeLessThan(idxPhase);
+  });
+
+  it("设计阶段：声明含确认门，不含执行态的派发链与纠正措辞", () => {
+    const prompt = buildDynamicModePrompt(emptyTeam, "design", "sess-1");
+    expect(prompt).toContain("明确确认");
+    expect(prompt).toContain("当前唯一有效的状态");
+    // 执行态专属措辞不得渗入设计态（否则提示模型在确认门前派发）
+    expect(prompt).not.toContain("立即停下并改为派发");
+  });
+
+  it("执行阶段：注入执行态声明，位置在第一动作协议之前", () => {
+    const prompt = buildDynamicModePrompt(teamWithMembers, "execution");
+    const idxDecl = prompt.indexOf("状态：你正在团队会话中（Team Lead）");
+    const idxProtocol = prompt.indexOf("第一动作协议");
+    expect(idxDecl).toBeGreaterThan(-1);
+    expect(idxProtocol).toBeGreaterThan(-1);
+    expect(idxDecl).toBeLessThan(idxProtocol);
+    expect(prompt).toContain("当前唯一有效的状态");
+    expect(prompt).toContain("立即停下并改为派发");
+  });
+});
+
 describe("buildDynamicModePrompt — goal closing protocol", () => {
   it("design phase lists goal tools (set_goal/finish_goal)", () => {
     const prompt = buildDynamicModePrompt(emptyTeam, "design");
@@ -113,9 +143,11 @@ describe("buildDynamicModePrompt — execution phase", () => {
     expect(prompt).toContain("绝不能自己做");
   });
 
-  it("包含第一动作协议，且位于铁律段落之前", () => {
+  it("包含第一动作协议（有序链），且位于铁律段落之前", () => {
     expect(prompt).toContain("第一动作协议");
-    expect(prompt).toContain("start_member` 或 `team_send_and_wait");
+    expect(prompt).toContain("**还没写共享上下文**");
+    expect(prompt).toContain("**需要的成员还没启动**");
+    expect(prompt).toContain("**派发任务**");
     const idxProtocol = prompt.indexOf("第一动作协议");
     const idxIronRule = prompt.indexOf("铁律：你绝不能自己做");
     expect(idxProtocol).toBeGreaterThan(-1);

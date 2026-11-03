@@ -3,6 +3,7 @@ import { join, dirname } from "node:path";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { FIRST_ACTION_PROTOCOL_PROMPT } from "./tl-first-action";
+import { buildTeamStateDeclaration } from "./session-transition-notice";
 import { GOAL_CLOSING_PROTOCOL_PROMPT } from "./goal-closing-protocol";
 import { TASK_DISPATCH_PROTOCOL_PROMPT } from "./task-dispatch-protocol";
 import { getSharedContextPath } from "../session/shared-context";
@@ -59,6 +60,7 @@ export function buildDynamicModePrompt(team: TeamDefinition, phase: "design" | "
   return `
 ## 当前任务：Team Lead（动态团队模式 — ${phase === "design" ? "设计阶段" : "执行阶段"}）
 
+${buildTeamStateDeclaration(phase === "design" ? "design" : "execution", team.name)}
 你现在是一个 **Team Lead**。在动态团队模式下，你的职责因阶段而异。
 
 ${

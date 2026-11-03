@@ -476,6 +476,67 @@ describe("agent_settled handler", () => {
   });
 });
 
+// ── Team session state declaration (stage 0) ─────────────
+// The team prompt block used to carry NO statement of authority, while the exit
+// banner was fixed exactly that way (decision #24) and verified end to end.
+// The declaration is the same variable applied to the entry side: it sits at the
+// very top of the team block so it is read before the long role/rules sections.
+
+describe("team session state declaration", () => {
+  let pi: ExtensionAPI;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    delete process.env.TEAM_ROLE;
+    pi = createMockPi();
+    const mod = await import("../index");
+    mod.default(pi);
+  });
+
+  function getHandler(name: string): Function {
+    const onCalls = (pi.on as ReturnType<typeof vi.fn>).mock.calls;
+    return onCalls.find((c: any) => c[0] === name)![1];
+  }
+
+  it("injects the declaration at the top of the team block, before the first-action protocol", async () => {
+    const { startSession, endSession } = await import("./session/state");
+    endSession();
+    startSession({
+      name: "decl-team",
+      description: "Test",
+      members: [{ name: "worker", systemPrompt: "do work" }],
+    });
+
+    const handler = getHandler("before_agent_start");
+    const result = await handler({ systemPrompt: "BASE" }, { ui: createMockUi() });
+    const prompt = result.systemPrompt;
+
+    const idxHeading = prompt.indexOf("## 当前任务：Team Lead");
+    const idxDecl = prompt.indexOf("状态：你正在团队会话中（Team Lead）");
+    const idxProtocol = prompt.indexOf("第一动作协议");
+
+    expect(idxHeading).toBeGreaterThan(-1);
+    expect(idxDecl).toBeGreaterThan(idxHeading);
+    expect(idxProtocol).toBeGreaterThan(-1);
+    expect(idxDecl).toBeLessThan(idxProtocol);
+
+    // authoritative wording + team name rendered from live session state
+    expect(prompt).toContain("当前唯一有效的状态");
+    expect(prompt).toContain("以本提示为准");
+    expect(prompt).toContain("团队会话「decl-team」");
+    endSession();
+  });
+
+  it("does not inject the declaration outside a team session", async () => {
+    const { endSession } = await import("./session/state");
+    endSession();
+
+    const handler = getHandler("before_agent_start");
+    const result = await handler({ systemPrompt: "BASE" }, { ui: createMockUi() });
+    expect(result).toBeUndefined();
+  });
+});
+
 // ── TL first-action protocol prompt injection ─────────────
 
 describe("TL first-action protocol prompt injection", () => {

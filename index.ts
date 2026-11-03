@@ -43,6 +43,7 @@ import { createMessageChannel } from "./src/setup/message-channel";
 import { scheduleCloudDetection, type DetectOptions } from "./src/sync/detect";
 import { buildDynamicModePrompt } from "./src/prompts/dynamic-mode";
 import { FIRST_ACTION_PROTOCOL_PROMPT } from "./src/prompts/tl-first-action";
+import { buildTeamStateDeclaration } from "./src/prompts/session-transition-notice";
 import { GOAL_CLOSING_PROTOCOL_PROMPT } from "./src/prompts/goal-closing-protocol";
 import { TASK_DISPATCH_PROTOCOL_PROMPT } from "./src/prompts/task-dispatch-protocol";
 import { buildWorkflowPrompt, WORKFLOW_ACTIVATION_BANNER } from "./src/prompts/workflow-prompt";
@@ -1304,6 +1305,7 @@ export default function (pi: ExtensionAPI) {
       extraPrompt = `
 ## 当前任务：Team Lead
 
+${buildTeamStateDeclaration("predefined", team.name)}
 你现在是一个 **Team Lead**，负责领导团队完成任务。
 
 ${FIRST_ACTION_PROTOCOL_PROMPT}
