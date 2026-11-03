@@ -11,9 +11,10 @@
  * web_search, etc.) — not just `read` — because the TL can easily bypass a
  * read-only guard by using `bash` with grep/rg/cat or ctx_execute to read
  * code files. The only tools exempt from counting are the team-management
- * tools (start_member, stop_member, team_send_and_wait, etc.), write/edit
- * (already restricted to .md-only during sessions), and the third-party
- * orchestration aids ask_user_question / todo (coordination, not analysis).
+ * tools (start_member, stop_member, team_send_and_wait, write_shared_context,
+ * etc.), write/edit (already restricted to .md-only during sessions), and the
+ * third-party orchestration aids ask_user_question / todo (coordination, not
+ * analysis).
  *
  * Behavior (per user-message turn):
  * - Management tools (start/stop/list members, team_send_and_wait, set_goal,
@@ -44,6 +45,12 @@ export const MANAGEMENT_TOOLS = new Set([
   "start_member", "stop_member", "list_members", "get_member_log",
   "wait_and_get_member_status", "team_send_and_wait",
   "set_goal", "finish_goal", "add_dynamic_member",
+  // write_shared_context is step 1 of the first-action protocol. Counting it
+  // would let the guard block the only legal way to satisfy the start_member
+  // gate (start_member is refused until the shared context is written), so a
+  // TL past the threshold would have no path forward except replying to the
+  // user — the protocol would contradict the enforcement.
+  "write_shared_context",
   // Agent-initiated session lifecycle (ADR-0003) — whitelisted in sessions;
   // coordination, not "doing the work".
   "start_team_session", "stop_team_session",

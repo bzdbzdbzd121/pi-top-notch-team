@@ -841,6 +841,7 @@ The prompt builder function `buildDynamicModePrompt(team, phase)` in `src/prompt
 When `/team start` creates a team session, the extension sets up a `before_agent_start` handler that injects a structured prompt with the following sections:
 
 - **角色定义**: "你现在是一个 Team Lead"
+- **常驻状态声明**: 团队块标题之后、第一动作协议之前注入 `buildTeamStateDeclaration`（`src/prompts/session-transition-notice.ts`，决策 #47）——声明「本段是当前唯一有效的状态说明」、历史里进入本会话之前的做法属于普通模式不构成本回合授权，并给出阶段正确的下一步（预定义/动态执行阶段为派发，设计阶段为确认门）。历史断言只限定于「进入之前」+「与本提示冲突」，不否定会话内的合法 read/.md 写入/resume 历史
 - **团队信息**: 名称、描述、成员列表
 - **核心原则：委派优先**: 明确 TL 的职责是委派而非执行，能交给 Member 做的事绝不自己做。成员完成任务后不得主动停止其进程。TL 可以编写 .md 文档（共享上下文、ADR 等）但不得直接写代码文件
 - **需求讨论方式**: 逐问确认、挑战模糊语言、用场景检验边界、对照实际代码、术语和决策立即固化到 `.shared-context.md`
@@ -916,8 +917,8 @@ Strict 模式的注入结构相同，但标题为「严格模式 ⚡ — 必须�
 - 机制：以 `agent_start` 为 turn 边界重置计数；每个 turn 内未发生 `team_send_and_wait` 派发时，TL 对**所有非管理工具**（read、bash、web_search、ctx_execute 等——不只 `read`，否则可用 bash grep/rg/cat 绕过）的调用计数，超过阈值（默认 3）即进入**持续拦截模式**：派发前每次非管理工具调用都会被 block，reason 中包含纠偏指引。
 - 设计属性：
   - **持续拦截（sticky）**：阈值触发后不是 block 一次就放行——一次性的软提醒实测可被模型无视（看到一次错误后继续用下一个工具分析）。现在派发前所有非管理工具调用持续被拦截，TL 唯一出路是 `team_send_and_wait` 派发任务或直接回复用户。首次拦截带 `firstBlock` 标记，供 UI 弹通知/状态栏警示；派发（`team_send_and_wait`）后立即解锁，后续工具调用全部放行。
-  - **fail-open**：`.md` 读取不计数（文档工作是 TL 本职）；管理工具（start/stop/list_members、team_send_and_wait、write/edit 等）与编排辅助工具（`ask_user_question`、`todo`，决策 #44——不消耗预算、sticky 期间仍可用）永不拦截（解锁通道永远畅通）；派发后不再拦截（派发后的 read 视为协调/审阅）；设计阶段不启用本守卫（无 Member 可派发），取而代之的是**设计阶段 read 软限制**（`createDesignReadGuard`，见上）：非 `.md` read 每 4 次拦截一次提醒，确需读取时再次调用即放行。
-  - 提示词层（`src/prompts/tl-first-action.ts` 的"第一动作协议"，注入预定义团队与动态模式执行阶段提示词顶部）与运行时层（本守卫）配对，模型能预知规则被强制执行。
+  - **fail-open**：`.md` 读取不计数（文档工作是 TL 本职）；管理工具（start/stop/list_members、team_send_and_wait、write_shared_context、write/edit 等）与编排辅助工具（`ask_user_question`、`todo`，决策 #44——不消耗预算、sticky 期间仍可用）永不拦截（解锁通道永远畅通）；`write_shared_context` 必须在豁免清单内（决策 #47）：它是第一动作协议的第 1 步，且 `start_member` 在共享上下文写入前被硬拦截，若它也被计数，粘滞态下协议的三步会互相锁死；派发后不再拦截（派发后的 read 视为协调/审阅）；设计阶段不启用本守卫（无 Member 可派发），取而代之的是**设计阶段 read 软限制**（`createDesignReadGuard`，见上）：非 `.md` read 每 4 次拦截一次提醒，确需读取时再次调用即放行。
+  - 提示词层（`src/prompts/tl-first-action.ts` 的"第一动作协议"，注入预定义团队与动态模式执行阶段提示词顶部；决策 #47 起为一条有序链 `write_shared_context` → `start_member` → `team_send_and_wait`）与运行时层（本守卫）配对，模型能预知规则被强制执行。
 
 The handler stays registered for the entire pi session but checks `session.active` to decide whether to inject regular TL instructions. When `/team stop` ends the session, `session.active` becomes `false` and no regular TL instructions are injected; a one-shot session-ended banner may be injected on the next turn and is then consumed.
 

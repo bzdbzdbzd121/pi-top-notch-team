@@ -155,6 +155,29 @@ describe("createTlReadGuard", () => {
     expect(g.preDispatchCalls).toBe(1); // only bash counted
   });
 
+  it("write_shared_context is exempt: it is step 1 of the first-action protocol", () => {
+    // Regression: the guard counted write_shared_context as a non-management
+    // call, so a TL past the threshold could not write the shared context —
+    // and start_member is refused until that flag is set. The protocol's first
+    // step would be blocked by the guard enforcing the same protocol.
+    const g = createTlReadGuard({ threshold: 0 }); // sticky immediately for non-mgmt
+    expect(g.checkToolCall("bash", undefined).block).toBe(true); // sticky on
+    expect(g.checkToolCall("write_shared_context", undefined).block).toBe(false);
+    expect(g.preDispatchCalls).toBe(1); // only bash counted
+  });
+
+  it("write_shared_context does not consume the pre-dispatch budget", () => {
+    const g = createTlReadGuard({ threshold: 2 });
+    for (let i = 0; i < 10; i++) {
+      expect(g.checkToolCall("write_shared_context", undefined).block).toBe(false);
+    }
+    expect(g.preDispatchCalls).toBe(0);
+    // the budget is still intact afterwards: threshold calls pass, next blocks
+    expect(g.checkToolCall("read", "src/a.ts").block).toBe(false);
+    expect(g.checkToolCall("read", "src/b.ts").block).toBe(false);
+    expect(g.checkToolCall("read", "src/c.ts").block).toBe(true);
+  });
+
   it("management tools remain usable while sticky (dispatch path stays open)", () => {
     const g = createTlReadGuard({ threshold: 0 });
     expect(g.checkToolCall("bash", undefined).block).toBe(true); // sticky
