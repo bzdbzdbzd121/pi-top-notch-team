@@ -116,6 +116,20 @@ export const SESSION_ENTRY_NOTICE_CUSTOM_TYPE = "team-session-notice";
 /** Max turns the entry notice may be injected. 0 disables, 1 = strict one-shot. */
 export const SESSION_ENTRY_NOTICE_MAX_TURNS = 2;
 
+/**
+ * Literal first-line prefix of the notice — the ONLY string another component
+ * may use to refer to it.
+ *
+ * Two reasons it is a constant rather than a hand-typed quote:
+ * - The exit banner has to name the notice so the two do not tie in the history.
+ *   A paraphrase ("已进入团队会话") is not findable in the transcript; the prefix
+ *   is exactly what the model sees at the top of the notice.
+ * - The banner must not leak the internal customType identifier
+ *   ("team-session-notice") into model-facing text; importing this constant
+ *   makes that impossible by construction.
+ */
+export const SESSION_ENTRY_NOTICE_ANCHOR = "【系统通知｜团队会话状态】";
+
 export type SessionEntryNoticeVariant = "dispatch" | "design";
 
 export interface SessionEntryNoticeInput {
@@ -183,7 +197,7 @@ export function buildSessionEntryNotice(input: SessionEntryNoticeInput): Session
     input.variant === "design"
       ? DESIGN_NOTICE_BODY
       : DISPATCH_NOTICE_BODY.replace("{teamName}", input.teamName);
-  const content = `【系统通知｜团队会话状态】本条不是用户输入，也不是新任务——不要回复本条，直接处理用户的上一条消息。
+  const content = `${SESSION_ENTRY_NOTICE_ANCHOR}本条不是用户输入，也不是新任务——不要回复本条，直接处理用户的上一条消息。
 
 ${body}
 

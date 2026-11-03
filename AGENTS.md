@@ -122,8 +122,8 @@ src/
 │   ├── agent-initiated-mode.ts ← agent 自主会话提示词（ADR-0003）：使命锚定、无 grilling/确认门/第一动作协议
 │   ├── tl-first-action.ts ← 共享「第一动作协议」提示词片段，注入两种模式 TL 提示词顶部（决策 #47：一条有序链 write_shared_context → start_member → team_send_and_wait，取代旧的并行双规则）
 │   ├── tl-first-action.test.ts ← 第一动作协议：唯一「第一个工具调用」+ 三步顺序 + 例外/运行时威慑保留
-│   ├── session-transition-notice.ts ← 常驻团队状态声明（决策 #47）：buildTeamStateDeclaration 三变体（predefined/execution 逐字节同文、design 含确认门），单一事实来源防漂移
-│   ├── session-transition-notice.test.ts ← 三变体内容与互斥、历史断言范围（仅进入前 + 冲突）、合成团队名不渲染、Record 穷尽派发
+│   ├── session-transition-notice.ts ← 会话切换提示单一来源（决策 #47）：buildTeamStateDeclaration 三变体（predefined/execution 逐字节同文、design 含确认门）+ buildSessionEntryNotice（dispatch/design 通知文案 + 锚点常量）+ decideEntryNotice（inject/stop/none 纯判定）+ MAX_TURNS 常量；DESIGN.md §34
+│   ├── session-transition-notice.test.ts ← 三变体内容与互斥、历史断言范围（仅进入前 + 冲突）、合成团队名不渲染、Record 穷尽派发；通知判定表、两份文案硬要求与纪律矩阵、锚点前缀、窗口数字与常量联动
 │   ├── goal-closing-protocol.ts ← 共享「强制 Goal 关闭协议」提示词片段（预定义/dynamic/agent-initiated 三模式复用防漂移）
 │   ├── task-dispatch-protocol.ts ← 共享任务派发协议（决策 #43）：目标/非目标/修改范围/验收标准，三模式及 team_send_and_wait promptGuidelines 同源
 │   ├── task-dispatch-protocol.test.ts ← 协议语义与 dynamic/agent 两阶段注入测试
@@ -203,7 +203,8 @@ src/
 │   └── pi-key-decode.test.ts ← 本地解码器单元测试（kitty CSI-u / modifyOtherKeys / legacy 三协议 + 修饰拒绝 + Caps Lock 掩码）
 ├── config.ts         ← getRootDir() via env var or ~/.pi/top-notch-team
 ├── config.test.ts    ← getRootDir() env var tests
-├── static-scan.test.ts ← 阶段 5 防退化守卫（R4）：静态扫描全仓 loadSettings( 调用点，除白名单（settings.ts / session-settings.ts / setting-handler.ts）外必须经合并层；负例 fixture 锁定「人为新增绕过 → 测试红」
+├── static-scan.test.ts ← 阶段 5 防退化守卫（R4）：静态扫描全仓 loadSettings( 调用点，除白名单（settings.ts / session-settings.ts / setting-handler.ts）外必须经合并层；负例 fixture 锁定「人为新增绕过 → 测试红」。决策 #47 起另扫绝对化历史断言：范围 index.ts（退场横幅）+ src/prompts/*.ts，三种模式（进入前断言 / 前置量词 / 后置量词），排除 *.test.ts，零文件级豁免
+├── index-session-entry.agent-session.test.ts ← 会话切换请求级断言（决策 #47）：真实 pi AgentSession 夹具——通知在出站请求中位于用户消息之后、系统提示含团队块、持久化为 custom_message、/team start 零模型请求
 ├── static-scan-child-process.test.ts ← 阶段 5 静态守卫：child_process 白名单（sync/git-runner.ts + 三个成员进程模块），同步模块绕过统一 git 执行器 → 测试红；含 `src/sync/` 目录专项检查
 └── test/fixtures/    ← Test YAML files + mock-extension-api.ts
 ```
@@ -451,7 +452,7 @@ src/
 
 46. **成员浮窗总览页（每成员一行图标轨迹）** — `alt+t` 每次打开默认总览，显式 `overview/member(name)` 页面身份，不伪造成员 tab。总览按名册稳定排序，↑↓/PgUp/PgDn/Home/End 选择成员、Enter 进入会话，←→ 在总览与成员页间循环；总览不执行单成员发送/中断/压缩，ctrl+b 全员中断仍可用。总览不显示表头、状态文字列和底部图例；轨迹最左图标复用控制面覆盖与 activity-tracker 细粒度活动表示当前状态。上下文用水平占用条和百分比显示，null/未知显示中性点条加 `?`、失败旧值加 `~`、停止/崩溃显示 `—`。轨迹使用 💭思考/✏️输出/📖读取/📝修改/🔧其他工具，新操作从左插入、旧记录向右移，含当前状态最多20个图标，窄屏显示更少并在尾部用完整 `(N)` 表示累计未显示的真实记录数（含已淘汰历史，不受64条保留上限限制）。当前活动匹配最新记录时原位复用，否则补充显示位置但不写历史；活动/错误图标加下划线与语义色。每块/每工具调用一条，不逐 delta 追加。压缩历史只认成员侧 compaction_start、成功 get_state.isCompacting=true，或孤立结束携带成功 `result.summary`；控制面 compacting 同时用于 stats 预检占位，绝不能据此写压缩历史。总览通过只读 isCompacting 区分真实压缩和预检，避免首条历史误记 🗜️。无开始依据且无成功结果的 compaction_end 不补造记录，真实压缩失败仍按开始记录更新。`member-overview-store.ts` 每成员64条环形缓冲，另用一个累计计数器只在追加语义动作时递增；关联索引同步淘汰，不保留正文/参数；`index.ts` 在会话期持续采集，浮窗关闭不清空，stop/shutdown 清空，resume 不重建旧轨迹。创建成员捕获 sessionId 与 handle 身份，旧来源显示事件不进入新总览；包装成功 start（含 auto-restart）发出显示专用 process_started，避免等待首个 agent_start 才解除旧进程死亡门。总览渲染只读取可见成员轨迹，固定总览标签+当前成员水平窗口，窄屏保留选择反馈。stats 打开时立即查询，轮询结束5秒后再排，最多四路，关闭/换句柄后不写回。删除浮窗全员状态汇总行，notice/newBelow 迁到提示行，常规 chrome 8→7，小高度退化为选中成员摘要+退出提示。外部 team-status-widget、控制面与派发规则不改。详见 `docs/design-member-inspector-overview.md` 与 DESIGN.md §17；`src/index-overview.test.ts` 覆盖会话级接线。
 
-47. **常驻团队状态声明 + 第一动作协议有序链（进场感知阶段 0）** — 长对话里执行 `/team start` 后，TL 常继续像普通编码助手一样自己读代码分析而不派发。核查发现进场侧与退场侧不对称：退场侧有一次性权威横幅（决策 #24，措辞权威化后经真实端到端验证生效），进场侧既没有「切换事件」也没有任何权威声明——团队提示词每回合都在注入，但整段话没有一句压过历史惯性（且系统提示词正文不落会话历史，模型只能看到历史里的自身行为）。本阶段只改措辞/提示词结构，不加状态、不加通道、不新增模型调用、不改守卫阈值与策略：
+47. **会话切换提示：常驻状态声明 + 有界进入通知 + 退场一致性（决策 #24 的进场侧对偶，阶段 0–4 收口）** — 长对话里执行 `/team start` 后，TL 常继续像普通编码助手一样自己读代码分析而不派发。核查发现进场侧与退场侧不对称：退场侧有一次性权威横幅（决策 #24，措辞权威化后经真实端到端验证生效），进场侧既没有「切换事件」也没有任何权威声明——团队提示词每回合都在注入，但整段话没有一句压过历史惯性（且系统提示词正文不落会话历史，模型只能看到历史里的自身行为）。两层结构：**声明**回答「我现在是什么角色」（每回合都在），**通知**回答「切换刚刚发生」（有界）。完整设计、判定表、生命周期与限制见 DESIGN.md §34。不加新状态机、不改守卫阈值、不改可见性/上限策略、不新增模型调用：
    - **常驻状态声明**（`src/prompts/session-transition-notice.ts` 的 `buildTeamStateDeclaration`，单一事实来源）：置于团队提示词块**标题之后、第一动作协议之前**（`index.ts` 预定义团队块；`dynamic-mode.ts` 两阶段各自对应变体）。三变体：`predefined` 与 `execution` **逐字节一致**（同工具面同派发协议，两份文案只会漂移，测试 `toBe` 锁定）；`design` 独立（含确认门：用户明确确认前不要注册/启动/派发——否则提示模型越过自家硬门；动态团队名是合成 `_dynamic_<ts>` 故设计态不渲染团队名）。agent 自主会话（`start_team_session`）**不注入**（agent 自己发起、已知情）。注入位置刻意不动（仍在系统提示词末尾、同一条通道），以便把任何实测收益归因于措辞而非位置；`Record<>` 派发使未来新增变体成为编译错误，`??` 回退保证未知运行时值不会在提示词组装中抛错（抛错会丢掉整段团队提示词）。
    - **文案纪律（审查修订）**：历史断言必须双重限定——只针对 ①**进入本会话之前**的记录，②**与本提示冲突**的做法；不得声称「历史里所有自分析记录都发生在进入之前」（同一团队会话内有设计阶段合法 read、`.md` 写入、resume 恢复的历史，绝对化断言为假，会导致模型整段折扣提示）。它是授权声明，不是事实断言；并去掉「一律」等绝对量词。
    - **第一动作协议改写为一条有序链**：`write_shared_context` → `start_member`（`/team start` 只写定义不启动进程）→ `team_send_and_wait` 派发。旧版同一条规则里出现两个「你的第一个工具调用必须是…」（共享上下文 vs 派发）且完全漏掉 `start_member`，直接派发必命中「目标成员不存在或未启动」，等于让模型先吃一次错误。保留 1-2 文件例外与运行时威慑说明。
@@ -460,7 +461,11 @@ src/
    - **生命周期六条清理**：`/team start` 置 2（`start-handler`）；用户来源的 `bootstrapDynamicSession` 置 2（`origin === "agent"` 不置位——自主会话由 agent 自己发起，告知「你刚进入」是噪音）；`teardownTeamSession` 无条件清零；`session_start(reason:"new")` 清零；陈旧会话清理（`entries.length <= 1` 且会话活跃）清零。`/team resume` 刻意不置位（恢复横幅已覆盖且更具体）。通知构建包**局部** try/catch：失败 → 本次不注入、计数不减、一次 `console.warn`（团队提示词照常注入，不因通知失败整体丢失）。
    - **文案纪律**：首行声明来源（「不是用户输入 / 不要回复本条」）；声明权威并按「进入之前」+「与本提示冲突」限定历史；给出有序动作链（dispatch）或确认门（design，不含执行态派发链）；保留 1-2 文件例外与「闲聊不强行派发」例外。`decideEntryNotice` 按阶段在**注入时**求值变体。
    - **退场侧痕迹判定已计入通知（最小修复，从阶段 2 前拉）**：`index.ts` 的 `historyHasTeamTraces` 改用 `TEAM_TRACE_CUSTOM_TYPES = {team-message, SESSION_ENTRY_NOTICE_CUSTOM_TYPE}`（常量从 prompt 模块导入，不硬编码——硬编码字符串会静默失效）。理由：「进入 → 只讨论、一次团队工具都没调 → /team stop」是本需求最典型的会话形态，若不认通知，退场横幅会在这最需要它的场景被抑制。
-   - **仍未做**（后续阶段）：退场横幅正文交叉引用「进入提示同样失效」与互斥不变式测试（阶段 2 剩余项）；流式窗口（M1）覆盖（阶段 3，默认不做）；完整文档章节（阶段 4）。
+   - **阶段 2（已交付）：退场侧一致性** — 横幅新增**条件式**交叉引用（「若历史里出现过「【系统通知｜团队会话状态】」系统通知，它同样已失效」）：锚点必须是历史里**真实存在**的串（通知首行前缀常量 `SESSION_ENTRY_NOTICE_ANCHOR`，转述句模型在历史里搜不到），且横幅正文**不得出现**内部标识符 `team-session-notice`（断言锁定）；条件式因为 `/team resume` 等路径可能从未注入过通知，无条件断言是假的。互斥不变式：进入通知要求 `session.active`、退场横幅要求 `!session.active`，同一 `before_agent_start` 内判定——运行时用例只断言「活跃→只有通知 / stop 后→只有横幅」，**结构半边由 `decideEntryNotice({sessionActive:false, remaining:2}) === "none"` 单独锁定**（teardown 也清零计数，故运行时观察无法区分两个原因）。不叠加第二条同义消息级通知（同请求里「横幅 + 同义 user 角色消息」会让通知被当成输入的概率翻倍）。
+   - **阶段 4（已交付）：文档 + 静态守卫** — DESIGN.md §34 完整章节（两层结构、判定表、生命周期、退场一致性、限制）；本决策条目补齐理由与未做项；Source Map 登记新模块/测试与守卫。静态守卫（`src/static-scan.test.ts`）扫描 `index.ts`（退场横幅）+ `src/prompts/*.ts`（全部提示词模块）的绝对化历史断言，三种模式：进入前断言（`都/均/全部发生在进入`）、前置量词（所有/全部/一切 + 历史/记录）、**后置量词**（历史/记录 + 都/全部/一律/无一例外，10 字符内）。排除 `*.test.ts`；**零文件级豁免**——退场横幅「成功调用都发生在会话结束之前」是对已结束会话的事实陈述，不匹配模式，故无需豁免；将来命中应改写文案而非加例外（可豁免的守卫等于没有守卫）。
+   - **为何用消息而非改写用户输入 / 即时投递**：`before_agent_start` 返回 `message` 是两版 pi（0.83.0 / 1.5.0）都支持的唯一形态，落在用户消息**之后**且不改写原话；`input` 事件加前缀会永久改写输入（进入 transcript / 复制 / fork），无参 `sendMessage` 在流式期间会 steer 打断当前回答、且消费时无法判断会话是否仍活跃；`event.messageType` 在 0.83.0 不存在，故**不依赖**它区分提醒回合。
+   - **已知限制**：流式窗口（M1）未覆盖——`/team start` 在流式输出中执行时该回合已被 arm 的 prompt 走 steer/followUp，系统提示词不重建，通知顺延到下一回合（损害有界、自我修复）；覆盖需改写输入或打断当前回答，属条件触发的阶段 3（用户裁定不做）。纯文本自分析（不调工具直接给结论）任何提醒与守卫都触达不到，只能靠人工抽样判定。有效性证据来自退场侧同形先例，进场侧仍待真实模型抽样（闲聊/纯问答/「先别动」负例）。
+   - **动态执行阶段的 dispatch 变体实际不可达（防御性保留）**：`start_member` 硬门控要求共享上下文已写入，成功即同时满足「已运转」→ 判定先返回 `stop`；`handle` 只在 teardown 清除，单会话内成员计数单调不减。
    - **附带修订**：AGENTS.md 决策 #17 与 DESIGN.md §10 的管理工具清单同步补充 `write_shared_context`（与守卫实现一致，防后人按旧说明改回去）。
 
 ## Dependency Injection Pattern

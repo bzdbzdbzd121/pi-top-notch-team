@@ -6,6 +6,11 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { transitionState } from "./session/state-machine";
 import type { MemberOperationalState } from "./session/context";
 import { createMockContext } from "./test/fixtures/mock-extension-api";
+import {
+  decideEntryNotice,
+  SESSION_ENTRY_NOTICE_ANCHOR,
+  SESSION_ENTRY_NOTICE_MAX_TURNS,
+} from "./prompts/session-transition-notice";
 import { saveSyncConfig } from "./sync/config";
 
 // P2 集成测试：start_member 完整链路需要 mock 成员子进程 spawn（避免真实启动
@@ -1658,16 +1663,25 @@ describe("session-ended banner in before_agent_start", () => {
       },
     });
     expect(result.systemPrompt).toContain("团队会话已结束");
-    expect(result.systemPrompt).toContain("已进入团队会话");
-    expect(result.systemPrompt).toContain("team-session-notice");
-    expect(result.systemPrompt).toContain("同样已失效");
+    // The cross-reference must quote text that actually exists in the
+    // transcript — the notice's first-line prefix — not a paraphrase, or the
+    // model cannot find it in history.
+    expect(result.systemPrompt).toContain(SESSION_ENTRY_NOTICE_ANCHOR);
+    // Conditional: sessions resumed without ever arming the notice exist, so
+    // the banner must not assert that a notice was present.
+    expect(result.systemPrompt).toContain("若历史里出现过");
+    // The internal customType identifier never leaks into model-facing text.
+    expect(result.systemPrompt).not.toContain("team-session-notice");
   });
 
-  it("acceptance 4: entry notice and exit banner are mutually exclusive within one turn", async () => {
-    // Structural invariant, not just wording: the notice requires
-    // session.active, the banner requires !session.active, and they are
-    // evaluated in the same before_agent_start call. If someone ever moves the
-    // notice decision out of the active branch, this test fails.
+  it("acceptance 4: entry notice and exit banner never co-occur in one turn", async () => {
+    // What the runtime halves actually show: an active turn yields the notice
+    // and no banner; the turn after /team stop yields the banner and no notice.
+    // They do NOT by themselves prove the structural rule — after teardown the
+    // counter is also zeroed, so absence of the notice has two independent
+    // causes. The structural half is pinned below by decideEntryNotice with an
+    // inactive session and a full counter, which is what fails if the notice
+    // decision ever moves out of the active branch.
     const cmdDef = getTeamCommandHandler();
     await cmdDef.handler("dynamic", createMockContext());
 
@@ -1691,6 +1705,18 @@ describe("session-ended banner in before_agent_start", () => {
     expect(after.systemPrompt).toContain("团队会话已结束");
     // …and the notice text itself is not resurrected inside the prompt.
     expect(after.systemPrompt).not.toContain("本条不是用户输入");
+
+    // Structural half: an inactive session never injects, even with a full
+    // counter and an otherwise injectable state.
+    expect(
+      decideEntryNotice({
+        sessionActive: false,
+        remaining: SESSION_ENTRY_NOTICE_MAX_TURNS,
+        hasResumeBanner: false,
+        sharedContextWritten: false,
+        startedMemberCount: 0,
+      }),
+    ).toBe("none");
   });
 
   it("banner fires on routed member messages too (custom_message team-message trace)", async () => {

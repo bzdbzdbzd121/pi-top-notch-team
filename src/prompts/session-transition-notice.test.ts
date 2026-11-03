@@ -4,6 +4,7 @@ import {
   buildTeamStateDeclaration,
   buildSessionEntryNotice,
   decideEntryNotice,
+  SESSION_ENTRY_NOTICE_ANCHOR,
   SESSION_ENTRY_NOTICE_CUSTOM_TYPE,
   SESSION_ENTRY_NOTICE_MAX_TURNS,
 } from "./session-transition-notice";
@@ -197,6 +198,13 @@ describe("buildSessionEntryNotice — dispatch variant (predefined / dynamic exe
     variant: "dispatch",
   });
 
+  it("starts with the shared anchor prefix (the only string history can match)", () => {
+    expect(notice.content.startsWith(SESSION_ENTRY_NOTICE_ANCHOR)).toBe(true);
+    // The anchor is user-facing text, not the internal customType identifier.
+    expect(SESSION_ENTRY_NOTICE_ANCHOR).not.toContain("team-session-notice");
+    expect(SESSION_ENTRY_NOTICE_ANCHOR).toContain("系统通知");
+  });
+
   it("returns the shape before_agent_start needs (customType/display/details)", () => {
     expect(notice.customType).toBe(SESSION_ENTRY_NOTICE_CUSTOM_TYPE);
     expect(notice.display).toBe(true);
@@ -260,6 +268,10 @@ describe("buildSessionEntryNotice — design variant (dynamic design phase)", ()
     teamName: "_dynamic_1750000000000",
     sessionId: null,
     variant: "design",
+  });
+
+  it("starts with the shared anchor prefix too", () => {
+    expect(notice.content.startsWith(SESSION_ENTRY_NOTICE_ANCHOR)).toBe(true);
   });
 
   it("carries the variant in details (and tolerates a null session id)", () => {
@@ -356,40 +368,6 @@ describe("both notice variants — discipline matrix", () => {
   }
 });
 
-describe("static guard — absolute quantifiers in transition prompts", () => {
-  const source = readFileSync(
-    new URL("./session-transition-notice.ts", import.meta.url),
-    "utf-8",
-  );
-
-  it("never claims that every history record predates the entry", () => {
-    for (const forbidden of [
-      "都发生在进入之前",
-      "都发生在进入团队会话",
-      "所有记录都发生在",
-      "均发生在进入之前",
-    ]) {
-      expect(source).not.toContain(forbidden);
-    }
-  });
-
-  it("never applies an absolute quantifier to the authority claim", () => {
-    // "一律" was removed in the stage-0 review round; keep it out of both layers.
-    expect(source).not.toContain("一律以本提示为准");
-    expect(source).not.toMatch(/(所有|全部|一切)[^。\n]{0,12}(历史|记录)/);
-  });
-
-  it("keeps the dual scoping in every prompt text of the module", () => {
-    // Guard the shape, not just the two current strings: each declaration and
-    // each notice body must scope by pre-session records AND by conflict.
-    const matches = source.match(/进入本会话之前/g) ?? [];
-    expect(matches.length).toBeGreaterThanOrEqual(4); // 2 declarations + 2 notices
-    const conflicts = source.match(/与本提示冲突/g) ?? [];
-    expect(conflicts.length).toBeGreaterThanOrEqual(4);
-  });
-
-  it("derives the window text from the constant instead of hardcoding a numeral", () => {
-    expect(source).toContain("${turns} 个回合");
-    expect(source).not.toContain("前两个回合");
-  });
-});
+// The absolute-quantifier pattern scan lives in src/static-scan.test.ts: it
+// covers index.ts (exit banner) and every src/prompts/* module, so a prompt edit
+// anywhere trips the same guard instead of only this file.

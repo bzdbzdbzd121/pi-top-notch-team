@@ -47,6 +47,7 @@ import {
   buildSessionEntryNotice,
   buildTeamStateDeclaration,
   decideEntryNotice,
+  SESSION_ENTRY_NOTICE_ANCHOR,
   SESSION_ENTRY_NOTICE_CUSTOM_TYPE,
 } from "./src/prompts/session-transition-notice";
 import { GOAL_CLOSING_PROTOCOL_PROMPT } from "./src/prompts/goal-closing-protocol";
@@ -1210,7 +1211,7 @@ export default function (pi: ExtensionAPI) {
 - 你在历史记录里看到的 \`write_shared_context\`、\`start_member\`、\`team_send_and_wait\`、\`list_members\` 等成功调用都发生在会话结束**之前**，不代表团队会话仍然活跃
 - 你**不再是 Team Lead**，成员进程已全部停止，团队工具（team_send_and_wait、start_member、stop_member、list_members、get_member_log、wait_and_get_member_status、write_shared_context、set_goal、finish_goal 等）已全部停用
 - 请直接以普通模式用 read/bash/edit/write 等常规工具回答用户或完成任务，不要尝试调用团队工具（误调只会得到 "Tool xxx not found" 错误）
-- 对话历史里此前出现的「已进入团队会话」提示（team-session-notice）**同样已失效**；以本提示为准
+- 若历史里出现过「${SESSION_ENTRY_NOTICE_ANCHOR}」系统通知（进入团队会话时注入），它同样已失效；以本提示为准
 - 如果用户需要再次进入团队模式，请告知用户使用 /team start 或 /team dynamic
 `;
       }
