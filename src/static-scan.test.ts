@@ -82,6 +82,12 @@ export function scanLoadSettingsConsumers(root: string): ScanViolation[] {
 // 豁免规则：**零文件级豁免**。判定靠「四特征同句」保证精确，因此不需要例外清单：
 // 出现命中就是文案该改写（限定为进入前 / 冲突情形），而不是往这里加白名单——一份可
 // 豁免的守卫等于没有守卫。
+//
+// 残留误报（已知、刻意接受）：切句只按 。！？；换行，**句内跨逗号**共现仍可能把
+// 两条独立断言拼成四特征齐全。例如「历史里的记录都属于普通模式，切换后以本提示为准」
+// 会被判违规。修法是继续细分到逗号，但那会让「保持宁可漏报不误报」的取向反过来
+// （短句切分更易组合出特征、也更易漏掉真正的长句断言），且零豁免下每次误报都是强制
+// 改文案。故维持现状，命中即人工复核该句是否需要双限定。
 // ────────────────────────────────────────────────────────────────
 
 /**
@@ -99,17 +105,22 @@ export function scanLoadSettingsConsumers(root: string): ScanViolation[] {
  * 状态），因此不存在跨调用污染；保留各特征自身的 flags，不再用 `new RegExp(source)`
  * 重建（那会丢 flags）。
  */
-const ABSOLUTE_CLAIM_FEATURES: ReadonlyArray<{ id: string; label: string; pattern: RegExp }> = [
-  { id: "history-noun", label: "历史名词（历史/记录）", pattern: /历史|记录/ },
-  { id: "quantifier", label: "量词（所有/全部/一切/都/均/一律/无一例外）", pattern: /所有|全部|一切|都|均|一律|无一例外/ },
-  { id: "assertion-predicate", label: "断言谓词（发生在/发生于/属于/视作）", pattern: /发生在|发生于|属于|视作/ },
-  { id: "entry-scope", label: "进入范围词（进入/切换）", pattern: /进入|切换/ },
+const ABSOLUTE_CLAIM_FEATURES: ReadonlyArray<{ id: string; pattern: RegExp }> = [
+  { id: "history-noun", pattern: /历史|记录/ },
+  { id: "quantifier", pattern: /所有|全部|一切|都|均|一律|无一例外/ },
+  { id: "assertion-predicate", pattern: /发生在|发生于|属于|视作/ },
+  { id: "entry-scope", pattern: /进入|切换/ },
 ];
 
-/** 按句切分（。！？与换行都是边界），保留字节偏移以便报告行号。 */
+/**
+ * 按句切分（。！？、**；**与换行都是边界），保留字节偏移以便报告行号。
+ *
+ * `；` 也是边界：分号两侧是两个独立断言（行业写法「A；B」），跨分号组合出的
+ * 「历史 + 量词 + 谓词 + 进入」不是一句完整断言，判它违规就是误报。
+ */
 function splitSentences(source: string): Array<{ text: string; offset: number }> {
   const out: Array<{ text: string; offset: number }> = [];
-  for (const m of source.matchAll(/[^。！？\n]+/g)) {
+  for (const m of source.matchAll(/[^。！？；\n]+/g)) {
     out.push({ text: m[0], offset: m.index ?? 0 });
   }
   return out;
@@ -121,7 +132,10 @@ export interface AbsoluteClaimHit {
   line: number;
   /** 违规句（trim 后），便于直接定位与改写。 */
   sentence: string;
-  /** 缺失特征（用于解释为何判为违规：空数组 = 四特征齐全）。 */
+  /**
+   * 命中的特征 id，顺序与 ABSOLUTE_CLAIM_FEATURES 一致。命中即四特征齐全
+   * （扫描器只在此条件下产出记录），断言该数组等价于断言「规则确实按四特征判定」。
+   */
   matchedFeatures: string[];
 }
 
@@ -202,6 +216,10 @@ describe("静态扫描守卫（决策 #47）：提示词与退场横幅不得含
       "历史里**进入本会话之前**留下的做法属于普通模式",
       // ⑦ 横幅交叉引用句（缩短版）：锚点 + 进入范围，无量词/谓词
       "若历史里出现过以「【系统通知｜团队会话状态】」开头的系统通知（进入团队会话时注入），它同样已失效",
+      // ⑧ 分号两侧各是独立断言：跨分号组合出的四特征不是一句完整断言（审查反例 1）
+      "历史里的记录都属于普通模式；切换后以本提示为准",
+      // ⑨ 同上（审查反例 2）：量词与进入范围分别落在分号两侧
+      "所有历史记录均在批次 2 生成；进入批次 3 时重新校验",
     ];
     for (const text of legitimate) {
       expect(scanAbsoluteHistoryClaims(text), text).toEqual([]);
@@ -222,6 +240,17 @@ describe("静态扫描守卫（决策 #47）：提示词与退场横幅不得含
       "assertion-predicate",
       "entry-scope",
     ]);
+  });
+
+  it("分号也是边界：跨分号的四特征不判违规（去引导断言不影响判定）", () => {
+    // 反例固定：分号两侧是两句独立断言。
+    expect(
+      scanAbsoluteHistoryClaims("历史里的记录都属于普通模式；切换后以本提示为准"),
+    ).toEqual([]);
+    // 同一句内（少一个分号）则仍必须命中——边界不能把守卫变空壳。
+    expect(
+      scanAbsoluteHistoryClaims("历史里的记录都属于普通模式切换后以本提示为准"),
+    ).toHaveLength(1);
   });
 
   it("跨行不断句：一句被换行拆开时分段判定（宁可漏报不误报，规则写明）", () => {
