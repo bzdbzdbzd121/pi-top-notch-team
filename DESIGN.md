@@ -2455,7 +2455,7 @@ resolver 矩阵 8（undefined/true/false/getter 异常/null·undefined settings 
 
 **相位在注入时求值**（`isDynamicSession && dynamicPhase === "design"` → design 变体），不是置位时：动态会话可能中途转执行阶段。**动态执行阶段分支实际不可达**（防御性保留）：`start_member` 硬门控要求共享上下文已写入，成功即同时满足「已运转」→ 决策先返回 `stop`；`handle` 只在 teardown 清除，因此单会话内 `startedMemberCount` 单调不减。
 
-### 34.4 生命周期（六条清理，缺一不可）
+### 34.4 六条生命周期动作（武装 1 + 不武装 2 + 清零 3）
 
 | 时机 | 动作 |
 |---|---|
@@ -2474,7 +2474,7 @@ resolver 矩阵 8（undefined/true/false/getter 异常/null·undefined settings 
 
 ### 34.6 静态守卫与测试
 
-- `src/static-scan.test.ts` 新增绝对化历史断言扫描：范围 `index.ts`（退场横幅）+ `src/prompts/*.ts`（全部提示词模块），三种模式（进入前断言 / 前置量词 / 后置量词），排除 `*.test.ts`。**零文件级豁免**：退场横幅「成功调用都发生在会话结束之前」是对已结束会话的事实陈述，不匹配模式，无需豁免；将来若某文件命中，正确做法是改写文案。
+- `src/static-scan.test.ts` 新增绝对化历史断言扫描：范围 `index.ts`（退场横幅）+ `src/prompts/*.ts`（全部提示词模块），排除 `*.test.ts`。**判定规则 = 四特征同句**（历史名词 历史/记录；量词 所有/全部/一切/都/均/一律/无一例外；断言谓词 发生在/发生于/属于/视作；进入范围词 进入/切换）——只按「历史 + 量词」共现会把「历史里的所有做法都属于普通模式」「所有历史记录均由 extension 维护」这类合法文案判成违规，而零豁免策略会把误报升级为「必须改对文本」。**零文件级豁免**：退场横幅「成功调用都发生在会话结束之前」缺进入范围词，本就不命中；将来若命中应改写文案而非加例外。**扫描范围取舍**：不扩到 `src/tools/*.ts`（工具描述 / promptGuidelines / 拒绝文案讲的是工具用法与拦截原因，不做历史断言）与 `orchestration-playbook.md`（编排方法论）；这些文本的合法措辞与历史断言高度同形，扩面会把守卫变成噪音源。分段判定（按 。！？与换行切句）意味着跨行绝对断言可能漏报——宁漏报不误报的刻意取舍。
 - `src/prompts/session-transition-notice.test.ts`：三变体内容与互斥、`decideEntryNotice` 判定表、两份通知文案的硬要求与纪律矩阵、窗口数字与常量联动、锚点前缀。
 - `src/index.test.ts`「session entry notice」：验收 1–9、11（含 builder 抛错的降级与「失败不消耗计数」）；「session-ended banner」新增痕迹/交叉引用/互斥用例。
 - `src/index-session-entry.agent-session.test.ts`：**请求级**断言（真实 pi AgentSession 夹具）——通知在出站请求中位于用户消息之后、系统提示仍含团队块、会话条目持久化为 `custom_message`、`/team start` 本身零模型请求。
