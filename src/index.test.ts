@@ -1637,7 +1637,10 @@ describe("session-ended banner in before_agent_start", () => {
           {
             type: "custom_message",
             customType: "team-session-notice",
-            display: true,
+            // Real entries carry display:false (the notice is user-invisible).
+            // Trace detection looks at type + customType only, never at display —
+            // that is exactly why the exit banner still fires here.
+            display: false,
             content: "【系统通知｜团队会话状态】…",
           },
         ],

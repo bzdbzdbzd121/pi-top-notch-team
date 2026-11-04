@@ -248,7 +248,10 @@ describe("session entry notice — request-level (real AgentSession)", () => {
     else process.env.TEAM_ROLE = savedTeamRole;
   });
 
-  it("puts the notice after the user message in the outbound request and persists it as a custom entry", async () => {
+  // Explicit timeout: this case drives THREE real prompts through the installed
+  // AgentSession; the 5s default is fine on an idle machine and flaky on a loaded
+  // CI box.
+  it("puts the notice after the user message in the outbound request and persists it as a custom entry", { timeout: 20_000 }, async () => {
     // /team start itself must not call the model — it only flips state.
     await harness.runTeamCommand(`start ${TEAM_NAME}`);
     expect(harness.state.streamCalls).toBe(0);
