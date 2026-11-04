@@ -147,20 +147,29 @@ export interface SessionEntryNotice {
    * and is still persisted, it just is not rendered in the chat history.
    *
    * Verified against both supported pi releases before switching it off (the
-   * trace check depends on persistence, so this could not be assumed):
-   * - enters the context: `convertToLlm` maps `custom` → user role without
-   *   looking at `display` (0.83.0 messages.js case "custom"; 1.5.0 same), and
-   *   the message is pushed into the run's messages regardless of `display`
-   *   (0.83.0 agent-session.js `_preparePromptAndToolLoadout`/prompt path;
-   *   1.5.0 agent-session.js ~1532).
-   * - still persisted: `message_end` with role "custom" always calls
-   *   `appendCustomMessageEntry(..., display, ...)` (0.83.0 ~355; 1.5.0 ~768),
-   *   and `display` is stored on the entry, not used as a filter. So
+   * trace check depends on persistence, so this could not be assumed). Anchors
+   * are SYMBOLS, not line numbers — dist line numbers drift between patch
+   * releases; the same shapes exist in 0.83.0 and 1.5.0:
+   * - enters the context: `convertToLlm`'s `case "custom"` in `core/messages.js`
+   *   maps a custom message to the user role without consulting `display`; the
+   *   prompt path in `core/agent-session.js` pushes the handler's message into
+   *   the run's message list (`messages.push({ role: "custom", ... })` right
+   *   after the `emitBeforeAgentStart` call) — it copies `display` through and
+   *   never filters on it.
+   * - still persisted: the `message_end` branch in `core/agent-session.js`
+   *   (`if (event.message.role === "custom")`) always calls
+   *   `appendCustomMessageEntry(customType, content, display, details)`; the
+   *   flag is stored on the entry and never used as a filter. So
    *   `historyHasTeamTraces` still sees the entry and the exit banner keeps
    *   firing after "entered → discussed → /team stop".
-   * - not rendered: the TUI gates custom messages on `message.display`
-   *   (0.83.0 interactive-mode.js `addMessageToChat` case "custom"; 1.5.0
-   *   ~3217) and, on history replay, on `entry.display` (1.5.0 ~2841).
+   * - not rendered: the TUI's `addMessageToChat` `case "custom"` in
+   *   `modes/interactive/interactive-mode.js` is gated by `if (message.display)`,
+   *   and the history-replay path goes through `sessionEntryToContextMessages` →
+   *   `createCustomMessage` → the same gate (1.5.0 additionally prefilters the
+   *   replay event on `entry.display`).
+   *
+   * Runtime proof: src/index-session-entry.agent-session.test.ts asserts both
+   * the user role in the outbound request and the persisted entry.
    */
   display: false;
   details: {

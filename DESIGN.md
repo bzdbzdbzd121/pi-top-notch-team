@@ -2442,9 +2442,11 @@ resolver 矩阵 8（undefined/true/false/getter 异常/null·undefined settings 
 - **`display: false`（用户裁决，最终定稿）**：通知**不进聊天记录**（不给用户增加噪音），但注入行为、上限、判定、痕迹计入全部不变。`display` 只控制 TUI 渲染，不影响模型可见性与持久化——切换前逐一实读两版 pi dist 确认，因为痕迹判定依赖持久化，不能假设：
   | 结论 | 0.83.0 | 1.5.0 |
   |---|---|---|
-  | (a) 仍进模型上下文（user 角色） | `convertToLlm` 的 `case "custom"` → `{role:"user"}`，不读 `display`（`core/messages.js`）；`before_agent_start` 的 message 恒被 push 进本轮 messages（`core/agent-session.js` prompt 路径） | 同（`core/messages.js` `case "custom"`；`core/agent-session.js` ~1532） |
-  | (b) 仍持久化为 `custom_message` | `message_end` 且 `role === "custom"` → `appendCustomMessageEntry(..., display, ...)` 恒调用，`display` 只被存储（`core/agent-session.js` ~355） | 同（`core/agent-session.js` ~768） |
-  | (c) TUI 不渲染 | `addMessageToChat` 的 `case "custom"` 以 `if (message.display)` 为闸门（`modes/interactive/interactive-mode.js`）；历史回放走 `sessionEntryToContextMessages` → `createCustomMessage(display)` → 同一闸门 | 同（~3217）；历史回放额外以 `entry.type === "custom_message" && entry.display` 先行过滤（~2841） |
+  | (a) 仍进模型上下文（user 角色） | `core/messages.js` 的 `convertToLlm` `case "custom"` → `{role:"user"}`，不读 `display`；`core/agent-session.js` prompt 路径在 `emitBeforeAgentStart` 之后 `messages.push({ role: "custom", … })`，恒入本轮 messages | 同（同样两处符号） |
+  | (b) 仍持久化为 `custom_message` | `core/agent-session.js` 的 `message_end` 分支（`if (event.message.role === "custom")`）恒调 `appendCustomMessageEntry(customType, content, display, details)`，`display` 只被存储 | 同（同一调用处） |
+  | (c) TUI 不渲染 | `modes/interactive/interactive-mode.js` 的 `addMessageToChat` `case "custom"`：`if (message.display)` 闸门；历史回放经 `sessionEntryToContextMessages` → `createCustomMessage(display)` → 同一闸门 | 同（同一闸门）；回放事件另以 `entry.type === "custom_message" && entry.display` 先行过滤 |
+
+  > 引用按符号锚定（`appendCustomMessageEntry` 调用处 / `addMessageToChat` 的 `if (message.display)`），不按行号——dist 行号随补丁版本漂移。
 
   端到端证据不止于读码：`src/index-session-entry.agent-session.test.ts`（真实 AgentSession + 真实 `/team start`）在 `display: false` 下同时断言 (a) 出站请求里通知仍是 user 角色且位于用户消息之后、(b) 会话条目里仍有 `custom_message`（`display === false`）、`/team start` 零模型请求。
 - **首行锚点**：正文以常量 `SESSION_ENTRY_NOTICE_ANCHOR = 「【系统通知｜团队会话状态】」` 开头。它是**唯一**允许被外部引用的字符串（退场横幅用它指向通知）；内部 `customType` 标识符 `team-session-notice` 不得进入模型可见文本。

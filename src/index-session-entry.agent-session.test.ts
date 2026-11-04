@@ -13,6 +13,10 @@ import {
 import { createMockContext } from "./test/fixtures/mock-extension-api";
 import { endSession } from "./session/state";
 import { writeTeam } from "./team/store";
+import {
+  SESSION_ENTRY_NOTICE_ANCHOR,
+  SESSION_ENTRY_NOTICE_MAX_TURNS,
+} from "./prompts/session-transition-notice";
 
 /**
  * Request-level assertion for the session entry notice (stage 1, acceptance 10).
@@ -194,6 +198,13 @@ async function createHarness(): Promise<Harness> {
   };
 }
 
+/** How many notice messages a request carries (each one is a separate user-role part). */
+function countNotices(messages: any[]): number {
+  return messages.filter(
+    (m: any) => m?.role === "user" && messageText(m).includes(SESSION_ENTRY_NOTICE_ANCHOR),
+  ).length;
+}
+
 function messageText(message: any): string {
   if (typeof message?.content === "string") return message.content;
   if (Array.isArray(message?.content)) {
@@ -262,6 +273,7 @@ describe("session entry notice — request-level (real AgentSession)", () => {
     expect(noticeIndex).toBeGreaterThan(userIndex);
     expect(messageText(messages[userIndex])).toBe(userPrompt);
     expect(messageText(messages[noticeIndex])).toContain("不要回复本条");
+    expect(SESSION_ENTRY_NOTICE_MAX_TURNS).toBe(2);
 
     // The team prompt is still active in the same request.
     expect(systemPrompt).toContain("当前任务：Team Lead");
@@ -279,5 +291,25 @@ describe("session entry notice — request-level (real AgentSession)", () => {
     expect(String(noticeEntry.content)).toContain("不要回复本条");
     expect(noticeEntry.details?.kind).toBe("session-entry");
     expect(noticeEntry.details?.teamName).toBe(TEAM_NAME);
+
+    // ── Replay path ──
+    // Turn 2: the persisted entry is re-read through
+    // sessionEntryToContextMessages → convertToLlm and sent again. display:false
+    // is not a filter on that path either.
+    // Turn 1 carried exactly one notice (the fresh injection).
+    expect(countNotices(harness.state.requests[0].messages)).toBe(1);
+
+    // Turn 2 injects once more and replays the first one → two.
+    await harness.session.prompt("第二轮用户消息");
+    expect(harness.state.requests).toHaveLength(2);
+    expect(countNotices(harness.state.requests[1].messages)).toBe(2);
+
+    // Turn 3 closes the window (SESSION_ENTRY_NOTICE_MAX_TURNS = 2 injections),
+    // so the count must stay at two: both occurrences can ONLY come from replay
+    // (a third injection would make it three). This is the assertion that fails
+    // if display:false ever suppresses the replay path.
+    await harness.session.prompt("第三轮用户消息");
+    expect(harness.state.requests).toHaveLength(3);
+    expect(countNotices(harness.state.requests[2].messages)).toBe(2);
   });
 });
