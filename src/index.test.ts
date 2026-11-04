@@ -1248,7 +1248,8 @@ describe("session entry notice", () => {
 
     expect(result.message).toBeDefined();
     expect(result.message.customType).toBe("team-session-notice");
-    expect(result.message.display).toBe(true);
+    // display:false — invisible in the chat history, still in the model context.
+    expect(result.message.display).toBe(false);
     expect(result.message.details).toEqual({
       kind: "session-entry",
       teamName: "entry-team",

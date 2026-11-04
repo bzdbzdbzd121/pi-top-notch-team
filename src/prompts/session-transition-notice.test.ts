@@ -207,7 +207,11 @@ describe("buildSessionEntryNotice — dispatch variant (predefined / dynamic exe
 
   it("returns the shape before_agent_start needs (customType/display/details)", () => {
     expect(notice.customType).toBe(SESSION_ENTRY_NOTICE_CUSTOM_TYPE);
-    expect(notice.display).toBe(true);
+    // User-invisible by decision: display only gates TUI rendering — the message
+    // still enters the model context and is still persisted, which is what the
+    // trace check and the exit banner rely on (contract verified against both
+    // supported pi releases; see the field's doc comment).
+    expect(notice.display).toBe(false);
     expect(notice.details).toEqual({
       kind: "session-entry",
       teamName: "研发队",

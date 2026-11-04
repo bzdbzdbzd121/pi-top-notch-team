@@ -273,7 +273,9 @@ describe("session entry notice — request-level (real AgentSession)", () => {
       (e: any) => e.type === "custom_message" && e.customType === "team-session-notice",
     ) as any;
     expect(noticeEntry).toBeDefined();
-    expect(noticeEntry.display).toBe(true);
+    // display:false keeps it out of the TUI, but persistence is unconditional —
+    // this entry is exactly what historyHasTeamTraces reads for the exit banner.
+    expect(noticeEntry.display).toBe(false);
     expect(String(noticeEntry.content)).toContain("不要回复本条");
     expect(noticeEntry.details?.kind).toBe("session-entry");
     expect(noticeEntry.details?.teamName).toBe(TEAM_NAME);

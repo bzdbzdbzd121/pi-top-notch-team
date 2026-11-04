@@ -142,7 +142,27 @@ export interface SessionEntryNoticeInput {
 export interface SessionEntryNotice {
   customType: string;
   content: string;
-  display: true;
+  /**
+   * User-invisible (user decision): the notice still enters the model context
+   * and is still persisted, it just is not rendered in the chat history.
+   *
+   * Verified against both supported pi releases before switching it off (the
+   * trace check depends on persistence, so this could not be assumed):
+   * - enters the context: `convertToLlm` maps `custom` → user role without
+   *   looking at `display` (0.83.0 messages.js case "custom"; 1.5.0 same), and
+   *   the message is pushed into the run's messages regardless of `display`
+   *   (0.83.0 agent-session.js `_preparePromptAndToolLoadout`/prompt path;
+   *   1.5.0 agent-session.js ~1532).
+   * - still persisted: `message_end` with role "custom" always calls
+   *   `appendCustomMessageEntry(..., display, ...)` (0.83.0 ~355; 1.5.0 ~768),
+   *   and `display` is stored on the entry, not used as a filter. So
+   *   `historyHasTeamTraces` still sees the entry and the exit banner keeps
+   *   firing after "entered → discussed → /team stop".
+   * - not rendered: the TUI gates custom messages on `message.display`
+   *   (0.83.0 interactive-mode.js `addMessageToChat` case "custom"; 1.5.0
+   *   ~3217) and, on history replay, on `entry.display` (1.5.0 ~2841).
+   */
+  display: false;
   details: {
     kind: "session-entry";
     teamName: string;
@@ -206,7 +226,7 @@ ${entryWindowPhrase()}`;
   return {
     customType: SESSION_ENTRY_NOTICE_CUSTOM_TYPE,
     content,
-    display: true,
+    display: false,
     details: {
       kind: "session-entry",
       teamName: input.teamName,

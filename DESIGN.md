@@ -2439,7 +2439,14 @@ resolver 矩阵 8（undefined/true/false/getter 异常/null·undefined settings 
 ### 34.2 进入通知（有界，最多 2 回合）
 
 - **传递方式**：`before_agent_start` 返回 `message`（`Pick<CustomMessage, "customType" | "content" | "display" | "details">`，pi 0.83.0 与 1.5.0 均支持）。pi 将 custom 消息映射为 **user 角色**，位置在用户消息**之后**（生成前最后一段用户角色内容），并持久化为 `custom_message` 会话条目。**不改写用户原话**（`input` 事件加前缀会永久改写输入，进入 transcript / 复制 / fork），**不用即时 `sendMessage`**（流式期间会 steer 打断当前回答，且消费时无法判断会话是否仍活跃），**不依赖 `event.messageType`**（0.83.0 无该字段）。
-- **`display: true`**：用户能在聊天记录里看到这条通知，从而自行判断「这次它到底收到没有」——机制可观察。`display` 只影响用户可见性，不影响模型可见性。
+- **`display: false`（用户裁决，最终定稿）**：通知**不进聊天记录**（不给用户增加噪音），但注入行为、上限、判定、痕迹计入全部不变。`display` 只控制 TUI 渲染，不影响模型可见性与持久化——切换前逐一实读两版 pi dist 确认，因为痕迹判定依赖持久化，不能假设：
+  | 结论 | 0.83.0 | 1.5.0 |
+  |---|---|---|
+  | (a) 仍进模型上下文（user 角色） | `convertToLlm` 的 `case "custom"` → `{role:"user"}`，不读 `display`（`core/messages.js`）；`before_agent_start` 的 message 恒被 push 进本轮 messages（`core/agent-session.js` prompt 路径） | 同（`core/messages.js` `case "custom"`；`core/agent-session.js` ~1532） |
+  | (b) 仍持久化为 `custom_message` | `message_end` 且 `role === "custom"` → `appendCustomMessageEntry(..., display, ...)` 恒调用，`display` 只被存储（`core/agent-session.js` ~355） | 同（`core/agent-session.js` ~768） |
+  | (c) TUI 不渲染 | `addMessageToChat` 的 `case "custom"` 以 `if (message.display)` 为闸门（`modes/interactive/interactive-mode.js`）；历史回放走 `sessionEntryToContextMessages` → `createCustomMessage(display)` → 同一闸门 | 同（~3217）；历史回放额外以 `entry.type === "custom_message" && entry.display` 先行过滤（~2841） |
+
+  端到端证据不止于读码：`src/index-session-entry.agent-session.test.ts`（真实 AgentSession + 真实 `/team start`）在 `display: false` 下同时断言 (a) 出站请求里通知仍是 user 角色且位于用户消息之后、(b) 会话条目里仍有 `custom_message`（`display === false`）、`/team start` 零模型请求。
 - **首行锚点**：正文以常量 `SESSION_ENTRY_NOTICE_ANCHOR = 「【系统通知｜团队会话状态】」` 开头。它是**唯一**允许被外部引用的字符串（退场横幅用它指向通知）；内部 `customType` 标识符 `team-session-notice` 不得进入模型可见文本。
 - **文案硬要求**：① 声明来源（不是用户输入 / 不要回复本条）；② 声明权威且历史断言**双重限定**（只针对进入本会话之前的记录 + 与本提示冲突的做法）；③ 给出**有序动作链**而不是口号（dispatch：`write_shared_context` → `start_member` → `team_send_and_wait`，保留 1-2 文件例外与「闲聊不强行派发」例外；design：对齐 → 计划书 → 明确确认后才落地）。窗口回合数由 `SESSION_ENTRY_NOTICE_MAX_TURNS` 派生，禁止在正文里硬编码数字。
 
@@ -2477,7 +2484,7 @@ resolver 矩阵 8（undefined/true/false/getter 异常/null·undefined settings 
 - `src/static-scan.test.ts` 新增绝对化历史断言扫描：范围 `index.ts`（退场横幅）+ `src/prompts/*.ts`（全部提示词模块），排除 `*.test.ts`。**判定规则 = 四特征同句**（历史名词 历史/记录；量词 所有/全部/一切/都/均/一律/无一例外；断言谓词 发生在/发生于/属于/视作；进入范围词 进入/切换）——只按「历史 + 量词」共现会把「历史里的所有做法都属于普通模式」「所有历史记录均由 extension 维护」这类合法文案判成违规，而零豁免策略会把误报升级为「必须改对文本」。**零文件级豁免**：退场横幅「成功调用都发生在会话结束之前」缺进入范围词，本就不命中；将来若命中应改写文案而非加例外。**扫描范围取舍**：不扩到 `src/tools/*.ts`（工具描述 / promptGuidelines / 拒绝文案讲的是工具用法与拦截原因，不做历史断言）与 `orchestration-playbook.md`（编排方法论）；这些文本的合法措辞与历史断言高度同形，扩面会把守卫变成噪音源。**切句边界**为 。！？、**；** 与换行（分号两侧是两个独立断言，跨分号组合出的四特征不判违规）；跨行绝对断言可能漏报——宁漏报不误报的刻意取舍。**已知残留误报**：句内**跨逗号**共现仍可能把两条独立断言拼成四特征齐全（如「历史里的记录都属于普通模式，切换后以本提示为准」会命中）。不细分到逗号是有意为之：短句切分更易组合出特征、也更易漏掉真正的长句断言，而零豁免下每次误报都是强制改文案；命中即人工复核该句是否需要双限定。
 - `src/prompts/session-transition-notice.test.ts`：三变体内容与互斥、`decideEntryNotice` 判定表、两份通知文案的硬要求与纪律矩阵、窗口数字与常量联动、锚点前缀。
 - `src/index.test.ts`「session entry notice」：验收 1–9、11（含 builder 抛错的降级与「失败不消耗计数」）；「session-ended banner」新增痕迹/交叉引用/互斥用例。
-- `src/index-session-entry.agent-session.test.ts`：**请求级**断言（真实 pi AgentSession 夹具）——通知在出站请求中位于用户消息之后、系统提示仍含团队块、会话条目持久化为 `custom_message`、`/team start` 本身零模型请求。
+- `src/index-session-entry.agent-session.test.ts`：**请求级**断言（真实 pi AgentSession 夹具）——通知在出站请求中位于用户消息之后、系统提示仍含团队块、会话条目持久化为 `custom_message`（`display === false` 仍持久化，这是 (b) 的运行时证据）、`/team start` 本身零模型请求。
 - `src/session/teardown.test.ts`：teardown 清零与「空转 stop 不武装」。
 
 ### 34.7 已知限制
