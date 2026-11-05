@@ -24,7 +24,6 @@ import { resolveMessageCoalescing } from "./src/settings/resolve-message-coalesc
 import { resolvePeerMessaging } from "./src/settings/resolve-peer-messaging";
 import { resolveAgentSessionAllowed } from "./src/settings/resolve-agent-session";
 import { resolveTlSelfWorkGuard } from "./src/settings/resolve-tl-self-work-guard";
-import { DEFAULT_TL_SELF_WORK_GUARD_THRESHOLD } from "./src/settings/tl-self-work-guard-constants";
 import { getSupportedThinkingLevelsFor } from "./src/settings/resolve-thinking";
 import { registerTlTools, type TlToolsDeps } from "./src/tools/tl-tools";
 import { registerGoalTools, registerGoalAgentHandler, resetGoal, GOAL_TOOL_NAMES } from "./src/tools/goal-tools";
@@ -667,12 +666,11 @@ export default function (pi: ExtensionAPI) {
     } catch {
       // 异常回默认（方案阶段 2）：**不得**保留上一次成功解析的配置——上一次若是
       // enabled:false，保留等于「异常期间约束保持关闭」，与 resolver 的「异常保持
-      // 约束」方向相反。这里显式回落「开启 + 默认次数」。
-      tlReadGuard.configure({
-        enabled: true,
-        threshold: DEFAULT_TL_SELF_WORK_GUARD_THRESHOLD,
-      });
-      designReadGuard.configure({ enabled: true });
+      // 约束」方向相反。默认值复用 resolver 的无参形态（同为 开启 + 默认次数，
+      // 本身自带 try/catch），不在这里重复一份「开启 + 默认次数」知识。
+      const fallback = resolveTlSelfWorkGuard();
+      tlReadGuard.configure(fallback);
+      designReadGuard.configure({ enabled: fallback.enabled });
     }
   });
 

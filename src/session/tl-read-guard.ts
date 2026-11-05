@@ -193,7 +193,18 @@ export function createDesignReadGuard(options: DesignReadGuardOptions = {}): Des
     },
 
     configure(config) {
-      enabled = config.enabled;
+      const wasEnabled = enabled;
+      // fail-safe（与执行阶段限制器同款）：只认字面 false。
+      enabled = config.enabled !== false;
+      // 与执行阶段限制器的「关→开从零预算」对称复位：关闭期间不计数，重新开启
+      // 若保留 readCount / justBlocked / firstBlocked，会导致「重新武装后第 N 次
+      // 提醒静默出现」（firstBlock 仍为 false，用户看不到通知），而且周期相位
+      // 会沿用关闭前的余数。生产路径 resetTurn → configure 行为不变（先重置）。
+      if (!wasEnabled && enabled) {
+        readCount = 0;
+        firstBlocked = false;
+        justBlocked = false;
+      }
     },
 
     checkToolCall(toolName, filePath) {
@@ -260,6 +271,11 @@ export function createTlReadGuard(options: TlReadGuardOptions = {}): TlReadGuard
     },
 
     configure(config) {
+      const wasEnabled = enabled;
+      // fail-safe（与 resolver 同款）：只认字面 false；undefined / null / 字符串 /
+      // 其他异常形态一律保持开启。方向与设置层一致——误放宽是静默的角色漂移，
+      // 误拦是响亮的且可当场修正。
+      enabled = config.enabled !== false;
       // 入参防御：非整数 / NaN / 低于下限 → 默认值。调用点（回合边界）已保证
       // 合法值；这里只保证内部状态不变量（不能出现 0 或 NaN 造成的「每调用必拦」）。
       threshold =
@@ -267,8 +283,6 @@ export function createTlReadGuard(options: TlReadGuardOptions = {}): TlReadGuard
         config.threshold >= MIN_TL_SELF_WORK_GUARD_THRESHOLD
           ? config.threshold
           : DEFAULT_TL_SELF_WORK_GUARD_THRESHOLD;
-      const wasEnabled = enabled;
-      enabled = config.enabled;
       // 由关变开：关闭期间不计数，所以重新开启必须从零预算开始——否则残留的
       // sticky 会在开启后的第一次调用上静默拦截（firstBlock=false，用户看不到
       // 通知）。只作用于配置状态转换，resetTurn →configure 生产路径不受影响

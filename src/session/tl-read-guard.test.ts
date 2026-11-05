@@ -510,3 +510,95 @@ describe("设计阶段软提醒的对等入口", () => {
     expect(blocked.reason).toContain("/team setting");
   });
 });
+
+// ── 阶段 2 审查末轮：enabled 入参 fail-safe / 设计限制器复位对称 / 文案双向 ──
+
+describe("configure 的 enabled 入参 fail-safe（异常保持约束）", () => {
+  it("只认字面 false：undefined / null / \"false\" / 0 一律保持开启", () => {
+    const g = createTlReadGuard();
+    for (const bad of [undefined, null, "false", 0]) {
+      g.configure({ enabled: bad as unknown as boolean, threshold: 3 });
+      expect(g.enabled).toBe(true);
+    }
+    g.configure({ enabled: false, threshold: 3 });
+    expect(g.enabled).toBe(false);
+  });
+
+  it("fail-safe 后仍会拦截（不是静默关闭）", () => {
+    const g = createTlReadGuard();
+    g.configure({ enabled: undefined as unknown as boolean, threshold: 2 });
+    for (const p of ["src/a.ts", "src/b.ts"]) expect(g.checkToolCall("read", p).block).toBe(false);
+    expect(g.checkToolCall("read", "src/c.ts").block).toBe(true);
+  });
+});
+
+describe("createDesignReadGuard — 关→开复位对称 + enabled fail-safe", () => {
+  it("关→开复位 readCount / justBlocked / firstBlocked（与执行阶段限制器对称）", () => {
+    const g = createDesignReadGuard();
+    for (const p of ["src/a.ts", "src/b.ts", "src/c.ts"]) g.checkToolCall("read", p);
+    expect(g.checkToolCall("read", "src/d.ts").block).toBe(true); // 4th, firstBlock
+    expect(g.readCount).toBe(4);
+
+    g.configure({ enabled: false });
+    g.configure({ enabled: true });
+
+    // 关闭期间不计数 → 重新开启从零预算开始（对称复位）
+    expect(g.readCount).toBe(0);
+    for (const p of ["src/e.ts", "src/f.ts", "src/g.ts"]) {
+      expect(g.checkToolCall("read", p).block).toBe(false);
+    }
+    const again = g.checkToolCall("read", "src/h.ts");
+    expect(again.block).toBe(true);
+    // 重新武装后 firstBlock 重新为真（用户可见通知恢复，而不是沉默的第 N 次提醒）
+    expect(again.firstBlock).toBe(true);
+  });
+
+  it("同状态 / 关→关的 configure 不清零（生产路径 resetTurn → configure 行为不变）", () => {
+    const g = createDesignReadGuard();
+    g.checkToolCall("read", "src/a.ts");
+    g.checkToolCall("read", "src/b.ts");
+    g.configure({ enabled: true }); // 已开启 → 不动
+    expect(g.readCount).toBe(2);
+    g.configure({ enabled: false }); // 开→关 → 不清（关闭期间本就不计数）
+    expect(g.readCount).toBe(2);
+  });
+
+  it("fail-safe: enabled 非字面 false 一律保持开启", () => {
+    const g = createDesignReadGuard();
+    for (const bad of [undefined, null, "false", 0]) {
+      g.configure({ enabled: bad as unknown as boolean });
+      expect(g.enabled).toBe(true);
+    }
+    g.configure({ enabled: false });
+    expect(g.enabled).toBe(false);
+  });
+});
+
+describe("豁免文案双向断言（解析文案，而不是采样几个工具）", () => {
+  /** 从 EXEMPT_ACTIONS_LINE 解析出被广告为「不受此限制」的工具名。 */
+  function advertisedTools(): string[] {
+    const bullet = EXEMPT_ACTIONS_LINE.split("\n").find((line) =>
+      line.startsWith("• 以下动作不受此限制")
+    );
+    expect(bullet).toBeDefined();
+    // 取冒号后的工具枚举；「，以及读取 .md 文档（…）」不是工具名，先切掉。
+    const payload = bullet!.slice(bullet!.indexOf("：") + 1).split("，以及")[0];
+    return payload
+      .split("、")
+      .flatMap((seg) => seg.replace(/（[^）]*）/g, "").trim().split("/"))
+      .map((seg) => seg.replace(/。$/, "").trim())
+      .filter((seg) => /^[a-z_][a-z0-9_]*$/.test(seg));
+  }
+
+  it("解析出的每一项都 ∈ MANAGEMENT_TOOLS（文案不得广告会计数的工具）", () => {
+    const advertised = advertisedTools();
+    expect(advertised.length).toBeGreaterThan(10);
+    for (const tool of advertised) {
+      expect(MANAGEMENT_TOOLS.has(tool)).toBe(true);
+    }
+  });
+
+  it("解析结果与 MANAGEMENT_TOOLS 完全一致（无遗漏、无多余）", () => {
+    expect(advertisedTools().sort()).toEqual([...MANAGEMENT_TOOLS].sort());
+  });
+});
