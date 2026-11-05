@@ -23,6 +23,7 @@ import { resolveAutoCompact } from "./src/settings/resolve-auto-compact";
 import { resolveMessageCoalescing } from "./src/settings/resolve-message-coalescing";
 import { resolvePeerMessaging } from "./src/settings/resolve-peer-messaging";
 import { resolveAgentSessionAllowed } from "./src/settings/resolve-agent-session";
+import { resolveTlSelfWorkGuard } from "./src/settings/resolve-tl-self-work-guard";
 import { getSupportedThinkingLevelsFor } from "./src/settings/resolve-thinking";
 import { registerTlTools, type TlToolsDeps } from "./src/tools/tl-tools";
 import { registerGoalTools, registerGoalAgentHandler, resetGoal, GOAL_TOOL_NAMES } from "./src/tools/goal-tools";
@@ -650,6 +651,19 @@ export default function (pi: ExtensionAPI) {
       ctx?.ui?.setStatus?.("tl-pre-dispatch-guard", undefined);
       ctx?.ui?.setStatus?.("tl-design-read-guard", undefined);
     } catch { /* fail-open */ }
+
+    // 阶段 2：回合边界解析并注入生效配置（开关 + 次数）。仅团队会话读取设置，
+    // 非团队会话零额外 IO。解析必须包 try/catch 且放在回合开始事件里——两个事件
+    // 的异常后果不对称：本事件的处理器抛错只记一条扩展错误，而工具调用事件的
+    // 处理器抛错会被包成 `Extension failed, blocking execution`，等于每次工具
+    // 调用都被阻断。异常方向 = 保持上一次成功解析的配置（首次即默认 开启+3）。
+    try {
+      if (getSessionState().active) {
+        const cfg = resolveTlSelfWorkGuard(getEffectiveSettings());
+        tlReadGuard.configure({ enabled: cfg.enabled, threshold: cfg.threshold });
+        designReadGuard.configure({ enabled: cfg.enabled });
+      }
+    } catch { /* fail-open: 保持现有配置（默认 = 开启、每回合 3 次）*/ }
   });
 
   // ── Call-level guard: whitelist-based blocking during team session ───
@@ -752,7 +766,7 @@ export default function (pi: ExtensionAPI) {
           if (verdict.firstBlock) {
             try {
               ctx?.ui?.notify?.(
-                `⚠️ 已拦截 TL 在未派发任务情况下的亲自分析（第 ${tlReadGuard.preDispatchCalls} 次工具调用）— 请通过 team_send_and_wait 派发任务给 Member`,
+                `⚠️ 已拦截 TL 在未派发任务情况下的亲自分析（本回合第 ${tlReadGuard.preDispatchCalls} 次工具调用；上限 ${tlReadGuard.threshold} 次/回合，可在 /team setting 调整或关闭）— 请通过 team_send_and_wait 派发任务给 Member`,
                 "warning"
               );
               ctx?.ui?.setStatus?.("tl-pre-dispatch-guard", "⚠️ TL 未派发任务 — 亲自分析已被持续拦截，直到 team_send_and_wait");

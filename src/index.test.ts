@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from "vitest";
-import { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -612,13 +612,24 @@ describe("TL first-action protocol prompt injection", () => {
 
 describe("TL pre-dispatch guard in tool_call handler", () => {
   let pi: ExtensionAPI;
+  let tmpDir: string;
 
   beforeEach(async () => {
     vi.resetModules();
     delete process.env.TEAM_ROLE;
+    // 测试隔离（阶段 2）：agent_start 现在会在团队会话活跃时解析生效设置。
+    // 不指向临时目录的话，本组会读开发者本机真实 settings.yaml——本机若把上限
+    // 改成 10 或关闭，下面「第 4 次被拦」的用例会随机变红。
+    tmpDir = mkdtempSync(join(tmpdir(), "tl-pre-dispatch-guard-"));
+    process.env.TOP_NOTCH_TEAM_ROOT = tmpDir;
     pi = createMockPi();
     const mod = await import("../index");
     mod.default(pi);
+  });
+
+  afterEach(() => {
+    delete process.env.TOP_NOTCH_TEAM_ROOT;
+    rmSync(tmpDir, { recursive: true, force: true });
   });
 
   function getHandler(name: string): Function {
@@ -1969,12 +1980,14 @@ describe("per-session settings wiring (阶段 2)", () => {
     expect(loadSettingsCallSites.length).toBe(0);
     // 唯一入口形态：委托合并层
     expect(source).toContain("loadEffectiveSettings(getRootDir())");
-    // 9 个消费点全部经 getEffectiveSettings：getAutoCompact×2 / getCoalescing /
+    // 10 个消费点全部经 getEffectiveSettings：getAutoCompact×2 / getCoalescing /
     // getPeerMessagingAllowed（P2）/ getSettings（tlToolsDeps）+ buildMemberConfig 两
     // 调用点（start_member、startResumedMember）/ start_team_session getSettings
-    // （阶段② L2 execute 门控）/ startTeamSessionVisible（阶段③ L1 可见性门控）
+    // （阶段② L2 execute 门控）/ startTeamSessionVisible（阶段③ L1 可见性门控）/
+    // 阶段 2：回合边界 TL 亲自分析限制（resolveTlSelfWorkGuard，团队会话才读）。
+    // 计数是刻意锁死的：新增消费点必须经合并层，且这里要同步 +1（而不是静默漂移）。
     const effectiveCalls = source.match(/getEffectiveSettings\(\)/g) ?? [];
-    expect(effectiveCalls.length).toBe(9);
+    expect(effectiveCalls.length).toBe(10);
   });
 });
 
@@ -2185,5 +2198,245 @@ describe("per-session settings active-period wiring (阶段 3)", () => {
     );
     // handleResume 内唯一加载点（startResumedMember 之前）
     expect((resumeSource.match(/loadSessionSettingsSnapshot\(/g) ?? []).length).toBe(1);
+  });
+});
+
+// ── 阶段 2：TL 亲自分析限制可配置（开关 / 次数 / 回合边界）──────────
+// Handlers 只做「按当前配置判定」，配置在回合边界（agent_start）解析一次——
+// 所以每个用例都显式跑 agent_start，模拟真实回合开始。
+
+describe("TL self-work guard configurability (阶段 2)", () => {
+  let pi: ExtensionAPI;
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    delete process.env.TEAM_ROLE;
+    tmpDir = mkdtempSync(join(tmpdir(), "tl-self-work-guard-"));
+    process.env.TOP_NOTCH_TEAM_ROOT = tmpDir;
+    pi = createMockPi();
+    const mod = await import("../index");
+    mod.default(pi);
+  });
+
+  afterEach(() => {
+    delete process.env.TOP_NOTCH_TEAM_ROOT;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function getHandler(name: string): Function {
+    const onCalls = (pi.on as ReturnType<typeof vi.fn>).mock.calls;
+    return onCalls.find((c: any) => c[0] === name)![1];
+  }
+
+  async function startActiveSession() {
+    const { startSession, endSession } = await import("./session/state");
+    endSession();
+    startSession({
+      name: "test-team",
+      description: "Test",
+      members: [{ name: "worker", systemPrompt: "do work" }],
+    });
+  }
+
+  async function enterDesignPhase() {
+    const cmdDef = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    await cmdDef.handler("dynamic", createMockContext());
+  }
+
+  function writeSettings(yaml: string): void {
+    writeFileSync(join(tmpDir, "settings.yaml"), yaml, "utf-8");
+  }
+
+  /** 断言：没有任何「警示」类状态栏写入（undefined = 清除，允许）。 */
+  function statusWrites(ui: ReturnType<typeof createMockUi>): unknown[][] {
+    return ui.setStatus.mock.calls.filter((c: any[]) => c[1] !== undefined);
+  }
+
+  it("关闭后连读 6 个代码文件全放行：零通知、零状态栏、零计数（验收 1）", async () => {
+    writeSettings("tlSelfWorkGuard:\n  enabled: false\n");
+    await startActiveSession();
+    const agentStart = getHandler("agent_start");
+    const toolCall = getHandler("tool_call");
+    const ui = createMockUi();
+    const ctx = { ui };
+
+    agentStart({}, ctx);
+    for (let i = 0; i < 6; i++) {
+      expect(toolCall({ toolName: "read", input: { path: `src/f${i}.ts` } }, ctx)).toBeUndefined();
+    }
+    expect(ui.notify).not.toHaveBeenCalled();
+    expect(statusWrites(ui)).toEqual([]);
+    // 计数为 0 由单元测试锁定（guard 不对外暴露实例）；这里锁「放行 + 无告警」。
+  });
+
+  it("关闭后混杂工具也不拦（bash/web_search 同样放行）", async () => {
+    writeSettings("tlSelfWorkGuard:\n  enabled: false\n");
+    await startActiveSession();
+    const agentStart = getHandler("agent_start");
+    const toolCall = getHandler("tool_call");
+    agentStart({}, undefined);
+    for (let i = 0; i < 5; i++) {
+      expect(toolCall({ toolName: "bash", input: { command: "grep foo src/" } })).toBeUndefined();
+      expect(toolCall({ toolName: "web_search", input: { query: "x" } })).toBeUndefined();
+    }
+  });
+
+  it("上限 5：前 5 次放行，第 6 次拦截，文案含「5 次/回合」与 write_shared_context（验收 2）", async () => {
+    writeSettings("tlSelfWorkGuard:\n  enabled: true\n  threshold: 5\n");
+    await startActiveSession();
+    const agentStart = getHandler("agent_start");
+    const toolCall = getHandler("tool_call");
+    agentStart({}, undefined);
+
+    for (let i = 0; i < 5; i++) {
+      expect(toolCall({ toolName: "read", input: { path: `src/f${i}.ts` } })).toBeUndefined();
+    }
+    const blocked = toolCall({ toolName: "read", input: { path: "src/g.ts" } });
+    expect(blocked).toEqual(expect.objectContaining({ block: true }));
+    expect(blocked.reason).toContain("5 次/回合");
+    expect(blocked.reason).toContain("write_shared_context");
+    // 仍必须提到解锁方式（既有语义不变）
+    expect(blocked.reason).toContain("team_send_and_wait");
+    // sticky 保持
+    expect(toolCall({ toolName: "read", input: { path: "src/h.ts" } })).toEqual(
+      expect.objectContaining({ block: true })
+    );
+  });
+
+  it("坏 YAML：按默认（开启、3）工作，且处理器不抛错（无 Extension failed，验收 4）", async () => {
+    writeSettings("tlSelfWorkGuard: {enabled: false\n"); // 故意损坏
+    await startActiveSession();
+    const agentStart = getHandler("agent_start");
+    const toolCall = getHandler("tool_call");
+
+    // 事件处理器抛错会被 pi 包成 `Extension failed, blocking execution` ——
+    // 直接断言不抛（工具调用事件没有异常兜底，抛错会阻断每一次工具调用）。
+    expect(() => agentStart({}, undefined)).not.toThrow();
+    for (const p of ["src/a.ts", "src/b.ts", "src/c.ts"]) {
+      expect(() => toolCall({ toolName: "read", input: { path: p } })).not.toThrow();
+    }
+    // 默认值 = 改造前行为：第 4 次拦截
+    expect(toolCall({ toolName: "read", input: { path: "src/d.ts" } })).toEqual(
+      expect.objectContaining({ block: true })
+    );
+  });
+
+  it("设计阶段关闭：连读 8 个全放行、零通知（验收 3a）", async () => {
+    writeSettings("tlSelfWorkGuard:\n  enabled: false\n");
+    await enterDesignPhase();
+    const agentStart = getHandler("agent_start");
+    const toolCall = getHandler("tool_call");
+    const ui = createMockUi();
+    const ctx = { ui };
+
+    agentStart({}, ctx);
+    for (let i = 0; i < 8; i++) {
+      expect(toolCall({ toolName: "read", input: { path: `src/f${i}.ts` } }, ctx)).toBeUndefined();
+    }
+    expect(ui.notify).not.toHaveBeenCalled();
+    expect(statusWrites(ui)).toEqual([]);
+  });
+
+  it("设计阶段开启（默认）：第 4 次仍被软提醒（验收 3b，既有行为不变）", async () => {
+    await enterDesignPhase();
+    const agentStart = getHandler("agent_start");
+    const toolCall = getHandler("tool_call");
+    agentStart({}, undefined);
+
+    for (const p of ["src/a.ts", "src/b.ts", "src/c.ts"]) {
+      expect(toolCall({ toolName: "read", input: { path: p } })).toBeUndefined();
+    }
+    const blocked = toolCall({ toolName: "read", input: { path: "src/d.ts" } });
+    expect(blocked).toEqual(expect.objectContaining({ block: true }));
+    expect(blocked.reason).toContain("再次调用 read");
+    // 软提醒：下一次放行
+    expect(toolCall({ toolName: "read", input: { path: "src/e.ts" } })).toBeUndefined();
+  });
+
+  it("回合边界生效：回合内改设置不改变当前回合，下一回合生效", async () => {
+    await startActiveSession();
+    const agentStart = getHandler("agent_start");
+    const toolCall = getHandler("tool_call");
+    const read = (p: string) => toolCall({ toolName: "read", input: { path: p } });
+
+    agentStart({}, undefined);
+    read("src/a.ts");
+    read("src/b.ts");
+    read("src/c.ts");
+    expect(read("src/d.ts")).toEqual(expect.objectContaining({ block: true })); // sticky
+
+    // TL 回答过程中把限制关掉 —— 当前回合仍按旧值（回合内不重读设置）
+    writeSettings("tlSelfWorkGuard:\n  enabled: false\n");
+    expect(read("src/e.ts")).toEqual(expect.objectContaining({ block: true }));
+
+    // 下一回合边界：新配置生效
+    agentStart({}, undefined);
+    for (let i = 0; i < 6; i++) {
+      expect(read(`src/f${i}.ts`)).toBeUndefined();
+    }
+  });
+
+  it("把上限从 3 调到 7 后，第 8 次才拦（下一回合生效）", async () => {
+    await startActiveSession();
+    const agentStart = getHandler("agent_start");
+    const toolCall = getHandler("tool_call");
+    const read = (p: string) => toolCall({ toolName: "read", input: { path: p } });
+
+    writeSettings("tlSelfWorkGuard:\n  enabled: true\n  threshold: 7\n");
+    agentStart({}, undefined);
+    for (let i = 0; i < 7; i++) {
+      expect(read(`src/f${i}.ts`)).toBeUndefined();
+    }
+    expect(read("src/g.ts")).toEqual(expect.objectContaining({ block: true }));
+  });
+
+  it("链式回归：粘滞 → write_shared_context 放行 → start_member 放行 → 派发 → read 放行（验收 5）", async () => {
+    await startActiveSession();
+    const agentStart = getHandler("agent_start");
+    const toolCall = getHandler("tool_call");
+
+    agentStart({}, undefined);
+    for (const p of ["src/a.ts", "src/b.ts", "src/c.ts"]) {
+      toolCall({ toolName: "read", input: { path: p } });
+    }
+    expect(toolCall({ toolName: "read", input: { path: "src/d.ts" } })).toEqual(
+      expect.objectContaining({ block: true })
+    );
+
+    // 协议第 1 步：写入共享上下文（否则 start_member 被硬门控拒绝）
+    expect(
+      toolCall({ toolName: "write_shared_context", input: { content: "# ctx" } })
+    ).toBeUndefined();
+    // 协议第 2 步：启动成员
+    expect(toolCall({ toolName: "start_member", input: { name: "worker" } })).toBeUndefined();
+    // 协议第 3 步：派发（解锁）
+    expect(
+      toolCall({
+        toolName: "team_send_and_wait",
+        input: { tasks: [{ to: "worker", content: "go" }] },
+      })
+    ).toBeUndefined();
+    // 派发后的读取视为协调/审阅
+    expect(toolCall({ toolName: "read", input: { path: "src/after.ts" } })).toBeUndefined();
+  });
+
+  it("关闭态下协议工具仍然可用（write_shared_context / start_member / 派发）", async () => {
+    writeSettings("tlSelfWorkGuard:\n  enabled: false\n");
+    await startActiveSession();
+    const agentStart = getHandler("agent_start");
+    const toolCall = getHandler("tool_call");
+    agentStart({}, undefined);
+
+    expect(
+      toolCall({ toolName: "write_shared_context", input: { content: "# ctx" } })
+    ).toBeUndefined();
+    expect(toolCall({ toolName: "start_member", input: { name: "worker" } })).toBeUndefined();
+    expect(
+      toolCall({
+        toolName: "team_send_and_wait",
+        input: { tasks: [{ to: "worker", content: "go" }] },
+      })
+    ).toBeUndefined();
   });
 });

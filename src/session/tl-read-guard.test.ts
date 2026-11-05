@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { createTlReadGuard, createDesignReadGuard, MANAGEMENT_TOOLS } from "./tl-read-guard";
+import {
+  createTlReadGuard,
+  createDesignReadGuard,
+  MANAGEMENT_TOOLS,
+  DESIGN_READ_GUARD_THRESHOLD,
+} from "./tl-read-guard";
+import { SESSION_TOOL_NAMES } from "./session-tool-visibility";
 
 describe("createDesignReadGuard", () => {
   it("allows .md reads without counting them (docs are legitimate design work)", () => {
@@ -238,5 +244,181 @@ describe("createTlReadGuard", () => {
     expect(g.checkToolCall("write", "shared-context.md").block).toBe(false);
     expect(g.checkToolCall("edit", "some.md").block).toBe(false);
     expect(g.preDispatchCalls).toBe(0);
+  });
+});
+
+// ── 阶段 2：可配置（开关 / 次数）+ 豁免不变式 ──────────────────────
+
+describe("createTlReadGuard — 可配置（阶段 2）", () => {
+  const EXEMPT_LIST_MARKER = "以下动作不受此限制";
+
+  it("defaults to 3 and enabled (缺省即现状)", () => {
+    const g = createTlReadGuard();
+    expect(g.enabled).toBe(true);
+    expect(g.threshold).toBe(3);
+  });
+
+  it("disabled: every code read passes and nothing is counted (preDispatchCalls stays 0)", () => {
+    const g = createTlReadGuard({ enabled: false });
+    for (let i = 0; i < 6; i++) {
+      expect(g.checkToolCall("read", `src/f${i}.ts`).block).toBe(false);
+    }
+    // 关闭期间不计数：否则重新开启时会立刻粘滞（历史累计变成隐藏的惩罚）
+    expect(g.preDispatchCalls).toBe(0);
+  });
+
+  it("disabled: non-read tools also pass and stay uncounted", () => {
+    const g = createTlReadGuard({ enabled: false });
+    for (const tool of ["bash", "web_search", "ctx_execute", "fetch_content"]) {
+      expect(g.checkToolCall(tool, undefined).block).toBe(false);
+    }
+    expect(g.preDispatchCalls).toBe(0);
+  });
+
+  it("configure() applies a new threshold mid-turn WITHOUT resetting the turn counter", () => {
+    const g = createTlReadGuard();
+    g.checkToolCall("read", "src/a.ts"); // count = 1
+    g.configure({ enabled: true, threshold: 5 });
+    expect(g.threshold).toBe(5);
+    expect(g.preDispatchCalls).toBe(1);
+    // 剩余预算 = 5 - 1 = 4 次
+    for (const p of ["src/b.ts", "src/c.ts", "src/d.ts", "src/e.ts"]) {
+      expect(g.checkToolCall("read", p).block).toBe(false);
+    }
+    expect(g.checkToolCall("read", "src/f.ts").block).toBe(true);
+  });
+
+  it("configure({enabled:false}) mid-turn stops blocking immediately but keeps the count", () => {
+    const g = createTlReadGuard();
+    for (const p of ["src/a.ts", "src/b.ts", "src/c.ts"]) g.checkToolCall("read", p);
+    expect(g.checkToolCall("read", "src/d.ts").block).toBe(true); // sticky
+    g.configure({ enabled: false, threshold: 3 });
+    expect(g.enabled).toBe(false);
+    // 关闭后连读放行（粘滞态被绕过），计数冻结在 4（不重置、不增长）
+    for (let i = 0; i < 6; i++) {
+      expect(g.checkToolCall("read", `src/x${i}.ts`).block).toBe(false);
+    }
+    expect(g.preDispatchCalls).toBe(4);
+  });
+
+  it("blocking reasons carry the current threshold and the exempt-action list", () => {
+    const g = createTlReadGuard({ threshold: 5 });
+    for (let i = 0; i < 5; i++) expect(g.checkToolCall("read", `src/f${i}.ts`).block).toBe(false);
+
+    const first = g.checkToolCall("read", "src/g.ts");
+    expect(first.block).toBe(true);
+    expect(first.reason).toContain("5 次/回合");
+    expect(first.reason).toContain(EXEMPT_LIST_MARKER);
+    expect(first.reason).toContain("write_shared_context");
+    expect(first.reason).toContain("start_member");
+    expect(first.reason).toContain("/team setting");
+
+    const sticky = g.checkToolCall("read", "src/h.ts");
+    expect(sticky.block).toBe(true);
+    expect(sticky.reason).toContain("5 次/回合");
+    expect(sticky.reason).toContain(EXEMPT_LIST_MARKER);
+    expect(sticky.reason).toContain("write_shared_context");
+    expect(sticky.reason).toContain("/team setting");
+  });
+
+  it(".md reads stay exempt while sticky and never increment the counter (safety valve before counting)", () => {
+    const g = createTlReadGuard({ threshold: 2 });
+    g.checkToolCall("read", "src/a.ts");
+    g.checkToolCall("read", "src/b.ts");
+    expect(g.checkToolCall("read", "src/c.ts").block).toBe(true); // sticky
+    const before = g.preDispatchCalls;
+    for (let i = 0; i < 5; i++) {
+      expect(g.checkToolCall("read", "DESIGN.md").block).toBe(false);
+      expect(g.checkToolCall("read", undefined).block).toBe(false);
+    }
+    expect(g.preDispatchCalls).toBe(before);
+  });
+
+  it("management tools stay usable while disabled or sticky (dispatch path never closes)", () => {
+    for (const enabled of [true, false]) {
+      const g = createTlReadGuard({ enabled, threshold: 2 });
+      g.checkToolCall("read", "src/a.ts");
+      g.checkToolCall("read", "src/b.ts");
+      g.checkToolCall("read", "src/c.ts");
+      for (const tool of MANAGEMENT_TOOLS) {
+        expect(g.checkToolCall(tool, undefined).block).toBe(false);
+      }
+    }
+  });
+
+  it("resetTurn keeps the configured threshold/enabled (配置按回合边界注入，不随重置丢失)", () => {
+    const g = createTlReadGuard();
+    g.configure({ enabled: false, threshold: 7 });
+    g.resetTurn();
+    expect(g.enabled).toBe(false);
+    expect(g.threshold).toBe(7);
+  });
+});
+
+describe("createDesignReadGuard — 可配置（阶段 2）", () => {
+  it("keeps the fixed rhythm of 4 (named constant, independent of the execution-phase threshold)", () => {
+    expect(DESIGN_READ_GUARD_THRESHOLD).toBe(4);
+    const g = createDesignReadGuard();
+    expect(g.enabled).toBe(true);
+    for (const p of ["src/a.ts", "src/b.ts", "src/c.ts"]) {
+      expect(g.checkToolCall("read", p).block).toBe(false);
+    }
+    expect(g.checkToolCall("read", "src/d.ts").block).toBe(true);
+  });
+
+  it("disabled: 8 code reads pass and readCount stays 0 (关闭时完全不计数)", () => {
+    const g = createDesignReadGuard({ enabled: false });
+    for (let i = 0; i < 8; i++) {
+      expect(g.checkToolCall("read", `src/f${i}.ts`).block).toBe(false);
+    }
+    expect(g.readCount).toBe(0);
+  });
+
+  it("configure({enabled:false}) mid-turn stops the reminders immediately", () => {
+    const g = createDesignReadGuard();
+    for (const p of ["src/a.ts", "src/b.ts", "src/c.ts"]) g.checkToolCall("read", p);
+    expect(g.checkToolCall("read", "src/d.ts").block).toBe(true); // 4th
+    g.configure({ enabled: false });
+    for (let i = 0; i < 8; i++) {
+      expect(g.checkToolCall("read", `src/x${i}.ts`).block).toBe(false);
+    }
+  });
+
+  it("enabled again: the rhythm resumes (soft reminders, never sticky)", () => {
+    const g = createDesignReadGuard({ enabled: false });
+    for (let i = 0; i < 4; i++) g.checkToolCall("read", `src/f${i}.ts`);
+    g.configure({ enabled: true });
+    // readCount 未增长（关闭期间不计数）→ 重新开启后前 3 次仍放行
+    for (const p of ["src/g.ts", "src/h.ts", "src/i.ts"]) {
+      expect(g.checkToolCall("read", p).block).toBe(false);
+    }
+    expect(g.checkToolCall("read", "src/j.ts").block).toBe(true);
+  });
+});
+
+describe("豁免名单不变式（协议依赖的工具永不计数）", () => {
+  it("tools the start_member hard gate depends on are exempt (死锁类缺陷的直接护栏)", () => {
+    // write_shared_context 未写入前 start_member 被硬门控拒绝；若前者被计数，
+    // 粘滞态下二者互相锁死，TL 只能回头找用户（真实缺陷回归护栏）。
+    for (const tool of ["write_shared_context", "start_member"]) {
+      expect(MANAGEMENT_TOOLS.has(tool)).toBe(true);
+    }
+  });
+
+  it("every session-scoped team tool is exempt (consistency snapshot — 变红 = 设计决策点，不是自动加白名单)", () => {
+    for (const tool of SESSION_TOOL_NAMES) {
+      expect(MANAGEMENT_TOOLS.has(tool)).toBe(true);
+    }
+  });
+
+  it("exempt tools never unlock the guard (they do not reset the counter either)", () => {
+    const g = createTlReadGuard({ threshold: 2 });
+    g.checkToolCall("read", "src/a.ts");
+    g.checkToolCall("write_shared_context", undefined);
+    g.checkToolCall("start_member", undefined);
+    expect(g.preDispatchCalls).toBe(1);
+    // 仍然只有派发能解锁：豁免调用不改变粘滞判定
+    g.checkToolCall("read", "src/b.ts");
+    expect(g.checkToolCall("read", "src/c.ts").block).toBe(true);
   });
 });
