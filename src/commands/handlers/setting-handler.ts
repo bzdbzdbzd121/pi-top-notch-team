@@ -174,6 +174,10 @@ export async function handleSetting(
         }${SCOPE_LABEL.global}`
       : `${OPT_SCOPE}：全局（临时设置不可用：无法获取当前 pi 会话）`;
 
+    // 尺寸测量（阶段 4 审查）：当前顶层 10 项（有临时设置时 11 项），最长标签约
+    // 74 列（成员默认模型带 model ref 时），含标题/提示的整屏高度约 14 行——在常规
+    // 终端（≥ 80×24）内完整可见，故仍用 ctx.ui.select。**再增项（≥ 12）应迁
+    // src/ui/scroll-select.ts 的 scrollSelect**：内置 select 不做滚动，短终端会截断。
     const items = [
       scopeItem,
       `${OPT_MEMBER_MODEL}（当前：${describeMemberModelSetting(effective, currentModelRef(ctx))}）${badge("memberModel")}${teamYamlNote ? `（${teamYamlNote}）` : ""}`,
@@ -604,9 +608,16 @@ async function configureTlSelfWorkGuard(
       );
       if (text === undefined) continue; // Esc
       const n = Number(text.trim());
-      if (!Number.isInteger(n) || n < MIN_TL_SELF_WORK_GUARD_THRESHOLD) {
+      // 上界与 settings.ts 解析、session-settings 快照 sanitize 同一区间
+      // （[MIN, Number.MAX_SAFE_INTEGER]）：超出安全整数区间的数字不可能是真实
+      // 配置，静默接受等于静默关闭约束（1e30 实际等价于永不拦截）。
+      if (
+        !Number.isInteger(n) ||
+        n < MIN_TL_SELF_WORK_GUARD_THRESHOLD ||
+        n > Number.MAX_SAFE_INTEGER
+      ) {
         ctx.ui.notify(
-          `无效输入：请输入 ≥ ${MIN_TL_SELF_WORK_GUARD_THRESHOLD} 的整数（下限 ${MIN_TL_SELF_WORK_GUARD_THRESHOLD}；要关闭请用开关）。未保存。`,
+          `无效输入：请输入 ≥ ${MIN_TL_SELF_WORK_GUARD_THRESHOLD} 且不超过 ${Number.MAX_SAFE_INTEGER} 的整数（下限 ${MIN_TL_SELF_WORK_GUARD_THRESHOLD}；要关闭请用开关）。未保存。`,
           "warning"
         );
         continue;

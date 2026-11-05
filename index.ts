@@ -785,7 +785,7 @@ export default function (pi: ExtensionAPI) {
           if (verdict.firstBlock) {
             try {
               ctx?.ui?.notify?.(
-                `⚠️ 已拦截 TL 在未派发任务情况下的亲自分析（本回合第 ${tlReadGuard.preDispatchCalls} 次工具调用；上限 ${tlReadGuard.threshold} 次/回合，可在 /team setting 调整或关闭）— 请通过 team_send_and_wait 派发任务给 Member；write_shared_context、add_dynamic_member 等管理工具不受此限制`,
+                `⚠️ 已拦截 TL 在未派发任务情况下的亲自分析（本回合第 ${tlReadGuard.preDispatchCalls} 次工具调用；上限 ${tlReadGuard.threshold} 次/回合，可在 /team setting →「TL 亲自分析限制」调整或关闭）— 请通过 team_send_and_wait 派发任务给 Member；write_shared_context、add_dynamic_member 等管理工具不受此限制`,
                 "warning"
               );
               ctx?.ui?.setStatus?.("tl-pre-dispatch-guard", "⚠️ TL 未派发任务 — 亲自分析已被持续拦截，直到 team_send_and_wait");

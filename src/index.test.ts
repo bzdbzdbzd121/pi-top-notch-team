@@ -2471,6 +2471,24 @@ describe("TL self-work guard configurability (阶段 2)", () => {
     expect(read("src/g.ts")).toEqual(expect.objectContaining({ block: true }));
   });
 
+  it("首次拦截通知的指针逐字对应菜单项名（不是死指针）", async () => {
+    await startActiveSession();
+    const agentStart = getHandler("agent_start");
+    const toolCall = getHandler("tool_call");
+    const ui = createMockUi();
+    const ctx = { ui };
+
+    agentStart({}, ctx);
+    for (const p of ["src/a.ts", "src/b.ts", "src/c.ts", "src/d.ts"]) {
+      toolCall({ toolName: "read", input: { path: p } }, ctx);
+    }
+    // 与守卫拦截文案同一指针形态：/team setting →「TL 亲自分析限制」
+    expect(ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("可在 /team setting →「TL 亲自分析限制」调整或关闭"),
+      "warning"
+    );
+  });
+
   it("链式回归：粘滞 → write_shared_context 放行 → start_member 放行 → 派发 → read 放行（验收 5）", async () => {
     await startActiveSession();
     const agentStart = getHandler("agent_start");

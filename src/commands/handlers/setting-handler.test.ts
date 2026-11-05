@@ -1280,6 +1280,39 @@ describe("/team setting — TL 亲自分析限制 (阶段 4)", () => {
     }
   );
 
+  it("次数上界：1e30 超出安全整数区间 → 不落盘 + 警告（与 settings/snapshot 区间对齐）", async () => {
+    const ctx = createCtx({
+      sessionId: "sess-1",
+      selectImpl: pickContaining(SELF_WORK_ITEM, "每回合允许次数", undefined),
+    });
+    (ctx.ui.input as any).mockResolvedValueOnce("1e30");
+    await handleSetting(ctx as any);
+
+    expect(getSessionSettings()).toEqual({});
+    expect(existsSync(getSettingsPath(tmpDir))).toBe(false);
+    const warn = notifies(ctx).find((n) => n.includes("无效输入"));
+    expect(warn).toContain("下限 2");
+    expect(warn).toContain("要关闭请用开关");
+  });
+
+  it("自定义阈值 + 切开关：阈值保留（{enabled:true, threshold:7} → {enabled:false, threshold:7}）", async () => {
+    saveSettings(
+      {
+        ...structuredClone(DEFAULT_SETTINGS),
+        tlSelfWorkGuard: { enabled: true, threshold: 7 },
+      },
+      tmpDir
+    );
+    const ctx = createCtx({
+      sessionId: "sess-1",
+      selectImpl: pickContaining("设置作用域", SELF_WORK_ITEM, "开关", undefined),
+    });
+    await handleSetting(ctx as any);
+
+    // 切开关只翻转 enabled，不得把自定义阈值重置成默认 3（突变缺口）
+    expect(loadSettings(tmpDir).tlSelfWorkGuard).toEqual({ enabled: false, threshold: 7 });
+  });
+
   it("恢复默认次数：把次数改回 3，保留开关状态（全局作用域，关闭态保持关闭）", async () => {
     saveSettings(
       {
