@@ -4,8 +4,10 @@ import {
   createDesignReadGuard,
   MANAGEMENT_TOOLS,
   DESIGN_READ_GUARD_THRESHOLD,
+  EXEMPT_ACTIONS_LINE,
 } from "./tl-read-guard";
 import { SESSION_TOOL_NAMES } from "./session-tool-visibility";
+import { DEFAULT_TL_SELF_WORK_GUARD_THRESHOLD } from "../settings/tl-self-work-guard-constants";
 
 describe("createDesignReadGuard", () => {
   it("allows .md reads without counting them (docs are legitimate design work)", () => {
@@ -420,5 +422,91 @@ describe("豁免名单不变式（协议依赖的工具永不计数）", () => {
     // 仍然只有派发能解锁：豁免调用不改变粘滞判定
     g.checkToolCall("read", "src/b.ts");
     expect(g.checkToolCall("read", "src/c.ts").block).toBe(true);
+  });
+});
+
+// ── 阶段 2 审查：configure 与 sticky 的耦合 / 文案一致性 / 入参防御 ──
+
+describe("configure 与 sticky 的耦合（由关变开必须清掉陈旧粘滞）", () => {
+  it("disabled→enabled clears sticky AND the stale count (fresh budget, notification re-armed)", () => {
+    const g = createTlReadGuard();
+    for (const p of ["src/a.ts", "src/b.ts", "src/c.ts"]) g.checkToolCall("read", p);
+    expect(g.checkToolCall("read", "src/d.ts").block).toBe(true); // sticky, count = 4
+
+    g.configure({ enabled: false, threshold: 3 });
+    g.configure({ enabled: true, threshold: 3 });
+
+    // 关闭期间的「不计数」语义延伸到重新开启：预算从零开始，不继承关闭前的债
+    expect(g.preDispatchCalls).toBe(0);
+    for (let i = 0; i < 3; i++) {
+      expect(g.checkToolCall("read", `src/e${i}.ts`).block).toBe(false);
+    }
+    const first = g.checkToolCall("read", "src/f.ts");
+    expect(first.block).toBe(true);
+    // 重新武装后第一次拦截仍带通知标记（不是静默的陈旧粘滞）
+    expect(first.firstBlock).toBe(true);
+  });
+
+  it("enabled→enabled configure keeps the turn's counters and sticky state (既有语义不变)", () => {
+    const g = createTlReadGuard();
+    for (const p of ["src/a.ts", "src/b.ts", "src/c.ts"]) g.checkToolCall("read", p);
+    expect(g.checkToolCall("read", "src/d.ts").block).toBe(true);
+    g.configure({ enabled: true, threshold: 3 }); // 同一状态重复注入
+    expect(g.preDispatchCalls).toBe(4);
+    expect(g.checkToolCall("read", "src/e.ts").block).toBe(true); // 仍粘滞
+  });
+
+  it("production path (resetTurn → configure) is unchanged: a disabled turn leaves no residue", () => {
+    const g = createTlReadGuard();
+    // 第 1 回合：关闭
+    g.resetTurn();
+    g.configure({ enabled: false, threshold: 3 });
+    for (let i = 0; i < 6; i++) g.checkToolCall("read", `src/a${i}.ts`);
+    // 第 2 回合：开启
+    g.resetTurn();
+    g.configure({ enabled: true, threshold: 3 });
+    expect(g.preDispatchCalls).toBe(0);
+    for (let i = 0; i < 3; i++) {
+      expect(g.checkToolCall("read", `src/b${i}.ts`).block).toBe(false);
+    }
+    expect(g.checkToolCall("read", "src/c.ts").block).toBe(true);
+  });
+
+  it("defensive: non-integer / NaN / out-of-range thresholds fall back to the default", () => {
+    const g = createTlReadGuard();
+    for (const bad of [Number.NaN, 2.5, 1, 0, -3, Number.POSITIVE_INFINITY]) {
+      g.configure({ enabled: true, threshold: bad });
+      expect(g.threshold).toBe(DEFAULT_TL_SELF_WORK_GUARD_THRESHOLD);
+    }
+    g.configure({ enabled: true, threshold: 2 });
+    expect(g.threshold).toBe(2); // 合法下界仍接受
+  });
+});
+
+describe("拦截文案豁免清单与 MANAGEMENT_TOOLS 事实一致", () => {
+  it("names every management tool (含 add_dynamic_member 与 agent 会话生命周期工具)", () => {
+    for (const tool of MANAGEMENT_TOOLS) {
+      expect(EXEMPT_ACTIONS_LINE).toContain(tool);
+    }
+  });
+
+  it("never advertises a counting tool as exempt", () => {
+    for (const tool of ["bash", "web_search", "fetch_content", "ctx_execute", "ctx_search"]) {
+      expect(EXEMPT_ACTIONS_LINE).not.toContain(tool);
+    }
+  });
+
+  it("points at the settings entry", () => {
+    expect(EXEMPT_ACTIONS_LINE).toContain("/team setting");
+  });
+});
+
+describe("设计阶段软提醒的对等入口", () => {
+  it("mentions /team setting so the user can turn the reminder off", () => {
+    const g = createDesignReadGuard();
+    for (const p of ["src/a.ts", "src/b.ts", "src/c.ts"]) g.checkToolCall("read", p);
+    const blocked = g.checkToolCall("read", "src/d.ts");
+    expect(blocked.block).toBe(true);
+    expect(blocked.reason).toContain("/team setting");
   });
 });

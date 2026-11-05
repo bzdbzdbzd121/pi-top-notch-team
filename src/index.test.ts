@@ -2304,6 +2304,29 @@ describe("TL self-work guard configurability (阶段 2)", () => {
     );
   });
 
+  it("首次拦截的用户通知带上限与豁免提示（add_dynamic_member）", async () => {
+    await startActiveSession();
+    const agentStart = getHandler("agent_start");
+    const toolCall = getHandler("tool_call");
+    const ui = createMockUi();
+    const ctx = { ui };
+
+    agentStart({}, ctx);
+    for (const p of ["src/a.ts", "src/b.ts", "src/c.ts", "src/d.ts"]) {
+      toolCall({ toolName: "read", input: { path: p } }, ctx);
+    }
+    // 通知必须点出「还有哪些动作合法」，否则被拦的模型只会换个工具继续试
+    expect(ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("add_dynamic_member"),
+      "warning"
+    );
+    expect(ui.notify).toHaveBeenCalledWith(expect.stringContaining("3 次/回合"), "warning");
+    expect(ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("write_shared_context"),
+      "warning"
+    );
+  });
+
   it("坏 YAML：按默认（开启、3）工作，且处理器不抛错（无 Extension failed，验收 4）", async () => {
     writeSettings("tlSelfWorkGuard: {enabled: false\n"); // 故意损坏
     await startActiveSession();

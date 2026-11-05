@@ -1,4 +1,8 @@
 import type { TeamSettings } from "./settings";
+import {
+  DEFAULT_TL_SELF_WORK_GUARD_THRESHOLD,
+  MIN_TL_SELF_WORK_GUARD_THRESHOLD,
+} from "./tl-self-work-guard-constants";
 
 /**
  * TL「亲自分析限制」（tlSelfWorkGuard）解析器。
@@ -9,16 +13,15 @@ import type { TeamSettings } from "./settings";
  *
  * 本模块**不得** `import { loadSettings }`（静态扫描白名单会红）——调用方统一经
  * 合并层 `getEffectiveSettings()` 读取，保证临时设置生效。
+ *
+ * 数值常量已下沉到 `tl-self-work-guard-constants.ts`（零依赖）：运行时守卫只引那个
+ * 文件，不传递引入 fs / yaml。这里重新导出（保持既有导入路径可用）。
  */
 
-export const DEFAULT_TL_SELF_WORK_GUARD_THRESHOLD = 3;
-
-/**
- * 次数下限 2：团队提示词保证「需求对齐阶段允许读取 1-2 个文件」，上限 < 2 会让该
- * 例外当场失效（提示词与运行时冲突）。`0` 也不接受——它与同菜单里「等待上限 0 =
- * 不限」的约定方向相反，想关闭请用开关。
- */
-export const MIN_TL_SELF_WORK_GUARD_THRESHOLD = 2;
+export {
+  DEFAULT_TL_SELF_WORK_GUARD_THRESHOLD,
+  MIN_TL_SELF_WORK_GUARD_THRESHOLD,
+};
 
 export interface ResolvedTlSelfWorkGuard {
   /** 限制是否生效（两个限制器共用）。 */

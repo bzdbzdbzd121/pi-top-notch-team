@@ -40,7 +40,10 @@
  * exploring code to understand the project is legitimate design work there.
  */
 
-import { DEFAULT_TL_SELF_WORK_GUARD_THRESHOLD } from "../settings/resolve-tl-self-work-guard";
+import {
+  DEFAULT_TL_SELF_WORK_GUARD_THRESHOLD,
+  MIN_TL_SELF_WORK_GUARD_THRESHOLD,
+} from "../settings/tl-self-work-guard-constants";
 
 /** Tools that are explicitly team-management/coordination and never count. */
 export const MANAGEMENT_TOOLS = new Set([
@@ -68,10 +71,12 @@ export const MANAGEMENT_TOOLS = new Set([
 /**
  * 拦截文案里的豁免清单（阶段 2）：告诉被拦的模型「还有哪些动作合法」，否则它
  * 只会看到一条错误就去试下一个工具或直接回复用户。工具名一律写字面量（本模块
- * 保持叶层：只引用设置层的数值常量，不 import 工具注册链路）。
+ * 保持叶层：只引用常量文件，不 import 工具注册链路）。
+ * 不变式（有测试锁定）：这里出现的工具名必须全部属于 MANAGEMENT_TOOLS，且
+ * MANAGEMENT_TOOLS 的每一项都必须在这里出现——文案与事实不得分叉。
  */
-const EXEMPT_ACTIONS_LINE =
-  `• 以下动作不受此限制（不计数、不会被拦）：write_shared_context、start_member、stop_member、list_members、get_member_log、wait_and_get_member_status、team_send_and_wait、set_goal、finish_goal、write/edit（仅 .md 文档）、ask_user_question、todo，以及读取 .md 文档（含 .shared-context.md）。\n` +
+export const EXEMPT_ACTIONS_LINE =
+  `• 以下动作不受此限制（不计数、不会被拦）：write_shared_context、start_member、stop_member、list_members、get_member_log、wait_and_get_member_status、team_send_and_wait、set_goal、finish_goal、add_dynamic_member、start_team_session、stop_team_session、write/edit（仅 .md 文档）、ask_user_question、todo，以及读取 .md 文档（含 .shared-context.md）。\n` +
   `• 上限可在 /team setting →「TL 亲自分析限制」中调整次数或关闭。`;
 
 export interface TlReadGuardConfig {
@@ -218,7 +223,8 @@ export function createDesignReadGuard(options: DesignReadGuardOptions = {}): Des
             `⚠️ 设计阶段已累计 ${readCount} 次非文档 read（代码/项目文件读取）。作为团队设计师，反复读取项目文件会偏离设计职责——请确认是否真的需要读取该文件：\n` +
             `• 若确需查证（如项目结构、需求细节）→ 直接再次调用 read 即可，本次为单次提醒，不会持续拦截；\n` +
             `• 若已进入代码分析 → 请停止，先与用户对齐需求；代码分析由执行阶段的 Member 完成。\n` +
-            `• 读取 .md 文档（README/ADR/需求文档）不计数、不拦截。`,
+            `• 读取 .md 文档（README/ADR/需求文档）不计数、不拦截。\n` +
+            `• 若不希望保留该提醒，可在 /team setting →「TL 亲自分析限制」中关闭（设计阶段的提醒节奏固定每 4 次，不随次数设置变化）。`,
         };
       }
       return { block: false };
@@ -254,8 +260,23 @@ export function createTlReadGuard(options: TlReadGuardOptions = {}): TlReadGuard
     },
 
     configure(config) {
+      // 入参防御：非整数 / NaN / 低于下限 → 默认值。调用点（回合边界）已保证
+      // 合法值；这里只保证内部状态不变量（不能出现 0 或 NaN 造成的「每调用必拦」）。
+      threshold =
+        Number.isInteger(config.threshold) &&
+        config.threshold >= MIN_TL_SELF_WORK_GUARD_THRESHOLD
+          ? config.threshold
+          : DEFAULT_TL_SELF_WORK_GUARD_THRESHOLD;
+      const wasEnabled = enabled;
       enabled = config.enabled;
-      threshold = config.threshold;
+      // 由关变开：关闭期间不计数，所以重新开启必须从零预算开始——否则残留的
+      // sticky 会在开启后的第一次调用上静默拦截（firstBlock=false，用户看不到
+      // 通知）。只作用于配置状态转换，resetTurn →configure 生产路径不受影响
+      // （resetTurn 已先清零）。
+      if (!wasEnabled && enabled) {
+        callCount = 0;
+        sticky = false;
+      }
     },
 
     checkToolCall(toolName, filePath) {

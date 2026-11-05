@@ -24,6 +24,7 @@ import { resolveMessageCoalescing } from "./src/settings/resolve-message-coalesc
 import { resolvePeerMessaging } from "./src/settings/resolve-peer-messaging";
 import { resolveAgentSessionAllowed } from "./src/settings/resolve-agent-session";
 import { resolveTlSelfWorkGuard } from "./src/settings/resolve-tl-self-work-guard";
+import { DEFAULT_TL_SELF_WORK_GUARD_THRESHOLD } from "./src/settings/tl-self-work-guard-constants";
 import { getSupportedThinkingLevelsFor } from "./src/settings/resolve-thinking";
 import { registerTlTools, type TlToolsDeps } from "./src/tools/tl-tools";
 import { registerGoalTools, registerGoalAgentHandler, resetGoal, GOAL_TOOL_NAMES } from "./src/tools/goal-tools";
@@ -656,14 +657,23 @@ export default function (pi: ExtensionAPI) {
     // 非团队会话零额外 IO。解析必须包 try/catch 且放在回合开始事件里——两个事件
     // 的异常后果不对称：本事件的处理器抛错只记一条扩展错误，而工具调用事件的
     // 处理器抛错会被包成 `Extension failed, blocking execution`，等于每次工具
-    // 调用都被阻断。异常方向 = 保持上一次成功解析的配置（首次即默认 开启+3）。
+    // 调用都被阻断。
     try {
       if (getSessionState().active) {
         const cfg = resolveTlSelfWorkGuard(getEffectiveSettings());
         tlReadGuard.configure({ enabled: cfg.enabled, threshold: cfg.threshold });
         designReadGuard.configure({ enabled: cfg.enabled });
       }
-    } catch { /* fail-open: 保持现有配置（默认 = 开启、每回合 3 次）*/ }
+    } catch {
+      // 异常回默认（方案阶段 2）：**不得**保留上一次成功解析的配置——上一次若是
+      // enabled:false，保留等于「异常期间约束保持关闭」，与 resolver 的「异常保持
+      // 约束」方向相反。这里显式回落「开启 + 默认次数」。
+      tlReadGuard.configure({
+        enabled: true,
+        threshold: DEFAULT_TL_SELF_WORK_GUARD_THRESHOLD,
+      });
+      designReadGuard.configure({ enabled: true });
+    }
   });
 
   // ── Call-level guard: whitelist-based blocking during team session ───
@@ -766,7 +776,7 @@ export default function (pi: ExtensionAPI) {
           if (verdict.firstBlock) {
             try {
               ctx?.ui?.notify?.(
-                `⚠️ 已拦截 TL 在未派发任务情况下的亲自分析（本回合第 ${tlReadGuard.preDispatchCalls} 次工具调用；上限 ${tlReadGuard.threshold} 次/回合，可在 /team setting 调整或关闭）— 请通过 team_send_and_wait 派发任务给 Member`,
+                `⚠️ 已拦截 TL 在未派发任务情况下的亲自分析（本回合第 ${tlReadGuard.preDispatchCalls} 次工具调用；上限 ${tlReadGuard.threshold} 次/回合，可在 /team setting 调整或关闭）— 请通过 team_send_and_wait 派发任务给 Member；write_shared_context、add_dynamic_member 等管理工具不受此限制`,
                 "warning"
               );
               ctx?.ui?.setStatus?.("tl-pre-dispatch-guard", "⚠️ TL 未派发任务 — 亲自分析已被持续拦截，直到 team_send_and_wait");
