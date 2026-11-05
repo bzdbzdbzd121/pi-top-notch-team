@@ -2,7 +2,8 @@ import type { TeamDefinition } from "../team/definition";
 import { join, dirname } from "node:path";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { FIRST_ACTION_PROTOCOL_PROMPT } from "./tl-first-action";
+import { buildFirstActionProtocolPrompt } from "./tl-first-action";
+import { resolveTlSelfWorkGuard, type ResolvedTlSelfWorkGuard } from "../settings/resolve-tl-self-work-guard";
 import { buildTeamStateDeclaration } from "./session-transition-notice";
 import { GOAL_CLOSING_PROTOCOL_PROMPT } from "./goal-closing-protocol";
 import { TASK_DISPATCH_PROTOCOL_PROMPT } from "./task-dispatch-protocol";
@@ -43,8 +44,21 @@ function loadOrchestrationPlaybook(): string {
  * @param team - Current team definition (may have 0 members during design phase)
  * @param phase - Current dynamic mode phase ("design" | "execution")
  * @param sessionId - Optional session ID for isolating session directories
+ * @param opts - 生效的 TL 亲自分析限制（省略 = 默认 开启 + 每回合 3 次）。
+ *   两个阶段都必须与运行时一致：执行阶段参数化「超过 N 次」的威慑段，
+ *   设计阶段按开关条件化「每 4 次」的频率提醒（关闭时不得声称会提醒）。
  */
-export function buildDynamicModePrompt(team: TeamDefinition, phase: "design" | "execution", sessionId?: string | null): string {
+export interface DynamicModePromptOptions {
+  selfWorkGuard?: ResolvedTlSelfWorkGuard;
+}
+
+export function buildDynamicModePrompt(
+  team: TeamDefinition,
+  phase: "design" | "execution",
+  sessionId?: string | null,
+  opts: DynamicModePromptOptions = {}
+): string {
+  const guard = opts.selfWorkGuard ?? resolveTlSelfWorkGuard();
   const sharedCtxPath = getSharedContextPath(team.name, sessionId ?? null);
 
   const memberLines =
@@ -65,18 +79,32 @@ ${buildTeamStateDeclaration(phase === "design" ? "design" : "execution", team.na
 
 ${
   phase === "design"
-    ? designPhasePrompt(sharedCtxPath, memberLines, team)
-    : executionPhasePrompt(sharedCtxPath, memberLines, team)
+    ? designPhasePrompt(sharedCtxPath, memberLines, team, guard)
+    : executionPhasePrompt(sharedCtxPath, memberLines, team, guard)
 }
 ${TASK_DISPATCH_PROTOCOL_PROMPT}
 `;
 }
 
-function designPhasePrompt(sharedCtxPath: string, memberLines: string, team: TeamDefinition): string {
+function designPhasePrompt(
+  sharedCtxPath: string,
+  memberLines: string,
+  team: TeamDefinition,
+  guard: ResolvedTlSelfWorkGuard
+): string {
+  // 设计阶段的 read 节奏固定 4 次（不受执行阶段 threshold 影响），只随总开关开关。
+  // 关闭时不写任何「有提醒」的陈述：提示词不得包含与运行时不符的事实断言。
+  const readLimitNote = guard.enabled
+    ? `（系统允许有限度地读取文件查证需求，但有频率提醒，见下）`
+    : `（系统允许读取文件查证需求）`;
+  const readFreqNote = guard.enabled
+    ? `但每 4 次非文档 read（代码/项目文件）会被系统**拦截一次并提醒**「是否真的需要读取」——若确实需要，**直接再次调用 read 即可放行**（单次提醒，不会持续拦截）。`
+    : `（读取次数不受限制）`;
+
   return `
 ═══ 设计阶段 — 你的角色 ═══
 
-在这个阶段，你是一名**团队设计师**，不是工程师。你的代码能力在此阶段**处于休眠状态**——你不能分析或修改项目代码。你的全部精力都放在与用户讨论和设计方案上（系统允许有限度地读取文件查证需求，但有频率提醒，见下）。
+在这个阶段，你是一名**团队设计师**，不是工程师。你的代码能力在此阶段**处于休眠状态**——你不能分析或修改项目代码。你的全部精力都放在与用户讨论和设计方案上${readLimitNote}。
 
 ### 【铁律：绝对禁止的行为】
 
@@ -90,7 +118,7 @@ function designPhasePrompt(sharedCtxPath: string, memberLines: string, team: Tea
 
 你只能做的操作：
   ✅ 与用户对话讨论需求
-  ✅ read — 可以读取文件（**不限制 .md 文档**，如 README/ADR/需求文档）；但每 4 次非文档 read（代码/项目文件）会被系统**拦截一次并提醒**「是否真的需要读取」——若确实需要，**直接再次调用 read 即可放行**（单次提醒，不会持续拦截）。优先读 .md 文档，代码分析留给执行阶段的 Member。
+  ✅ read — 可以读取文件（**不限制 .md 文档**，如 README/ADR/需求文档）；${readFreqNote}优先读 .md 文档，代码分析留给执行阶段的 Member。
   ✅ add_dynamic_member — 注册成员
   ✅ write_shared_context — 写入共享上下文（启动成员的必经步骤，未写入时 start_member 会被拦截）
   ✅ write（仅 .md 文件，如 ADR；**但 .shared-context.md 必须用 write_shared_context 工具写入**）
@@ -181,13 +209,18 @@ ${loadOrchestrationPlaybook()}
   // The prompt below is the behavioral guidance layer.
 }
 
-function executionPhasePrompt(sharedCtxPath: string, memberLines: string, team: TeamDefinition): string {
+function executionPhasePrompt(
+  sharedCtxPath: string,
+  memberLines: string,
+  team: TeamDefinition,
+  guard: ResolvedTlSelfWorkGuard
+): string {
   return `
 ═══ 执行阶段 — 你的角色 ═══
 
 在这个阶段，你是一名**团队经理**，不是执行者。成员进程已在运行，你的职责是拆解任务、分配工作、协调进度和处理异常。
 
-${FIRST_ACTION_PROTOCOL_PROMPT}
+${buildFirstActionProtocolPrompt(guard)}
 ### ⚠️ 铁律：你绝不能自己做 Member 能做的事
 
 你是 Team Lead（团队经理），不是执行者。你的核心工作是**分派任务和管理进度**，不是动手做事。

@@ -43,7 +43,7 @@ import { splitModelRef } from "./src/settings/resolve-model";
 import { createMessageChannel } from "./src/setup/message-channel";
 import { scheduleCloudDetection, type DetectOptions } from "./src/sync/detect";
 import { buildDynamicModePrompt } from "./src/prompts/dynamic-mode";
-import { FIRST_ACTION_PROTOCOL_PROMPT } from "./src/prompts/tl-first-action";
+import { buildFirstActionProtocolPrompt } from "./src/prompts/tl-first-action";
 import {
   buildSessionEntryNotice,
   buildTeamStateDeclaration,
@@ -306,6 +306,17 @@ export default function (pi: ExtensionAPI) {
   // 合并逻辑收敛于 session-settings.loadEffectiveSettings（阶段 5）——静态扫描
   // 守卫（src/static-scan.test.ts）强制全仓除白名单外无裸 loadSettings 调用。
   const getEffectiveSettings = () => loadEffectiveSettings(getRootDir());
+
+  // 阶段 3：提示词构建处解析生效的「TL 亲自分析限制」。仅在团队会话的提示词分支
+  // 调用（每回合至多一次小文件读取）。异常 → 默认（开启 + 3）：before_agent_start
+  // 抛错会让整段团队提示词（含团队上下文）丢失，比默认值更危险。
+  const getSelfWorkGuardForPrompt = () => {
+    try {
+      return resolveTlSelfWorkGuard(getEffectiveSettings());
+    } catch {
+      return resolveTlSelfWorkGuard();
+    }
+  };
 
   // ── Message channel: queue → router (extracted to src/setup/message-channel.ts) ──
   const { router, messageQueue, responseWaiter, autoCompact, coalescer, tlWaitGate } = createMessageChannel({
@@ -1345,7 +1356,10 @@ export default function (pi: ExtensionAPI) {
             session.sessionId,
             teamCtx.agentInitiatedTask ?? "（任务描述缺失——请回顾对话上下文确认使命）",
           )
-        : buildDynamicModePrompt(session.teamDefinition, teamCtx.dynamicPhase, session.sessionId);
+        : buildDynamicModePrompt(session.teamDefinition, teamCtx.dynamicPhase, session.sessionId, {
+            // 阶段 3：两个阶段都按生效设置构建（执行阶段「超过 N 次」/ 设计阶段是否提频率提醒）
+            selfWorkGuard: getSelfWorkGuardForPrompt(),
+          });
     } else if (session.active && session.teamDefinition) {
       const team = session.teamDefinition;
       const memberLines = team.members
@@ -1363,7 +1377,7 @@ export default function (pi: ExtensionAPI) {
 ${buildTeamStateDeclaration("predefined", team.name)}
 你现在是一个 **Team Lead**，负责领导团队完成任务。
 
-${FIRST_ACTION_PROTOCOL_PROMPT}
+${buildFirstActionProtocolPrompt(getSelfWorkGuardForPrompt())}
 ${team.workflow ? WORKFLOW_ACTIVATION_BANNER : ""}
 ### 团队：${team.name}
 ${team.description}

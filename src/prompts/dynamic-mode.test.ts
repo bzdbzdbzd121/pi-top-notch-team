@@ -173,3 +173,67 @@ describe("buildDynamicModePrompt — execution phase", () => {
     expect(prompt).not.toContain("todo");
   });
 });
+
+// ── 阶段 3：TL 亲自分析限制的两态一致性（提示词不得与运行时不符）──────
+
+describe("buildDynamicModePrompt — TL 亲自分析限制（设计阶段）", () => {
+  it("开启（默认）：含「每 4 次」软提醒说明", () => {
+    const prompt = buildDynamicModePrompt(emptyTeam, "design", "sess-1");
+    expect(prompt).toContain("每 4 次");
+    expect(prompt).toContain("直接再次调用 read 即可放行");
+  });
+
+  it("显式开启：与缺省一致（参数化不改变节奏）", () => {
+    const prompt = buildDynamicModePrompt(emptyTeam, "design", "sess-1", {
+      selfWorkGuard: { enabled: true, threshold: 7 },
+    });
+    // 设计阶段的节奏固定 4，不受执行阶段次数影响
+    expect(prompt).toContain("每 4 次");
+    expect(prompt).not.toContain("每 7 次");
+  });
+
+  it("关闭：不含「每 4 次」与频率提醒措辞", () => {
+    const prompt = buildDynamicModePrompt(emptyTeam, "design", "sess-1", {
+      selfWorkGuard: { enabled: false, threshold: 3 },
+    });
+    expect(prompt).not.toContain("每 4 次");
+    expect(prompt).not.toContain("频率提醒");
+    expect(prompt).not.toContain("拦截一次并提醒");
+  });
+
+  it("两态都保留：.md 不限制 + 代码分析留给执行阶段的 Member", () => {
+    for (const enabled of [true, false]) {
+      const prompt = buildDynamicModePrompt(emptyTeam, "design", "sess-1", {
+        selfWorkGuard: { enabled, threshold: 3 },
+      });
+      expect(prompt).toContain("不限制 .md 文档");
+      expect(prompt).toContain("代码分析留给执行阶段的 Member");
+    }
+  });
+});
+
+describe("buildDynamicModePrompt — TL 亲自分析限制（执行阶段）", () => {
+  it("默认：含「超过 3 次」与「持续拦截」", () => {
+    const prompt = buildDynamicModePrompt(teamWithMembers, "execution");
+    expect(prompt).toContain("超过 3 次");
+    expect(prompt).toContain("持续拦截");
+  });
+
+  it("上限 7：含「超过 7 次」、不含「超过 3 次」", () => {
+    const prompt = buildDynamicModePrompt(teamWithMembers, "execution", null, {
+      selfWorkGuard: { enabled: true, threshold: 7 },
+    });
+    expect(prompt).toContain("超过 7 次");
+    expect(prompt).not.toContain("超过 3 次");
+  });
+
+  it("关闭：不含「持续拦截」，但行为规则与硬门控保留", () => {
+    const prompt = buildDynamicModePrompt(teamWithMembers, "execution", null, {
+      selfWorkGuard: { enabled: false, threshold: 3 },
+    });
+    expect(prompt).not.toContain("持续拦截");
+    expect(prompt).toContain("禁止 read / bash 代码文件");
+    expect(prompt).toContain("允许读取 1-2 个文件");
+    expect(prompt).toContain("未写入前 `start_member` 会被系统拦截");
+  });
+});

@@ -554,13 +554,23 @@ describe("team session state declaration", () => {
 
 describe("TL first-action protocol prompt injection", () => {
   let pi: ExtensionAPI;
+  let tmpDir: string;
 
   beforeEach(async () => {
     vi.resetModules();
     delete process.env.TEAM_ROLE;
+    // 测试隔离（阶段 3）：before_agent_start 现在按生效设置构建协议段，
+    // 不指向临时目录会读开发者本机真实 settings.yaml。
+    tmpDir = mkdtempSync(join(tmpdir(), "first-action-protocol-"));
+    process.env.TOP_NOTCH_TEAM_ROOT = tmpDir;
     pi = createMockPi();
     const mod = await import("../index");
     mod.default(pi);
+  });
+
+  afterEach(() => {
+    delete process.env.TOP_NOTCH_TEAM_ROOT;
+    rmSync(tmpDir, { recursive: true, force: true });
   });
 
   function getHandler(name: string): Function {
@@ -604,6 +614,52 @@ describe("TL first-action protocol prompt injection", () => {
     expect(result.systemPrompt).toContain("允许读取 1-2 个文件");
     // old wording gave the model a loophole to analyze code itself
     expect(result.systemPrompt).not.toContain("先查阅代码再给出结论");
+    endSession();
+  });
+
+  it("上限 7：注入的协议写「超过 7 次」，不再写「超过 3 次」（提示词与运行时一致）", async () => {
+    writeFileSync(
+      join(tmpDir, "settings.yaml"),
+      "tlSelfWorkGuard:\n  enabled: true\n  threshold: 7\n",
+      "utf-8"
+    );
+    const { startSession, endSession } = await import("./session/state");
+    endSession();
+    startSession({
+      name: "test-team",
+      description: "Test",
+      members: [{ name: "worker", systemPrompt: "do work" }],
+    });
+
+    const handler = getHandler("before_agent_start");
+    const result = await handler({ systemPrompt: "BASE" }, { ui: createMockUi() });
+    expect(result.systemPrompt).toContain("超过 7 次");
+    expect(result.systemPrompt).not.toContain("超过 3 次");
+    endSession();
+  });
+
+  it("关闭：注入的协议不含「持续拦截」与「超过 … 次」，行为规则与硬门控仍在", async () => {
+    writeFileSync(
+      join(tmpDir, "settings.yaml"),
+      "tlSelfWorkGuard:\n  enabled: false\n",
+      "utf-8"
+    );
+    const { startSession, endSession } = await import("./session/state");
+    endSession();
+    startSession({
+      name: "test-team",
+      description: "Test",
+      members: [{ name: "worker", systemPrompt: "do work" }],
+    });
+
+    const handler = getHandler("before_agent_start");
+    const result = await handler({ systemPrompt: "BASE" }, { ui: createMockUi() });
+    expect(result.systemPrompt).not.toContain("持续拦截");
+    expect(result.systemPrompt).not.toMatch(/超过\s*\d+\s*次/);
+    // 行为规则与 start_member 硬门控与开关无关
+    expect(result.systemPrompt).toContain("禁止 read / bash 代码文件");
+    expect(result.systemPrompt).toContain("允许读取 1-2 个文件");
+    expect(result.systemPrompt).toContain("未写入前 `start_member` 会被系统拦截");
     endSession();
   });
 });
@@ -1980,14 +2036,15 @@ describe("per-session settings wiring (阶段 2)", () => {
     expect(loadSettingsCallSites.length).toBe(0);
     // 唯一入口形态：委托合并层
     expect(source).toContain("loadEffectiveSettings(getRootDir())");
-    // 10 个消费点全部经 getEffectiveSettings：getAutoCompact×2 / getCoalescing /
+    // 11 个消费点全部经 getEffectiveSettings：getAutoCompact×2 / getCoalescing /
     // getPeerMessagingAllowed（P2）/ getSettings（tlToolsDeps）+ buildMemberConfig 两
     // 调用点（start_member、startResumedMember）/ start_team_session getSettings
     // （阶段② L2 execute 门控）/ startTeamSessionVisible（阶段③ L1 可见性门控）/
-    // 阶段 2：回合边界 TL 亲自分析限制（resolveTlSelfWorkGuard，团队会话才读）。
+    // 阶段 2：回合边界 TL 亲自分析限制（resolveTlSelfWorkGuard，团队会话才读）/
+    // 阶段 3：提示词构建处的同一限制解析（getSelfWorkGuardForPrompt）。
     // 计数是刻意锁死的：新增消费点必须经合并层，且这里要同步 +1（而不是静默漂移）。
     const effectiveCalls = source.match(/getEffectiveSettings\(\)/g) ?? [];
-    expect(effectiveCalls.length).toBe(10);
+    expect(effectiveCalls.length).toBe(11);
   });
 });
 

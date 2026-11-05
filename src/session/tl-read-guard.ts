@@ -107,8 +107,10 @@ export interface TlReadGuard {
   recordDispatch(): void;
   /**
    * Inject the effective configuration at the turn boundary (agent_start).
-   * Does NOT reset this turn's counters — resetTurn() owns that (the caller
-   * runs both, reset first).
+   * Re-configuring with the same `enabled` state does NOT reset this turn's
+   * counters (resetTurn() owns the normal per-turn reset); a disabled→enabled
+   * transition DOES reset them, because calls made while disabled were never
+   * counted and a stale sticky flag would block silently right after re-enable.
    */
   configure(config: TlReadGuardConfig): void;
   /**
