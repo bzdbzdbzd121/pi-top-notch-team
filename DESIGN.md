@@ -2509,13 +2509,13 @@ resolver 矩阵 8（undefined/true/false/getter 异常/null·undefined settings 
 - 生效时点：**下一回合边界**。`agent_start` 读一次生效设置并 `configure()`；当前回合仍按旧值（命令处理器可以在模型响应过程中运行，所以菜单通知与本文都明写这一点）。
 - 用户面区间：整数 **≥ 2**（默认 3）。不支持 `0`（与同菜单「等待上限 `0` = 不限」的约定方向相反，也正是这个原因不把 `0` 当关闭开关）与 `1`（会让提示词「允许读取 1-2 个文件」的例外当场失效）。
 - **三处校验同一闭区间 `[2, Number.MAX_SAFE_INTEGER]`**：`settings.ts` 解析、`session-settings.ts` 快照 `sanitizeSnapshotData`、菜单输入。上界不是洁癖：`1e30` 这类值实际等价于「永不拦截」，静默接受等于静默放宽约束。
-- 非法值处理：`enabled` 仅接受 boolean（其余丢弃 → 保持开启），`threshold` 越界/非整数丢弃 → 回默认 3；解析层与菜单各有一条 warn-once 通道（按 `(filePath, kind)` 去重），警告文案带下限与「要关闭请用开关」，避免「我明明关了」静默失效。
+- 非法值处理：`enabled` 仅接受 boolean（其余丢弃 → 保持开启），`threshold` 越界/非整数丢弃 → 回默认 3。两层行为不同，如实说明：**解析层**（`settings.ts` 读盘）按 `(filePath, kind)` **warn-once 去重**——同文件同类问题只打一次 `console.warn`（`loadSettings` 每回合高频调用，不去重会刷屏）；**菜单输入**是**每次 `notify` 提示、不做去重**——用户是交互式改设置，每次非法输入都应立刻看到反馈。两处的警告文案都带下限与「要关闭请用开关」，避免「我明明关了」静默失效。
 
 ### 35.2 覆盖范围与必须保留的既有性质
 
 | 限制器 | 何时生效 | 节奏 | 越界行为 | 计数对象 |
 |---|---|---|---|---|
-| 派发前拦截（sticky） | 团队会话**执行阶段**（预定义团队全程；动态团队在首次 `start_member` 之后） | 每回合 `threshold` 次（默认 3，**可配**） | **粘滞**：之后每次非管理工具调用都被拦，直到本回合派发 | 除 `.md` 读取外的非管理工具（read/bash/web_search/ctx_execute 等） |
+| 派发前拦截（sticky） | 团队会话**执行阶段**（预定义团队全程；动态团队在首次 `start_member` 之后） | 每回合 `threshold` 次（默认 3，**可配**） | **粘滞**：之后每次**除 `.md` 读取外的**非管理工具调用都被拦，直到本回合派发 | 除 `.md` 读取外的非管理工具（read/bash/web_search/ctx_execute 等） |
 | 设计阶段 read 提醒 | 动态团队**设计阶段** | **固定 4 次**（不随次数设置变） | **软**：拦一次并提醒，再调一次放行 | 仅非 `.md` 的 `read` |
 
 改造必须保留（均有测试锁定）：`.md` 文档读取**永不计数**且判断发生在计数之前（粘滞态仍可读 `DESIGN.md` / `.shared-context.md`，这是既有安全阀）；**派发即解锁**（调用 `team_send_and_wait` 即放行，衡量的是「有没有选择派发」而不是「派发是否成功」）；管理工具（含 `write_shared_context`、`start_member`、write/edit 与编排辅助 `ask_user_question`/`todo`）不计数、不拦截。
@@ -2572,6 +2572,7 @@ resolver 矩阵 8（undefined/true/false/getter 异常/null·undefined settings 
 - [ ] **阶段 2、3、4 在同一版本内发布**（阶段 5 文档可紧随）。只发阶段 2 → 设置生效但提示词仍写「超过 3 次」；只发阶段 3/4 → 提示词/菜单承诺「可配置」而运行时仍固定 3。
 - [ ] 文档三处已更新：`README.md`（设置表 + `/team setting` 关键词）、`DESIGN.md`（§5 / §10 / §12 / 本节）、`AGENTS.md`（决策 #17 补可配置、决策 #48、Source Map、Commands Reference）。
 - [ ] 发布说明提示「**升级后重启 pi 进程**」——扩展只在进程启动时载入；`/reload` 能否加载改动后的 TypeScript 尚未验证，不作为升级手段。
+- [ ] **可执行门槛全绿**：`npm test`（全量）、`npx tsc --noEmit`、`npm run check:goal-reminder`，以及两个静态扫描（`src/static-scan.test.ts` 的 `loadSettings(` 白名单与绝对化历史断言、`src/static-scan-child-process.test.ts` 的 `child_process` 白名单）——任一项红即不得发版。
 - [ ] 真机目视顶层菜单（10 / 11 项）在目标终端不截断。
 
 ### 35.9 测试与守卫
@@ -2583,5 +2584,5 @@ resolver 矩阵 8（undefined/true/false/getter 异常/null·undefined settings 
 - `src/index.test.ts`（守卫可配置块，含临时数据目录隔离）：关闭 6 读零通知零状态栏 / 阈值 5 / 坏 YAML 回默认且不阻断 / 回合边界生效 / 设计阶段两态 / 链式回归（粘滞 → `write_shared_context` → `start_member` → 派发 → read）。
 - `src/index-guard-fallback.test.ts`：设置读取抛错 → 回落「开启 + 默认」且不抛；恢复后下一回合按文件配置（回落非粘性）。
 - `src/prompts/tl-first-action.test.ts` / `dynamic-mode.test.ts` / `agent-initiated-mode.test.ts`：三态文案矩阵、设计阶段两态、必填参数、旁路来源回归锁。
-- `src/commands/handlers/setting-handler.test.ts`「TL 亲自分析限制 (阶段 4)」：顶层三态与位置、子菜单结构与标题、全局/临时作用域、非法输入矩阵、恢复默认保留开关、Esc。
+- `src/commands/handlers/setting-handler.test.ts`「TL 亲自分析限制 (阶段 4)」：顶层三态与位置、子菜单结构与标题、全局/临时作用域、非法输入矩阵、恢复默认保留开关、Esc；**指针契约**用例把导出的 `OPT_SELF_WORK` 与守卫 `EXEMPT_ACTIONS_LINE`、`index.ts` 首次拦截通知逐字对齐（任一处改字即红）。
 - 静态守卫：`src/static-scan.test.ts` 的 `loadSettings(` 白名单（resolver 不得裸调用）与绝对化历史断言扫描（`index.ts` + `src/prompts/*.ts`）保持绿。

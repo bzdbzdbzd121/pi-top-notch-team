@@ -67,8 +67,10 @@ const OPT_COALESCE = "消息合并";
 /**
  * 顶层项名称必须保留「TL 亲自分析限制」字样：守卫的拦截文案与用户通知里已有
  * 指针「/team setting →「TL 亲自分析限制」」，改名字会把它变成死指针。
+ * 因此**导出**该常量：`setting-handler.test.ts` 的「指针契约」用例把它与
+ * `EXEMPT_ACTIONS_LINE`、`index.ts` 首次拦截通知的文案对齐——任何一处改字都会变红。
  */
-const OPT_SELF_WORK = "TL 亲自分析限制";
+export const OPT_SELF_WORK = "TL 亲自分析限制";
 const OPT_PEER = "成员互发消息";
 const OPT_AGENT_SESSION = "Agent 自主团队会话";
 const OPT_CLOUD_SYNC = "云同步（机器级）";

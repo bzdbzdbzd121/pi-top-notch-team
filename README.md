@@ -289,7 +289,7 @@ git --git-dir ~/.pi/top-notch-team/teams/.git show <提交>:<名字>.yaml
 | `/team status` | 查看会话与成员状态 |
 | `/team sync` | 与云端私有仓库双向同步团队定义（冲突逐个决策，被放弃的一侧留档） |
 | `/team sync status` | 查看云同步状态（不推送、不改团队文件与工作区；读取云端并更新 `.git` 内对象/远端跟踪引用，不写 `FETCH_HEAD`） |
-| `/team setting` | 团队设置（临时/全局）——模型、思考强度、自动压缩、等待上限、消息合并、**亲自分析限制**、成员互发、agent 自主会话 |
+| `/team setting` | 团队设置（临时/全局）——模型、思考强度、自动压缩、等待上限、消息合并、**TL 亲自分析限制**、成员互发、agent 自主会话 |
 | `/team help` | 显示使用帮助 |
 
 `/team start`、`/team show`、`/team delete`、`/team edit` 支持团队名 Tab 补全。

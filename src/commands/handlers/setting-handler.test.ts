@@ -1,9 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createMockContext } from "../../test/fixtures/mock-extension-api";
-import { handleSetting } from "./setting-handler";
+import { handleSetting, OPT_SELF_WORK } from "./setting-handler";
+import { EXEMPT_ACTIONS_LINE } from "../../session/tl-read-guard";
 import {
   loadSettings,
   saveSettings,
@@ -1364,6 +1365,16 @@ describe("/team setting — TL 亲自分析限制 (阶段 4)", () => {
     });
     await handleSetting(ctx as any);
     expect(getSessionSettings()).toEqual({ tlSelfWorkGuard: { threshold: 3 } });
+  });
+
+  it("指针契约：守卫拦截文案 / 首次拦截通知 / 菜单项名共用同一常量（改字即红）", () => {
+    // 1) 守卫拦截文案（EXEMPT_ACTIONS_LINE：需要再次拦截时模型读到的指引）
+    expect(EXEMPT_ACTIONS_LINE).toContain(`/team setting →「${OPT_SELF_WORK}」`);
+    // 2) index.ts 的首次拦截通知（源码内是字面量，必须与常量逐字一致）
+    const indexSource = readFileSync(new URL("../../../index.ts", import.meta.url), "utf-8");
+    expect(indexSource).toContain(`可在 /team setting →「${OPT_SELF_WORK}」调整或关闭`);
+    // 3) 菜单项名以该常量开头（顶层项 = 用户点进去的那个入口）
+    expect(OPT_SELF_WORK).toBe("TL 亲自分析限制");
   });
 
   it("子菜单 Esc → 设置不变；顶层 Esc → 不写盘", async () => {
