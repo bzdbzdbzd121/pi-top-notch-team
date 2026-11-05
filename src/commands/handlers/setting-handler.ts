@@ -31,6 +31,15 @@ import {
   resolveAgentSessionAllowed,
 } from "../../settings/resolve-agent-session";
 import {
+  describeTlSelfWorkGuardSetting,
+  resolveTlSelfWorkGuard,
+} from "../../settings/resolve-tl-self-work-guard";
+import {
+  DEFAULT_TL_SELF_WORK_GUARD_THRESHOLD,
+  DESIGN_READ_GUARD_THRESHOLD,
+  MIN_TL_SELF_WORK_GUARD_THRESHOLD,
+} from "../../settings/tl-self-work-guard-constants";
+import {
   getSessionSettings,
   setSessionSetting,
   clearSessionSetting,
@@ -55,6 +64,11 @@ const OPT_MEMBER_THINKING = "成员思考强度";
 const OPT_AUTO_COMPACT = "自动压缩";
 const OPT_WAIT_TIMEOUT = "等待上限";
 const OPT_COALESCE = "消息合并";
+/**
+ * 顶层项名称必须保留「TL 亲自分析限制」字样：守卫的拦截文案与用户通知里已有
+ * 指针「/team setting →「TL 亲自分析限制」」，改名字会把它变成死指针。
+ */
+const OPT_SELF_WORK = "TL 亲自分析限制";
 const OPT_PEER = "成员互发消息";
 const OPT_AGENT_SESSION = "Agent 自主团队会话";
 const OPT_CLOUD_SYNC = "云同步（机器级）";
@@ -80,6 +94,11 @@ const AC_SET_TIMEOUT = "设置超时（分钟）";
 const COALESCE_TOGGLE = "开关切换";
 const COALESCE_SET_SIZE = "设置批量上限（条数）";
 const COALESCE_SET_CHARS = "设置总字符上限";
+
+// TL 亲自分析限制子菜单选项（阶段 4）
+const SELF_WORK_TOGGLE = "开关";
+const SELF_WORK_THRESHOLD = "每回合允许次数";
+const SELF_WORK_RESTORE = "恢复默认次数";
 
 /** 设置作用域：仅当前会话（临时 overlay）/ 全局（settings.yaml）。 */
 type SettingScope = "temp" | "global";
@@ -162,6 +181,9 @@ export async function handleSetting(
       `${OPT_AUTO_COMPACT}（当前：${describeAutoCompactSetting(effective)}）${badge("autoCompact")}`,
       `${OPT_WAIT_TIMEOUT}（当前：${describeWaitTimeoutSetting(effective)}）${badge("waitTimeoutMinutes")}`,
       `${OPT_COALESCE}（当前：${describeMessageCoalescingSetting(effective)}）${badge("messageCoalescing")}`,
+      // 阶段 4：TL 亲自分析限制（插在消息合并之后、成员互发之前）。
+      // 关闭态只显示「关闭」，不输出次数（避免「关闭 · 每回合 5 次」这种自相矛盾标签）。
+      `${OPT_SELF_WORK}（当前：${describeTlSelfWorkGuardSetting(effective)}）${badge("tlSelfWorkGuard")}`,
       `${OPT_PEER}（当前：${describePeerMessagingSetting(effective)}）${badge("allowPeerMessaging")}`,
       `${OPT_AGENT_SESSION}（当前：${describeAgentSessionSetting(effective)}）${badge("allowAgentInitiatedSessions")}`,
       `${OPT_CLOUD_SYNC}（当前：${describeCloudSync(loadSyncConfig(rootDir))}）`,
@@ -232,6 +254,8 @@ export async function handleSetting(
       await configureWaitTimeout(ctx, working, persistFor("waitTimeoutMinutes"), noticeSuffix);
     } else if (topChoice.startsWith(OPT_COALESCE)) {
       await configureMessageCoalescing(ctx, working, persistFor("messageCoalescing"), noticeSuffix);
+    } else if (topChoice.startsWith(OPT_SELF_WORK)) {
+      await configureTlSelfWorkGuard(ctx, working, persistFor("tlSelfWorkGuard"), noticeSuffix);
     } else if (topChoice.startsWith(OPT_PEER)) {
       await configurePeerMessaging(ctx, working, persistFor("allowPeerMessaging"), noticeSuffix);
     } else if (topChoice.startsWith(OPT_AGENT_SESSION)) {
@@ -523,6 +547,95 @@ async function configureAgentSession(
     `Agent 自主团队会话已设为「禁止」：agent 调用 start_team_session 将被拒绝（下一回合边界即生效）。仅影响启动——运行中的团队会话不终止；手动 /team start、/team dynamic 不受影响。${noticeSuffix}`,
     "info"
   );
+}
+
+/**
+ * TL 亲自分析限制子菜单（阶段 4，循环式，仿自动压缩）。
+ *
+ * 三项：开关 / 每回合允许次数 / 恢复默认次数。语义边界（标题与通知如实说明）：
+ *  - 总开关同时覆盖两个按阶段互斥的限制器（执行阶段派发前拦截 + 设计阶段
+ *    read 频率提醒），因为它们按阶段互斥，共用一个开关不会出现「两套阈值打架」；
+ *  - 次数**只**作用于执行阶段；设计阶段节奏固定为 DESIGN_READ_GUARD_THRESHOLD；
+ *  - 生效时点：下一回合边界（回合内改设置不影响当前回合）——必须在通知里明说。
+ *
+ * 次数校验：整数 ≥ MIN（默认 3）。0/1 不接受（0 与同菜单「等待上限 0 = 不限」的
+ * 约定方向相反；1 会让提示词里「允许读取 1-2 个文件」的例外当场失效），要关闭请用开关。
+ */
+async function configureTlSelfWorkGuard(
+  ctx: ExtensionCommandContext,
+  settings: TeamSettings,
+  persist: () => void,
+  noticeSuffix: string,
+): Promise<void> {
+  for (;;) {
+    const r = resolveTlSelfWorkGuard(settings);
+    const items = [
+      `${SELF_WORK_TOGGLE}：${r.enabled ? "开启" : "关闭"}（● 当前，选中切换）`,
+      `${SELF_WORK_THRESHOLD}（当前：${r.threshold} 次，最小 ${MIN_TL_SELF_WORK_GUARD_THRESHOLD}）`,
+      `${SELF_WORK_RESTORE}（${DEFAULT_TL_SELF_WORK_GUARD_THRESHOLD} 次）`,
+    ];
+    const choice = await ctx.ui.select(
+      `TL 亲自分析限制（当前：${describeTlSelfWorkGuardSetting(settings)}）— 开关同时作用于执行阶段拦截与设计阶段 read 提醒；设计阶段节奏固定为每 ${DESIGN_READ_GUARD_THRESHOLD} 次（Esc 返回）`,
+      items
+    );
+    if (choice === undefined) return; // Esc — no change
+
+    if (choice.startsWith(SELF_WORK_TOGGLE)) {
+      const nextEnabled = !r.enabled;
+      settings.tlSelfWorkGuard = {
+        ...(settings.tlSelfWorkGuard ?? {}),
+        enabled: nextEnabled,
+        threshold: settings.tlSelfWorkGuard?.threshold ?? r.threshold,
+      };
+      persist();
+      ctx.ui.notify(
+        nextEnabled
+          ? `已开启「TL 亲自分析限制」：下一回合生效（当前回合仍按旧值）。执行阶段的派发前拦截恢复；设计阶段的 read 频率提醒（每 ${DESIGN_READ_GUARD_THRESHOLD} 次）同时恢复。${noticeSuffix}`
+          : `已关闭「TL 亲自分析限制」：下一回合生效（当前回合仍按旧值）。执行阶段的派发前拦截与设计阶段的 read 频率提醒同时关闭。${noticeSuffix}`,
+        "info"
+      );
+      continue;
+    }
+
+    if (choice.startsWith(SELF_WORK_THRESHOLD)) {
+      const text = await ctx.ui.input(
+        `每回合允许的非团队工具调用次数（整数 ≥ ${MIN_TL_SELF_WORK_GUARD_THRESHOLD}；要关闭请用开关）`,
+        String(r.threshold)
+      );
+      if (text === undefined) continue; // Esc
+      const n = Number(text.trim());
+      if (!Number.isInteger(n) || n < MIN_TL_SELF_WORK_GUARD_THRESHOLD) {
+        ctx.ui.notify(
+          `无效输入：请输入 ≥ ${MIN_TL_SELF_WORK_GUARD_THRESHOLD} 的整数（下限 ${MIN_TL_SELF_WORK_GUARD_THRESHOLD}；要关闭请用开关）。未保存。`,
+          "warning"
+        );
+        continue;
+      }
+      settings.tlSelfWorkGuard = {
+        ...(settings.tlSelfWorkGuard ?? {}),
+        enabled: settings.tlSelfWorkGuard?.enabled ?? r.enabled,
+        threshold: n,
+      };
+      persist();
+      ctx.ui.notify(
+        `已设为每回合 ${n} 次：下一回合生效（当前回合仍按旧值）。仅影响执行阶段的派发前拦截，设计阶段提醒节奏固定每 ${DESIGN_READ_GUARD_THRESHOLD} 次。${noticeSuffix}`,
+        "info"
+      );
+      continue;
+    }
+
+    // 恢复默认次数：只改次数，**保留开关状态**（关闭态的「恢复默认」不得顺手开启）
+    settings.tlSelfWorkGuard = {
+      ...(settings.tlSelfWorkGuard ?? {}),
+      enabled: settings.tlSelfWorkGuard?.enabled ?? r.enabled,
+      threshold: DEFAULT_TL_SELF_WORK_GUARD_THRESHOLD,
+    };
+    persist();
+    ctx.ui.notify(
+      `已恢复默认次数（${DEFAULT_TL_SELF_WORK_GUARD_THRESHOLD} 次）：下一回合生效（当前回合仍按旧值）。开关状态保持「${r.enabled ? "开启" : "关闭"}」。${noticeSuffix}`,
+      "info"
+    );
+  }
 }
 
 /**
