@@ -2,6 +2,10 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { parseMemberThinkingSetting, type MemberThinkingSetting } from "./resolve-thinking";
+import {
+  DEFAULT_TL_SELF_WORK_GUARD_THRESHOLD,
+  MIN_TL_SELF_WORK_GUARD_THRESHOLD,
+} from "./resolve-tl-self-work-guard";
 
 /** How the default model for team members is chosen. */
 export type MemberModelMode = "follow" | "fixed";
@@ -36,6 +40,21 @@ export interface MessageCoalescingSetting {
   maxBatchSize?: number;
   /** 合并包总字符软上限（>=1）。Undefined = 默认 4000. 硬守卫 MAX_COMMAND_SIZE 恒不超。 */
   maxBatchChars?: number;
+}
+
+/**
+ * TL「亲自分析限制」设置：一个总开关 + 一个次数，同时覆盖两个按阶段互斥的
+ * 运行时限制器（执行阶段派发前拦截 + 动态团队设计阶段 read 频率提醒）。
+ * 默认值与改造前行为一致（开启、每回合 3 次），所以不动它时行为零变化。
+ */
+export interface TlSelfWorkGuardSetting {
+  /** 总开关。true（默认）= 与现状一致；false = 两个限制器都不拦。 */
+  enabled: boolean;
+  /**
+   * 每回合允许的非管理工具调用次数（整数 ≥ 2；缺省 3）。第 N+1 次起持续拦截。
+   * 设计阶段的提醒节奏固定每 4 次，不随此值变化。
+   */
+  threshold?: number;
 }
 
 /** Global top-notch-team settings (apply to all team sessions). */
@@ -83,6 +102,12 @@ export interface TeamSettings {
    * （waitTimeoutMinutes 先例），本键不焊死语义。
    */
   allowAgentInitiatedSessions?: boolean;
+  /**
+   * TL 亲自分析限制：执行阶段派发前拦截 + 设计阶段 read 频率提醒（同开关）。
+   * 缺省/非法值回落为「开启 + 每回合 3 次」（= 改造前行为；异常方向是**保持约束**，
+   * 见 src/settings/resolve-tl-self-work-guard.ts 的不对称论证）。
+   */
+  tlSelfWorkGuard?: TlSelfWorkGuardSetting;
 }
 
 export const DEFAULT_SETTINGS: TeamSettings = {
@@ -92,6 +117,7 @@ export const DEFAULT_SETTINGS: TeamSettings = {
   messageCoalescing: { enabled: true, maxBatchSize: 5, maxBatchChars: 4000 },
   allowPeerMessaging: true,
   allowAgentInitiatedSessions: true,
+  tlSelfWorkGuard: { enabled: true, threshold: DEFAULT_TL_SELF_WORK_GUARD_THRESHOLD },
 };
 
 const SETTINGS_FILE = "settings.yaml";
@@ -99,6 +125,10 @@ const SETTINGS_FILE = "settings.yaml";
 /** 近似意图非法值 warn 去重（每文件路径一次；loadSettings 每 dispatch 高频调用，防刷屏）。 */
 const warnedApproximatePeerMessaging = new Set<string>();
 const warnedApproximateAgentSession = new Set<string>();
+/** tlSelfWorkGuard.enabled（或整个键形态错）近似意图 warn 去重。 */
+const warnedApproximateSelfWorkGuard = new Set<string>();
+/** tlSelfWorkGuard.threshold 越界/非整数 warn 去重。 */
+const warnedSelfWorkThreshold = new Set<string>();
 
 export function getSettingsPath(rootDir: string): string {
   return join(rootDir, SETTINGS_FILE);
@@ -257,6 +287,51 @@ export function loadSettings(rootDir: string): TeamSettings {
       warnedApproximateAgentSession.add(filePath);
       console.warn(
         `[top-notch-team] settings: allowAgentInitiatedSessions 值 ${JSON.stringify(aais)} 非法（需要 true/false），已忽略并按「允许」处理——请经 /team setting 或编辑 ${filePath} 修正。`
+      );
+    }
+
+    // tlSelfWorkGuard (top-level): TL 亲自分析限制。严格姿态同 allowPeerMessaging/
+    // allowAgentInitiatedSessions：enabled 仅接受 boolean，其余丢弃并回退「开启」
+    // （保持约束）；threshold 仅接受 ≥ 2 的整数，其余丢弃并回退 3。两条 warn-once
+    // 通道各自去重（enabled 形态错 / threshold 越界），warning 文案带上下限与
+    // 「要关闭请用开关」，避免用户把 0/1 当成关闭手段。
+    const sg = rawData.tlSelfWorkGuard;
+    if (typeof sg === "object" && sg !== null) {
+      const sgObj = sg as Record<string, unknown>;
+      if (typeof sgObj.enabled === "boolean") {
+        settings.tlSelfWorkGuard!.enabled = sgObj.enabled;
+      } else if (
+        sgObj.enabled !== undefined &&
+        !warnedApproximateSelfWorkGuard.has(filePath)
+      ) {
+        warnedApproximateSelfWorkGuard.add(filePath);
+        console.warn(
+          `[top-notch-team] settings: tlSelfWorkGuard.enabled 值 ${JSON.stringify(sgObj.enabled)} 非法（需要 true/false），已忽略并按「开启」处理——请经 /team setting 或编辑 ${filePath} 修正。`
+        );
+      }
+      const t = sgObj.threshold;
+      if (t === null || t === undefined) {
+        // 显式清空/缺省 = 默认次数（3），不是非法值，不 warn
+        settings.tlSelfWorkGuard!.threshold = DEFAULT_TL_SELF_WORK_GUARD_THRESHOLD;
+      } else if (
+        typeof t === "number" &&
+        Number.isInteger(t) &&
+        t >= MIN_TL_SELF_WORK_GUARD_THRESHOLD
+      ) {
+        settings.tlSelfWorkGuard!.threshold = t;
+      } else {
+        settings.tlSelfWorkGuard!.threshold = DEFAULT_TL_SELF_WORK_GUARD_THRESHOLD;
+        if (!warnedSelfWorkThreshold.has(filePath)) {
+          warnedSelfWorkThreshold.add(filePath);
+          console.warn(
+            `[top-notch-team] settings: tlSelfWorkGuard.threshold 值 ${JSON.stringify(t)} 非法（需要 ≥ ${MIN_TL_SELF_WORK_GUARD_THRESHOLD} 的整数，默认 ${DEFAULT_TL_SELF_WORK_GUARD_THRESHOLD}）——要关闭限制请用 enabled: false。`
+          );
+        }
+      }
+    } else if (sg !== undefined && !warnedApproximateSelfWorkGuard.has(filePath)) {
+      warnedApproximateSelfWorkGuard.add(filePath);
+      console.warn(
+        `[top-notch-team] settings: tlSelfWorkGuard 需要对象 { enabled, threshold }，已忽略并按默认（开启、${DEFAULT_TL_SELF_WORK_GUARD_THRESHOLD} 次）处理——请编辑 ${filePath} 修正。`
       );
     }
 

@@ -2,12 +2,14 @@ import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync 
 import { join } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { parseMemberThinkingSetting } from "./resolve-thinking";
+import { MIN_TL_SELF_WORK_GUARD_THRESHOLD } from "./resolve-tl-self-work-guard";
 import {
   loadSettings,
   type AutoCompactSetting,
   type MemberModelSetting,
   type MessageCoalescingSetting,
   type TeamSettings,
+  type TlSelfWorkGuardSetting,
 } from "./settings";
 
 /**
@@ -302,6 +304,24 @@ function sanitizeSnapshotData(data: Record<string, unknown>): DeepPartial<TeamSe
   // /team resume 静默丢失该键（S3 场景破坏，验收 checklist 第一项）。
   if (typeof data.allowAgentInitiatedSessions === "boolean") {
     out.allowAgentInitiatedSessions = data.allowAgentInitiatedSessions;
+  }
+
+  // tlSelfWorkGuard：TL 亲自分析限制（对象两字段；非 boolean / 越界次数丢弃 = 不覆盖，
+  // 跟随全局；次数下限与全局 loadSettings 同源——MIN_TL_SELF_WORK_GUARD_THRESHOLD）。
+  // **必须登记**——未登记则 /team resume 静默丢失该键（同 allowAgentInitiatedSessions
+  // 的验收教训）。
+  const sg = data.tlSelfWorkGuard;
+  if (isPlainObject(sg)) {
+    const s: DeepPartial<TlSelfWorkGuardSetting> = {};
+    if (typeof sg.enabled === "boolean") {
+      s.enabled = sg.enabled;
+    }
+    if (isIntInRange(sg.threshold, MIN_TL_SELF_WORK_GUARD_THRESHOLD, Number.MAX_SAFE_INTEGER)) {
+      s.threshold = sg.threshold;
+    }
+    if (Object.keys(s).length > 0) {
+      out.tlSelfWorkGuard = s;
+    }
   }
 
   return out;
