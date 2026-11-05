@@ -3,7 +3,8 @@ import { join, dirname } from "node:path";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { buildFirstActionProtocolPrompt } from "./tl-first-action";
-import { resolveTlSelfWorkGuard, type ResolvedTlSelfWorkGuard } from "../settings/resolve-tl-self-work-guard";
+import type { ResolvedTlSelfWorkGuard } from "../settings/resolve-tl-self-work-guard";
+import { DESIGN_READ_GUARD_THRESHOLD } from "../settings/tl-self-work-guard-constants";
 import { buildTeamStateDeclaration } from "./session-transition-notice";
 import { GOAL_CLOSING_PROTOCOL_PROMPT } from "./goal-closing-protocol";
 import { TASK_DISPATCH_PROTOCOL_PROMPT } from "./task-dispatch-protocol";
@@ -44,21 +45,25 @@ function loadOrchestrationPlaybook(): string {
  * @param team - Current team definition (may have 0 members during design phase)
  * @param phase - Current dynamic mode phase ("design" | "execution")
  * @param sessionId - Optional session ID for isolating session directories
- * @param opts - 生效的 TL 亲自分析限制（省略 = 默认 开启 + 每回合 3 次）。
- *   两个阶段都必须与运行时一致：执行阶段参数化「超过 N 次」的威慑段，
- *   设计阶段按开关条件化「每 4 次」的频率提醒（关闭时不得声称会提醒）。
+ * @param opts - 生效的 TL 亲自分析限制（**必填**）。省略会渲染「开启 + 3」，
+ *   与用户真实配置可能不符——宁可编译期报错/运行时抛错，也不得在提示词里说假话。
  */
 export interface DynamicModePromptOptions {
-  selfWorkGuard?: ResolvedTlSelfWorkGuard;
+  selfWorkGuard: ResolvedTlSelfWorkGuard;
 }
 
 export function buildDynamicModePrompt(
   team: TeamDefinition,
   phase: "design" | "execution",
-  sessionId?: string | null,
-  opts: DynamicModePromptOptions = {}
+  sessionId: string | null | undefined,
+  opts: DynamicModePromptOptions
 ): string {
-  const guard = opts.selfWorkGuard ?? resolveTlSelfWorkGuard();
+  const guard = opts?.selfWorkGuard;
+  if (!guard) {
+    throw new TypeError(
+      "buildDynamicModePrompt: opts.selfWorkGuard 为必填（不得用默认值冒充真实配置）"
+    );
+  }
   const sharedCtxPath = getSharedContextPath(team.name, sessionId ?? null);
 
   const memberLines =
@@ -98,8 +103,8 @@ function designPhasePrompt(
     ? `（系统允许有限度地读取文件查证需求，但有频率提醒，见下）`
     : `（系统允许读取文件查证需求）`;
   const readFreqNote = guard.enabled
-    ? `但每 4 次非文档 read（代码/项目文件）会被系统**拦截一次并提醒**「是否真的需要读取」——若确实需要，**直接再次调用 read 即可放行**（单次提醒，不会持续拦截）。`
-    : `（读取次数不受限制）`;
+    ? `但每 ${DESIGN_READ_GUARD_THRESHOLD} 次非文档 read（代码/项目文件）会被系统**拦截一次并提醒**「是否真的需要读取」——若确实需要，**直接再次调用 read 即可放行**（单次提醒，不会持续拦截）。`
+    : `读取次数不受提醒限制。`;
 
   return `
 ═══ 设计阶段 — 你的角色 ═══
@@ -118,7 +123,7 @@ function designPhasePrompt(
 
 你只能做的操作：
   ✅ 与用户对话讨论需求
-  ✅ read — 可以读取文件（**不限制 .md 文档**，如 README/ADR/需求文档）；${readFreqNote}优先读 .md 文档，代码分析留给执行阶段的 Member。
+  ✅ read — 可以读取文件（**不限制 .md 文档**，如 README/ADR/需求文档）。${readFreqNote}优先读 .md 文档，代码分析留给执行阶段的 Member。
   ✅ add_dynamic_member — 注册成员
   ✅ write_shared_context — 写入共享上下文（启动成员的必经步骤，未写入时 start_member 会被拦截）
   ✅ write（仅 .md 文件，如 ADR；**但 .shared-context.md 必须用 write_shared_context 工具写入**）

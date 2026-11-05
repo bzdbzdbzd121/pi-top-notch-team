@@ -42,8 +42,15 @@
 
 import {
   DEFAULT_TL_SELF_WORK_GUARD_THRESHOLD,
+  DESIGN_READ_GUARD_THRESHOLD,
   MIN_TL_SELF_WORK_GUARD_THRESHOLD,
 } from "../settings/tl-self-work-guard-constants";
+
+/**
+ * 设计阶段的 read 提醒节奏（常量已下沉到设置层常量文件，使提示词可以直接插值；
+ * 这里重新导出保持既有导入路径不变）。
+ */
+export { DESIGN_READ_GUARD_THRESHOLD };
 
 /** Tools that are explicitly team-management/coordination and never count. */
 export const MANAGEMENT_TOOLS = new Set([
@@ -150,18 +157,11 @@ export interface TlReadGuard {
 //     count.
 
 export interface DesignReadGuardOptions {
-  /** Code reads allowed between reminders. Every `threshold`-th code read is blocked once. Default: 4 (same rhythm as the pre-dispatch guard's 4th-call block). */
+  /** Code reads allowed between reminders. Every `threshold`-th code read is blocked once. Default: DESIGN_READ_GUARD_THRESHOLD. */
   threshold?: number;
   /** Whether the limiter is active. Default: true. Shares the `enabled` switch with the pre-dispatch guard. */
   enabled?: boolean;
 }
-
-/**
- * 设计阶段的 read 提醒节奏，固定 4 次（导出为具名常量供测试与文档引用）。
- * 刻意不与执行阶段的 threshold 共用一个数字：设计阶段没有可派发对象，
- * 「每 N 次提醒一次」与「N 次后持续拦截」是两种不同语义。
- */
-export const DESIGN_READ_GUARD_THRESHOLD = 4;
 
 export interface DesignReadGuard {
   /** Reset per-turn counters. Call on agent_start (once per user-message turn). */

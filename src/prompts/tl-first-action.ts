@@ -37,9 +37,12 @@ export interface FirstActionProtocolOptions {
 
 export function buildFirstActionProtocolPrompt(o: FirstActionProtocolOptions): string {
   const runtimeDetection = o.enabled
-    ? `系统带有运行时检测：未派发任务就连续调用工具（read/bash/搜索等）超过 ${o.threshold} 次时，所有非管理工具会被**持续拦截**，直到你调用 \`team_send_and_wait\` 派发任务为止。\n`
+    ? // 范围必须与运行时一致：粘滞态下管理工具与 .md 文档读取仍然放行，
+      // 写「所有非管理工具」会被一次 .md read 当场证伪。
+      `\n系统带有运行时检测：未派发任务就连续调用工具（read/bash/搜索等）超过 ${o.threshold} 次时，除 .md 文档读取外的非管理工具会被**持续拦截**，直到你调用 \`team_send_and_wait\` 派发任务为止。\n`
     : "";
 
+  // 尾随换行对称：三态都以恰好一个换行结尾（否则注入点多一个空行）。
   return `### 🚨 最高优先级：第一动作协议
 
 收到任何**任务型诉求**（分析、排查、修改、重构、审查、实现等）时，按下面的顺序做，不要在派发前自己动手：
@@ -51,6 +54,5 @@ export function buildFirstActionProtocolPrompt(o: FirstActionProtocolOptions): s
 派发之前**禁止 read / bash 代码文件**——一旦你开始自己读代码，角色就已经偏了。
 
 > 唯一例外：需求对齐阶段为确认某个具体事实，允许读取 1-2 个文件；完整的分析、排查、代码理解一律分派给 Member。
-
 ${runtimeDetection}`;
 }

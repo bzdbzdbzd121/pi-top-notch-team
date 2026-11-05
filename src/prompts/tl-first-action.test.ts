@@ -103,3 +103,39 @@ describe("提示词不携带绝对化历史断言（仓内静态扫描守卫）"
     }
   });
 });
+
+// ── 阶段 3 审查：拦截范围措辞 / 尾随换行对称 ───────────────────────
+
+describe("拦截范围措辞（粘滞态 .md 读取仍放行）", () => {
+  it("开启态写「除 .md 文档读取外的非管理工具」，不写「所有非管理工具」", () => {
+    for (const threshold of [3, 7]) {
+      const prompt = buildFirstActionProtocolPrompt({ enabled: true, threshold });
+      expect(prompt).toContain("除 .md 文档读取外的非管理工具");
+      // 过度承诺：「所有非管理工具」会被一次 .md read 证伪
+      expect(prompt).not.toContain("所有非管理工具会被");
+    }
+  });
+});
+
+describe("三态首尾结构一致（注入点不会因开关多出空行）", () => {
+  it("三种配置都以恰好一个换行结尾", () => {
+    for (const { opts } of STATES) {
+      const prompt = buildFirstActionProtocolPrompt(opts);
+      expect(prompt.endsWith("\n")).toBe(true);
+      expect(prompt.endsWith("\n\n")).toBe(false);
+    }
+  });
+
+  it("关闭态与开启态在同一个位置收尾（唯一差异是运行时检测段）", () => {
+    const on = buildFirstActionProtocolPrompt({ enabled: true, threshold: 3 });
+    const off = buildFirstActionProtocolPrompt({ enabled: false, threshold: 3 });
+    const offTrimmed = off.trimEnd();
+    const onWithoutRuntime = on
+      .split("\n")
+      .filter((line) => !line.startsWith("系统带有运行时检测："))
+      .join("\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trimEnd();
+    expect(offTrimmed).toBe(onWithoutRuntime);
+  });
+});
