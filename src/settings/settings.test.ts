@@ -594,7 +594,7 @@ describe("tlSelfWorkGuard (TL 亲自分析限制)", () => {
   });
 
   it("drops invalid threshold values → 3, warning once per file path", () => {
-    for (const raw of ["1", "0", "-1", "3.5", '"5"']) {
+    for (const raw of ["1", "0", "-1", "3.5", '"5"', "1e30"]) {
       const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
       const dir = mkdtempSync(join(tmpdir(), "team-settings-selfwork-threshold-"));
       try {
@@ -604,11 +604,12 @@ describe("tlSelfWorkGuard (TL 亲自分析限制)", () => {
           "utf-8"
         );
         expect(loadSettings(dir).tlSelfWorkGuard).toEqual({ enabled: true, threshold: 3 });
-        // threshold 的警告文案刻意不带路径（与其他键不同：它总是与 enabled 修复
-        // 建议同句），按子串过滤本用例自己的 spy 即可。
         const warns = () =>
           warnSpy.mock.calls.filter(
-            (c) => String(c[0]).includes("tlSelfWorkGuard") && String(c[0]).includes("threshold")
+            (c) =>
+              String(c[0]).includes("tlSelfWorkGuard") &&
+              String(c[0]).includes("threshold") &&
+              String(c[0]).includes(dir)
           );
         expect(warns()).toHaveLength(1);
         // 下限提示：告知用户「要关闭请用开关」，避免把 0/1 当关闭手段
@@ -622,6 +623,66 @@ describe("tlSelfWorkGuard (TL 亲自分析限制)", () => {
         warnSpy.mockRestore();
         rmSync(dir, { recursive: true, force: true });
       }
+    }
+  });
+
+  it("accepts the upper bound exactly (Number.MAX_SAFE_INTEGER), rejects beyond it", () => {
+    // 与 session-settings.ts 的快照区间校验（≤ Number.MAX_SAFE_INTEGER）同一语义：
+    // 超出安全整数区间的次数不可能是真实配置，静默接受等于静默关闭约束。
+    writeFileSync(
+      getSettingsPath(tmpDir),
+      `tlSelfWorkGuard:\n  threshold: ${Number.MAX_SAFE_INTEGER}\n`,
+      "utf-8"
+    );
+    expect(loadSettings(tmpDir).tlSelfWorkGuard?.threshold).toBe(Number.MAX_SAFE_INTEGER);
+
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const dir = mkdtempSync(join(tmpdir(), "team-settings-selfwork-threshold-ub-"));
+    try {
+      writeFileSync(
+        getSettingsPath(dir),
+        `tlSelfWorkGuard:\n  threshold: ${Number.MAX_SAFE_INTEGER + 1}\n`,
+        "utf-8"
+      );
+      expect(loadSettings(dir).tlSelfWorkGuard?.threshold).toBe(3);
+      expect(warnSpy.mock.calls.filter((c) => String(c[0]).includes(dir))).toHaveLength(1);
+    } finally {
+      warnSpy.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("dedupes warn-once per (filePath, kind): fixing the shape state re-arms the enabled warning", () => {
+    // 一个去重键服务两类问题会让第二类永久静默：进程内同一路径先报「非对象形态」，
+    // 用户改文件为对象但仍写错 enabled —— 同一个 Set 键会把第二次吞掉。
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const kinds = () => ({
+        shape: warnSpy.mock.calls.filter(
+          (c) => String(c[0]).includes(tmpDir) && String(c[0]).includes("需要对象")
+        ).length,
+        enabled: warnSpy.mock.calls.filter(
+          (c) => String(c[0]).includes(tmpDir) && String(c[0]).includes("tlSelfWorkGuard.enabled")
+        ).length,
+      });
+
+      // 1) 非对象形态 → 一次「需要对象」警告
+      writeFileSync(getSettingsPath(tmpDir), 'tlSelfWorkGuard: "off"\n', "utf-8");
+      expect(loadSettings(tmpDir).tlSelfWorkGuard).toEqual({ enabled: true, threshold: 3 });
+      loadSettings(tmpDir);
+      expect(kinds()).toEqual({ shape: 1, enabled: 0 });
+
+      // 2) 同一路径改成对象形态但 enabled 非法 → 必须能再次收到警告
+      writeFileSync(getSettingsPath(tmpDir), 'tlSelfWorkGuard:\n  enabled: "false"\n', "utf-8");
+      expect(loadSettings(tmpDir).tlSelfWorkGuard).toEqual({ enabled: true, threshold: 3 });
+      expect(kinds()).toEqual({ shape: 1, enabled: 1 });
+
+      // 3) 同一 kind 重复 load 仍只 warn 一次（去重语义不变）
+      loadSettings(tmpDir);
+      loadSettings(tmpDir);
+      expect(kinds()).toEqual({ shape: 1, enabled: 1 });
+    } finally {
+      warnSpy.mockRestore();
     }
   });
 

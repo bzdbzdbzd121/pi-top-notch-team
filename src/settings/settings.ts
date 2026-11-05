@@ -125,8 +125,12 @@ const SETTINGS_FILE = "settings.yaml";
 /** 近似意图非法值 warn 去重（每文件路径一次；loadSettings 每 dispatch 高频调用，防刷屏）。 */
 const warnedApproximatePeerMessaging = new Set<string>();
 const warnedApproximateAgentSession = new Set<string>();
-/** tlSelfWorkGuard.enabled（或整个键形态错）近似意图 warn 去重。 */
-const warnedApproximateSelfWorkGuard = new Set<string>();
+/** tlSelfWorkGuard 近似意图 warn 去重。两类问题分开去重（kind 维度）：
+ * 同一个 Set 键服务两类会让后出现的那类永久静默——例如进程内首次读到
+ * `tlSelfWorkGuard: "off"`（形态错）后，用户改成对象但 enabled 仍写错，
+ * 若共用一个键则第二条警告再也不会出现。 */
+const warnedSelfWorkShape = new Set<string>();
+const warnedSelfWorkEnabled = new Set<string>();
 /** tlSelfWorkGuard.threshold 越界/非整数 warn 去重。 */
 const warnedSelfWorkThreshold = new Set<string>();
 
@@ -292,19 +296,17 @@ export function loadSettings(rootDir: string): TeamSettings {
 
     // tlSelfWorkGuard (top-level): TL 亲自分析限制。严格姿态同 allowPeerMessaging/
     // allowAgentInitiatedSessions：enabled 仅接受 boolean，其余丢弃并回退「开启」
-    // （保持约束）；threshold 仅接受 ≥ 2 的整数，其余丢弃并回退 3。两条 warn-once
-    // 通道各自去重（enabled 形态错 / threshold 越界），warning 文案带上下限与
-    // 「要关闭请用开关」，避免用户把 0/1 当成关闭手段。
+    // （保持约束）；threshold 仅接受 [MIN, MAX_SAFE_INTEGER] 内的整数，其余丢弃并
+    // 回退 3。warn-once 按 (filePath, kind) 去重（形态错 / enabled 非法 / threshold
+    // 越界三类各自独立），warning 文案均带文件路径与修复建议，避免用户把 0/1 当成
+    // 关闭手段、也避免误改后的第二个问题被吞掉。
     const sg = rawData.tlSelfWorkGuard;
     if (typeof sg === "object" && sg !== null) {
       const sgObj = sg as Record<string, unknown>;
       if (typeof sgObj.enabled === "boolean") {
         settings.tlSelfWorkGuard!.enabled = sgObj.enabled;
-      } else if (
-        sgObj.enabled !== undefined &&
-        !warnedApproximateSelfWorkGuard.has(filePath)
-      ) {
-        warnedApproximateSelfWorkGuard.add(filePath);
+      } else if (sgObj.enabled !== undefined && !warnedSelfWorkEnabled.has(filePath)) {
+        warnedSelfWorkEnabled.add(filePath);
         console.warn(
           `[top-notch-team] settings: tlSelfWorkGuard.enabled 值 ${JSON.stringify(sgObj.enabled)} 非法（需要 true/false），已忽略并按「开启」处理——请经 /team setting 或编辑 ${filePath} 修正。`
         );
@@ -316,7 +318,10 @@ export function loadSettings(rootDir: string): TeamSettings {
       } else if (
         typeof t === "number" &&
         Number.isInteger(t) &&
-        t >= MIN_TL_SELF_WORK_GUARD_THRESHOLD
+        t >= MIN_TL_SELF_WORK_GUARD_THRESHOLD &&
+        // 上界与 session-settings 的快照区间校验（≤ Number.MAX_SAFE_INTEGER）同语义：
+        // 超出安全整数区间的次数不可能是真实配置，静默接受等于静默关闭约束。
+        t <= Number.MAX_SAFE_INTEGER
       ) {
         settings.tlSelfWorkGuard!.threshold = t;
       } else {
@@ -324,12 +329,12 @@ export function loadSettings(rootDir: string): TeamSettings {
         if (!warnedSelfWorkThreshold.has(filePath)) {
           warnedSelfWorkThreshold.add(filePath);
           console.warn(
-            `[top-notch-team] settings: tlSelfWorkGuard.threshold 值 ${JSON.stringify(t)} 非法（需要 ≥ ${MIN_TL_SELF_WORK_GUARD_THRESHOLD} 的整数，默认 ${DEFAULT_TL_SELF_WORK_GUARD_THRESHOLD}）——要关闭限制请用 enabled: false。`
+            `[top-notch-team] settings: tlSelfWorkGuard.threshold 值 ${JSON.stringify(t)} 非法（需要 ≥ ${MIN_TL_SELF_WORK_GUARD_THRESHOLD} 的整数，默认 ${DEFAULT_TL_SELF_WORK_GUARD_THRESHOLD}）——要关闭限制请用 enabled: false。请编辑 ${filePath} 修正。`
           );
         }
       }
-    } else if (sg !== undefined && !warnedApproximateSelfWorkGuard.has(filePath)) {
-      warnedApproximateSelfWorkGuard.add(filePath);
+    } else if (sg !== undefined && !warnedSelfWorkShape.has(filePath)) {
+      warnedSelfWorkShape.add(filePath);
       console.warn(
         `[top-notch-team] settings: tlSelfWorkGuard 需要对象 { enabled, threshold }，已忽略并按默认（开启、${DEFAULT_TL_SELF_WORK_GUARD_THRESHOLD} 次）处理——请编辑 ${filePath} 修正。`
       );
