@@ -22,6 +22,7 @@ import {
   setActiveSessionDir,
   type DeepPartial,
 } from "./session-settings";
+import { resolveTlSelfWorkGuard } from "./resolve-tl-self-work-guard";
 
 /** Fresh full settings (a deep clone of DEFAULT_SETTINGS with a few custom values). */
 function makeGlobal(): TeamSettings {
@@ -951,6 +952,95 @@ describe("allowAgentInitiatedSessions 快照登记 (S3 场景: 写快照 → 清
     writeFileSync(
       getSessionSettingsSnapshotPath(sessionDir),
       "allowAgentInitiatedSessions: 0\n",
+      "utf-8"
+    );
+    expect(loadSessionSettingsSnapshot(sessionDir, "session-B")).toBe(false);
+    expect(getSessionSettings()).toEqual({});
+  });
+});
+
+describe("tlSelfWorkGuard 快照登记 (阶段 1：写快照 → 清内存 → resume 恢复)", () => {
+  let sessionDir: string;
+
+  beforeEach(() => {
+    resetSessionSettingsState();
+    sessionDir = mkdtempSync(join(tmpdir(), "team-settings-selfwork-snap-test-"));
+  });
+
+  afterEach(() => {
+    resetSessionSettingsState();
+    rmSync(sessionDir, { recursive: true, force: true });
+  });
+
+  it("round-trips {enabled:false, threshold:5} through the snapshot (未登记则 resume 静默丢失)", () => {
+    setSessionSetting("tlSelfWorkGuard", { enabled: false, threshold: 5 });
+    expect(saveSessionSettingsSnapshot(sessionDir)).toBe(true);
+
+    const parsed = parseYaml(
+      readFileSync(getSessionSettingsSnapshotPath(sessionDir), "utf-8")
+    ) as Record<string, unknown>;
+    expect(parsed.tlSelfWorkGuard).toEqual({ enabled: false, threshold: 5 });
+
+    // 模拟跨进程 resume：清内存 → 加载快照 → 新键进入 overlay 且解析结果不变
+    clearSessionSettingsMemory();
+    expect(getSessionSettings()).toEqual({});
+    expect(loadSessionSettingsSnapshot(sessionDir, "session-B")).toBe(true);
+    expect(getSessionSettings()).toEqual({
+      tlSelfWorkGuard: { enabled: false, threshold: 5 },
+    });
+    expect(
+      resolveTlSelfWorkGuard(resolveEffectiveSettings(makeGlobal(), getSessionSettings()))
+    ).toEqual({ enabled: false, threshold: 5 });
+  });
+
+  it("字段级 merge：全局 {threshold:5} + 临时 {enabled:false} → 生效 {false,5}", () => {
+    const global: TeamSettings = {
+      ...makeGlobal(),
+      tlSelfWorkGuard: { enabled: true, threshold: 5 },
+    };
+    setSessionSetting("tlSelfWorkGuard", { enabled: false });
+
+    const effective = resolveEffectiveSettings(global, getSessionSettings());
+    expect(effective.tlSelfWorkGuard).toEqual({ enabled: false, threshold: 5 });
+    expect(resolveTlSelfWorkGuard(effective)).toEqual({ enabled: false, threshold: 5 });
+    // 合并隔离：不改动 global
+    expect(global.tlSelfWorkGuard).toEqual({ enabled: true, threshold: 5 });
+  });
+
+  it("drops invalid threshold values from snapshots, keeps the valid sibling field", () => {
+    mkdirSync(sessionDir, { recursive: true });
+    for (const raw of ["1", "0", "3.5", '"5"']) {
+      resetSessionSettingsState();
+      writeFileSync(
+        getSessionSettingsSnapshotPath(sessionDir),
+        `tlSelfWorkGuard:\n  enabled: false\n  threshold: ${raw}\nwaitTimeoutMinutes: 5\n`,
+        "utf-8"
+      );
+      expect(loadSessionSettingsSnapshot(sessionDir, "session-B")).toBe(true);
+      expect(getSessionSettings().tlSelfWorkGuard).toEqual({ enabled: false });
+    }
+  });
+
+  it("drops a non-boolean enabled from snapshots (字段级校验负例)", () => {
+    mkdirSync(sessionDir, { recursive: true });
+    writeFileSync(
+      getSessionSettingsSnapshotPath(sessionDir),
+      'tlSelfWorkGuard:\n  enabled: "false"\n  threshold: 5\nwaitTimeoutMinutes: 5\n',
+      "utf-8"
+    );
+    expect(loadSessionSettingsSnapshot(sessionDir, "session-B")).toBe(true);
+    expect(getSessionSettings().tlSelfWorkGuard).toEqual({ threshold: 5 });
+    // 回落到默认（保持约束）而非把字符串猜成关闭
+    expect(
+      resolveTlSelfWorkGuard(resolveEffectiveSettings(makeGlobal(), getSessionSettings()))
+    ).toEqual({ enabled: true, threshold: 5 });
+  });
+
+  it("load returns false when the snapshot only holds invalid values", () => {
+    mkdirSync(sessionDir, { recursive: true });
+    writeFileSync(
+      getSessionSettingsSnapshotPath(sessionDir),
+      'tlSelfWorkGuard:\n  enabled: "false"\n  threshold: 1\n',
       "utf-8"
     );
     expect(loadSessionSettingsSnapshot(sessionDir, "session-B")).toBe(false);

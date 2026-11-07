@@ -462,6 +462,12 @@ The TL follows the **Orchestration Playbook** (`src/prompts/orchestration-playbo
   - **Support-set semantics**（逐字复刻 pi-ai `getSupportedThinkingLevels`，版本锚定 pi 0.83.x dist bundle；不 import pi-ai——非本包依赖且 jiti alias 深导入有拼坏前科，见 §17）：非 reasoning 模型仅 `off`；reasoning 模型 `off/minimal/low/medium/high` 默认支持（`thinkingLevelMap` 映射为 `null` 者除外），`xhigh/max` 仅当 `thinkingLevelMap` 存在对应条目。`isMemberThinkingLevel` 校验保持严格不变——`follow` 是模式不是级别，绝不混入级别值域。
   - **Wiring**: `index.ts` 在 `session_start` 缓存 `ctx.modelRegistry`；`buildMemberConfig` 新增 `lookupSupportedThinkingLevels?(modelRef)` 选项——按 `provider/modelId` 在 `getAvailable()` 查模型后返回支持集（查不到/注册表不可用 fail-open）。两个调用点均传入：`start_member` 工具与 `/team resume` 的 `startResumedMember`；崩溃 auto-restart 复用已存 config，flag 自然保留。无生效模型覆盖（source=none）时不检测；团队 YAML `model: "provider/id:high"` 后缀逃生口不受影响（含后缀的 id 匹配不到注册表 → fail-open）。仅影响之后启动的成员。
   - `start_member` 结果附注三态（`describeSpawnThinkingAnnotation`，P2）：跟随成功「思考强度：<level>（跟随 TL，模型支持该级别）」/ 跟随降级「思考强度：跟随 TL，但模型不支持该级别，保持默认」/ TL 级别未知「思考强度：跟随 TL（TL 级别未知，保持默认）」；非 follow 保持既有格式「思考强度：<level|默认>」。
+- Also supports: **TL 亲自分析限制**（`tlSelfWorkGuard?`；`src/settings/resolve-tl-self-work-guard.ts` + `src/settings/tl-self-work-guard-constants.ts`，决策 #48）
+  - 顶层项 `TL 亲自分析限制（当前：开启 · 每回合 3 次）`（关闭态只显示 `（当前：关闭）`，**不输出次数**，避免「关闭 · 每回合 N 次」自相矛盾）；临时覆盖带 `[临时]`；位置在「消息合并」之后、「成员互发消息」之前。**项名是稳定契约**：守卫拦截文案、豁免清单与首次拦截通知都按 `/team setting →「TL 亲自分析限制」` 引用，改名即死指针
+  - 子菜单三项（循环式，Esc 返回）：`开关（● 当前，选中切换）` / `每回合允许次数（整数 ≥ 2，默认 3）` / `恢复默认次数（3 次，保留开关状态）`；非法输入（`0`/`1`/非整数/超出安全整数上限如 `1e30`）不落盘 + 警告（含「下限 2」与「要关闭请用开关」）
+  - 语义：开关**同时**覆盖执行阶段派发前拦截与设计阶段 read 频率提醒；**次数只作用于执行阶段**（设计阶段节奏固定 4 次）；四处通知统一含「**下一回合生效（当前回合仍按旧值）**」
+  - 完整设计（数据形态、三处校验、提示词三态、异常方向、菜单容量策略、排障判别表、发布检查清单）见 **§35**
+
 
 ## 6. TL Process Management Tools
 
@@ -905,7 +911,7 @@ Strict 模式的注入结构相同，但标题为「严格模式 ⚡ — 必须�
 **设计阶段白名单（`DESIGN_PHASE_WHITELIST`）：**
 - 仅允许：`add_dynamic_member`、`start_member`、`stop_member`、`list_members`、`get_member_log`、`wait_and_get_member_status`、`team_send_and_wait`、`set_goal`、`finish_goal`、`write_shared_context`、`read`（不受限）、`write`（仅 `.md` 文件）、`ask_user_question`/`todo`（第三方编排辅助，决策 #44——白名单放行，不写项目文件；提示词不列举）
 - 其他工具全部被阻断（包括 `bash`、`edit`、`web_search` 等），TL 只能讨论方案、有限度读取文件、写入共享上下文。
-- **设计阶段 read 软限制**（`src/session/tl-read-guard.ts` 的 `createDesignReadGuard`）：read 是允许的（了解项目以设计方案是合法设计工作），但非 `.md` 读取每 4 次会被**拦截一次并提醒**「是否真的需要 read」——若确实需要，再次调用 read 即可放行（单次提醒、不持续拦截，与执行阶段的 sticky 拦截不同：设计阶段没有可派发的 Member）。`.md` 读取不计数、不拦截；首次拦截带 `firstBlock` 标记触发用户可见通知与状态栏警示；`agent_start` 重置每轮计数。
+- **设计阶段 read 软限制**（`src/session/tl-read-guard.ts` 的 `createDesignReadGuard`）：read 是允许的（了解项目以设计方案是合法设计工作），但非 `.md` 读取每 4 次会被**拦截一次并提醒**「是否真的需要 read」——若确实需要，再次调用 read 即可放行（单次提醒、不持续拦截，与执行阶段的 sticky 拦截不同：设计阶段没有可派发的 Member）。`.md` 读取不计数、不拦截；首次拦截带 `firstBlock` 标记触发用户可见通知与状态栏警示；`agent_start` 重置每轮计数。**节奏固定 4 次**（`DESIGN_READ_GUARD_THRESHOLD`，提示词插值同源），**只随总开关启用/停用**、不随执行阶段次数变化；关闭后直接放行且不计数（决策 #48，见 §35）。
 
 **执行阶段白名单（`EXECUTION_PHASE_WHITELIST`）：**
 - 团队管理工具 + 第三方编排辅助工具（`ask_user_question`、`todo`，决策 #44——仅白名单放行；提示词不列举）+ 只读分析工具（`read`、`bash`、`web_search`、`fetch_content`、`ctx_search`、`true_sight_*` 等）+ `write`/`edit`（仅 `.md` 文件）
@@ -914,10 +920,10 @@ Strict 模式的注入结构相同，但标题为「严格模式 ⚡ — 必须�
 
 **TL 亲自分析的运行时软纠偏（`src/session/tl-read-guard.ts`）：**
 - 问题：执行阶段白名单放行了 `read`/`bash`（TL 监控协调所需），提示词中的"铁律"是纯软约束，TL 仍可能亲自埋头分析代码而不派发任务。
-- 机制：以 `agent_start` 为 turn 边界重置计数；每个 turn 内未发生 `team_send_and_wait` 派发时，TL 对**所有非管理工具**（read、bash、web_search、ctx_execute 等——不只 `read`，否则可用 bash grep/rg/cat 绕过）的调用计数，超过阈值（默认 3）即进入**持续拦截模式**：派发前每次非管理工具调用都会被 block，reason 中包含纠偏指引。
+- 机制：以 `agent_start` 为 turn 边界重置计数；每个 turn 内未发生 `team_send_and_wait` 派发时，TL 对**除 `.md` 读取外的非管理工具**（read、bash、web_search、ctx_execute 等——不只 `read`，否则可用 bash grep/rg/cat 绕过）的调用计数，超过阈值即进入**持续拦截模式**：派发前每次此类工具调用都会被 block，reason 中包含纠偏指引。**阈值默认 3，可在 `/team setting →「TL 亲自分析限制」` 调成整数 ≥ 2 或整体关闭**（决策 #48；配置在回合边界注入，**下一回合生效**；关闭后不计数、不拦截、不弹通知、不留状态栏）。**次数只作用于执行阶段**：设计阶段 read 提醒节奏固定 4 次，只随同一个总开关启停。
 - 设计属性：
-  - **持续拦截（sticky）**：阈值触发后不是 block 一次就放行——一次性的软提醒实测可被模型无视（看到一次错误后继续用下一个工具分析）。现在派发前所有非管理工具调用持续被拦截，TL 唯一出路是 `team_send_and_wait` 派发任务或直接回复用户。首次拦截带 `firstBlock` 标记，供 UI 弹通知/状态栏警示；派发（`team_send_and_wait`）后立即解锁，后续工具调用全部放行。
-  - **fail-open**：`.md` 读取不计数（文档工作是 TL 本职）；管理工具（start/stop/list_members、team_send_and_wait、write_shared_context、write/edit 等）与编排辅助工具（`ask_user_question`、`todo`，决策 #44——不消耗预算、sticky 期间仍可用）永不拦截（解锁通道永远畅通）；`write_shared_context` 必须在豁免清单内（决策 #47）：它是第一动作协议的第 1 步，且 `start_member` 在共享上下文写入前被硬拦截，若它也被计数，粘滞态下协议的三步会互相锁死；派发后不再拦截（派发后的 read 视为协调/审阅）；设计阶段不启用本守卫（无 Member 可派发），取而代之的是**设计阶段 read 软限制**（`createDesignReadGuard`，见上）：非 `.md` read 每 4 次拦截一次提醒，确需读取时再次调用即放行。
+  - **持续拦截（sticky）**：阈值触发后不是 block 一次就放行——一次性的软提醒实测可被模型无视（看到一次错误后继续用下一个工具分析）。现在派发前除 `.md` 读取外的非管理工具调用持续被拦截，TL 唯一出路是 `team_send_and_wait` 派发任务或直接回复用户。首次拦截带 `firstBlock` 标记，供 UI 弹通知/状态栏警示；派发（`team_send_and_wait`）后立即解锁，后续工具调用全部放行。
+  - **fail-open**：`.md` 读取不计数（文档工作是 TL 本职）；管理工具（start/stop/list_members、team_send_and_wait、write_shared_context、write/edit 等）与编排辅助工具（`ask_user_question`、`todo`，决策 #44——不消耗预算、sticky 期间仍可用）永不拦截（解锁通道永远畅通）；`write_shared_context` 必须在豁免清单内（决策 #47）：它是第一动作协议的第 1 步，且 `start_member` 在共享上下文写入前被硬拦截，若它也被计数，粘滞态下协议的三步会互相锁死；派发后不再拦截（派发后的 read 视为协调/审阅）；设计阶段不启用本守卫（无 Member 可派发），取而代之的是**设计阶段 read 软限制**（`createDesignReadGuard`，见上）：非 `.md` read 每 4 次拦截一次提醒，确需读取时再次调用即放行。**异常方向（决策 #48）**：回合边界解析设置失败时回默认「开启 + 3」而不保留上一次配置——上一次若是关闭，保留等于异常期间约束保持关闭，与 resolver 的「异常保持约束」相反。
   - 提示词层（`src/prompts/tl-first-action.ts` 的"第一动作协议"，注入预定义团队与动态模式执行阶段提示词顶部；决策 #47 起为一条有序链 `write_shared_context` → `start_member` → `team_send_and_wait`）与运行时层（本守卫）配对，模型能预知规则被强制执行。
 
 The handler stays registered for the entire pi session but checks `session.active` to decide whether to inject regular TL instructions. When `/team stop` ends the session, `session.active` becomes `false` and no regular TL instructions are injected; a one-shot session-ended banner may be injected on the next turn and is then consumed.
@@ -988,6 +994,10 @@ Session state (active + team definition) is stored in `session/state.ts` as a mo
 
 - `wait_and_get_member_status` waits for the all-idle condition until the configured diagnostic deadline (`waitTimeoutMinutes`, default 15 minutes; `0` means unlimited); expiry returns the current statuses and stuck-member recovery guidance
 - TL can use `stop_member` + `start_member` to restart
+
+### TL 亲自分析限制相关症状（被拦 / 写共享上下文被拦 / 设置不生效）
+
+- 按**错误原文**分流，见 §35.6 的判别表（同类原文互斥：守卫拦截 / `.shared-context.md` 直写重定向 / 会话外调用 / 工具未注册 / 文件写入失败 / 会话无团队定义 / 白名单拦截 / 扩展处理器抛错）。
 
 ### TL crash
 
@@ -2495,3 +2505,93 @@ resolver 矩阵 8（undefined/true/false/getter 异常/null·undefined settings 
 2. **纯文本自分析无法拦截**：守卫只对工具调用生效；模型不调工具直接给结论时任何提醒都触达不到（验收口径含人工抽样）。
 3. **流式窗口（M1）未覆盖**：`/team start` 在流式输出中执行时，该回合已被 arm 的 prompt 走 steer/followUp，不会重建系统提示词；通知顺延到下一个回合（不丢失）。覆盖需改写用户输入或打断当前回答，属阶段 3（默认不做）。
 4. **效果未经真实模型抽样验证**：机制有效性的证据是退场侧的同形先例（措辞权威化后生效），进场侧仍需端到端抽样确认（闲聊/纯问答/「先别动」负例各 3 次）。
+
+## 35. TL 亲自分析限制（可配置 + 可关闭，阶段 1–5 收口，决策 #48）
+
+用户诉求：团队模式下「TL 不许自己埋头干活」有两个运行时限制器——执行阶段的派发前 sticky 拦截（默认每回合 3 次）与动态团队设计阶段的 read 频率提醒（固定每 4 次）——数字写死在源码里，设置里看不到也改不了。本特性把它暴露为 `/team setting` 的一个设置项，并守住两条契约：**提示词说的 = 运行时做的**，**拦截文案指的入口 = 菜单里真的存在**。
+
+### 35.1 形态与语义
+
+- 键：`tlSelfWorkGuard?: { enabled, threshold }`（`<rootDir>/settings.yaml`）；DEFAULT `{ enabled: true, threshold: 3 }` = 改造前行为（**缺省即现状**，不动它时行为逐位不变）。
+- **总开关**同时覆盖两个按阶段互斥的限制器：执行阶段派发前拦截 + 设计阶段 read 频率提醒。两者结构上不会同时生效，共用开关不会出现「两套阈值打架」；关闭后不计数、不拦截、不弹通知、不留状态栏。
+- **次数只作用于执行阶段**：设计阶段节奏**固定 4 次**（`DESIGN_READ_GUARD_THRESHOLD`，提示词插值同源），不提供第二个数字（避免「两个数字各管一段」）。「把次数调到很大」不等于关闭——仍会计数、仍可能有状态栏警示，想彻底不拦请用开关。
+- 生效时点：**下一回合边界**。`agent_start` 读一次生效设置并 `configure()`；当前回合仍按旧值（命令处理器可以在模型响应过程中运行，所以菜单通知与本文都明写这一点）。
+- 用户面区间：整数 **≥ 2**（默认 3）。不支持 `0`（与同菜单「等待上限 `0` = 不限」的约定方向相反，也正是这个原因不把 `0` 当关闭开关）与 `1`（会让提示词「允许读取 1-2 个文件」的例外当场失效）。
+- **三处校验同一闭区间 `[2, Number.MAX_SAFE_INTEGER]`**：`settings.ts` 解析、`session-settings.ts` 快照 `sanitizeSnapshotData`、菜单输入。上界不是洁癖：`1e30` 这类值实际等价于「永不拦截」，静默接受等于静默放宽约束。
+- 非法值处理：`enabled` 仅接受 boolean（其余丢弃 → 保持开启），`threshold` 越界/非整数丢弃 → 回默认 3。两层行为不同，如实说明：**解析层**（`settings.ts` 读盘）按 `(filePath, kind)` **warn-once 去重**——同文件同类问题只打一次 `console.warn`（`loadSettings` 每回合高频调用，不去重会刷屏）；**菜单输入**是**每次 `notify` 提示、不做去重**——用户是交互式改设置，每次非法输入都应立刻看到反馈。两处的警告文案都带下限与「要关闭请用开关」，避免「我明明关了」静默失效。
+
+### 35.2 覆盖范围与必须保留的既有性质
+
+| 限制器 | 何时生效 | 节奏 | 越界行为 | 计数对象 |
+|---|---|---|---|---|
+| 派发前拦截（sticky） | 团队会话**执行阶段**（预定义团队全程；动态团队在首次 `start_member` 之后） | 每回合 `threshold` 次（默认 3，**可配**） | **粘滞**：之后每次**除 `.md` 读取外的**非管理工具调用都被拦，直到本回合派发 | 除 `.md` 读取外的非管理工具（read/bash/web_search/ctx_execute 等） |
+| 设计阶段 read 提醒 | 动态团队**设计阶段** | **固定 4 次**（不随次数设置变） | **软**：拦一次并提醒，再调一次放行 | 仅非 `.md` 的 `read` |
+
+改造必须保留（均有测试锁定）：`.md` 文档读取**永不计数**且判断发生在计数之前（粘滞态仍可读 `DESIGN.md` / `.shared-context.md`，这是既有安全阀）；**派发即解锁**（调用 `team_send_and_wait` 即放行，衡量的是「有没有选择派发」而不是「派发是否成功」）；管理工具（含 `write_shared_context`、`start_member`、write/edit 与编排辅助 `ask_user_question`/`todo`）不计数、不拦截。
+
+### 35.3 运行时接线与失败方向
+
+- `agent_start`：`resetTurn()` → 仅团队会话活跃时 `resolveTlSelfWorkGuard(getEffectiveSettings())` → `configure()`（执行阶段取 `{enabled, threshold}`，设计阶段只取 `enabled`）。非团队会话不读设置，零额外开销。
+- 解析**必须在回合开始事件内**且包 try/catch：该事件处理器抛错只记一条扩展错误；工具调用事件的处理器抛错会被包成 `Extension failed, blocking execution`，等于每次工具调用都被阻断。放错位置的代价远大于选错失败方向。
+- **异常回默认（开启 + 默认次数）**，**不得**保留上一次成功解析的配置：上一次若是 `enabled: false`，保留等于「异常期间约束保持关闭」，与 resolver 的「异常保持约束」方向相反。回落复用 `resolveTlSelfWorkGuard()` 的无参形态（自带 try/catch），不重复一份默认值知识。
+- `configure()` 语义：同状态重复注入**不**重置本回合计数；**由关变开时清计数并清 sticky**（关闭期间不计数，重新开启必须从零预算开始，否则残留 sticky 会在开启后的第一次调用上静默拦截且不弹通知）。两个限制器对称复位。`enabled` 入参 fail-safe（只认字面 `false`），非法 `threshold` 回默认。
+- 成本：每个用户回合**至多 3 次**小文件读取——回合开始解析 / 工具可见性门控（`startTeamSessionVisible`）/ 提示词构建（`getSelfWorkGuardForPrompt`，仅预定义与动态两处注入点使用）。刻意**不**在工具调用事件里逐次读盘（高频路径 + 无异常兜底）。
+
+### 35.4 提示词一致性（阶段 3）
+
+- `src/prompts/tl-first-action.ts`：常量 → `buildFirstActionProtocolPrompt({ enabled, threshold })`（**参数必填**）。开启态写真实上限：「……超过 N 次时，**除 .md 文档读取外的**非管理工具会被**持续拦截**」；关闭态整段不输出（也不写「已关闭」这类配置陈述——对模型无价值且引入配置耦合）。三态都保留行为规则（「派发之前禁止 read / bash 代码文件」）、「允许读取 1-2 个文件」例外与「未写入前 `start_member` 会被系统拦截」（与开关无关，永远成立）。
+- `src/prompts/dynamic-mode.ts`：`buildDynamicModePrompt(team, phase, sessionId, { selfWorkGuard })`——`selfWorkGuard` **必填**（禁止默认值冒充真实配置；缺字段直接抛错），执行阶段用上述构建函数；设计阶段「每 4 次」句按开关条件化（关闭 → 「读取次数不受提醒限制。」），并把同段落前一句「有频率提醒，见下」一并条件化（否则关闭态仍留一句假话）；节奏数字由常量插值。
+- **叶模块纪律（纠正早前表述）**：`src/session/tl-read-guard.ts` 仅有 1 个 import——零依赖常量文件 `src/settings/tl-self-work-guard-constants.ts`（guard 不再传递引入 `fs`/`yaml`）。仓内**不存在**「tl-read-guard 零 import」的静态测试，早期方案里「有静态测试锁定零 import」的描述不准确；真正的锁是「豁免名单不变式」与「会话工具 ⊆ 豁免名单」两组用例。
+- agent 自主会话（ADR-0003）旁路两个限制器，其提示词**不含**任何「会拦截」措辞（`agent-initiated-mode.test.ts` 回归锁，防止将来误把第一动作协议注入该来源）。
+
+### 35.5 菜单（阶段 4）
+
+- 顶层：`TL 亲自分析限制（当前：开启 · 每回合 3 次）`；关闭态 `（当前：关闭）`（不输出次数）；临时覆盖带 `[临时]`。位置在「消息合并」之后、「成员互发消息」之前。
+- 子菜单（循环式，Esc 返回）：`开关：开启（● 当前，选中切换）` / `每回合允许次数（当前：N 次，最小 2）` / `恢复默认次数（3 次）`。**恢复默认只改次数，保留开关状态**（关闭态不会被顺手开启）。
+- 通知四处（开启 / 关闭 / 改次数 / 恢复默认）统一含「**下一回合生效（当前回合仍按旧值）**」；开关项说明「设计阶段 read 提醒同时关闭/恢复」，改次数说明「仅影响执行阶段」，恢复默认说明开关状态保持。作用域沿用既有分流：全局直写 `settings.yaml`；临时经字段级 diff 只 pin 实际改动的子字段（切开关只写 `enabled`，不把 `threshold` 一并固定）。
+- 指针统一形态 `/team setting →「TL 亲自分析限制」`（守卫拦截文案、豁免清单、首次拦截通知三处同形）——**顶层项名必须保留该短语前缀**。
+- **容量策略**：顶层当前 10 项（有临时设置时 11 项），最长标签约 74 列、含标题整屏约 14 行——常规终端（≥ 80×24）完整可见，故仍用 `ctx.ui.select`。**再增项（≥ 12）须迁 `src/ui/scroll-select.ts` 的 `scrollSelect`**：内置 select 不做滚动，短终端会截断（同 `/team resume` 与模型选择器的先例）。
+
+### 35.6 排障判别表（错误原文 → 来源 → 处置）
+
+下表每行互斥——同一时刻只会出现其中一类原文，取一条即可定位。前 6 行是用户可见的拦截/失败原文（守卫拦截、直写重定向、会话外调用、工具未注册、文件写入失败、会话无团队定义），后 2 行是白名单与环境/实现缺陷类：
+
+| 看到的原文（关键片段） | 来源 | 处置 |
+|---|---|---|
+| `🚫 仍未派发任务却继续调用工具` / `⚠️ 检测到你在尚未派发任何任务` | 派发前限制器 | 正常拦截。若出现在 `write_shared_context` / `start_member` 上 = 回归（进程早于豁免修复启动，或构建不含修复）→ 重启进程 / 更新构建后复测 |
+| `共享上下文必须通过 write_shared_context 工具写入` | `.shared-context.md` 直写重定向 | 设计行为：模型用了 `write`/`edit` 而非专用工具；不算故障 |
+| `write_shared_context 只能在活跃的团队会话中使用` | 工具自身的活跃检查 | `/team stop` 之后仍尝试写入；已有退场横幅兜底 |
+| `Tool write_shared_context not found` | 框架对非活跃工具的短路 | 会话外调用，或工具未在活跃集内；扩展无法改写该文案，属已知限制 |
+| `写入共享上下文失败：…` | 文件系统写入失败 | **与守卫无关**。它不会置位「已写入」标记，因此 `start_member` 会被持续拒绝——症状与「不能启动任务」完全一致，最易误判 |
+| `无法写入共享上下文：当前会话没有团队定义。` | 工具自身的会话检查 | 会话状态异常；结束并重开会话 |
+| `动态团队模式设计阶段不得使用 X` / `团队会话期间不得使用 X` | 工具白名单 | 与计数无关；**白名单不受本设置影响**（`ctx_execute` 等仍被拦） |
+| `Extension failed, blocking execution: …` | 扩展处理器抛错 | 属实现缺陷；本特性要求解析包 try/catch，并有「坏配置不阻断工具」用例锁定 |
+
+### 35.7 残余限制
+
+1. **设置读取异常期间显示与运行会短暂不一致**（方案 §4.6 的既定取舍）：异常回默认让运行时按「开启 + 默认次数」工作，而菜单 / `settings.yaml` 仍显示磁盘值（可能是「关闭」）。选择前者的理由——误拦是响亮的（当场弹文案、可立刻修正），误放宽是安静的（TL 悄悄自己干活，不会归因到「设置读取异常」）。
+2. 「次数调到极大」事实上接近不拦，但仍计数、仍可能有状态栏警示——想彻底不拦请用开关。
+3. 次数上限极高（如 `Number.MAX_SAFE_INTEGER`）与关闭等价，但语义不同：前者仍会计数。
+4. agent 自主会话不受这两个限制器约束，设置对其无效果；纯文本自分析任何运行时守卫都触达不到（既有局限）。
+5. 未发布风险：`57c60db`（`write_shared_context` 计入豁免）若不进发布分支，从发布渠道安装的用户仍会复现「写共享上下文被拦 → `start_member` 硬门控 → 卡死」，见 §35.8。
+
+### 35.8 发布检查清单
+
+- [ ] `57c60db`（`write_shared_context` 豁免修复）已合并进 `origin/main`（发布分支）——否则第二件事（「想更新共享上下文却被拦」）在发布渠道仍然复现。
+- [ ] **阶段 2、3、4 在同一版本内发布**（阶段 5 文档可紧随）。只发阶段 2 → 设置生效但提示词仍写「超过 3 次」；只发阶段 3/4 → 提示词/菜单承诺「可配置」而运行时仍固定 3。
+- [ ] 文档三处已更新：`README.md`（设置表 + `/team setting` 关键词）、`DESIGN.md`（§5 / §10 / §12 / 本节）、`AGENTS.md`（决策 #17 补可配置、决策 #48、Source Map、Commands Reference）。
+- [ ] 发布说明提示「**升级后重启 pi 进程**」——扩展只在进程启动时载入；`/reload` 能否加载改动后的 TypeScript 尚未验证，不作为升级手段。
+- [ ] **可执行门槛全绿**：`npm test`（全量）、`npx tsc --noEmit`、`npm run check:goal-reminder`，以及两个静态扫描（`src/static-scan.test.ts` 的 `loadSettings(` 白名单与绝对化历史断言、`src/static-scan-child-process.test.ts` 的 `child_process` 白名单）——任一项红即不得发版。
+- [ ] 真机目视顶层菜单（10 / 11 项）在目标终端不截断。
+
+### 35.9 测试与守卫
+
+- `src/settings/resolve-tl-self-work-guard.test.ts`：resolver 矩阵（缺省/空对象/关闭/自定义/越界/异常 getter/null settings）+ describe 两态。
+- `src/settings/settings.test.ts`：缺省 / 往返 / 非法值矩阵 / warn-once 按 `(filePath, kind)` 去重 / 上界（`MAX_SAFE_INTEGER` 接受、+1 与 `1e30` 回退）。
+- `src/settings/session-settings.test.ts`：快照登记往返 + 字段级 merge + 非法字段丢弃。
+- `src/session/tl-read-guard.test.ts`：关闭不计数不拦、`configure` 改阈值不重置计数、关→开复位对称、`enabled` fail-safe、`.md` 安全阀、豁免文案与 `MANAGEMENT_TOOLS` 双向一致、豁免不变式（协议依赖工具永不计数）。
+- `src/index.test.ts`（守卫可配置块，含临时数据目录隔离）：关闭 6 读零通知零状态栏 / 阈值 5 / 坏 YAML 回默认且不阻断 / 回合边界生效 / 设计阶段两态 / 链式回归（粘滞 → `write_shared_context` → `start_member` → 派发 → read）。
+- `src/index-guard-fallback.test.ts`：设置读取抛错 → 回落「开启 + 默认」且不抛；恢复后下一回合按文件配置（回落非粘性）。
+- `src/prompts/tl-first-action.test.ts` / `dynamic-mode.test.ts` / `agent-initiated-mode.test.ts`：三态文案矩阵、设计阶段两态、必填参数、旁路来源回归锁。
+- `src/commands/handlers/setting-handler.test.ts`「TL 亲自分析限制 (阶段 4)」：顶层三态与位置、子菜单结构与标题、全局/临时作用域、非法输入矩阵、恢复默认保留开关、Esc；**指针契约**用例把导出的 `OPT_SELF_WORK` 与守卫 `EXEMPT_ACTIONS_LINE`、`index.ts` 首次拦截通知逐字对齐（任一处改字即红）。
+- 静态守卫：`src/static-scan.test.ts` 的 `loadSettings(` 白名单（resolver 不得裸调用）与绝对化历史断言扫描（`index.ts` + `src/prompts/*.ts`）保持绿。

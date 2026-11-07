@@ -29,7 +29,9 @@ describe("task dispatch protocol", () => {
   });
 
   it.each(["design", "execution"] as const)("injects the shared protocol once in dynamic %s", phase => {
-    const prompt = buildDynamicModePrompt(team, phase);
+    const prompt = buildDynamicModePrompt(team, phase, null, {
+      selfWorkGuard: { enabled: true, threshold: 3 },
+    });
     expect(prompt.split(TASK_DISPATCH_PROTOCOL_PROMPT)).toHaveLength(2);
   });
 

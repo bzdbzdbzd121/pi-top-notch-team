@@ -1,10 +1,16 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createMockContext } from "../../test/fixtures/mock-extension-api";
-import { handleSetting } from "./setting-handler";
-import { loadSettings, getSettingsPath } from "../../settings/settings";
+import { handleSetting, OPT_SELF_WORK } from "./setting-handler";
+import { EXEMPT_ACTIONS_LINE } from "../../session/tl-read-guard";
+import {
+  loadSettings,
+  saveSettings,
+  getSettingsPath,
+  DEFAULT_SETTINGS,
+} from "../../settings/settings";
 import { endSession, startSession } from "../../session/state";
 import { getSyncConfigPath, loadSyncConfig, saveSyncConfig } from "../../sync/config";
 import {
@@ -1110,5 +1116,278 @@ describe("/team setting — 云同步（机器级，阶段 2）", () => {
     await handleSetting(ctx as any);
     expect(existsSync(getSyncConfigPath(tmpDir))).toBe(false);
     expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("不能内嵌"), "warning");
+  });
+});
+
+// ── 阶段 4：TL 亲自分析限制菜单入口 ───────────────────────────────
+
+describe("/team setting — TL 亲自分析限制 (阶段 4)", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "team-setting-selfwork-"));
+    process.env.TOP_NOTCH_TEAM_ROOT = tmpDir;
+    resetSessionSettingsState();
+  });
+
+  afterEach(() => {
+    endSession();
+    resetSessionSettingsState();
+    delete process.env.TOP_NOTCH_TEAM_ROOT;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  const SELF_WORK_ITEM = "TL 亲自分析限制";
+
+  function topItems(ctx: ReturnType<typeof createCtx>): string[] {
+    return (ctx.ui.select as any).mock.calls[0][1] as string[];
+  }
+
+  function notifies(ctx: ReturnType<typeof createCtx>): string[] {
+    return (ctx.ui.notify as any).mock.calls.map((c: any[]) => String(c[0]));
+  }
+
+  it("顶层菜单：默认生效值「开启 · 每回合 3 次」，插在消息合并之后、成员互发之前（指针可对应）", async () => {
+    const ctx = createCtx({ sessionId: "sess-1", selectImpl: pickContaining(undefined) });
+    await handleSetting(ctx as any);
+
+    const items = topItems(ctx);
+    const selfWork = items.find((i) => i.startsWith(SELF_WORK_ITEM));
+    expect(selfWork).toBe(`${SELF_WORK_ITEM}（当前：开启 · 每回合 3 次）`);
+
+    const coalesce = items.findIndex((i) => i.startsWith("消息合并"));
+    const peer = items.findIndex((i) => i.startsWith("成员互发消息"));
+    expect(coalesce).toBeGreaterThan(-1);
+    expect(items.indexOf(selfWork!)).toBeGreaterThan(coalesce);
+    expect(items.indexOf(selfWork!)).toBeLessThan(peer);
+  });
+
+  it("顶层菜单：settings.yaml 关闭时显示「关闭」（不带次数，避免自相矛盾）", async () => {
+    saveSettings(
+      { ...structuredClone(DEFAULT_SETTINGS), tlSelfWorkGuard: { enabled: false, threshold: 3 } },
+      tmpDir
+    );
+    const ctx = createCtx({ sessionId: "sess-1", selectImpl: pickContaining(undefined) });
+    await handleSetting(ctx as any);
+    const selfWork = topItems(ctx).find((i) => i.startsWith(SELF_WORK_ITEM))!;
+    expect(selfWork).toBe(`${SELF_WORK_ITEM}（当前：关闭）`);
+    expect(selfWork).not.toContain("次");
+  });
+
+  it("顶层菜单：临时覆盖时带 [临时] 徽标（overlay 含该键）", async () => {
+    setSessionSetting("tlSelfWorkGuard", { enabled: false });
+    const ctx = createCtx({ sessionId: "sess-1", selectImpl: pickContaining(undefined) });
+    await handleSetting(ctx as any);
+    const selfWork = topItems(ctx).find((i) => i.startsWith(SELF_WORK_ITEM))!;
+    expect(selfWork).toContain("（当前：关闭）");
+    expect(selfWork).toContain("[临时]");
+  });
+
+  it("子菜单结构：开关（● 当前）/ 每回合允许次数（当前 N，最小 2）/ 恢复默认次数", async () => {
+    const ctx = createCtx({
+      sessionId: "sess-1",
+      selectImpl: pickContaining(SELF_WORK_ITEM, undefined),
+    });
+    await handleSetting(ctx as any);
+    const subItems = (ctx.ui.select as any).mock.calls[1][1] as string[];
+    const subTitle = (ctx.ui.select as any).mock.calls[1][0] as string;
+
+    expect(subItems[0]).toContain("开关：开启");
+    expect(subItems[0]).toContain("●");
+    expect(subItems[1]).toContain("每回合允许次数（当前：3 次");
+    expect(subItems[1]).toContain("最小 2");
+    expect(subItems[2]).toContain("恢复默认次数");
+    // 标题明示设计阶段节奏固定（不受次数影响）
+    expect(subTitle).toContain("每 4 次");
+  });
+
+  it("全局作用域：子菜单切开关 → settings.yaml 落盘 + 通知含「下一回合生效」与设计阶段范围", async () => {
+    const ctx = createCtx({
+      sessionId: "sess-1",
+      selectImpl: pickContaining("设置作用域", SELF_WORK_ITEM, "开关", undefined),
+    });
+    await handleSetting(ctx as any);
+
+    expect(loadSettings(tmpDir).tlSelfWorkGuard).toEqual({ enabled: false, threshold: 3 });
+    const msg = notifies(ctx).find((n) => n.includes("已关闭「TL 亲自分析限制」"));
+    expect(msg).toBeDefined();
+    expect(msg).toContain("下一回合生效");
+    expect(msg).toContain("设计阶段");
+    expect(msg).toContain("read 频率提醒");
+  });
+
+  it("全局作用域：再切一次开关 → 恢复开启，通知说明设计阶段提醒同时恢复", async () => {
+    saveSettings(
+      { ...structuredClone(DEFAULT_SETTINGS), tlSelfWorkGuard: { enabled: false, threshold: 3 } },
+      tmpDir
+    );
+    const ctx = createCtx({
+      sessionId: "sess-1",
+      selectImpl: pickContaining("设置作用域", SELF_WORK_ITEM, "开关", undefined),
+    });
+    await handleSetting(ctx as any);
+
+    expect(loadSettings(tmpDir).tlSelfWorkGuard).toEqual({ enabled: true, threshold: 3 });
+    const msg = notifies(ctx).find((n) => n.includes("已开启「TL 亲自分析限制」"));
+    expect(msg).toContain("下一回合生效");
+    expect(msg).toContain("设计阶段");
+  });
+
+  it("临时作用域：切开关只 pin enabled（threshold 不被一并固定），settings.yaml 零改动", async () => {
+    const ctx = createCtx({
+      sessionId: "sess-1",
+      selectImpl: pickContaining(SELF_WORK_ITEM, "开关", undefined),
+    });
+    await handleSetting(ctx as any);
+
+    expect(getSessionSettings()).toEqual({ tlSelfWorkGuard: { enabled: false } });
+    expect(existsSync(getSettingsPath(tmpDir))).toBe(false);
+    const msg = notifies(ctx).find((n) => n.includes("已关闭「TL 亲自分析限制」"));
+    expect(msg).toContain("（仅当前 pi 会话生效，重启后失效）");
+  });
+
+  it("每回合允许次数：合法输入 → 落盘 + 通知含「下一回合生效」与「仅影响执行阶段」", async () => {
+    const ctx = createCtx({
+      sessionId: "sess-1",
+      selectImpl: pickContaining("设置作用域", SELF_WORK_ITEM, "每回合允许次数", undefined),
+    });
+    (ctx.ui.input as any).mockResolvedValueOnce("5");
+    await handleSetting(ctx as any);
+
+    expect(loadSettings(tmpDir).tlSelfWorkGuard?.threshold).toBe(5);
+    // 输入框默认值 = 当前生效值
+    expect((ctx.ui.input as any).mock.calls[0][1]).toBe("3");
+    const msg = notifies(ctx).find((n) => n.includes("已设为每回合 5 次"));
+    expect(msg).toContain("下一回合生效");
+    expect(msg).toContain("仅影响执行阶段");
+  });
+
+  it.each(["0", "1", "abc", "2.5", ""])(
+    "非法次数输入「%s」→ 不落盘 + 警告含下限 2 与「要关闭请用开关」",
+    async (bad) => {
+      const ctx = createCtx({
+        sessionId: "sess-1",
+        selectImpl: pickContaining(SELF_WORK_ITEM, "每回合允许次数", undefined),
+      });
+      (ctx.ui.input as any).mockResolvedValueOnce(bad);
+      await handleSetting(ctx as any);
+
+      expect(getSessionSettings()).toEqual({}); // 临时作用域也没写入
+      expect(existsSync(getSettingsPath(tmpDir))).toBe(false);
+      const warn = notifies(ctx).find((n) => n.includes("无效输入"));
+      expect(warn).toBeDefined();
+      expect(warn).toContain("下限 2");
+      expect(warn).toContain("要关闭请用开关");
+    }
+  );
+
+  it("次数上界：1e30 超出安全整数区间 → 不落盘 + 警告（与 settings/snapshot 区间对齐）", async () => {
+    const ctx = createCtx({
+      sessionId: "sess-1",
+      selectImpl: pickContaining(SELF_WORK_ITEM, "每回合允许次数", undefined),
+    });
+    (ctx.ui.input as any).mockResolvedValueOnce("1e30");
+    await handleSetting(ctx as any);
+
+    expect(getSessionSettings()).toEqual({});
+    expect(existsSync(getSettingsPath(tmpDir))).toBe(false);
+    const warn = notifies(ctx).find((n) => n.includes("无效输入"));
+    expect(warn).toContain("下限 2");
+    expect(warn).toContain("要关闭请用开关");
+  });
+
+  it("自定义阈值 + 切开关：阈值保留（{enabled:true, threshold:7} → {enabled:false, threshold:7}）", async () => {
+    saveSettings(
+      {
+        ...structuredClone(DEFAULT_SETTINGS),
+        tlSelfWorkGuard: { enabled: true, threshold: 7 },
+      },
+      tmpDir
+    );
+    const ctx = createCtx({
+      sessionId: "sess-1",
+      selectImpl: pickContaining("设置作用域", SELF_WORK_ITEM, "开关", undefined),
+    });
+    await handleSetting(ctx as any);
+
+    // 切开关只翻转 enabled，不得把自定义阈值重置成默认 3（突变缺口）
+    expect(loadSettings(tmpDir).tlSelfWorkGuard).toEqual({ enabled: false, threshold: 7 });
+  });
+
+  it("恢复默认次数：把次数改回 3，保留开关状态（全局作用域，关闭态保持关闭）", async () => {
+    saveSettings(
+      {
+        ...structuredClone(DEFAULT_SETTINGS),
+        tlSelfWorkGuard: { enabled: false, threshold: 7 },
+      },
+      tmpDir
+    );
+    const ctx = createCtx({
+      sessionId: "sess-1",
+      selectImpl: pickContaining("设置作用域", SELF_WORK_ITEM, "恢复默认次数", undefined),
+    });
+    await handleSetting(ctx as any);
+
+    expect(loadSettings(tmpDir).tlSelfWorkGuard).toEqual({ enabled: false, threshold: 3 });
+    const msg = notifies(ctx).find((n) => n.includes("已恢复默认次数"));
+    expect(msg).toContain("下一回合生效");
+    expect(msg).toContain("保持「关闭」");
+  });
+
+  it("恢复默认次数（开启态）：次数回 3，开关仍为开启", async () => {
+    saveSettings(
+      {
+        ...structuredClone(DEFAULT_SETTINGS),
+        tlSelfWorkGuard: { enabled: true, threshold: 9 },
+      },
+      tmpDir
+    );
+    const ctx = createCtx({
+      sessionId: "sess-1",
+      selectImpl: pickContaining("设置作用域", SELF_WORK_ITEM, "恢复默认次数", undefined),
+    });
+    await handleSetting(ctx as any);
+    expect(loadSettings(tmpDir).tlSelfWorkGuard).toEqual({ enabled: true, threshold: 3 });
+  });
+
+  it("临时作用域：恢复默认次数只 pin 与全局不同的字段", async () => {
+    // 全局 threshold = 7；临时作用域恢复默认 3 → 只 pin threshold:3
+    saveSettings(
+      {
+        ...structuredClone(DEFAULT_SETTINGS),
+        tlSelfWorkGuard: { enabled: true, threshold: 7 },
+      },
+      tmpDir
+    );
+    const ctx = createCtx({
+      sessionId: "sess-1",
+      selectImpl: pickContaining(SELF_WORK_ITEM, "恢复默认次数", undefined),
+    });
+    await handleSetting(ctx as any);
+    expect(getSessionSettings()).toEqual({ tlSelfWorkGuard: { threshold: 3 } });
+  });
+
+  it("指针契约：守卫拦截文案 / 首次拦截通知 / 菜单项名共用同一常量（改字即红）", () => {
+    // 1) 守卫拦截文案（EXEMPT_ACTIONS_LINE：需要再次拦截时模型读到的指引）
+    expect(EXEMPT_ACTIONS_LINE).toContain(`/team setting →「${OPT_SELF_WORK}」`);
+    // 2) index.ts 的首次拦截通知（源码内是字面量，必须与常量逐字一致）
+    const indexSource = readFileSync(new URL("../../../index.ts", import.meta.url), "utf-8");
+    expect(indexSource).toContain(`可在 /team setting →「${OPT_SELF_WORK}」调整或关闭`);
+    // 3) 菜单项名以该常量开头（顶层项 = 用户点进去的那个入口）
+    expect(OPT_SELF_WORK).toBe("TL 亲自分析限制");
+  });
+
+  it("子菜单 Esc → 设置不变；顶层 Esc → 不写盘", async () => {
+    const ctx = createCtx({
+      sessionId: "sess-1",
+      selectImpl: pickContaining("设置作用域", SELF_WORK_ITEM, undefined),
+    });
+    await handleSetting(ctx as any);
+    expect(loadSettings(tmpDir).tlSelfWorkGuard).toEqual({ enabled: true, threshold: 3 });
+    expect(getSessionSettings()).toEqual({});
+
+    const ctx2 = createCtx({ sessionId: "sess-1", selectImpl: pickContaining(undefined) });
+    await handleSetting(ctx2 as any);
+    expect(existsSync(getSettingsPath(tmpDir))).toBe(false);
   });
 });

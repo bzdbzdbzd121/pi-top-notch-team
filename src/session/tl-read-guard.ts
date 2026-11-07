@@ -40,6 +40,18 @@
  * exploring code to understand the project is legitimate design work there.
  */
 
+import {
+  DEFAULT_TL_SELF_WORK_GUARD_THRESHOLD,
+  DESIGN_READ_GUARD_THRESHOLD,
+  MIN_TL_SELF_WORK_GUARD_THRESHOLD,
+} from "../settings/tl-self-work-guard-constants";
+
+/**
+ * 设计阶段的 read 提醒节奏（常量已下沉到设置层常量文件，使提示词可以直接插值；
+ * 这里重新导出保持既有导入路径不变）。
+ */
+export { DESIGN_READ_GUARD_THRESHOLD };
+
 /** Tools that are explicitly team-management/coordination and never count. */
 export const MANAGEMENT_TOOLS = new Set([
   "start_member", "stop_member", "list_members", "get_member_log",
@@ -63,9 +75,29 @@ export const MANAGEMENT_TOOLS = new Set([
   "ask_user_question", "todo",
 ]);
 
+/**
+ * 拦截文案里的豁免清单（阶段 2）：告诉被拦的模型「还有哪些动作合法」，否则它
+ * 只会看到一条错误就去试下一个工具或直接回复用户。工具名一律写字面量（本模块
+ * 保持叶层：只引用常量文件，不 import 工具注册链路）。
+ * 不变式（有测试锁定）：这里出现的工具名必须全部属于 MANAGEMENT_TOOLS，且
+ * MANAGEMENT_TOOLS 的每一项都必须在这里出现——文案与事实不得分叉。
+ */
+export const EXEMPT_ACTIONS_LINE =
+  `• 以下动作不受此限制（不计数、不会被拦）：write_shared_context、start_member、stop_member、list_members、get_member_log、wait_and_get_member_status、team_send_and_wait、set_goal、finish_goal、add_dynamic_member、start_team_session、stop_team_session、write/edit（仅 .md 文档）、ask_user_question、todo，以及读取 .md 文档（含 .shared-context.md）。\n` +
+  `• 上限可在 /team setting →「TL 亲自分析限制」中调整次数或关闭。`;
+
+export interface TlReadGuardConfig {
+  /** 总开关。false = 不拦截、不计数（两个限制器共用的同一个开关）。 */
+  enabled: boolean;
+  /** 每回合允许的非管理工具调用次数。 */
+  threshold: number;
+}
+
 export interface TlReadGuardOptions {
   /** Non-management tool calls allowed per turn before sticky blocking. Default: 3. */
   threshold?: number;
+  /** Whether the guard is active at all. Default: true (= behaviour before the setting existed). */
+  enabled?: boolean;
 }
 
 export interface TlReadGuardVerdict {
@@ -81,6 +113,14 @@ export interface TlReadGuard {
   /** Mark that the TL dispatched a task this turn (team_send_and_wait called). */
   recordDispatch(): void;
   /**
+   * Inject the effective configuration at the turn boundary (agent_start).
+   * Re-configuring with the same `enabled` state does NOT reset this turn's
+   * counters (resetTurn() owns the normal per-turn reset); a disabled→enabled
+   * transition DOES reset them, because calls made while disabled were never
+   * counted and a stale sticky flag would block silently right after re-enable.
+   */
+  configure(config: TlReadGuardConfig): void;
+  /**
    * Evaluate a tool call.
    * @param toolName - name of the tool being called
    * @param filePath - path extracted from input (only for read/write/edit); may be undefined
@@ -89,6 +129,10 @@ export interface TlReadGuard {
   checkToolCall(toolName: string, filePath?: string): TlReadGuardVerdict;
   /** Current non-management tool call count this turn (observability / testing). */
   readonly preDispatchCalls: number;
+  /** Effective threshold (after configure()). */
+  readonly threshold: number;
+  /** Whether the guard is currently active. */
+  readonly enabled: boolean;
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -113,13 +157,17 @@ export interface TlReadGuard {
 //     count.
 
 export interface DesignReadGuardOptions {
-  /** Code reads allowed between reminders. Every `threshold`-th code read is blocked once. Default: 4 (same rhythm as the pre-dispatch guard's 4th-call block). */
+  /** Code reads allowed between reminders. Every `threshold`-th code read is blocked once. Default: DESIGN_READ_GUARD_THRESHOLD. */
   threshold?: number;
+  /** Whether the limiter is active. Default: true. Shares the `enabled` switch with the pre-dispatch guard. */
+  enabled?: boolean;
 }
 
 export interface DesignReadGuard {
   /** Reset per-turn counters. Call on agent_start (once per user-message turn). */
   resetTurn(): void;
+  /** 回合边界注入开关（次数固定为 DESIGN_READ_GUARD_THRESHOLD，不可配）。 */
+  configure(config: { enabled: boolean }): void;
   /**
    * Evaluate a tool call. Only `read` on non-.md files is in scope.
    * @returns soft block verdict (blocked call is followed by a passing one)
@@ -127,10 +175,13 @@ export interface DesignReadGuard {
   checkToolCall(toolName: string, filePath?: string): TlReadGuardVerdict;
   /** Non-.md read calls this turn (observability / testing). */
   readonly readCount: number;
+  /** Whether the limiter is currently active. */
+  readonly enabled: boolean;
 }
 
 export function createDesignReadGuard(options: DesignReadGuardOptions = {}): DesignReadGuard {
-  const threshold = options.threshold ?? 4;
+  const threshold = options.threshold ?? DESIGN_READ_GUARD_THRESHOLD;
+  let enabled = options.enabled ?? true;
 
   let readCount = 0;
   let firstBlocked = false;
@@ -143,7 +194,24 @@ export function createDesignReadGuard(options: DesignReadGuardOptions = {}): Des
       justBlocked = false;
     },
 
+    configure(config) {
+      const wasEnabled = enabled;
+      // fail-safe（与执行阶段限制器同款）：只认字面 false。
+      enabled = config.enabled !== false;
+      // 与执行阶段限制器的「关→开从零预算」对称复位：关闭期间不计数，重新开启
+      // 若保留 readCount / justBlocked / firstBlocked，会导致「重新武装后第 N 次
+      // 提醒静默出现」（firstBlock 仍为 false，用户看不到通知），而且周期相位
+      // 会沿用关闭前的余数。生产路径 resetTurn → configure 行为不变（先重置）。
+      if (!wasEnabled && enabled) {
+        readCount = 0;
+        firstBlocked = false;
+        justBlocked = false;
+      }
+    },
+
     checkToolCall(toolName, filePath) {
+      // 关闭：直接放行，且**不计数**（否则关闭期间的读取会在重新开启时立刻触发提醒）。
+      if (!enabled) return { block: false };
       // Only `read` is in scope — the design-phase whitelist already blocks
       // every other non-management tool (bash, edit, web_search, ...).
       if (toolName !== "read") return { block: false };
@@ -168,7 +236,8 @@ export function createDesignReadGuard(options: DesignReadGuardOptions = {}): Des
             `⚠️ 设计阶段已累计 ${readCount} 次非文档 read（代码/项目文件读取）。作为团队设计师，反复读取项目文件会偏离设计职责——请确认是否真的需要读取该文件：\n` +
             `• 若确需查证（如项目结构、需求细节）→ 直接再次调用 read 即可，本次为单次提醒，不会持续拦截；\n` +
             `• 若已进入代码分析 → 请停止，先与用户对齐需求；代码分析由执行阶段的 Member 完成。\n` +
-            `• 读取 .md 文档（README/ADR/需求文档）不计数、不拦截。`,
+            `• 读取 .md 文档（README/ADR/需求文档）不计数、不拦截。\n` +
+            `• 若不希望保留该提醒，可在 /team setting →「TL 亲自分析限制」中关闭（设计阶段的提醒节奏固定每 4 次，不随次数设置变化）。`,
         };
       }
       return { block: false };
@@ -177,11 +246,16 @@ export function createDesignReadGuard(options: DesignReadGuardOptions = {}): Des
     get readCount() {
       return readCount;
     },
+
+    get enabled() {
+      return enabled;
+    },
   };
 }
 
 export function createTlReadGuard(options: TlReadGuardOptions = {}): TlReadGuard {
-  const threshold = options.threshold ?? 3;
+  let enabled = options.enabled ?? true;
+  let threshold = options.threshold ?? DEFAULT_TL_SELF_WORK_GUARD_THRESHOLD;
 
   let callCount = 0;
   let dispatched = false;
@@ -198,12 +272,38 @@ export function createTlReadGuard(options: TlReadGuardOptions = {}): TlReadGuard
       dispatched = true;
     },
 
+    configure(config) {
+      const wasEnabled = enabled;
+      // fail-safe（与 resolver 同款）：只认字面 false；undefined / null / 字符串 /
+      // 其他异常形态一律保持开启。方向与设置层一致——误放宽是静默的角色漂移，
+      // 误拦是响亮的且可当场修正。
+      enabled = config.enabled !== false;
+      // 入参防御：非整数 / NaN / 低于下限 → 默认值。调用点（回合边界）已保证
+      // 合法值；这里只保证内部状态不变量（不能出现 0 或 NaN 造成的「每调用必拦」）。
+      threshold =
+        Number.isInteger(config.threshold) &&
+        config.threshold >= MIN_TL_SELF_WORK_GUARD_THRESHOLD
+          ? config.threshold
+          : DEFAULT_TL_SELF_WORK_GUARD_THRESHOLD;
+      // 由关变开：关闭期间不计数，所以重新开启必须从零预算开始——否则残留的
+      // sticky 会在开启后的第一次调用上静默拦截（firstBlock=false，用户看不到
+      // 通知）。只作用于配置状态转换，resetTurn →configure 生产路径不受影响
+      // （resetTurn 已先清零）。
+      if (!wasEnabled && enabled) {
+        callCount = 0;
+        sticky = false;
+      }
+    },
+
     checkToolCall(toolName, filePath) {
+      // 关闭：直接放行，且**不计数**（否则关闭期间的调用会在重新开启时立刻粘滞）。
+      if (!enabled) return { block: false };
       // Management tools never count — they are coordination, not "doing the work".
       if (MANAGEMENT_TOOLS.has(toolName)) return { block: false };
       // After a dispatch, everything passes — post-dispatch tool calls are coordination/review.
       if (dispatched) return { block: false };
       // For `read` specifically: .md files / unknown paths never count — reading docs is legitimate.
+      // 必须在自增之前（粘滞态仍可读文档的安全阀）。
       if (toolName === "read" && (!filePath || filePath.endsWith(".md"))) return { block: false };
 
       callCount += 1;
@@ -213,10 +313,11 @@ export function createTlReadGuard(options: TlReadGuardOptions = {}): TlReadGuard
         return {
           block: true,
           reason:
-            `🚫 仍未派发任务却继续调用工具（已累计 ${callCount} 次非管理调用）。` +
+            `🚫 仍未派发任务却继续调用工具（已累计 ${callCount} 次非管理调用；当前上限 ${threshold} 次/回合）。` +
             `派发前工具调用会被持续拦截，继续调用只会浪费 token：\n` +
             `• 立即停止亲自分析，用 team_send_and_wait 把任务派给合适的 Member；\n` +
-            `• 或者直接回复用户说明当前情况，等待用户指示。`,
+            `• 或者直接回复用户说明当前情况，等待用户指示。\n` +
+            `${EXEMPT_ACTIONS_LINE}`,
         };
       }
 
@@ -226,10 +327,11 @@ export function createTlReadGuard(options: TlReadGuardOptions = {}): TlReadGuard
           block: true,
           firstBlock: true,
           reason:
-            `⚠️ 检测到你在尚未派发任何任务的情况下已连续调用 ${callCount} 次非管理工具（如 read/bash/search 等）。` +
+            `⚠️ 检测到你在尚未派发任何任务的情况下已连续调用 ${callCount} 次非管理工具（如 read/bash/search 等；当前上限 ${threshold} 次/回合）。` +
             `作为 Team Lead，代码分析/排查工作必须通过 team_send_and_wait 分派给 Member 完成，而不是自己动手。\n` +
             `• 立即停止当前分析，改用 team_send_and_wait 把任务派给合适的 Member。\n` +
-            `• 注意：在派发任务之前，后续工具调用都会被持续拦截（这是提醒不是围墙——派发后全部恢复）。`,
+            `• 在派发任务之前，后续工具调用都会被持续拦截（这是提醒不是围墙——派发后全部恢复）。\n` +
+            `${EXEMPT_ACTIONS_LINE}`,
         };
       }
       return { block: false };
@@ -237,6 +339,14 @@ export function createTlReadGuard(options: TlReadGuardOptions = {}): TlReadGuard
 
     get preDispatchCalls() {
       return callCount;
+    },
+
+    get threshold() {
+      return threshold;
+    },
+
+    get enabled() {
+      return enabled;
     },
   };
 }

@@ -1,6 +1,19 @@
 import { describe, it, expect } from "vitest";
 import { buildDynamicModePrompt } from "./dynamic-mode";
 import type { TeamDefinition } from "../team/definition";
+import { DESIGN_READ_GUARD_THRESHOLD } from "../settings/tl-self-work-guard-constants";
+
+/** 所有用例显式传三态（`selfWorkGuard` 必填——省略不得冒充「开启+3」）。 */
+const DEFAULT_GUARD = { enabled: true, threshold: 3 } as const;
+
+function buildPrompt(
+  team: TeamDefinition,
+  phase: "design" | "execution",
+  sessionId?: string | null,
+  selfWorkGuard: { enabled: boolean; threshold: number } = DEFAULT_GUARD
+): string {
+  return buildDynamicModePrompt(team, phase, sessionId ?? null, { selfWorkGuard });
+}
 
 // Ordering assertions anchor on the protocol BLOCK HEADING, not the bare phrase
 // "第一动作协议": since decision #47 the state declaration at the top of the
@@ -26,7 +39,7 @@ const teamWithMembers: TeamDefinition = {
 };
 
 describe("buildDynamicModePrompt — design phase", () => {
-  const prompt = buildDynamicModePrompt(emptyTeam, "design", "sess-1");
+  const prompt = buildPrompt(emptyTeam, "design", "sess-1");
 
   it("标注为设计阶段", () => {
     expect(prompt).toContain("设计阶段");
@@ -78,7 +91,7 @@ describe("buildDynamicModePrompt — design phase", () => {
   });
 
   it("展示已注册成员", () => {
-    const p = buildDynamicModePrompt(teamWithMembers, "design");
+    const p = buildPrompt(teamWithMembers, "design");
     expect(p).toContain("coder（编码员）");
     expect(p).toContain("reviewer（审查员）");
   });
@@ -86,7 +99,7 @@ describe("buildDynamicModePrompt — design phase", () => {
 
 describe("buildDynamicModePrompt — 常驻状态声明（阶段 0）", () => {
   it("设计阶段：注入设计态声明，位置在设计阶段正文之前", () => {
-    const prompt = buildDynamicModePrompt(emptyTeam, "design", "sess-1");
+    const prompt = buildPrompt(emptyTeam, "design", "sess-1");
     const idxDecl = prompt.indexOf("状态：你正在团队会话中（动态团队 — 设计阶段）");
     const idxPhase = prompt.indexOf("═══ 设计阶段 — 你的角色 ═══");
     expect(idxDecl).toBeGreaterThan(-1);
@@ -95,7 +108,7 @@ describe("buildDynamicModePrompt — 常驻状态声明（阶段 0）", () => {
   });
 
   it("设计阶段：声明含确认门，不含执行态的派发链与纠正措辞", () => {
-    const prompt = buildDynamicModePrompt(emptyTeam, "design", "sess-1");
+    const prompt = buildPrompt(emptyTeam, "design", "sess-1");
     expect(prompt).toContain("明确确认");
     expect(prompt).toContain("当前唯一有效的状态");
     // 执行态专属措辞不得渗入设计态（否则提示模型在确认门前派发）
@@ -103,7 +116,7 @@ describe("buildDynamicModePrompt — 常驻状态声明（阶段 0）", () => {
   });
 
   it("执行阶段：注入执行态声明，位置在第一动作协议之前", () => {
-    const prompt = buildDynamicModePrompt(teamWithMembers, "execution");
+    const prompt = buildPrompt(teamWithMembers, "execution");
     const idxDecl = prompt.indexOf("状态：你正在团队会话中（Team Lead）");
     const idxProtocol = prompt.indexOf(PROTOCOL_HEADING);
     expect(idxDecl).toBeGreaterThan(-1);
@@ -116,13 +129,13 @@ describe("buildDynamicModePrompt — 常驻状态声明（阶段 0）", () => {
 
 describe("buildDynamicModePrompt — goal closing protocol", () => {
   it("design phase lists goal tools (set_goal/finish_goal)", () => {
-    const prompt = buildDynamicModePrompt(emptyTeam, "design");
+    const prompt = buildPrompt(emptyTeam, "design");
     expect(prompt).toContain("set_goal");
     expect(prompt).toContain("finish_goal");
   });
 
   it("execution phase lists goal tools and mandates the closing protocol", () => {
-    const prompt = buildDynamicModePrompt(teamWithMembers, "execution");
+    const prompt = buildPrompt(teamWithMembers, "execution");
     expect(prompt).toContain("set_goal");
     expect(prompt).toContain("finish_goal");
     // 收尾协议：完成/阻塞 → 强制调用 finish_goal，禁止仅口头宣称
@@ -141,7 +154,7 @@ describe("buildDynamicModePrompt — goal closing protocol", () => {
 });
 
 describe("buildDynamicModePrompt — execution phase", () => {
-  const prompt = buildDynamicModePrompt(teamWithMembers, "execution");
+  const prompt = buildPrompt(teamWithMembers, "execution");
 
   it("标注为执行阶段", () => {
     expect(prompt).toContain("执行阶段");
@@ -171,5 +184,85 @@ describe("buildDynamicModePrompt — execution phase", () => {
   it("不列举第三方编排工具 ask_user_question / todo（决策 #44）", () => {
     expect(prompt).not.toContain("ask_user_question");
     expect(prompt).not.toContain("todo");
+  });
+});
+
+// ── 阶段 3：TL 亲自分析限制的两态一致性（提示词不得与运行时不符）──────
+
+describe("buildDynamicModePrompt — TL 亲自分析限制（设计阶段）", () => {
+  it("开启（默认）：含「每 4 次」软提醒说明", () => {
+    const prompt = buildPrompt(emptyTeam, "design", "sess-1");
+    expect(prompt).toContain("每 4 次");
+    expect(prompt).toContain("直接再次调用 read 即可放行");
+  });
+
+  it("显式开启：与缺省一致（参数化不改变节奏）", () => {
+    const prompt = buildPrompt(emptyTeam, "design", "sess-1", { enabled: true, threshold: 7 });
+    // 设计阶段的节奏固定 4，不受执行阶段次数影响
+    expect(prompt).toContain("每 4 次");
+    expect(prompt).not.toContain("每 7 次");
+  });
+
+  it("关闭：不含「每 4 次」与频率提醒措辞", () => {
+    const prompt = buildPrompt(emptyTeam, "design", "sess-1", { enabled: false, threshold: 3 });
+    expect(prompt).not.toContain("每 4 次");
+    expect(prompt).not.toContain("频率提醒");
+    expect(prompt).not.toContain("拦截一次并提醒");
+  });
+
+  it("两态都保留：.md 不限制 + 代码分析留给执行阶段的 Member", () => {
+    for (const enabled of [true, false]) {
+      const prompt = buildPrompt(emptyTeam, "design", "sess-1", { enabled, threshold: 3 });
+      expect(prompt).toContain("不限制 .md 文档");
+      expect(prompt).toContain("代码分析留给执行阶段的 Member");
+    }
+  });
+});
+
+describe("buildDynamicModePrompt — TL 亲自分析限制（执行阶段）", () => {
+  it("默认：含「超过 3 次」与「持续拦截」", () => {
+    const prompt = buildPrompt(teamWithMembers, "execution");
+    expect(prompt).toContain("超过 3 次");
+    expect(prompt).toContain("持续拦截");
+  });
+
+  it("上限 7：含「超过 7 次」、不含「超过 3 次」", () => {
+    const prompt = buildPrompt(teamWithMembers, "execution", null, { enabled: true, threshold: 7 });
+    expect(prompt).toContain("超过 7 次");
+    expect(prompt).not.toContain("超过 3 次");
+  });
+
+  it("关闭：不含「持续拦截」，但行为规则与硬门控保留", () => {
+    const prompt = buildPrompt(teamWithMembers, "execution", null, { enabled: false, threshold: 3 });
+    expect(prompt).not.toContain("持续拦截");
+    expect(prompt).toContain("禁止 read / bash 代码文件");
+    expect(prompt).toContain("允许读取 1-2 个文件");
+    expect(prompt).toContain("未写入前 `start_member` 会被系统拦截");
+  });
+});
+
+// ── 阶段 3 审查：必填参数 / 节奏常量插值 / 关闭态句式 ─────────────────
+
+describe("buildDynamicModePrompt — 参数与文案细则（阶段 3 审查）", () => {
+  it("selfWorkGuard 必填：省略 opts 即编译期失败（不得用默认值冒充真实配置）", () => {
+    // @ts-expect-error selfWorkGuard 为必填字段——省略会渲染「开启+3」，与真实配置可能不符
+    const build = () => buildDynamicModePrompt(emptyTeam, "design", "sess-1", {});
+    // 运行时同样不静默退回默认：缺字段直接抛（响亮失败优于渲染假话）
+    expect(build).toThrow();
+  });
+
+  it("设计阶段「每 N 次」由 DESIGN_READ_GUARD_THRESHOLD 插值（联动断言，防硬编码漂移）", () => {
+    const prompt = buildPrompt(emptyTeam, "design", "sess-1", DEFAULT_GUARD);
+    expect(prompt).toContain(`每 ${DESIGN_READ_GUARD_THRESHOLD} 次`);
+    expect(DESIGN_READ_GUARD_THRESHOLD).toBe(4);
+  });
+
+  it("设计阶段关闭态无重复标点（「）；（」），句式自洽", () => {
+    const prompt = buildPrompt(emptyTeam, "design", "sess-1", { enabled: false, threshold: 3 });
+    expect(prompt).not.toContain("）；（");
+    expect(prompt).toContain("读取次数不受提醒限制");
+    // 两态共同的 read 行结构不变
+    expect(prompt).toContain("不限制 .md 文档");
+    expect(prompt).toContain("代码分析留给执行阶段的 Member");
   });
 });

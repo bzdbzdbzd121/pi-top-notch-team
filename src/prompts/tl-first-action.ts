@@ -14,12 +14,36 @@
  * "目标成员不存在或未启动" and the model learned the protocol was wrong. The
  * session-entry reminder points at this chain, so it has to be executable.
  *
+ * **Parameterised by the effective runtime setting** (阶段 3): the closing
+ * paragraph is a factual statement about runtime enforcement ("超过 N 次会被
+ * 持续拦截"). When the TL self-work limit is disabled that statement becomes
+ * false and the model can falsify it with a single tool call — the project has
+ * measured twice that a false statement makes the model discount the whole
+ * surrounding rule set. So the paragraph is emitted only while the guard is
+ * enabled, and its number is the real threshold. When disabled we emit
+ * nothing about interception (and nothing about the setting either — the
+ * prompt is not a config dump); the behavioural rules and the start_member
+ * hard gate stay in both states because they are setting-independent.
+ *
  * Keep this snippet short — it previews the detailed rules that follow later
- * in the prompt, it does not replace them. Paired with the runtime soft
- * correction in src/session/tl-read-guard.ts (mentioned in the text so the
- * model knows the rule is enforced, not just advisory).
+ * in the prompt, it does not replace them.
  */
-export const FIRST_ACTION_PROTOCOL_PROMPT = `### 🚨 最高优先级：第一动作协议
+export interface FirstActionProtocolOptions {
+  /** TL 亲自分析限制的总开关（false = 运行时不再拦截）。 */
+  enabled: boolean;
+  /** 每回合允许的非管理工具调用次数（执行阶段生效）。 */
+  threshold: number;
+}
+
+export function buildFirstActionProtocolPrompt(o: FirstActionProtocolOptions): string {
+  const runtimeDetection = o.enabled
+    ? // 范围必须与运行时一致：粘滞态下管理工具与 .md 文档读取仍然放行，
+      // 写「所有非管理工具」会被一次 .md read 当场证伪。
+      `\n系统带有运行时检测：未派发任务就连续调用工具（read/bash/搜索等）超过 ${o.threshold} 次时，除 .md 文档读取外的非管理工具会被**持续拦截**，直到你调用 \`team_send_and_wait\` 派发任务为止。\n`
+    : "";
+
+  // 尾随换行对称：三态都以恰好一个换行结尾（否则注入点多一个空行）。
+  return `### 🚨 最高优先级：第一动作协议
 
 收到任何**任务型诉求**（分析、排查、修改、重构、审查、实现等）时，按下面的顺序做，不要在派发前自己动手：
 
@@ -30,6 +54,5 @@ export const FIRST_ACTION_PROTOCOL_PROMPT = `### 🚨 最高优先级：第一�
 派发之前**禁止 read / bash 代码文件**——一旦你开始自己读代码，角色就已经偏了。
 
 > 唯一例外：需求对齐阶段为确认某个具体事实，允许读取 1-2 个文件；完整的分析、排查、代码理解一律分派给 Member。
-
-系统带有运行时检测：未派发任务就连续调用工具（read/bash/搜索等）超过 3 次时，所有非管理工具会被**持续拦截**，直到你调用 \`team_send_and_wait\` 派发任务为止。
-`;
+${runtimeDetection}`;
+}

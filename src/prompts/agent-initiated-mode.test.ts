@@ -145,3 +145,18 @@ describe("buildAgentInitiatedPrompt (ADR-0003)", () => {
     });
   });
 });
+
+// ── 阶段 3 回归锁：旁路来源不得声称运行时检测 ────────────────────────
+describe("agent-initiated prompt — 不含 TL 亲自分析限制的运行时措辞", () => {
+  it("design / execution 两阶段都不出现「运行时检测」与「持续拦截」", () => {
+    // agent 自主会话整体旁路两个限制器（ADR-0003）；若将来有人把
+    // buildFirstActionProtocolPrompt 误注入这里，模型会读到一条当场可证伪的
+    // 「会拦截」陈述——这条用例就是那道护栏。
+    for (const phase of ["design", "execution"] as const) {
+      const prompt = buildAgentInitiatedPrompt(teamWithMembers, phase, "sess-1", TASK);
+      expect(prompt).not.toContain("运行时检测");
+      expect(prompt).not.toContain("持续拦截");
+      expect(prompt).not.toMatch(/超过\s*\d+\s*次/);
+    }
+  });
+});

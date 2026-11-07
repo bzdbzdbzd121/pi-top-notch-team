@@ -546,3 +546,226 @@ describe("allowAgentInitiatedSessions (agent 自主会话开关)", () => {
     expect(resolveAgentSessionAllowed(loadSettings(tmpDir))).toBe(false);
   });
 });
+
+describe("tlSelfWorkGuard (TL 亲自分析限制)", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "team-settings-selfwork-test-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("defaults to {enabled:true, threshold:3} when unset (缺省即现状)", () => {
+    expect(DEFAULT_SETTINGS.tlSelfWorkGuard).toEqual({ enabled: true, threshold: 3 });
+    const settings = loadSettings(tmpDir);
+    expect(settings.tlSelfWorkGuard).toEqual({ enabled: true, threshold: 3 });
+  });
+
+  it("defaults are back-filled for old files without the key", () => {
+    writeFileSync(getSettingsPath(tmpDir), "memberModel:\n  mode: follow\n", "utf-8");
+    expect(loadSettings(tmpDir).tlSelfWorkGuard).toEqual({ enabled: true, threshold: 3 });
+  });
+
+  it("round-trips {enabled:false, threshold:5} through save/load", () => {
+    saveSettings(
+      {
+        ...structuredClone(DEFAULT_SETTINGS),
+        tlSelfWorkGuard: { enabled: false, threshold: 5 },
+      },
+      tmpDir
+    );
+    const loaded = loadSettings(tmpDir);
+    expect(loaded.tlSelfWorkGuard).toEqual({ enabled: false, threshold: 5 });
+
+    // 只写开关（threshold 省略）也能往返，缺省值由 load 层补 3
+    writeFileSync(getSettingsPath(tmpDir), "tlSelfWorkGuard:\n  enabled: false\n", "utf-8");
+    expect(loadSettings(tmpDir).tlSelfWorkGuard).toEqual({ enabled: false, threshold: 3 });
+  });
+
+  it("accepts threshold 2 (lower bound) and larger integers", () => {
+    writeFileSync(getSettingsPath(tmpDir), "tlSelfWorkGuard:\n  threshold: 2\n", "utf-8");
+    expect(loadSettings(tmpDir).tlSelfWorkGuard?.threshold).toBe(2);
+
+    writeFileSync(getSettingsPath(tmpDir), "tlSelfWorkGuard:\n  threshold: 12\n", "utf-8");
+    expect(loadSettings(tmpDir).tlSelfWorkGuard?.threshold).toBe(12);
+  });
+
+  it("drops invalid threshold values → 3, warning once per file path", () => {
+    for (const raw of ["1", "0", "-1", "3.5", '"5"', "1e30"]) {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const dir = mkdtempSync(join(tmpdir(), "team-settings-selfwork-threshold-"));
+      try {
+        writeFileSync(
+          getSettingsPath(dir),
+          `tlSelfWorkGuard:\n  threshold: ${raw}\n`,
+          "utf-8"
+        );
+        expect(loadSettings(dir).tlSelfWorkGuard).toEqual({ enabled: true, threshold: 3 });
+        const warns = () =>
+          warnSpy.mock.calls.filter(
+            (c) =>
+              String(c[0]).includes("tlSelfWorkGuard") &&
+              String(c[0]).includes("threshold") &&
+              String(c[0]).includes(dir)
+          );
+        expect(warns()).toHaveLength(1);
+        // 下限提示：告知用户「要关闭请用开关」，避免把 0/1 当关闭手段
+        expect(String(warns()[0][0])).toContain("2");
+        expect(String(warns()[0][0])).toContain("enabled: false");
+        // 同文件路径重复 load 不刷屏
+        loadSettings(dir);
+        loadSettings(dir);
+        expect(warns()).toHaveLength(1);
+      } finally {
+        warnSpy.mockRestore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("accepts the upper bound exactly (Number.MAX_SAFE_INTEGER), rejects beyond it", () => {
+    // 与 session-settings.ts 的快照区间校验（≤ Number.MAX_SAFE_INTEGER）同一语义：
+    // 超出安全整数区间的次数不可能是真实配置，静默接受等于静默关闭约束。
+    writeFileSync(
+      getSettingsPath(tmpDir),
+      `tlSelfWorkGuard:\n  threshold: ${Number.MAX_SAFE_INTEGER}\n`,
+      "utf-8"
+    );
+    expect(loadSettings(tmpDir).tlSelfWorkGuard?.threshold).toBe(Number.MAX_SAFE_INTEGER);
+
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const dir = mkdtempSync(join(tmpdir(), "team-settings-selfwork-threshold-ub-"));
+    try {
+      writeFileSync(
+        getSettingsPath(dir),
+        `tlSelfWorkGuard:\n  threshold: ${Number.MAX_SAFE_INTEGER + 1}\n`,
+        "utf-8"
+      );
+      expect(loadSettings(dir).tlSelfWorkGuard?.threshold).toBe(3);
+      expect(warnSpy.mock.calls.filter((c) => String(c[0]).includes(dir))).toHaveLength(1);
+    } finally {
+      warnSpy.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("dedupes warn-once per (filePath, kind): fixing the shape state re-arms the enabled warning", () => {
+    // 一个去重键服务两类问题会让第二类永久静默：进程内同一路径先报「非对象形态」，
+    // 用户改文件为对象但仍写错 enabled —— 同一个 Set 键会把第二次吞掉。
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const kinds = () => ({
+        shape: warnSpy.mock.calls.filter(
+          (c) => String(c[0]).includes(tmpDir) && String(c[0]).includes("需要对象")
+        ).length,
+        enabled: warnSpy.mock.calls.filter(
+          (c) => String(c[0]).includes(tmpDir) && String(c[0]).includes("tlSelfWorkGuard.enabled")
+        ).length,
+      });
+
+      // 1) 非对象形态 → 一次「需要对象」警告
+      writeFileSync(getSettingsPath(tmpDir), 'tlSelfWorkGuard: "off"\n', "utf-8");
+      expect(loadSettings(tmpDir).tlSelfWorkGuard).toEqual({ enabled: true, threshold: 3 });
+      loadSettings(tmpDir);
+      expect(kinds()).toEqual({ shape: 1, enabled: 0 });
+
+      // 2) 同一路径改成对象形态但 enabled 非法 → 必须能再次收到警告
+      writeFileSync(getSettingsPath(tmpDir), 'tlSelfWorkGuard:\n  enabled: "false"\n', "utf-8");
+      expect(loadSettings(tmpDir).tlSelfWorkGuard).toEqual({ enabled: true, threshold: 3 });
+      expect(kinds()).toEqual({ shape: 1, enabled: 1 });
+
+      // 3) 同一 kind 重复 load 仍只 warn 一次（去重语义不变）
+      loadSettings(tmpDir);
+      loadSettings(tmpDir);
+      expect(kinds()).toEqual({ shape: 1, enabled: 1 });
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("treats explicit null/absent threshold as the default (no warning)", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      for (const raw of ["tlSelfWorkGuard:\n  threshold: null\n", "tlSelfWorkGuard:\n  enabled: true\n"]) {
+        const dir = mkdtempSync(join(tmpdir(), "team-settings-selfwork-threshold-null-"));
+        try {
+          writeFileSync(getSettingsPath(dir), raw, "utf-8");
+          expect(loadSettings(dir).tlSelfWorkGuard).toEqual({ enabled: true, threshold: 3 });
+          expect(warnSpy.mock.calls.filter((c) => String(c[0]).includes(dir))).toHaveLength(0);
+        } finally {
+          rmSync(dir, { recursive: true, force: true });
+        }
+      }
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("drops non-boolean enabled values → true, warning once per file path", () => {
+    for (const raw of ['"false"', "0", "null"]) {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const dir = mkdtempSync(join(tmpdir(), "team-settings-selfwork-enabled-"));
+      try {
+        writeFileSync(getSettingsPath(dir), `tlSelfWorkGuard:\n  enabled: ${raw}\n`, "utf-8");
+        // 严格姿态：字符串 "false" 不被猜成关闭——但必须有信号，避免「我明明关了」静默失效
+        expect(loadSettings(dir).tlSelfWorkGuard).toEqual({ enabled: true, threshold: 3 });
+        const warns = () =>
+          warnSpy.mock.calls.filter(
+            (c) => String(c[0]).includes(dir) && String(c[0]).includes("enabled")
+          );
+        expect(warns()).toHaveLength(1);
+        loadSettings(dir);
+        expect(warns()).toHaveLength(1);
+      } finally {
+        warnSpy.mockRestore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("drops a non-object tlSelfWorkGuard → defaults, warning once per file path", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      for (const raw of ['"off"', "3"]) {
+        const dir = mkdtempSync(join(tmpdir(), "team-settings-selfwork-shape-"));
+        try {
+          writeFileSync(getSettingsPath(dir), `tlSelfWorkGuard: ${raw}\n`, "utf-8");
+          expect(loadSettings(dir).tlSelfWorkGuard).toEqual({ enabled: true, threshold: 3 });
+          const warns = () =>
+            warnSpy.mock.calls.filter(
+              (c) => String(c[0]).includes(dir) && String(c[0]).includes("tlSelfWorkGuard")
+            );
+          expect(warns()).toHaveLength(1);
+          loadSettings(dir);
+          expect(warns()).toHaveLength(1);
+        } finally {
+          rmSync(dir, { recursive: true, force: true });
+        }
+      }
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("does not warn when the key is simply absent (old files stay silent)", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      writeFileSync(getSettingsPath(tmpDir), "memberModel:\n  mode: follow\n", "utf-8");
+      loadSettings(tmpDir);
+      expect(
+        warnSpy.mock.calls.filter((c) => String(c[0]).includes("tlSelfWorkGuard"))
+      ).toHaveLength(0);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("does not mutate DEFAULT_SETTINGS across load", () => {
+    writeFileSync(getSettingsPath(tmpDir), "tlSelfWorkGuard:\n  enabled: false\n", "utf-8");
+    loadSettings(tmpDir);
+    expect(DEFAULT_SETTINGS.tlSelfWorkGuard).toEqual({ enabled: true, threshold: 3 });
+  });
+});
