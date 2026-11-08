@@ -68,6 +68,83 @@ describe("buildDynamicModePrompt — design phase", () => {
     expect(prompt).toContain("分批循环处理");
   });
 
+  it("playbook 计划书模板含「团队名（建议）」字段，规则标注建议语义与不可改名", () => {
+    expect(prompt).toContain("### 团队名（建议）");
+    expect(prompt).toContain("不是开工条件");
+    expect(prompt).toContain("成员启动后不能再改名");
+  });
+
+  it("阶段 E 的字段枚举与 playbook 计划书模板一致（防漂移）", () => {
+    // Extract the fields the model is told to put in the plan document, then
+    // require every one of them to be enumerated at stage E — otherwise the
+    // confirmation gate would show a plan without that field (and the name
+    // freezes right after start_member).
+    const templateHeading = "### 计划书模板";
+    const template = prompt.slice(
+      prompt.indexOf(templateHeading) + templateHeading.length,
+      prompt.indexOf("### 规则")
+    );
+    const fields = template
+      .split("\n")
+      .filter((line) => line.startsWith("### "))
+      .map((line) => line.slice(4).trim());
+    expect(fields).toEqual([
+      "目标",
+      "任务拆分",
+      "工作流",
+      "团队分工",
+      "团队名（建议）",
+      "风险与应对",
+    ]);
+
+    const stageE = prompt.slice(
+      prompt.indexOf("#### 阶段 E：方案确认门"),
+      prompt.indexOf("#### 阶段 F：落地执行")
+    );
+    for (const field of fields) {
+      expect(stageE, `阶段 E 缺少计划书字段：${field}`).toContain(field);
+    }
+  });
+
+  it("阶段 F 落地顺序：命名 → 注册成员 → 写共享上下文 → 启动成员（阶段 5）", () => {
+    const fStart = prompt.indexOf("#### 阶段 F：落地执行");
+    const fEnd = prompt.indexOf("#### 目标（可选）");
+    expect(fStart).toBeGreaterThan(-1);
+    expect(fEnd).toBeGreaterThan(fStart);
+    const fSection = prompt.slice(fStart, fEnd);
+
+    expect(fSection).toContain("set_team_name");
+    expect(fSection).toContain("建议");
+    expect(fSection).toContain("成员启动后不能再改名");
+    // The freeze point is start_member, never add_dynamic_member.
+    expect(fSection).toContain("启动成员之前");
+
+    const setNameIdx = fSection.indexOf("set_team_name");
+    const addIdx = fSection.indexOf("add_dynamic_member");
+    const ctxIdx = fSection.indexOf("write_shared_context");
+    expect(setNameIdx).toBeGreaterThan(-1);
+    expect(setNameIdx).toBeLessThan(addIdx);
+    expect(addIdx).toBeLessThan(ctxIdx);
+  });
+
+  it("只能做的操作清单里包含 set_team_name", () => {
+    const ops = prompt.slice(
+      prompt.indexOf("你只能做的操作"),
+      prompt.indexOf("### 设计流程")
+    );
+    expect(ops).toContain("set_team_name");
+    expect(ops).toContain("启动成员前完成");
+  });
+
+  it("命名不是硬门控（负例锁）：无「必须命名」「不命名会被拦」类措辞", () => {
+    expect(prompt).not.toContain("必须命名");
+    expect(prompt).not.toContain("不命名");
+    expect(prompt).not.toMatch(/未命名[^。\n]*(拦截|禁止)/);
+    expect(prompt).not.toContain("禁止调用 `set_team_name`");
+    // 确认门仍只针对注册/启动成员（既有约束不得被改写稀释或扩大）
+    expect(prompt).toContain("禁止调用 `add_dynamic_member` 和 `start_member`");
+  });
+
   it("包含设计阶段铁律（工具硬阻断说明 + read 软限制）", () => {
     expect(prompt).toContain("铁律");
     expect(prompt).toContain("bash");

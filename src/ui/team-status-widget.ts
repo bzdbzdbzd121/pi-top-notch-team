@@ -1,6 +1,7 @@
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { TeamContext, MemberOperationalState } from "../session/context";
 import type { TeamMember } from "../team/definition";
+import { UNNAMED_TEAM_DISPLAY, TEAM_NAME_MAX_WIDTH, isSyntheticTeamName } from "../team/team-name";
 import type { ActivityTracker } from "../channel/activity-tracker";
 import { nextStreamFlushDelay } from "./member-inspector-state";
 
@@ -41,8 +42,14 @@ function renderStatusLine(
 ): string[] {
   width = Math.max(0, Math.floor(width));
   if (width === 0) return [""];
+  // Title budget shared by both layouts: the status bar caps the team name at
+  // min(20, width / 4) columns — TEAM_NAME_MAX_WIDTH is that same 20, so an
+  // accepted name is never necessarily truncated.
+  const titlePrefix = `${originMarker} ${truncateToWidth(singleLine(teamName), Math.min(TEAM_NAME_MAX_WIDTH, Math.floor(width / 4)), "…")}`;
   if (segments.length === 0) {
-    return [theme.fg("muted", truncateToWidth(`${originMarker} 设计阶段 · 设计团队中`, width, "…"))];
+    // Design phase (no members yet): show the team name too, so a rename is
+    // visible before the first start_member.
+    return [theme.fg("muted", truncateToWidth(`${titlePrefix} │ 设计阶段 · 设计团队中`, width, "…"))];
   }
 
   const rawSegment = (s: StatusSegment, labelWidth = 12) =>
@@ -50,7 +57,7 @@ function renderStatusLine(
   const styleSegment = (s: StatusSegment, raw: string) => s.color ? theme.fg(s.color, raw) : raw;
   const entries = segments.map(s => rawSegment(s));
   const suffix = (hidden: number) => hidden > 0 ? `  … 另${hidden}人` : "";
-  let prefix = `${originMarker} ${truncateToWidth(singleLine(teamName), Math.min(20, Math.floor(width / 4)), "…")}`;
+  let prefix = titlePrefix;
   // On very narrow terminals, member identity/status take priority over title.
   const firstMinimum = rawSegment(segments[0], Math.min(4, visibleWidth(segments[0].label)));
   if (visibleWidth(prefix) + 3 + visibleWidth(firstMinimum + suffix(segments.length - 1)) > width) {
@@ -117,7 +124,14 @@ const LIVE_REFRESH_WINDOW_MS = 120;
 const LIVE_REFRESH_MAX_WINDOW_MS = 1000;
 
 export function createTeamStatusWidget(options: {
-  teamName: string;
+  /**
+   * Dynamic getter for the team name — called exactly once per refresh, and the
+   * resolved value feeds BOTH the render dedup key and the rendered title (a
+   * rename therefore surfaces after exactly one setWidget). The synthetic
+   * `_dynamic_<ts>` fallback renders as UNNAMED_TEAM_DISPLAY; the real name
+   * stays authoritative for /team status and /team resume.
+   */
+  getTeamName: () => string;
   /** Dynamic getter for members — called on each refresh so dynamically added members appear. */
   getMembers: () => TeamMember[];
   teamCtx: TeamContext;
@@ -135,7 +149,7 @@ export function createTeamStatusWidget(options: {
    */
   origin?: "user" | "agent";
 }): TeamStatusWidget {
-  const { teamName, getMembers, teamCtx, memberOpsStates, activityTracker, origin = "user" } = options;
+  const { getTeamName, getMembers, teamCtx, memberOpsStates, activityTracker, origin = "user" } = options;
   const originMarker = origin === "agent" ? "🤖" : "👤";
   const contextUsageMap = new Map<string, MemberContextInfo | null>();
 
@@ -160,7 +174,7 @@ export function createTeamStatusWidget(options: {
   let lastRenderKey: string | null = null;
 
   // ── Build a display snapshot; lay it out at render(width) time ──
-  function buildDisplay(theme: WidgetTheme) {
+  function buildDisplay(theme: WidgetTheme, teamName: string) {
     // Stable O(N) priority buckets: crashed → working/compacting → idle/stopped.
     // Stream phases never reorder peers within a bucket.
     const buckets: TeamMember[][] = [[], [], []];
@@ -249,6 +263,9 @@ export function createTeamStatusWidget(options: {
     }
 
     return {
+      // The resolved title is part of the render key (a name change must show
+      // up after exactly one refresh; identical names must not re-render).
+      teamName,
       // Include every member, even currently hidden ones: a later resize can
       // reveal them without another event. Keep the N1 gate color-aware (B1).
       styled: segments.map(s => {
@@ -260,11 +277,20 @@ export function createTeamStatusWidget(options: {
     };
   }
 
+  /** Read the name once per refresh; the synthetic fallback renders as the placeholder. */
+  function resolvedTeamName(): string {
+    const raw = singleLine(getTeamName());
+    return raw && !isSyntheticTeamName(raw) ? raw : UNNAMED_TEAM_DISPLAY;
+  }
+
   // ── Refresh widget display (N1 render-side gate) ───────
   function refresh(): void {
     if (!currentUi || !currentTheme) return;
+    // Single read per refresh: the key and the rendered title never disagree
+    // (a twice-read getter could dedup against a newer name than it renders).
+    const teamName = resolvedTeamName();
     const t0 = performance.now();
-    const display = buildDisplay(currentTheme);
+    const display = buildDisplay(currentTheme, teamName);
     lastBuildMs = performance.now() - t0;
     // N1 render side: compare the STYLED lines (raw text + colors) with the
     // last output — unchanged content skips setWidget entirely (setWidget is
@@ -276,7 +302,7 @@ export function createTeamStatusWidget(options: {
     // v2.2: working 💭 default vs thinking 💭 accent. The styled comparison
     // captures both the color-only transitions and dedups the same-icon
     // same-color pair (tool-calling ↔ executing, both 🔧 warning).
-    const renderKey = display.styled.join("\n");
+    const renderKey = [display.teamName, ...display.styled].join("\n");
     if (renderKey === lastRenderKey) return;
     lastRenderKey = renderKey;
     try {

@@ -95,6 +95,24 @@ export function markSharedContextWritten(): void {
 }
 
 /**
+ * Rename the active session's team (in-memory only).
+ * Filesystem side effects (session directory move, manifest sync) belong to the
+ * caller; the name itself must already be validated by the caller
+ * (see src/team/team-name.ts).
+ * Like addMemberToSession this builds a fresh state object, preserving
+ * sessionId / startedAt / origin / sharedContextWritten and the member list.
+ */
+export function renameTeamInSession(newName: string): void {
+  if (!currentSession.active || !currentSession.teamDefinition) {
+    throw new Error("No active session — cannot rename team");
+  }
+  currentSession = {
+    ...currentSession,
+    teamDefinition: { ...currentSession.teamDefinition, name: newName },
+  };
+}
+
+/**
  * Add a new member to the active session's team definition.
  * Used by /team dynamic mode to dynamically build the team.
  * Unlike startSession, this does NOT reset startedAt.

@@ -70,9 +70,12 @@ const DECLARATION_BUILDERS: Record<TeamStateDeclarationVariant, (teamName: strin
  * Build the persistent state declaration.
  *
  * @param variant - `predefined` / `execution` produce identical text; `design` differs.
- * @param teamName - Rendered into the execution-state text only. The design text
- *   omits it on purpose: dynamic teams carry a synthetic `_dynamic_<ts>` name
- *   that carries no meaning for the model.
+ * @param teamName - Rendered into the execution-state text only. The design
+ *   declaration takes no name at all: during the design phase the session may
+ *   still carry the synthetic `_dynamic_<ts>` fallback (asserting it would be
+ *   noise), and once the team is named the actual name is already rendered by
+ *   the dynamic prompt's separate `### 当前团队：X` line — repeating it here
+ *   would introduce a second source for the same fact.
  */
 export function buildTeamStateDeclaration(
   variant: TeamStateDeclarationVariant,
@@ -196,8 +199,8 @@ const DESIGN_NOTICE_BODY = `用户刚刚进入动态团队会话，当前是设�
 
 设计阶段的顺序：
 1. 与用户对齐目标、范围、验收标准、约束与非目标（一次问一个问题，并给出推荐答案）；
-2. 拆解任务与依赖，给出计划书（目标、任务拆分、工作流、分工、风险）；
-3. 用户明确确认后再落地：add_dynamic_member 注册成员 → write_shared_context → start_member → team_send_and_wait 派发。
+2. 拆解任务与依赖，给出计划书（目标、任务拆分、工作流、分工、团队名（建议）、风险）；
+3. 用户明确确认后再落地：set_team_name 命名（建议，成员启动后不可改名）→ add_dynamic_member 注册成员 → write_shared_context → start_member → team_send_and_wait 派发。
 
 设计阶段不要派发任务、不要启动成员（此时团队可能一个成员都没有）。为确认事实可以读 1-2 个文件。`;
 

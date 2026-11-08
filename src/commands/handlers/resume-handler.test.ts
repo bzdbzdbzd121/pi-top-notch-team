@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, renameSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { handleResume, type ResumeHandlerDeps } from "./resume-handler";
@@ -15,7 +15,7 @@ const mockScrollSelect = scrollSelect as unknown as ReturnType<typeof vi.fn>;
 import type { TeamContext } from "../../session/context";
 import { getSessionState, endSession, startSession } from "../../session/state";
 import { getGoalState, resetGoal } from "../../tools/goal-tools";
-import { resetManifestRuntimeContext, readManifestFile, getManifestPath } from "../../session/manifest";
+import { resetManifestRuntimeContext, readManifestFile, getManifestPath, setManifestRuntimeContext, syncActiveManifest, markManifestStopped } from "../../session/manifest";
 import type { TeamSessionManifest } from "../../session/manifest";
 
 function makeTeamCtx(overrides?: Partial<TeamContext>): TeamContext {
@@ -182,6 +182,85 @@ describe("/team resume", () => {
     expect(active).toContain("stop_team_session");
   });
 
+  it("注册并激活 set_team_name（动态会话恢复后仍可在设计阶段改名）", async () => {
+    writeManifest(rootDir, {
+      teamName: "_dynamic_1",
+      sessionId: "dyn-1",
+      isDynamic: true,
+      dynamicPhase: "design",
+      startedMembers: [],
+      sharedContextWritten: true,
+    });
+    const pi = createMockExtensionAPI();
+    const ctx = createMockContext();
+    const teamCtx = makeTeamCtx();
+
+    await handleResume(pi as any, teamCtx, ctx as any, "", { startResumedMember: vi.fn() });
+
+    // Registered (pi.setActiveTools silently ignores unregistered names)
+    expect(pi.registerTool).toHaveBeenCalledWith(
+      expect.objectContaining({ name: "set_team_name" })
+    );
+    // Activated
+    const active = (pi.setActiveTools as any).mock.calls.at(-1)?.[0] as string[];
+    expect(active).toContain("set_team_name");
+    expect(teamCtx.dynamicPhase).toBe("design");
+
+    // 未启动成员的会话恢复后仍可改名（工具能真的执行成功）
+    const tool = (pi.registerTool as any).mock.calls.find(
+      ([d]: any) => d.name === "set_team_name"
+    )![0];
+    const outcome = await tool.execute("id", { name: "登录重构" }, undefined, undefined, ctx);
+    expect(outcome.content[0].text).toContain("登录重构");
+    expect(getSessionState().teamDefinition!.name).toBe("登录重构");
+    expect(existsSync(join(rootDir, "sessions", "登录重构", "dyn-1"))).toBe(true);
+  });
+
+  it("自愈：目录名是权威团队名（与清单 teamName 不一致时按目录名恢复并修正清单）", async () => {
+    // Simulate "directory renamed, manifest write lost": dir says 登录重构, manifest says _dynamic_1.
+    writeManifest(rootDir, {
+      teamName: "_dynamic_1",
+      sessionId: "dyn-1",
+      isDynamic: true,
+      dynamicPhase: "design",
+      startedMembers: [],
+    });
+    renameSync(join(rootDir, "sessions", "_dynamic_1"), join(rootDir, "sessions", "登录重构"));
+    // Settings snapshot lives in the DIRECTORY (authoritative) name.
+    writeFileSync(
+      join(rootDir, "sessions", "登录重构", "dyn-1", "session-settings.yaml"),
+      JSON.stringify({ waitTimeoutMinutes: 7 }),
+      "utf-8"
+    );
+
+    const pi = createMockExtensionAPI();
+    const ctx = createMockContext();
+    await handleResume(pi as any, makeTeamCtx(), ctx as any, "登录重构", {
+      startResumedMember: vi.fn(),
+    });
+
+    const s = getSessionState();
+    expect(s.active).toBe(true);
+    expect(s.teamDefinition!.name).toBe("登录重构");
+    expect(s.sessionId).toBe("dyn-1");
+    // Warning + manifest corrected in place
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("不一致"),
+      "warning"
+    );
+    const m = readManifestFile(getManifestPath(rootDir, "登录重构", "dyn-1"))!;
+    expect(m.teamName).toBe("登录重构");
+    // Snapshot loaded from the directory (authoritative) path
+    const settings = await import("../../settings/session-settings");
+    expect(settings.getSessionSettings().waitTimeoutMinutes).toBe(7);
+    settings.resetSessionSettingsState();
+
+    // Member paths follow the authoritative (directory) name too.
+    const { buildMemberConfig } = await import("../../setup/member-lifecycle");
+    const config = buildMemberConfig("analyst", getSessionState(), {});
+    expect(config?.sessionDir).toBe(join(rootDir, "sessions", "登录重构", "dyn-1", "analyst"));
+  });
+
   it("only lists sessions from the current working directory by default", async () => {
     writeManifest(rootDir, { teamName: "this-dir", sessionId: "s-here", startedMembers: [] });
     writeManifest(rootDir, { teamName: "other-dir", sessionId: "s-else", startedMembers: [], cwd: "/other/project" });
@@ -307,6 +386,57 @@ describe("临时设置恢复通道 (阶段 3)", () => {
     });
     expect(config?.model).toBe("openai/gpt-5");
     expect(config?.thinking).toBe("low");
+  });
+
+  it("改名后写临时设置 → 新目录 → stop → resume 仍生效，且旧目录未被重建", async () => {
+    const { applyTeamName } = await import("../../session/rename-team");
+    const { ensureSharedContextFile } = await import("../../session/shared-context");
+
+    const team = { name: "_dynamic_1", description: "动态团队", members: [] };
+    startSession(team, { sessionId: "sid-1" });
+    setManifestRuntimeContext({ isDynamic: true, dynamicPhase: "design", agentInitiatedTask: null });
+    mkdirSync(join(rootDir, "sessions", "_dynamic_1", "sid-1"), { recursive: true });
+    syncActiveManifest();
+    ensureSharedContextFile(team, "sid-1");
+    // Same binding as index.ts onSessionStart / onTeamRenamed.
+    sessionSettingsMod.setActiveSessionDir(join(rootDir, "sessions", "_dynamic_1", "sid-1"));
+
+    const outcome = applyTeamName("登录重构", {
+      rootDir,
+      isDynamic: true,
+      dynamicPhase: "design",
+      hasRunningMember: () => false,
+      onRenamed: (newName) =>
+        sessionSettingsMod.setActiveSessionDir(join(rootDir, "sessions", newName, "sid-1")),
+    });
+    expect(outcome.ok).toBe(true);
+
+    sessionSettingsMod.setSessionSetting("waitTimeoutMinutes", 5);
+    expect(
+      existsSync(join(rootDir, "sessions", "登录重构", "sid-1", "session-settings.yaml"))
+    ).toBe(true);
+    expect(existsSync(join(rootDir, "sessions", "_dynamic_1"))).toBe(false);
+
+    // /team stop: snapshot frozen, in-memory overlay cleared
+    sessionSettingsMod.setActiveSessionDir(null);
+    markManifestStopped("登录重构", "sid-1");
+    endSession();
+    resetManifestRuntimeContext();
+    sessionSettingsMod.resetSessionSettingsState();
+
+    // /team resume (--all: the manifest cwd is the real working directory)
+    await handleResume(
+      createMockExtensionAPI(),
+      makeTeamCtx(),
+      createMockContext() as any,
+      "--all",
+      { startResumedMember: vi.fn(async () => 111) }
+    );
+
+    expect(getSessionState().teamDefinition!.name).toBe("登录重构");
+    expect(sessionSettingsMod.getSessionSettings().waitTimeoutMinutes).toBe(5);
+    // The old-name directory is never recreated by the resume path.
+    expect(existsSync(join(rootDir, "sessions", "_dynamic_1"))).toBe(false);
   });
 
   it("S7: 活跃期 clear 后快照已删 → resume 不复活", async () => {

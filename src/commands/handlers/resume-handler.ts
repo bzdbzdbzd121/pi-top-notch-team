@@ -12,11 +12,13 @@ import { readTeam } from "../../team/store";
 import { getRootDir } from "../../config";
 import { loadSessionSettingsSnapshot } from "../../settings/session-settings";
 import { ensureAddDynamicMemberTool } from "../../setup/dynamic-session-bootstrap";
+import { ensureSetTeamNameTool } from "../../tools/team-name-tool";
 import { STOP_TEAM_SESSION_TOOL_NAME } from "../../tools/agent-session-tool-names";
+import { SET_TEAM_NAME_TOOL_NAME } from "../../tools/team-name-tool-names";
 import { scrollSelect } from "../../ui/scroll-select";
 import type { TeamDefinition } from "../../team/definition";
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 /**
  * /team resume [名称或sessionId前缀] — Resume an interrupted or stopped team session.
@@ -84,6 +86,19 @@ function formatEntry(m: TeamSessionManifest, showCwd: boolean): { label: string;
   };
 }
 
+/**
+ * The directory name is the AUTHORITATIVE team name on resume.
+ * A rename that lost its manifest write leaves "directory=new, manifest=old";
+ * trusting the manifest would rebuild an empty old-name directory and lose the
+ * member contexts plus the temporary-settings snapshot. Path shape is always
+ * `<root>/sessions/<teamName>/<sessionId>/session.json`.
+ */
+export function directoryTeamName(manifestPath: string): string | null {
+  const teamDir = dirname(dirname(manifestPath));
+  const name = basename(teamDir);
+  return name && name !== "." && name !== "/" ? name : null;
+}
+
 // ── Handler ────────────────────────────────────────────────
 
 export async function handleResume(
@@ -124,7 +139,12 @@ export async function handleResume(
   let candidates = entries;
   if (arg) {
     candidates = entries.filter(
-      (e) => e.manifest.teamName === arg || e.manifest.sessionId.startsWith(arg)
+      (e) =>
+        e.manifest.teamName === arg ||
+        // The directory name is authoritative — a stale manifest.teamName
+        // must not hide a renamed session from name matching.
+        directoryTeamName(e.path) === arg ||
+        e.manifest.sessionId.startsWith(arg)
     );
     if (candidates.length === 0) {
       ctx.ui.notify(
@@ -160,16 +180,26 @@ export async function handleResume(
 
   const manifest = selected.manifest;
 
+  // ── Directory-authoritative name (self-heal for a lost rename-manifest write) ──
+  const dirTeamName = directoryTeamName(selected.path);
+  const teamName = dirTeamName ?? manifest.teamName;
+  if (dirTeamName && dirTeamName !== manifest.teamName) {
+    ctx.ui.notify(
+      `⚠️ 会话目录名「${dirTeamName}」与清单记录「${manifest.teamName}」不一致，已按目录名恢复（恢复后清单会被修正）。`,
+      "warning"
+    );
+  }
+
   // ── Orphan member cleanup (best-effort) ──
-  const killedOrphans = cleanupOrphanMembers(manifest);
+  const killedOrphans = cleanupOrphanMembers({ ...manifest, teamName });
 
   // ── Rehydrate team definition: manifest roster is authoritative ──
   // (for dynamic teams it is the only copy; for predefined teams it is the
   // exact snapshot this session's member dirs were built from). Description
   // prefers the current YAML when available.
-  const yamlTeam = manifest.isDynamic ? null : readTeam(manifest.teamName, rootDir);
+  const yamlTeam = manifest.isDynamic ? null : readTeam(teamName, rootDir);
   const team: TeamDefinition = {
-    name: manifest.teamName,
+    name: teamName,
     description: yamlTeam?.description ?? "（恢复的团队会话）",
     members: manifest.members ?? [],
     defaults: yamlTeam?.defaults,
@@ -200,6 +230,9 @@ export async function handleResume(
   teamCtx.router!.updateMembers(team.members.map((m) => m.name));
   if (manifest.isDynamic) {
     ensureAddDynamicMemberTool(pi, teamCtx);
+    // Mode tool: must be REGISTERED before activation (pi.setActiveTools
+    // silently ignores unregistered names).
+    ensureSetTeamNameTool(pi, teamCtx);
   }
 
   // Widget + session-tool registration (onSessionStart also syncs the manifest)
@@ -212,13 +245,13 @@ export async function handleResume(
   // 走 effective settings（恢复的 model/thinking 直接作用于重启的成员进程）。
   // 文件缺失/解析失败 fail-open（忽略不报错）。非 resume 的新团队会话不经过这里。
   loadSessionSettingsSnapshot(
-    join(rootDir, "sessions", manifest.teamName, manifest.sessionId),
+    join(rootDir, "sessions", teamName, manifest.sessionId),
     ctx.sessionManager?.getSessionId?.() ?? ""
   );
 
   // Activate session tools (+ dynamic / agent-session extras)
   const extras = [
-    ...(manifest.isDynamic ? ["add_dynamic_member"] : []),
+    ...(manifest.isDynamic ? ["add_dynamic_member", SET_TEAM_NAME_TOOL_NAME] : []),
     ...(manifest.origin === "agent" ? [STOP_TEAM_SESSION_TOOL_NAME] : []),
   ];
   const currentActive = pi.getActiveTools();
@@ -244,7 +277,7 @@ export async function handleResume(
 
   // One-shot TL prompt banner (consumed by the next before_agent_start)
   teamCtx.resumedFrom = {
-    teamName: manifest.teamName,
+    teamName,
     sessionId: manifest.sessionId,
     restartedMembers: restarted,
     failedMembers: failed,
@@ -253,7 +286,7 @@ export async function handleResume(
   const orphanNote = killedOrphans.length > 0 ? `\n已清理 ${killedOrphans.length} 个残留成员进程（${killedOrphans.join(", ")}）。` : "";
   const failNote = failed.length > 0 ? `\n⚠️ ${failed.length} 个成员重启失败（${failed.join(", ")}）——TL 可用 start_member 重试。` : "";
   ctx.ui.notify(
-    `团队会话 "${manifest.teamName}" (${manifest.sessionId}) 已恢复。\n` +
+    `团队会话 "${teamName}" (${manifest.sessionId}) 已恢复。\n` +
       `${restarted.length} 个成员已带着完整上下文重启${restarted.length > 0 ? `（${restarted.join(", ")}）` : ""}。${orphanNote}${failNote}\n` +
       `中断前正在执行的任务不会自动继续——TL 会确认成员状态后继续。`,
     "info"

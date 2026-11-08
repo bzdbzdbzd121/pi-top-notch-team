@@ -37,6 +37,10 @@ function createHarness(options: {
   members: TeamMember[];
   opsStates: Record<string, MemberOperationalState>;
   teamCtx?: any;
+  /** Static name (default "test-team"). */
+  teamName?: string;
+  /** Dynamic name source (overrides `teamName`) — lets a test rename mid-flight. */
+  getTeamName?: () => string;
 }) {
   const tracker = createActivityTracker();
   const setWidget = vi.fn();
@@ -56,7 +60,7 @@ function createHarness(options: {
     if (!widget) {
       const mod = await import("./team-status-widget");
       widget = mod.createTeamStatusWidget({
-        teamName: "test-team",
+        getTeamName: options.getTeamName ?? (() => options.teamName ?? "test-team"),
         getMembers: () => options.members,
         teamCtx: options.teamCtx ?? createMockTeamCtx(),
         memberOpsStates,
@@ -123,6 +127,31 @@ describe("team-status-widget integration (tracker → widget live path)", () => 
     h.memberOpsStates.set("coder", "idle");
     await vi.advanceTimersByTimeAsync(300);
     expect(h.middle()).toContain("✅");
+  });
+
+  it("阶段 2：名字变化 → 恰好一次 setWidget 且含新名，轮询刷新不重复渲染", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    let name = "_dynamic_1789456123456";
+    const h = createHarness({
+      getTeamName: () => name,
+      members: [createTeamMember("coder", "编码员")],
+      opsStates: { coder: "idle" },
+    });
+    const widget = await h.getWidget();
+    widget.install(h.ui, h.theme);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.middle()).toContain("未命名团队");
+
+    h.setWidget.mockClear();
+    name = "登录重构";
+    widget.refresh();
+    expect(h.setWidget.mock.calls.length).toBe(1);
+    expect(h.middle()).toContain("登录重构");
+    expect(h.middle()).not.toContain("未命名团队");
+
+    // The poll completion refresh sees the same name + segments → gate holds.
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.setWidget).toHaveBeenCalledTimes(1);
   });
 
   it("P3: process_exit deletes the tracker entry — a crash during executing must not stick", async () => {

@@ -39,6 +39,27 @@ afterEach(() => {
 });
 
 describe("manifest sync", () => {
+  it("returns true when the manifest was written, false without an active session", () => {
+    // No active session → nothing written (rename transaction relies on this).
+    expect(syncActiveManifest()).toBe(false);
+
+    startSession(team, { sessionId: "s1" });
+    expect(syncActiveManifest()).toBe(true);
+    expect(readManifestFile(getManifestPath(rootDir, "think-tank", "s1"))).not.toBeNull();
+
+    endSession();
+    expect(syncActiveManifest()).toBe(false);
+  });
+
+  it("returns false when the write fails", () => {
+    startSession(team, { sessionId: "s1" });
+    // A file where the sessions directory must be forces a real fs failure
+    // (mkdir/write under a non-directory) — syncActiveManifest stays fail-open.
+    rmSync(join(rootDir, "sessions"), { recursive: true, force: true });
+    writeFileSync(join(rootDir, "sessions"), "not a directory", "utf-8");
+    expect(syncActiveManifest()).toBe(false);
+  });
+
   it("writes a manifest for the active session", () => {
     startSession(team, { sessionId: "s1" });
     syncActiveManifest();

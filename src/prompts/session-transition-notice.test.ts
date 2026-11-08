@@ -304,6 +304,15 @@ describe("buildSessionEntryNotice — design variant (dynamic design phase)", ()
     expect(notice.content).toContain("不要派发任务");
   });
 
+  it("names the naming step (suggested; frozen after members start)", () => {
+    expect(notice.content).toContain("团队名（建议）");
+    expect(notice.content).toContain("set_team_name");
+    expect(notice.content).toContain("成员启动后不可改名");
+    // Naming is a suggestion, never a gate in front of the confirmation flow.
+    expect(notice.content).not.toContain("必须命名");
+    expect(notice.content).not.toContain("不命名");
+  });
+
   it("does NOT carry the execution dispatch chain (that would break the gate)", () => {
     expect(notice.content).not.toContain("这一回合的动作顺序");
     expect(notice.content).not.toContain("先调用 `write_shared_context`");

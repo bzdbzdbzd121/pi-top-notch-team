@@ -106,13 +106,19 @@ src/
 │   ├── agent-session-tool-names.ts ← 工具名常量（叶子模块，防循环依赖）
 │   ├── session-tool-visibility.ts ← 会话工具可见性强制（纯函数）：9 个团队会话工具首次会话按需注册、会话期间激活，teardown 后 registry 保留、会话外从 activeTools 移除；before_agent_start 回合边界强制执行；AGENT_SESSION_TOOL_NAMES 按 origin 条件激活；阶段③ L1 策略门控：startTeamSessionVisible 统一不变式（决策 #42/D3，与会话状态无关），补回/移除只经 setActiveTools
 │   ├── shared-context-tool.ts ← write_shared_context 工具：唯一合法的共享上下文写入入口，成功后标记会话状态（start_member 门控依赖）
+│   ├── team-name-tool.ts ← set_team_name 模式工具（动态/自主会话；薄封装，事务在 rename-team.ts）；team-name-tool-names.ts ← 工具名常量（叶子模块）
 │   └── tl-tools-add-dynamic.test.ts  ← add_dynamic_member tool tests
 ├── team/
 │   ├── definition.ts ← TeamDefinition / TeamMember types
 │   ├── schema.ts     ← YAML field validation
+│   ├── team-name.ts  ← 命名规则（纯逻辑）：normalizeTeamName（NFC→trim→空白折 - →白名单→首尾字符→20 显示列→Windows 保留名）、isSyntheticTeamName、describeTeamNameRules、TEAM_NAME_MAX_WIDTH、UNNAMED_TEAM_DISPLAY；不做 NFKC
+│   ├── team-name.test.ts ← 合法/拒绝矩阵、归一化回显、列宽边界、保留名、合成名不变量
 │   └── store.ts      ← Read/write/delete team YAML files
 ├── session/
-│   ├── state.ts      ← TeamSessionState (structuredClone deep copy), addMemberToSession(), SessionOrigin
+│   ├── state.ts      ← TeamSessionState (structuredClone deep copy), addMemberToSession(), renameTeamInSession(), SessionOrigin
+│   ├── rename-team.ts ← 改名事务（阶段 4）：窗口判据（活跃∧动态∧design∧无 running 成员）→幂等→撞名→搬目录→内存改名→清单失败回滚→onRenamed 钩子→stub 条件重写；拒绝码 inactive/not-dynamic/phase-execution/member-running/invalid/taken/io/partial
+│   ├── rename-team.test.ts ← 成功/幂等/拒绝矩阵零副作用/失败注入回滚/partial 重绑
+│   ├── manifest.ts   ← 会话清单（syncActiveManifest 返回 boolean；目录名权威自愈的磁盘锚点）
 │   ├── teardown.ts   ← 共享会话终结逻辑（/team stop 与 stop_team_session 复用）+ sessionEndedNotice 一次性置位
 │   ├── teardown.test.ts ← sessionEndedNotice 置位/空转不置位测试
 │   ├── shared-context.ts ← Shared context path 单一来源 + ensureSharedContextFile() 自愈创建（缺 stub 则自动生成）
@@ -241,9 +247,9 @@ src/
    - `channel/response-waiter.ts` — correlation matching with response buffering
    - `session/state-machine.ts` — pure state transitions
 
-8. **Dynamic team mode (`/team dynamic`)** — A free-form mode where the TL designs the team at runtime. No YAML is written to disk. The TL enters a session with 0 members, discusses requirements with the user, uses `add_dynamic_member` to register member roles, then starts and dispatches them via the standard tool chain. The session guard blocks code file writes from the moment `/team dynamic` is entered. Session data is retained in `sessions/_dynamic_<ts>/` after stop so it can be resumed; `/team delete` is the explicit disk cleanup path.
+8. **Dynamic team mode (`/team dynamic`)** — A free-form mode where the TL designs the team at runtime. No YAML is written to disk. The TL enters a session with 0 members, discusses requirements with the user, uses `add_dynamic_member` to register member roles, then starts and dispatches them via the standard tool chain. The session guard blocks code file writes from the moment `/team dynamic` is entered. Session data lives under `sessions/<team-name>/<sessionId>/`; the team starts with the fallback name `_dynamic_<ts>` (that is the *unnamed* state, not the only naming form) and the TL may name it during the design phase via `set_team_name` — the name freezes once the first `start_member` succeeds (decision #50). Session data is retained after stop so it can be resumed; `/team delete` only takes YAML team definitions as its entry point and does not clean dynamic session directories.
 
-9. **Session isolation via sessionId** — Each team session generates a unique `sessionId` in `TeamSessionState`. `buildMemberConfig` uses this ID to nest session data under `sessions/<team-name>/<sessionId>/` instead of the flat `sessions/<team-name>/`. This prevents conflicts when the same pre-defined team is used across multiple sessions. `/team stop` and `session_shutdown` preserve the session directory and mark its manifest stopped/interrupted for `/team resume`; `/team delete` performs explicit disk cleanup. Dynamic mode sessions (`_dynamic_<ts>`) use their unique team name for the same isolation and resume semantics.
+9. **Session isolation via sessionId** — Each team session generates a unique `sessionId` in `TeamSessionState`. `buildMemberConfig` uses this ID to nest session data under `sessions/<team-name>/<sessionId>/` instead of the flat `sessions/<team-name>/`. This prevents conflicts when the same pre-defined team is used across multiple sessions. `/team stop` and `session_shutdown` preserve the session directory and mark its manifest stopped/interrupted for `/team resume`. Dynamic mode sessions get the same isolation and resume semantics; their team name is the system fallback `_dynamic_<ts>` until the TL names the team during the design phase (`set_team_name`, decision #50), and `/team resume` treats the directory name as authoritative (a lost rename-manifest write self-heals).
 
 10. **Goal system for TL autonomy** — `src/tools/goal-tools.ts` registers `set_goal` and `finish_goal` tools plus lifecycle handlers. A low-level `agent_end` only records the current run's candidate; `agent_settled` is the sole reminder delivery boundary, and its one-shot `setTimeout(0)` is only a listener re-entry barrier. Run state carries a stable `runId`, signal set, session ID/epoch, goal generation, abort state, settled state, first-user-prompt association, candidate, and one-shot suppression for a confirmed reminder continuation. A team session activated **mid-run** by `start_team_session` (the origin run's identity snapshot predates the session) records `sessionActivatedMidRun`/`activatedSessionId`/`activatedSessionEpoch` in `currentSessionIdentity()`, so the run that created the session can still produce a candidate at `agent_end`; switches between already-active sessions never set this (rollover protection preserved). Retry, compaction, and queued continuations reuse the outer run until settlement. The dispatch timer revalidates session/goal identity, completion, abort state, settled state, and `ctx.isIdle()`; busy contexts retain the candidate and never receive a queued reminder.
    - **Cooldown** is anchored exactly once immediately before `pi.sendUserMessage`; matching ACKs never refresh `lastReminder.at`.
@@ -307,7 +313,7 @@ src/
 
 22. **Agent 自主会话（agent-initiated team sessions，ADR-0003）** — `start_team_session(task)` 在**扩展加载时注册**（决策 #21 的唯一例外），agent 可随时自主进入动态团队会话委派复杂任务。核心设计哲学：**会话来源（`origin: "user" | "agent"`，`TeamSessionState.origin`）决定守卫强度**——手动会话 = 用户期望「以团队方式做事」，全守卫；自主会话 = agent 自己的手段选择，用户只要结果，故移除派发管制（tl-read-guard、设计 read 软限制、第一动作协议）**与写入管制（ADR-0003 修订，见 docs/adr/0003）**：设计+执行两阶段工具面与普通模式一致（write/edit 任意扩展名、bash、ctx_execute 等全部放行，早退分支在阶段/白名单解析之前生效），仅保留 `.shared-context.md` 必须经 `write_shared_context` 写入的机制契约（start_member 硬门控依赖其置位标记）。放开理由（三路论据）：写守卫是策略而非硬不变量（成员-成员并发写从未被管制）；守卫从未消除覆盖风险、只缩小重叠面；守卫在 agent 会话已被 bash 旁路事实绕过——放开是收敛回正规工具、更可观测。残余风险（低-中）由提示词写纪律（编辑前确认无成员处理同一文件 + 修改后通知重读重验）+ git 可恢复 + TL 回合挂起语义缓解。完全自主：无 Playbook grilling、无确认门；`task` 必填并自动置 Goal + 注入自主版提示词（`src/prompts/agent-initiated-mode.ts`）。生命周期对称：`stop_team_session` 由 agent 自主终结会话——会话作用域注册但**仅自主会话激活**（`AGENT_SESSION_TOOL_NAMES` 条件可见性），与 `/team stop` 共享 `src/session/teardown.ts`。嵌套结构性不可能（`TEAM_ROLE` 早退）；重入返回错误。可见性：启动 notify（🤖 + task 摘要）+ widget 持久来源标记（🤖/👤）。预定义团队支持明确推迟（dynamic-only 先行）。
 
-23. **团队会话恢复（/team resume，ADR-0004）** — 四层设计：(a) **member 会话落盘**：移除 spawn 参数中的 `--no-session false`（pi 的 `--no-session` 是裸布尔 flag，该写法曾使 member 纯内存运行、上下文从不落盘——根因 bug）；pi session 增量 append，崩溃仅丢最后半条。(b) **重启即续接**：`MemberProcessConfig.resume` + `buildMemberConfig` 自动探测（session 目录有 `.jsonl` 则 `--continue`）+ 进程内 `startedOnce`（崩溃 auto-restart 自动续接）；`hasSessionFiles` 守卫空目录。(c) **会话清单**：`sessions/<team>/<sessionId>/session.json` 持久化名册（动态团队唯一磁盘副本）/origin/phase/Goal/sharedContextWritten/startedMembers/memberPids，所有状态变更点合并写（tmp+rename 原子，fail-open）。(d) **停止即保留**：`/team stop`/`session_shutdown` 不再 rmSync，manifest 标记 `stopped` 或保留 `active`（中断语义）；`session_start` 检测到中断会话时状态栏提示。`/team resume` 以原 sessionId 重建状态、`--continue` 重启成员（上下文完整恢复）、/proc 校验后清理孤儿进程；中断时进行中的任务不重放，由 TL 确认状态后重建编排。会话列表按 **cwd 项目作用域**过滤（对齐 `pi --resume`：manifest 记录创建时的 cwd，默认只列当前目录会话，`--all` 显示全部并附目录标注）。多会话选择器用 `src/ui/scroll-select.ts`（maxVisible 滚动窗口 + 模糊筛选）——内置 `ctx.ui.select` 全量渲染不滚动，会话多时溢出屏幕（与模型选择器同因）。
+23. **团队会话恢复（/team resume，ADR-0004）** — 四层设计：(a) **member 会话落盘**：移除 spawn 参数中的 `--no-session false`（pi 的 `--no-session` 是裸布尔 flag，该写法曾使 member 纯内存运行、上下文从不落盘——根因 bug）；pi session 增量 append，崩溃仅丢最后半条。(b) **重启即续接**：`MemberProcessConfig.resume` + `buildMemberConfig` 自动探测（session 目录有 `.jsonl` 则 `--continue`）+ 进程内 `startedOnce`（崩溃 auto-restart 自动续接）；`hasSessionFiles` 守卫空目录。(c) **会话清单**：`sessions/<team>/<sessionId>/session.json` 持久化名册（动态团队唯一磁盘副本）/origin/phase/Goal/sharedContextWritten/startedMembers/memberPids，所有状态变更点合并写（tmp+rename 原子，fail-open）。(d) **停止即保留**：`/team stop`/`session_shutdown` 不再 rmSync，manifest 标记 `stopped` 或保留 `active`（中断语义）；`session_start` 检测到中断会话时状态栏提示。`/team resume` 以原 sessionId 重建状态、`--continue` 重启成员（上下文完整恢复）、/proc 校验后清理孤儿进程；中断时进行中的任务不重放，由 TL 确认状态后重建编排。会话列表按 **cwd 项目作用域**过滤（对齐 `pi --resume`：manifest 记录创建时的 cwd，默认只列当前目录会话，`--all` 显示全部并附目录标注）。多会话选择器用 `src/ui/scroll-select.ts`（maxVisible 滚动窗口 + 模糊筛选）——内置 `ctx.ui.select` 全量渲染不滚动，会话多时溢出屏幕（与模型选择器同因）。**会话目录保留与清理的事实口径**：`/team stop` 与 `session_shutdown` 只标记清单状态、保留会话目录以支持 `/team resume`；`/team delete` 以 YAML 团队定义为入口（本方案不改变其行为），不负责清理动态会话目录。恢复时以**目录名为权威团队名**（清单 `teamName` 与目录名不一致时打警告并按目录名恢复，恢复后清单就地修正）。
 
 24. **会话结束一次性提醒（session-ended banner）** — 用户 `/team stop`（或 agent 调 `stop_team_session`）后，TL 的对话历史仍含 Team Lead 系统提示词与团队工具使用模式，且会话工具已停用（决策 #21），TL 下一轮仍可能以 Team Lead 自居、尝试调用已停用的团队工具——而 pi 对非活跃工具的报错是晦涩的 `Tool xxx not found`（agent-loop 在 `beforeToolCall` 之前就短路，扩展无法改写该错误）。修复：`teardownTeamSession` 在会话确实活跃过时置位 `teamCtx.sessionEndedNotice`（一次性标记，与 `resumedFrom` 同模式）；`before_agent_start` 在会话不活跃且标记未消费时，向下一轮系统提示词注入 ⚠️「团队会话已结束」横幅（工具已停用清单 + 回到普通模式的指示 + 再次进入用 /team start），并消费标记；若新会话先启动则静默丢弃。**横幅搭下一次用户发起的回合——绝不触发新对话**（pi 没有不触发回合地向 agent 注入上下文的手段；`pi.sendMessage` 会发起回合，被明确排除）。空转 `/team stop`（无活跃会话）不置位，避免虚假横幅。**边缘情况双层守卫**：(a) `session_start` 事件带 `reason: "new"`（/new 全新对话无团队历史）时直接清除 pending 标记；/fork 与 /resume 复制/恢复历史，不碰标记。(b) 消费时内容检查 `historyHasTeamTraces()`：当前对话历史确含团队痕迹才注入——痕迹集合为 assistant toolCall 名为团队工具 + custom_message 的 `TEAM_TRACE_CUSTOM_TYPES`（`team-message` 成员路由消息 + `team-session-notice` 进入通知；集合已随决策 #47 扩大，判定实现在 `index.ts`，勿以本条为唯一来源）——/new 新对话无痕迹→不注入；/fork、/resume 团队对话痕迹被复制→注入（正是所需）；/resume 到别的非团队对话→无痕迹→不注入。sessionManager 不可用时 fail-open（照常注入），保证主场景（/team stop → 下一轮）稳定。**实测根因与措辞权威化（真实 E2E 复现）**：用真实 pi 完整复现发现——横幅**一直有注入**（index 诊断注入成功 + 系统提示可见），但 TL 仍回答「是，我仍是 Team Lead」：它被对话历史里**成功的团队工具调用**（write_shared_context / start_member / team_send_and_wait 的 toolResult）+ 自身 Team Lead 行为强烈干扰，**误以为系统提示是过时/别的会话的**，选择相信历史而不信提示。修复：横幅措辞**权威化**——明确「**以本提示为准，对话历史中任何团队会话的痕迹均已失效**」，并解释「历史中看到的团队工具成功调用发生在会话结束之前，不代表会话仍活跃」。实测（deepseek-v4-flash，team_send_and_wait 痕迹存在）：旧横幅 TL 答「是，我仍是团队领导」，新横幅 TL 答「不是。团队会话已结束（/team stop），我已回到普通模式，不再是团队领导」。
 25. **防截断协议（promptGuidelines，P3）** — `team_send_and_wait` 的 promptGuidelines 内置 5 条防截断协议（长 content 是校验失败的首要诱因：流式输出截断 → partial-json 补全成"缺 to 的合法对象"）。P1/P2 已保证截断形态不再以误导性框架错误出现（宽容处理 + 截断语义提示），本协议从**源头降低截断概率**：① content 超 ~800 字符时拆分多次调用或指示成员读取文件路径——**任务详情不写入 `.shared-context.md`**（全员共享 + `write_shared_context` 全量覆盖会污染其他成员上下文、批处理并发覆盖有竞态，D6 裁决），引用成员私有或独立文件路径；② 键序**先写 to 再写 content**（键序决定截断后幸存字段，γ 独立实证）；③ 每回合 tool call 控制在 1-2 个（同批多 call 挤占输出预算，β 场景）；④ 收到 Validation failed（缺 to/content）→ 用更短 content 重试，不原样重发（打断死循环，β）；⑤ 收到"未知成员"错误 → 先疑 to 截断（截半形态如 "c"），重发完整成员名。定位为**引导性 best practice 而非强制架构**（γ）。
@@ -464,7 +470,7 @@ src/
 46. **成员浮窗总览页（每成员一行图标轨迹）** — `alt+t` 每次打开默认总览，显式 `overview/member(name)` 页面身份，不伪造成员 tab。总览按名册稳定排序，↑↓/PgUp/PgDn/Home/End 选择成员、Enter 进入会话，←→ 在总览与成员页间循环；总览不执行单成员发送/中断/压缩，ctrl+b 全员中断仍可用。总览不显示表头、状态文字列和底部图例；轨迹最左图标复用控制面覆盖与 activity-tracker 细粒度活动表示当前状态。上下文用水平占用条和百分比显示，null/未知显示中性点条加 `?`、失败旧值加 `~`、停止/崩溃显示 `—`。轨迹使用 💭思考/✏️输出/📖读取/📝修改/🔧其他工具，新操作从左插入、旧记录向右移，含当前状态最多20个图标，窄屏显示更少并在尾部用完整 `(N)` 表示累计未显示的真实记录数（含已淘汰历史，不受64条保留上限限制）。当前活动匹配最新记录时原位复用，否则补充显示位置但不写历史；活动/错误图标加下划线与语义色。每块/每工具调用一条，不逐 delta 追加。压缩历史只认成员侧 compaction_start、成功 get_state.isCompacting=true，或孤立结束携带成功 `result.summary`；控制面 compacting 同时用于 stats 预检占位，绝不能据此写压缩历史。总览通过只读 isCompacting 区分真实压缩和预检，避免首条历史误记 🗜️。无开始依据且无成功结果的 compaction_end 不补造记录，真实压缩失败仍按开始记录更新。`member-overview-store.ts` 每成员64条环形缓冲，另用一个累计计数器只在追加语义动作时递增；关联索引同步淘汰，不保留正文/参数；`index.ts` 在会话期持续采集，浮窗关闭不清空，stop/shutdown 清空，resume 不重建旧轨迹。创建成员捕获 sessionId 与 handle 身份，旧来源显示事件不进入新总览；包装成功 start（含 auto-restart）发出显示专用 process_started，避免等待首个 agent_start 才解除旧进程死亡门。总览渲染只读取可见成员轨迹，固定总览标签+当前成员水平窗口，窄屏保留选择反馈。stats 打开时立即查询，轮询结束5秒后再排，最多四路，关闭/换句柄后不写回。删除浮窗全员状态汇总行，notice/newBelow 迁到提示行，常规 chrome 8→7，小高度退化为选中成员摘要+退出提示。外部 team-status-widget、控制面与派发规则不改。详见 `docs/design-member-inspector-overview.md` 与 DESIGN.md §17；`src/index-overview.test.ts` 覆盖会话级接线。
 
 47. **会话切换提示：常驻状态声明 + 有界进入通知 + 退场一致性（决策 #24 的进场侧对偶，阶段 0–4 收口）** — 长对话里执行 `/team start` 后，TL 常继续像普通编码助手一样自己读代码分析而不派发。核查发现进场侧与退场侧不对称：退场侧有一次性权威横幅（决策 #24，措辞权威化后经真实端到端验证生效），进场侧既没有「切换事件」也没有任何权威声明——团队提示词每回合都在注入，但整段话没有一句压过历史惯性（且系统提示词正文不落会话历史，模型只能看到历史里的自身行为）。两层结构：**声明**回答「我现在是什么角色」（每回合都在），**通知**回答「切换刚刚发生」（有界）。完整设计、判定表、生命周期与限制见 DESIGN.md §34。不加新状态机、不改守卫阈值、不改可见性/上限策略、不新增模型调用：
-   - **常驻状态声明**（`src/prompts/session-transition-notice.ts` 的 `buildTeamStateDeclaration`，单一事实来源）：置于团队提示词块**标题之后、第一动作协议之前**（`index.ts` 预定义团队块；`dynamic-mode.ts` 两阶段各自对应变体）。三变体：`predefined` 与 `execution` **逐字节一致**（同工具面同派发协议，两份文案只会漂移，测试 `toBe` 锁定）；`design` 独立（含确认门：用户明确确认前不要注册/启动/派发——否则提示模型越过自家硬门；动态团队名是合成 `_dynamic_<ts>` 故设计态不渲染团队名）。agent 自主会话（`start_team_session`）**不注入**（agent 自己发起、已知情）。注入位置刻意不动（仍在系统提示词末尾、同一条通道），以便把任何实测收益归因于措辞而非位置；`Record<>` 派发使未来新增变体成为编译错误，`??` 回退保证未知运行时值不会在提示词组装中抛错（抛错会丢掉整段团队提示词）。
+   - **常驻状态声明**（`src/prompts/session-transition-notice.ts` 的 `buildTeamStateDeclaration`，单一事实来源）：置于团队提示词块**标题之后、第一动作协议之前**（`index.ts` 预定义团队块；`dynamic-mode.ts` 两阶段各自对应变体）。三变体：`predefined` 与 `execution` **逐字节一致**（同工具面同派发协议，两份文案只会漂移，测试 `toBe` 锁定）；`design` 独立（含确认门：用户明确确认前不要注册/启动/派发——否则提示模型越过自家硬门；设计态不渲染团队名：此时名字可能尚未指定，而真实名已由动态提示词的 `### 当前团队：X` 行渲染，不重复）。agent 自主会话（`start_team_session`）**不注入**（agent 自己发起、已知情）。注入位置刻意不动（仍在系统提示词末尾、同一条通道），以便把任何实测收益归因于措辞而非位置；`Record<>` 派发使未来新增变体成为编译错误，`??` 回退保证未知运行时值不会在提示词组装中抛错（抛错会丢掉整段团队提示词）。
    - **文案纪律（审查修订）**：历史断言必须双重限定——只针对 ①**进入本会话之前**的记录，②**与本提示冲突**的做法；不得声称「历史里所有自分析记录都发生在进入之前」（同一团队会话内有设计阶段合法 read、`.md` 写入、resume 恢复的历史，绝对化断言为假，会导致模型整段折扣提示）。它是授权声明，不是事实断言；并去掉「一律」等绝对量词。
    - **第一动作协议改写为一条有序链**：`write_shared_context` → `start_member`（`/team start` 只写定义不启动进程）→ `team_send_and_wait` 派发。旧版同一条规则里出现两个「你的第一个工具调用必须是…」（共享上下文 vs 派发）且完全漏掉 `start_member`，直接派发必命中「目标成员不存在或未启动」，等于让模型先吃一次错误。保留 1-2 文件例外与运行时威慑说明。
    - **`write_shared_context` 加入 `tl-read-guard.ts` 的 `MANAGEMENT_TOOLS`**（正确性修复）：它曾是非管理工具，粘滞态下会被拦截，而 `start_member` 在共享上下文写入前被硬门控——协议的三个步骤会互相锁死，TL 唯一出路只剩回复用户。现在不消耗派发前预算、sticky 期间仍可用（测试锁定）。
@@ -498,6 +504,19 @@ src/
     - **不变式**（E1-E10，均有测试覆盖）：守卫先于归档；归档先于启动；归档同步执行；归档失败不阻断；配置层 `fresh` 优先于自动探测；被拒绝的调用零副作用；结构性守卫早于操作状态重置；`hasSessionFiles` 导出位置不变（三处整模块替身依赖它）；`/team clean` 只删形状合规且真实路径位于 `sessions/` 内的归档；**派发失败绝不留下「工作中」**。
     - **向已停止成员派发不再卡死（阶段 5，三层）**：① 工具层 `team_send_and_wait` 入队前校验显式目标（句柄存在且非 running → 立即拒绝，零副作用）；② 发送层 `dispatchPromptTextToMember` 派发前检查（明确非运行 → 不写「工作中」+ 通知未送达 + 标记等待失败；覆盖广播/合并包 flush/压缩补发）；③ 发送抛错时把「工作中」**恢复为写入前的值**（比较后写，不覆盖进程退出写入的真实状态）。句柄不存在（从未启动）与查询依赖未接线均保持旧行为（fail-open）。
     - **文档**：DESIGN.md §5（`/team clean`）/§6（`start_member` / `stop_member`）/§12（自动重启关闭 + 重启语义）/§13（归档布局与清理）+ README 工具表/特性行 + AGENTS 命令表/工具表/Source Map + `docs/adr/0004` 增量说明。
+
+50. **动态 / 自主团队命名（决策 #50，阶段 1–6 收口）** — 动态团队与 agent 自主会话此前一律叫 `_dynamic_<ts>`，状态栏/`/team status`/`/team resume`/成员提示词里都是时间戳。本决策给团队一个可读名字。完整语义、改名事务 14 个编号步骤（`rename-team.ts` Step 1-14，8-10 为目录搬迁一组）、恢复自愈与限制见 DESIGN.md §36；不可逆裁决的论证见 `docs/adr/0009-dynamic-team-naming.md`。
+    - **一个名字（数据模型）**：`TeamDefinition.name` 仍是唯一权威（不新增 `displayName`、不新增清单字段、`manifest.version` 不变）；用户可见名 = 清单名 = `TEAM_NAME` = 目录名，目录为 `sessions/<团队名>/<sessionId>/`。未命名 = 名字仍是兜底名 `_dynamic_<ts>`（命名规则要求首字符为字母/数字，用户不可能构造），**不需要新增状态字段**。
+    - **命名规则**（`src/team/team-name.ts`，纯逻辑）：NFC → trim → 连续空白折 `-` → 白名单（中文/其他语言字母/十进制数字/`-`/`_`）→ 首尾必须字母或数字 → **最多 20 显示列**（中文按 2 列，与状态栏标题预算 `min(20, 宽度/4)` 对齐）→ 拒绝 Windows 保留设备名；**不做 NFKC**（不静默改字），拒绝时回显具体原因 + 规则全文；`describeTeamNameRules()` 单一来源。
+    - **改名窗口**：活跃 ∧ 动态会话 ∧ `dynamicPhase === "design"` ∧ 无 running 成员（防御纵深）。冻结点是**启动成员**（`start_member`）：成员的 `TEAM_NAME`、绝对共享上下文路径、`--session-dir` 与已下发提示词在 spawn 时固化；注册成员（`add_dynamic_member`）不影响。阶段在第一个成员**成功启动**时翻为 execution 并写入清单（resume 从清单恢复），因此**崩溃/停止成员不会重新打开窗口**（工具先判阶段，返回 `phase-execution`）；唯一不被阻断的成员相关失败是 `start_member` 启动失败（阶段未翻转）。执行阶段仍可调用工具，但会被拒绝并说明真实原因与出路（结束会话后重开、启动成员前命名）。幂等（同名 → moved=false）、撞名（预定义团队，大小写不敏感）与目标目录已存在一律零副作用。
+    - **事务顺序**（`src/session/rename-team.ts`）：校验 → 搬目录（`sessions/<旧>/<sessionId>` → `sessions/<新>/<sessionId>`，收拾空父目录）→ 内存改名（保留 sessionId/startedAt/origin/sharedContextWritten/成员表）→ 清单写入（`syncActiveManifest` 返回 boolean；失败回滚目录+内存，回滚也失败 → `partial`）→ `onTeamRenamed` 钩子（重绑临时设置目录 + 刷新状态栏；**目录已搬的所有路径都触发**）→ 共享上下文 stub 条件重写。拒绝码：`inactive` / `not-dynamic` / `phase-execution` / `member-running` / `invalid` / `taken` / `io` / `partial`。
+    - **共享上下文 stub 判定是结构化的**：以旧团队名 + stub 结构（标题/自动创建警示/四个占位章节，**仅成员名册块允许变化**；description 行允许 resume 漂移）判定，不拿当前团队状态做整文件逐字节比对（bootstrap 时 0 成员生成，之后 `add_dynamic_member` 只改名册）。结果枚举 `rewritten / not-stub / missing / undecidable / write-failed` 如实返回，TL 写过的内容逐字节不动、附注重新 `write_shared_context`。
+    - **两条入口**：agent 入口 `start_team_session({task, teamName?})` 创建即命名，名字非法/撞名/缺省 → 兜底名照常开会并在结果说明原因（任务委派优先）；用户入口 `/team dynamic` **不接受名字参数**（用户已确认不需要，多余参数忽略），启动通知提示「可以告诉 TL 你希望的团队名称」，由 TL 在设计阶段调用 `set_team_name` 改名。
+    - **工具与接线**：`set_team_name` 是**模式工具**（与 `add_dynamic_member` 同生命周期：bootstrap / `/team resume` 注册并激活；**不改变 9 个会话工具**，`SESSION_TOOL_NAMES` 不变）；两阶段白名单都放行（执行阶段放行是为让拒绝理由来自工具而非泛化白名单错误）；`tl-read-guard` 的 `MANAGEMENT_TOOLS` 与 `EXEMPT_ACTIONS_LINE` 同步（双向不变式）；`teardown` 与 `index` 的三个清理集合移除（`_shutdownToRemove` / `_freshToRemove` / teardown toRemove），`TEAM_TRACE_TOOL_NAMES` 登记。
+    - **显示与提示**：状态栏对兜底名显示「未命名团队」（`UNNAMED_TEAM_DISPLAY`），0 成员设计行也显示名字；widget 的 `getTeamName` getter 每次 `refresh()` 只读一次并同时用于渲染去重键与标题；`/team status` 与 `/team resume` 仍显示真实名。命名是**建议**、不是开工条件（不做硬门控，提示词不得写「不命名会被拦截」）；一次性提醒只在「未命名动态会话的首个 `add_dynamic_member`」出现。
+    - **恢复自愈**：`/team resume` 以**目录名**为权威团队名——目录名与清单 `teamName` 不一致时打警告、按目录名恢复（成员路径/临时设置快照路径随之正确），恢复后的清单就地修正；匹配也接受目录名。
+    - **明确不做**：不改 `/team delete`（仍以 YAML 团队定义为入口，不清理动态会话目录）；不加 `/team dynamic <名字>` 参数；不做执行阶段改名（需要时唯一可行路线是 ADR-0009 的方案 B）；无数据迁移（旧 `_dynamic_*` 会话按未命名处理）。
+    - **测试与守卫**：命名规则矩阵/列宽/保留名/合成名不变量；事务成功/幂等/7 类拒绝零副作用/失败注入回滚/partial 重绑；stub 结构判定（名册变化、description 漂移、TL 内容不动、不可读）；resume 注册激活 + 自愈 + 改名后临时设置经 stop→resume 仍生效；白名单/守卫/清理集合；提示词结构断言 + 负例锁（无硬门控措辞、阶段 E 枚举与 playbook 模板一致防漂移）。
 
 ## Dependency Injection Pattern
 
@@ -657,7 +676,7 @@ printf '' | timeout 10 ./node_modules/.bin/pi --mode json --no-tools -e ./index.
 | `/team edit <name>` | Natural language team modification via TL dialogue; installs edit-mode widget (⟳ `onEditStart`/`onEditEnd` hooks) |
 | `/team start <name>` | Start team session with a pre-defined YAML team, activate TL tools |
 | `/team resume [标识\|--all]` | 恢复中断或已停止的团队会话：按 session.json 清单重建状态，成员以 `--continue` 带完整上下文重启。默认仅列当前目录（cwd）的会话，`--all` 显示全部（ADR-0004） |
-| `/team stop` | Stop all members, deactivate TL tools（会话目录保留并标记 stopped，可用 /team resume 恢复；磁盘清理由 /team delete 负责） |
+| `/team stop` | Stop all members, deactivate TL tools（会话目录保留并标记 stopped，可用 /team resume 恢复；`/team delete` 以 YAML 团队定义为入口，不清理动态会话目录） |
 | `/team list` | List all team definitions |
 | `/team show <name>` | Display team definition details |
 | `/team done`             | Finish and exit current create or edit mode |
@@ -677,12 +696,13 @@ printf '' | timeout 10 ./node_modules/.bin/pi --mode json --no-tools -e ./index.
 | Tool | Description |
 |------|-------------|
 | `start_team_session(task)` | **加载时注册**（决策 #21 唯一例外）。agent 自主启动动态团队会话（`origin: "agent"`）：`task` 必填——自动置 Goal + 注入自主版设计阶段提示词。全程无确认门；读/分析自由（无派发管制守卫），**可自由 read 与编辑文件（任意扩展名，写纪律见系统提示词；ADR-0003 修订）**，`.shared-context.md` 仍须经 `write_shared_context` 写入。已有活跃会话时返回错误。成员进程结构性无法调用（`TEAM_ROLE` 早退）。**受设置门控（决策 #42，双层）**：`allowAgentInitiatedSessions=false` 时 execute 首步拒绝且零副作用（L2 正确性硬闸门），且每回合边界从 activeTools 移除、promptSnippet/promptGuidelines 同步消失（L1 完备性层）；切换下一回合边界即生效；运行中会话不终止、stop_team_session 与 /team resume 不受影响。 |
-| `stop_team_session()` | 结束 agent 自主会话（停成员、摘 widget、保留会话目录供 `/team resume`；磁盘清理由 `/team delete` 负责）。会话作用域注册，**仅自主会话出现在活跃工具集**；对 `origin: "user"` 的会话拒绝执行（手动会话归用户 `/team stop`）。与 `/team stop` 共享 `teardownTeamSession()`。 |
+| `stop_team_session()` | 结束 agent 自主会话（停成员、摘 widget、保留会话目录供 `/team resume`；`/team delete` 以 YAML 团队定义为入口，不清理动态会话目录）。会话作用域注册，**仅自主会话出现在活跃工具集**；对 `origin: "user"` 的会话拒绝执行（手动会话归用户 `/team stop`）。与 `/team stop` 共享 `teardownTeamSession()`。 |
 
 | Tool | Description |
 |------|-------------|
 | `write_shared_context(content)` | Write the team shared context to the session's `.shared-context.md` (overwrite). **Must be called before the first `start_member` — start_member is blocked until then.** Sets the session `sharedContextWritten` flag; direct `write`/`edit` of `.shared-context.md` is intercepted and redirected here. Call again to update, then notify members to re-read. |
 | `add_dynamic_member(name, label, systemPrompt, model?)` | Register a member in `/team dynamic` mode. Name is the identifier, label is Chinese display name, systemPrompt is role definition. Only available in dynamic mode. |
+| `set_team_name(name)` | **模式工具**（与 `add_dynamic_member` 同生命周期：动态 bootstrap / `/team resume` 注册并激活；**不属于、也不改变那 9 个会话工具**）。给动态/自主会话的团队起一个可读名字，改名**迁移会话目录** `sessions/<旧名>/<sessionId> → sessions/<新名>/<sessionId>` 并同步清单、临时设置绑定、状态栏与之后启动成员的 `TEAM_NAME`。窗口 = 设计阶段且无成员进程 running；**名字在第一个 `start_member` 成功后冻结**（注册成员不影响），执行阶段调用会被工具拒绝并给出真实出路。名字规则：中文/字母/数字/`-`/`_`，≤20 显示列，不得与预定义团队同名（决策 #50）。 |
 | `set_goal(text, criteria)` | Set a session goal with verifiable completion criteria. The system reminds the TL only after one run is fully settled (with no automatic retry, compaction, or queued continuation) while the goal remains active (not yet closed); `agent_end` alone never sends a reminder. **可见性**：仅团队会话（`/team start`/`/team dynamic`）期间可见——`onSessionStart` 注册，`before_agent_start` 回合边界强制（见决策 #10）。 |
 | `finish_goal()` | Mark the current goal as completed and stop the reminder system. Call when all goal criteria are met, or when an unresolvable blocker is encountered. **仅条件全部满足或遇到不可解决阻塞时调用**——条件未满足且仍可推进时不得调用，继续派发任务；仅口头宣称完成不会停止提醒（提醒系统只认真实的 finish_goal 调用）。promptSnippet 区分于 set_goal（Finish 语义）。 |
 | `start_member(name, fresh?)` | Launch a Member's pi RPC process (dynamic mode: the first call triggers the design→execution phase transition). **重启默认尝试续接**该成员持久化的会话（实际是否续接见会话附注，不承诺上下文已保留）；`fresh: true` 丢弃该成员的对话（旧会话文件归档到 `<会话目录>/.member-resets/<成员>/<时间戳>/`，可恢复、`/team clean` 清理），**不回滚**已改写文件、不动共享上下文。**重复启动被拒绝**（已 running → 返回 PID + 三条出路；`stopped + PID 非空` → 「正在停止中」；命中零副作用；`createAndRegisterMember` 内另有结构性兜底）。结果含**会话事实附注**（决策 #49）：`已续接（历史 N 条）` / `⚠️ 未续接（查询到 0 条）` / `无法确认` / `全新会话（无历史）` / `全新会话（已归档 N 个 → 路径）` / `⚠️ 未能归档 M 个`，并带 `details.sessionMode` 等结构化字段；另附 tl-only 态「成员间互发：禁用」与设置来源（决策 #41）。 |
@@ -765,8 +785,8 @@ The design phase guard is active from the moment `/team dynamic` is entered. It 
 
 ```
 /team dynamic
-  → mkdir sessions/_dynamic_<ts>/
-  → startSession({name:"_dynamic_<ts>", members:[]})
+  → mkdir sessions/<team-name>/（未命名时 = sessions/_dynamic_<ts>/）
+  → startSession({name:"<team-name>", members:[]})
   → isDynamicSession = true
   → dynamicPhase = "design"
   → 激活 TL 工具 + 设计阶段严格守卫 + widget（显示"设计阶段"）
@@ -779,8 +799,8 @@ TL 按编排方法论 Playbook（orchestration-playbook.md，注入设计阶段�
   B. 任务拆分 — 按交付物拆，画依赖图，标注输入/输出/验收标准
   C. 工作流编排与质量加固 — 识别薄弱环节，选用交叉验证/对抗辩论/开发-审核循环等模式
   D. 团队设计 — 从工作流推导角色
-  E. 方案确认门 — 展示完整计划书；用户明确确认前禁止 add_dynamic_member / start_member
-  F. 落地执行 — 注册成员、写 shared-context、启动成员
+  E. 方案确认门 — 展示完整计划书（含团队名（建议））；用户明确确认前禁止 add_dynamic_member / start_member
+  F. 落地执行 — 命名（建议；set_team_name，启动成员前）→ 注册成员 → 写 shared-context → 启动成员
 
 TL: add_dynamic_member({name, label, systemPrompt, model?})
   → addMemberToSession() 刷新 currentSession
@@ -807,8 +827,8 @@ TL: team_send_and_wait(...)
 TL: 监控进展、协调异常、write_shared_context 更新共享上下文（更新后通知成员重新阅读）
 
 /team stop
-  → stopAll() → manifest=stopped (保留 sessions/_dynamic_<ts>/) → endSession() → dynamicPhase = "design"
-  → 可用 /team resume 恢复；/team delete 负责显式磁盘清理
+  → stopAll() → manifest=stopped (保留 sessions/<team-name>/<sessionId>/) → endSession() → dynamicPhase = "design"
+  → 可用 /team resume 恢复（以目录名为权威团队名）；/team delete 只处理 YAML 团队定义
 ```
 
 
@@ -845,7 +865,8 @@ TL: 监控进展、协调异常、write_shared_context 更新共享上下文（�
 - `docs/adr/0006-pi-upstream-abort-compaction-rpc.md` — Upstream `abort_compaction` RPC proposal (`agent-session.abortCompaction()` exists but is not reachable over RPC; ~3-line wiring in rpc-mode.js; non-blocking, for pi upstream issue)
 - `docs/adr/0007-pi-upstream-context-usage-reason.md` — Upstream `getContextUsage()` structured-reason proposal (`percent:null` after compaction is a legal state, indistinguishable from config-missing `undefined` by consumers; reason field primary / estimate alternative; non-blocking, for pi upstream issue)
 - `docs/adr/0008-team-definition-cloud-sync.md` — 团队定义云同步：git 私有仓库为后端、`teams/` 即工作区、提交树以云端树为基、不自动合并、冲突产物离开 `teams/`、配置独立文件、允许的唯一中间态
+- `docs/adr/0009-dynamic-team-naming.md` — 动态/自主团队命名：一个名字（可见名=清单名=TEAM_NAME=目录名）、设计期且无成员运行才可改名（冻结点是启动成员）、命名是建议不做硬门控；含被否决的双名与固定父目录方案及切换条件
 
 ## Design Document
 
-See [DESIGN.md](./DESIGN.md) for the full design specification (35 sections), including the Goal reminder lifecycle, the TL self-work limit（§35：可配置 + 可关闭、排障判别表、发布检查清单）and release verification checklists.
+See [DESIGN.md](./DESIGN.md) for the full design specification (36 sections), including the Goal reminder lifecycle, the TL self-work limit（§35：可配置 + 可关闭、排障判别表、发布检查清单）, dynamic/agent team naming（§36：命名规则、设计期改名事务、恢复自愈）and release verification checklists.

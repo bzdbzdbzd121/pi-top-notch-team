@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getRootDir } from "../config";
 import type { TeamDefinition } from "../team/definition";
@@ -77,4 +77,100 @@ export function ensureSharedContextFile(
     }
   }
   return path;
+}
+
+/**
+ * Outcome of the post-rename stub rewrite (the caller reports it honestly).
+ * - rewritten: the system stub was replaced with the new-name stub
+ * - not-stub:  the content is NOT the system stub (do not touch it)
+ * - missing:   no shared context file at the (new) session path
+ * - undecidable: the file could not be read, so nothing can be claimed
+ * - write-failed: recognized as the stub, but the write failed
+ */
+export type StubRewriteOutcome =
+  | "rewritten"
+  | "not-stub"
+  | "missing"
+  | "undecidable"
+  | "write-failed"
+  /** Idempotent rename (same name): the stub was not inspected nor touched. */
+  | "not-attempted";
+
+/**
+ * Is `content` still the system-generated stub for `team`?
+ *
+ * STRUCTURAL comparison, not a byte comparison against the current team state:
+ * the stub is written at bootstrap with 0 members, and `add_dynamic_member`
+ * later grows the roster without rewriting it — so the member block is allowed
+ * to differ (only its shape is validated). The description line may also drift:
+ * /team resume rebuilds dynamic teams with the placeholder description
+ * "（恢复的团队会话）" while the on-disk stub still holds "动态团队", so that one
+ * line is normalized away. Everything else (header + `- 名称：` with the OLD
+ * name, the auto-created warning, placeholder sections) must match byte-for-byte.
+ * `team` must carry the OLD team name.
+ */
+const STUB_DESCRIPTION_PREFIX = "- 描述：";
+
+export function isSystemStub(content: string, team: TeamDefinition): boolean {
+  function splitRoster(lines: string[]): { head: string[]; roster: string[]; tail: string[] } | null {
+    const start = lines.indexOf("## 成员");
+    const end = lines.indexOf("## 项目背景与目标");
+    if (start < 0 || end <= start) return null;
+    return {
+      head: lines.slice(0, start + 1),
+      roster: lines.slice(start + 1, end),
+      tail: lines.slice(end),
+    };
+  }
+
+  // The description is the ONLY head line allowed to differ (resume rewrites it).
+  const normalizeDescription = (lines: string[]) =>
+    lines.map((line) =>
+      line.startsWith(STUB_DESCRIPTION_PREFIX) ? `${STUB_DESCRIPTION_PREFIX}<任意>` : line
+    );
+
+  const actual = splitRoster(content.split("\n"));
+  const expected = splitRoster(buildStubContent(team).split("\n"));
+  if (!actual || !expected) return false;
+  if (normalizeDescription(actual.head).join("\n") !== normalizeDescription(expected.head).join("\n")) {
+    return false;
+  }
+  if (actual.tail.join("\n") !== expected.tail.join("\n")) return false;
+
+  // The roster block is the only mutable part: accept the empty marker or the
+  // `- name（label）` lines the generator emits. A TL-written file that kept
+  // every fixed section but injected arbitrary lines here is rejected.
+  const roster = actual.roster.filter((line) => line.trim() !== "");
+  if (roster.length === 0) return false;
+  if (roster.length === 1 && roster[0] === "（暂无成员）") return true;
+  return roster.every((line) => /^- .+（.+）$/.test(line));
+}
+
+/**
+ * Rewrite the system stub after a team rename. The caller has already moved
+ * the session directory, so the file is read at the NEW path.
+ * A TL-written (or otherwise modified) shared context is never touched.
+ */
+export function rewriteStubIfUnchanged(
+  oldTeam: TeamDefinition,
+  newTeam: TeamDefinition,
+  sessionId: string | null
+): StubRewriteOutcome {
+  const path = getSharedContextPath(newTeam.name, sessionId);
+  let content: string;
+  try {
+    if (!existsSync(path)) return "missing";
+    content = readFileSync(path, "utf-8");
+  } catch {
+    // Unreadable (permissions, a directory in place of the file, I/O error):
+    // do not guess — the caller must report "cannot tell".
+    return "undecidable";
+  }
+  if (!isSystemStub(content, oldTeam)) return "not-stub";
+  try {
+    writeFileSync(path, buildStubContent(newTeam), "utf-8");
+    return "rewritten";
+  } catch {
+    return "write-failed";
+  }
 }

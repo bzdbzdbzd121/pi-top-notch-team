@@ -77,6 +77,24 @@ describe("buildAgentInitiatedPrompt (ADR-0003)", () => {
       expect(prompt).toContain("stop_team_session");
     });
 
+    it("design sequence starts with naming (suggested; frozen once members start)", () => {
+      const seq = prompt.slice(
+        prompt.indexOf("### 推进顺序"),
+        prompt.indexOf("### 当前团队")
+      );
+      expect(seq).toContain("set_team_name");
+      expect(seq).toContain("命名团队（建议）");
+      expect(seq).toContain("成员启动后不能再改名");
+      expect(seq).toContain("不是开工条件");
+      // Naming comes first: it must precede task splitting and member registration.
+      const nameIdx = seq.indexOf("命名团队");
+      const splitIdx = seq.indexOf("任务拆分");
+      const addIdx = seq.indexOf("注册成员");
+      expect(nameIdx).toBeGreaterThan(-1);
+      expect(nameIdx).toBeLessThan(splitIdx);
+      expect(nameIdx).toBeLessThan(addIdx);
+    });
+
     it("lists registered members when present", () => {
       const p = buildAgentInitiatedPrompt(teamWithMembers, "design", "sess-1", TASK);
       expect(p).toContain("analyzer（分析员）");
@@ -102,6 +120,13 @@ describe("buildAgentInitiatedPrompt (ADR-0003)", () => {
 
     it("states read/analysis freedom without dispatch policing", () => {
       expect(prompt).toContain("无派发管制守卫");
+    });
+
+    it("does NOT carry a naming requirement (the name freezes before this phase)", () => {
+      expect(prompt).not.toContain("必须先命名");
+      expect(prompt).not.toContain("不命名");
+      expect(prompt).not.toContain("set_team_name");
+      expect(prompt).not.toMatch(/命名[^。\n]*(拦截|禁止)/);
     });
 
     it("replaces the hard code-write boundary with write discipline", () => {

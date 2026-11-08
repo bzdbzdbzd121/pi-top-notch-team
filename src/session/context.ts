@@ -91,6 +91,13 @@ export interface TeamContext {
   onSessionStart?: (ui: SessionUI) => void;
   /** Called immediately when /team stop runs. Removes team status widget. */
   onSessionEnd?: () => void;
+  /**
+   * Called after a successful team rename (set_team_name). index.ts rebinds the
+   * per-session settings directory to the new `<rootDir>/sessions/<name>/<sessionId>`
+   * and refreshes the status widget. Fail-open: the new name is already in effect,
+   * so a missing hook only delays the visible rebind.
+   */
+  onTeamRenamed?: (newName: string) => void;
   /** Called when /team edit <name> enters. Installs edit-mode widget. */
   onEditStart?: (ui: SessionUI) => void;
   /** Called when edit mode exits (cancel/save/start/stop). Removes edit-mode widget. */

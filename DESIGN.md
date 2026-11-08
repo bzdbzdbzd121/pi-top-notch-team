@@ -69,7 +69,9 @@ pi-top-notch-team/
 │       ├── 0004-team-session-resume.md
 │       ├── 0005-pi-upstream-truncation-marking.md
 │       ├── 0006-pi-upstream-abort-compaction-rpc.md
-│       └── 0007-pi-upstream-context-usage-reason.md
+│       ├── 0007-pi-upstream-context-usage-reason.md
+│       ├── 0008-team-definition-cloud-sync.md
+│       └── 0009-dynamic-team-naming.md
 ├── package.json              ← pi package manifest (see below)
 ├── scripts/
 │   └── check-goal-reminder.mjs ← Stage 3 static lifecycle/wording/release guard
@@ -336,8 +338,8 @@ The dynamic mode is split into two phases: **design** and **execution**.
 
 **Flow:**
 1. Check no active session exists
-2. Create temp directory `sessions/_dynamic_<ts>/`
-3. Create in-memory `TeamDefinition` with 0 members, name `_dynamic_<ts>`
+2. Create the session directory `sessions/<team-name>/`（未命名时 `<team-name>` = `_dynamic_<ts>`）
+3. Create in-memory `TeamDefinition` with 0 members, name = that fallback name（设计阶段可经 `set_team_name` 改名，见 §36）
 4. `startSession(emptyTeam)` — start session with empty team
 5. `teamCtx.isDynamicSession = true`, `teamCtx.dynamicPhase = "design"`
 6. Activate TL tools: `pi.setActiveTools([...current, ...tlToolNames])`
@@ -364,7 +366,7 @@ The TL follows the **Orchestration Playbook** (`src/prompts/orchestration-playbo
 - TL starts remaining Members, dispatches work via `team_send_and_wait`, monitors progress
 - Shared Context is updated as needed
 - TL reports completion; user runs `/team stop`
-- `/team stop` removes `sessions/_dynamic_<ts>/` directory and resets `dynamicPhase` to `"design"`
+- `/team stop` preserves the session directory `sessions/<team-name>/<sessionId>/`（未命名形态即 `sessions/_dynamic_<ts>/<sessionId>/`）、marks its manifest stopped, and resets `dynamicPhase` to `"design"`; `/team resume` restores it（以目录名为权威团队名），`/team delete` only takes YAML team definitions as its entry point
 
 ### `/team start <name>`
 
@@ -1064,19 +1066,24 @@ Each team session gets a unique `sessionId` (timestamp + random suffix) to isola
 - `fresh: true` 把成员会话目录下的全部 `.jsonl` 移到 **同级** 的 `.member-resets/<成员>/<时间戳>/`（保持相对路径与原文件名；移回即可恢复）。归档根与成员目录同级是**结构性**排除：扩展的续接探测是递归的，留在成员目录内（哪怕改后缀）仍会被当成“有历史”；归档目录不被任何工具读取
 - 归档默认**保留不自动删**（它是唯一的事后现场）；用 `/team clean [团队名]` 显式清理（只删 `.member-resets`）；`/team delete` 删整个团队会话目录时归档一并清除
 
-Dynamic sessions (`_dynamic_<ts>`) use their unique team name for isolation:
+Dynamic sessions use the same `<team-name>/<sessionId>/` layout. Until the TL names the team（`set_team_name`，设计阶段、成员启动前；§36）, `<team-name>` is the system fallback `_dynamic_<ts>`:
 
 ```
 ~/.pi/top-notch-team/
 └── sessions/
-    └── _dynamic_1719200000000/     ← timestamp-based, unique per session
-        ├── .shared-context.md
-        └── coder/
-            └── session.jsonl
+    └── <team-name>/                 ← `_dynamic_<ts>` until named, then the real name
+        └── <sessionId>/             ← unique per session
+            ├── .shared-context.md
+            ├── session-settings.yaml    (temporary settings snapshot, optional)
+            ├── session.json             (manifest — the /team resume anchor)
+            └── coder/
+                └── session.jsonl
 ```
 
+Renaming moves the whole `<sessionId>` subtree under the new `<team-name>`（一次原子 `rename`，§36）。
+
 Member sessions use `pi --mode rpc --session-dir <path>` so session files are persisted and recoverable.
-On `/team stop` and `session_shutdown`, the session subdirectory (`<sessionId>`) is preserved and its manifest is marked `stopped` (or left `active` for an interrupted shutdown); use `/team resume` to restore it and `/team delete` for explicit disk cleanup.
+On `/team stop` and `session_shutdown`, the session subdirectory (`<sessionId>`) is preserved and its manifest is marked `stopped` (or left `active` for an interrupted shutdown); use `/team resume` to restore it. `/team delete <name>` is scoped to **pre-defined** teams: it removes the YAML definition and, after a separate confirmation, that team's `sessions/<name>/` directory. Dynamic sessions have no YAML definition, so `/team delete` does not apply to them — their directories are preserved for `/team resume`.
 
 ## 14. Shared Context
 
@@ -1459,18 +1466,19 @@ TL calls start_team_session(task)          ← registered at extension LOAD (the
   │          effects (决策 #42 L2 execute gate — checked FIRST, before task
   │          validation and re-entry guard; see §29)
   ├─ guard: session already active → error (re-entry)
-  ├─ bootstrapDynamicSession(origin "agent")   src/setup/dynamic-session-bootstrap.ts
-  │    ├─ mkdir sessions/_dynamic_<ts>/
+  ├─ bootstrapDynamicSession(origin "agent", { teamName })   src/setup/dynamic-session-bootstrap.ts
+  │    ├─ resolve name: 合法且不撞名 → 用指定名；非法/撞名/缺省 → `_dynamic_<ts>` + nameIssue
+  │    ├─ mkdir sessions/<team-name>/
   │    ├─ startSession(emptyTeam, { origin: "agent" })
   │    ├─ ensureSharedContextFile (stub)
   │    ├─ teamCtx: isDynamicSession=true, dynamicPhase="design"
-  │    ├─ ensureAddDynamicMemberTool
-  │    └─ onSessionStart → activate session tools + add_dynamic_member + stop_team_session
+  │    ├─ ensureAddDynamicMemberTool + ensureSetTeamNameTool
+  │    └─ onSessionStart → activate session tools + add_dynamic_member + set_team_name + stop_team_session
   ├─ teamCtx.agentInitiatedTask = task
   ├─ setGoalInternal(task, derived criteria)   ← Goal reminders keep the TL on track
   └─ notify: "🤖 Agent 已自主启动团队会话：<task>"
 
-… autonomous design → add_dynamic_member → write_shared_context → start_member …
+… autonomous design → set_team_name (optional, design phase) → add_dynamic_member → write_shared_context → start_member …
 … (phase flips to execution as usual) dispatch → monitor → report …
 
 TL calls stop_team_session()               ← session-scoped; ACTIVATED only in
@@ -1479,7 +1487,10 @@ TL calls stop_team_session()               ← session-scoped; ACTIVATED only in
   └─ teardownTeamSession()                   src/session/teardown.ts — shared with
                                                /team stop: stop members, deactivate
                                                tools, widgets off, preserve resumable
-                                               dir; disk cleanup via /team delete;
+                                               dirs — disk cleanup via /team delete
+                                               applies only to pre-defined teams
+                                               (dynamic sessions have no YAML
+                                               definition; restore via /team resume);
                                                endSession + resetGoal
 ```
 
@@ -2634,3 +2645,75 @@ resolver 矩阵 8（undefined/true/false/getter 异常/null·undefined settings 
 - `src/prompts/tl-first-action.test.ts` / `dynamic-mode.test.ts` / `agent-initiated-mode.test.ts`：三态文案矩阵、设计阶段两态、必填参数、旁路来源回归锁。
 - `src/commands/handlers/setting-handler.test.ts`「TL 亲自分析限制 (阶段 4)」：顶层三态与位置、子菜单结构与标题、全局/临时作用域、非法输入矩阵、恢复默认保留开关、Esc；**指针契约**用例把导出的 `OPT_SELF_WORK` 与守卫 `EXEMPT_ACTIONS_LINE`、`index.ts` 首次拦截通知逐字对齐（任一处改字即红）。
 - 静态守卫：`src/static-scan.test.ts` 的 `loadSettings(` 白名单（resolver 不得裸调用）与绝对化历史断言扫描（`index.ts` + `src/prompts/*.ts`）保持绿。
+
+## 36. 动态 / 自主团队命名（决策 #50，阶段 1–6 收口）
+
+**目的**：动态团队（`/team dynamic`）与 agent 自主会话（`start_team_session`）此前一律叫 `_dynamic_<ts>`，状态栏、`/team status`、`/team resume` 与成员提示词里都是时间戳。现在团队可以在开工前拥有一个可读名字。不可逆裁决的论证与备选方案见 `docs/adr/0009-dynamic-team-naming.md`；本节是行为规范。
+
+### 36.1 语义与数据模型
+
+- **一个名字**：`TeamDefinition.name` 是唯一权威。用户可见名 = 清单 `teamName` = 成员进程 `TEAM_NAME` = 目录名；目录为 `sessions/<团队名>/<sessionId>/`。不新增 `displayName`、不新增清单字段，`manifest.version` 不变。
+- **未命名** = 名字仍是兜底名 `_dynamic_<ts>`。命名规则要求首字符是字母或数字，用户不可能构造该形态，因此"是否未命名"可靠推导，**不需要状态字段**。
+- 归一化只做两件无损的事：Unicode NFC、连续空白折成 `-`；**不做 NFKC**（`①`→`1`、`㎏`→`kg` 属静默改字）。归一化改变了输入时，工具结果回显最终名。
+
+### 36.2 命名规则（`src/team/team-name.ts`）
+
+- 允许：中文、其他语言的字母、十进制数字、`-`、`_`；必须以字母或数字开头并结尾。
+- 拒绝：路径分隔符、`.`、控制字符与换行、emoji、非十进制数字符号（如 `①`）、超长、Windows 保留设备名（`CON`/`PRN`/`AUX`/`NUL`/`COM1-9`/`LPT1-9`，大小写不敏感）。
+- **上限 20 显示列**（中文按 2 列计），与状态栏标题预算 `min(20, 终端宽度/4)` 对齐；20 列上限由 `TEAM_NAME_MAX_WIDTH` 单一来源插值。
+- 拒绝时回显**具体原因 + 规则全文**（`describeTeamNameRules()` 单一来源，错误文案与提示词共用）；控制字符以 `U+XXXX` 形式呈现。
+- 与已存在的**预定义团队**同名（大小写不敏感）被拒绝：同名会让同一个可读标识同时指向两个团队。
+
+### 36.3 两条入口
+
+- **agent 自主会话（主入口）**：`start_team_session({task, teamName?})`。名字合法且不撞名 → 会话直接建在该名字下（零搬迁）；非法/撞名/缺省 → 兜底名照常开会，结果文本写明最终名、来源（显式/兜底）与没用上给定名的原因（任务委派优先，绝不因命名失败拒绝开会）。创建时的命名是"在新目录建会话"，不是改名。
+- **用户入口 `/team dynamic`**：**不接受名字参数**（用户已确认不需要；`/team dynamic 名字` 与今天一致，多余参数被忽略，不产生命名副作用）。启动通知提示「团队暂未命名，可以告诉 TL 你希望的团队名称」；用户直接告诉 TL，由 TL 在设计阶段调用 `set_team_name`。
+
+### 36.4 改名窗口与事务（`src/session/rename-team.ts`）
+
+**窗口** = 会话活跃 ∧ 动态会话 ∧ `dynamicPhase === "design"` ∧ 无成员进程处于 running（防御纵深）。**冻结点是启动成员**：成员的 `TEAM_NAME`、绝对共享上下文路径、`--session-dir` 与已下发的系统提示词在 spawn 时固化；注册成员（`add_dynamic_member`）只改内存名册，不影响任何进程。阶段在第一个成员**成功启动**时翻为 `execution` 并写入清单（`/team resume` 从清单恢复），而 `applyTeamName` **先判阶段、后判 running**，所以**崩溃或主动停止的成员不会重新打开窗口**（返回 `phase-execution`）；唯一不被阻断的成员相关失败是 `start_member` 启动失败（阶段未翻转、残留 handle 非 running）。执行阶段仍可调用 `set_team_name`（白名单刻意放行），但工具会以"执行阶段/名称已冻结"拒绝并给真实出路（结束会话后重开、在启动成员前命名）。
+
+**步骤对照**：下面 6 段是"步骤组"，对应 `src/session/rename-team.ts` 的 **14 个编号步骤**（Step 1-14；其中 Step 8-10 是一组目录搬迁动作：建父目录 / `rename` / 收拾旧父目录）。不以"15 步"表述（方案原文的第 15 项是本函数返回，实现中不是独立步骤）。
+
+**顺序（不可重排）**：
+
+1. 前置校验（同步、零副作用）：活跃 → 动态 → 设计阶段 → 无 running 成员 → 名字规则 → **幂等**（归一后同名 → 成功且 `moved=false`，无文件系统动作）→ 撞名检查（预定义团队；目标目录已存在则拒绝，绝不覆盖）。撞名列表读取失败返回可读 io 文案，不抛异常。
+2. `mkdir sessions/<新名>` → `rename sessions/<旧名>/<sessionId>` → `sessions/<新名>/<sessionId>`（同文件系统一次原子操作；失败则清理空的新父目录并返回 io，状态未变）→ 旧父目录若空则尽力清理。
+3. 内存改名（构造新状态对象，保留 `sessionId`/`startedAt`/`origin`/`sharedContextWritten`/成员表）。
+4. 清单写入（`syncActiveManifest` 返回 `boolean`；失败 → 目录与内存回滚，回滚再失败 → `partial`，文案说明 `/team resume` 会按目录名自愈）。
+5. `onTeamRenamed` 钩子：重绑临时设置目录（`sessions/<新名>/<sessionId>`）+ 刷新状态栏。**目录已搬的所有路径都触发**（含 partial），否则之后写临时设置会在旧名下 `mkdirSync` 出杂散目录，`/team resume` 读不到快照。
+6. 共享上下文 stub 条件重写（见 36.5）。
+
+拒绝码：`inactive` / `not-dynamic` / `phase-execution` / `member-running` / `invalid` / `taken` / `io` / `partial`；每条都带可直接行动的下一步。
+
+### 36.5 共享上下文 stub 的判定与重写
+
+判定是**结构化**的，不是把整个文件与旧 stub 做文本比对：以**旧团队名** + stub 结构（首行 `# Shared Context — <旧名>`、`- 名称：<旧名>`、自动创建警示句、四个未改动的「（待 TL 补充）」占位章节）比对；**只有成员名册块允许变化**（bootstrap 时 0 成员生成，之后 `add_dynamic_member` 只改名册），description 行允许 resume 漂移（`/team resume` 会把 description 重建为「（恢复的团队会话）」）。TL 真正写入的内容不会匹配。
+
+重写结果以枚举如实返回：`rewritten`（已用新名重写）/ `not-stub`（不是系统 stub，未改写）/ `missing`（文件不存在）/ `undecidable`（不可读，无法判定）/ `write-failed`（识别为 stub 但写入失败）。工具按结果输出说明，不虚构"TL 已写入"。
+
+### 36.6 显示与提示词
+
+- 状态栏对兜底名显示「未命名团队」（`UNNAMED_TEAM_DISPLAY`），0 成员设计行也显示名字（`👤 未命名团队 │ 设计阶段 · 设计团队中`）；`/team status` 与 `/team resume` 仍显示真实名（便于排查与定位）。
+- widget 用 `getTeamName` getter：每次 `refresh()` 只读一次，同一个值同时用于渲染去重键与标题（名字变化恰好触发一次 `setWidget`；名字与成员都不变则不重复渲染）。
+- 提示词：设计阶段落地顺序为 `set_team_name`（建议，启动成员前）→ `add_dynamic_member` → `write_shared_context` → `start_member`；playbook 计划书模板含「### 团队名（建议）」，阶段 E 的字段枚举与模板一致（有防漂移断言）。命名是**建议**、不是开工条件，提示词不得出现"不命名会被拦截"这类假话；一次性提醒只在「未命名动态会话的首个 `add_dynamic_member`」出现。
+
+### 36.7 恢复自愈（`/team resume`）
+
+以**目录名**为权威团队名：清单文件实际所在目录 `sessions/<dirName>/<sessionId>/session.json` 的 `<dirName>` 优先于清单里的 `teamName`。不一致时（改名后清单写入丢失、进程被杀、历史手工改动）打一条警告、按目录名恢复（成员路径与临时设置快照路径随之正确），恢复完成后的清单写入会把 `teamName` 修正；按名称匹配时也接受目录名。这让"清单与目录分叉"从"成员上下文全丢 + 临时设置丢失"降级为"一条警告 + 自动修复"。
+
+### 36.8 限制与非目标
+
+- **执行阶段不能改名**（见 36.4）；需要执行期改名时唯一可行路线是 ADR-0009 的方案 B（只改显示名 + 接受成员自述滞后）。
+- `/team delete` 仍只以 YAML 团队定义为入口，不清理动态会话目录（既有行为，本方案不改）。
+- 不加 `/team dynamic <名字>` 参数；无数据迁移（旧 `_dynamic_*` 会话按未命名处理，恢复路径不变）。
+- 提示词建议只是引导，不能保证模型一定命名；未命名会话一切功能正常，只是显示为「未命名团队」。
+
+### 36.9 测试与守卫
+
+- `src/team/team-name.test.ts`：合法/拒绝矩阵、归一化回显（NFC 生效、NFKC 不生效）、20 列边界（ASCII/中文/混合）、Windows 保留名、`isSyntheticTeamName` 不变量。
+- `src/session/rename-team.test.ts`：成功三处一致、幂等、7 类拒绝零副作用、失败注入（moveDir 抛错 / 清单失败回滚 / 回滚再失败 partial 且重绑钩子）、先注册成员再命名、resume 描述漂移、stub 结构判定两向、`buildMemberConfig` 路径。
+- `src/tools/team-name-tool.test.ts`：成功/幂等/归一化回显、stub 结果文案（rewritten/not-stub/missing/undecidable）、拒绝文案与下一步、注册幂等、冻结点为 `start_member`。
+- `src/commands/handlers/resume-handler.test.ts`：注册并激活工具、目录名权威自愈、改名后临时设置经 stop→resume 仍生效且旧目录未重建。
+- `src/index.test.ts`：两阶段白名单放行、执行阶段不计入派发预算/sticky 期可用、`session_shutdown` 与 `/new` 清理路径移除工具。
+- 提示词：`dynamic-mode.test.ts` / `agent-initiated-mode.test.ts` / `session-transition-notice.test.ts` / `team-dynamic.test.ts`（结构断言 + 负例锁 + 阶段 E 防漂移 + 一次性提醒）。

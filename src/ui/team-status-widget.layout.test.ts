@@ -22,7 +22,7 @@ function harness(labels: string[], states: MemberOperationalState[], teamName = 
     sendCommandAndWait: async () => ({ data: { contextUsage: { percent: 42, tokens: 420, contextWindow: 1000 } } }),
   }));
   const widget = createTeamStatusWidget({
-    teamName,
+    getTeamName: () => teamName,
     getMembers: () => members,
     teamCtx: { getHandle } as unknown as TeamContext,
     memberOpsStates,
@@ -55,6 +55,26 @@ describe("team status single-line responsive layout", () => {
     expect(h.render(80)).toHaveLength(1);
     expect(h.line(80)).toContain("设计阶段");
     expect(h.line(80)).not.toMatch(/0人|尚无成员/);
+  });
+
+  it("shows the team name in the zero-member design line, with an unnamed placeholder", () => {
+    const unnamed = harness([], [], "_dynamic_1789456123456");
+    for (const width of [20, 40, 80]) {
+      expect(visibleWidth(unnamed.render(width)[0])).toBeLessThanOrEqual(width);
+      expect(unnamed.line(width)).toContain("设计阶段");
+    }
+    expect(unnamed.line(40)).toContain("👤 未命名团队");
+    expect(unnamed.line(80)).toContain("👤 未命名团队");
+    expect(unnamed.line(80)).toContain("设计阶段 · 设计团队中");
+    expect(unnamed.line(80)).not.toContain("_dynamic_");
+
+    const named = harness([], [], "开发团队");
+    for (const width of [20, 40, 80]) {
+      expect(visibleWidth(named.render(width)[0])).toBeLessThanOrEqual(width);
+      expect(named.line(width)).toContain("设计阶段");
+    }
+    expect(named.line(40)).toContain("👤 开发团队");
+    expect(named.line(80)).toContain("👤 开发团队");
   });
 
   it("ranks crashes before running/compacting, then idle/stopped, stable within each group", () => {

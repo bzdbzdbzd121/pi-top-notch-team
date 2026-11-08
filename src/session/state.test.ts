@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { startSession, endSession, getSessionState, addMemberToSession, isActive, getFrozenMembers, markSharedContextWritten } from "./state";
+import { startSession, endSession, getSessionState, addMemberToSession, isActive, getFrozenMembers, markSharedContextWritten, renameTeamInSession } from "./state";
 import type { TeamDefinition, TeamMember } from "../team/definition";
 
 describe("sessionId", () => {
@@ -269,5 +269,81 @@ describe("addMemberToSession", () => {
 
     const state = getSessionState();
     expect(state.teamDefinition!.members[0].model).toBe("anthropic/claude-sonnet-4");
+  });
+});
+
+describe("renameTeamInSession", () => {
+  let baseTeam: TeamDefinition;
+
+  beforeEach(() => {
+    endSession();
+    baseTeam = {
+      name: "_dynamic_1789456123456",
+      description: "A dynamic team",
+      defaults: { model: "anthropic/claude-sonnet-4" },
+      members: [{ name: "coder", label: "编码员", systemPrompt: "You are a coder" }],
+    };
+  });
+
+  it("throws when no active session", () => {
+    expect(() => renameTeamInSession("登录重构")).toThrow("No active session");
+  });
+
+  it("throws after the session ended", () => {
+    startSession(baseTeam);
+    endSession();
+    expect(() => renameTeamInSession("登录重构")).toThrow("No active session");
+  });
+
+  it("replaces the team name", () => {
+    startSession(baseTeam);
+    renameTeamInSession("登录重构");
+    expect(getSessionState().teamDefinition!.name).toBe("登录重构");
+  });
+
+  it("preserves sessionId, startedAt, origin, sharedContextWritten and members", () => {
+    startSession(baseTeam, { sessionId: "sid-1", origin: "agent" });
+    markSharedContextWritten();
+    const before = getSessionState();
+
+    renameTeamInSession("登录重构");
+
+    const after = getSessionState();
+    expect(after.active).toBe(true);
+    expect(after.sessionId).toBe("sid-1");
+    expect(after.startedAt).toBe(before.startedAt);
+    expect(after.origin).toBe("agent");
+    expect(after.sharedContextWritten).toBe(true);
+    expect(after.teamDefinition!.name).toBe("登录重构");
+    expect(after.teamDefinition!.description).toBe("A dynamic team");
+    expect(after.teamDefinition!.defaults).toEqual({ model: "anthropic/claude-sonnet-4" });
+    expect(after.teamDefinition!.members).toEqual(baseTeam.members);
+  });
+
+  it("does not mutate the definition object handed to startSession", () => {
+    startSession(baseTeam);
+    renameTeamInSession("登录重构");
+    expect(baseTeam.name).toBe("_dynamic_1789456123456");
+  });
+
+  it("keeps the last name on repeated renames", () => {
+    startSession(baseTeam);
+    renameTeamInSession("第一版");
+    renameTeamInSession("第二版");
+    expect(getSessionState().teamDefinition!.name).toBe("第二版");
+    expect(getSessionState().sessionId).toBeTruthy();
+  });
+
+  it("read snapshots are deep clones (mutating one does not leak into the session)", () => {
+    startSession(baseTeam);
+    renameTeamInSession("登录重构");
+
+    const snapshot = getSessionState();
+    snapshot.teamDefinition!.name = "被篡改";
+    snapshot.teamDefinition!.members[0].name = "被篡改";
+
+    const fresh = getSessionState();
+    expect(fresh.teamDefinition!.name).toBe("登录重构");
+    expect(fresh.teamDefinition!.members[0].name).toBe("coder");
   });
 });
