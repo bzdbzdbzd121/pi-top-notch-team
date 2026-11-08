@@ -89,6 +89,7 @@ for (const adrFile of [
   "0006-pi-upstream-abort-compaction-rpc.md",
   "0007-pi-upstream-context-usage-reason.md",
   "0008-team-definition-cloud-sync.md",
+  "0009-dynamic-team-naming.md",
 ]) {
   requireMatch(`DESIGN ADR layout includes ${adrFile}`, design, new RegExp(adrFile.replaceAll(".", "\\.")));
 }

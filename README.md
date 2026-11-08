@@ -129,6 +129,8 @@ members:
 
 **执行阶段**（确认后自动进入）：TL 注册成员、写共享上下文、启动成员并按工作流派发。之后的使用与 `/team start` 完全相同。
 
+**团队命名**：动态会话默认显示为「未命名团队」（内部是系统兜底名）。你可以直接把想要的团队名告诉 TL，它会在设计阶段用 `set_team_name` 改名（会话目录随之一并迁移）；**一旦启动成员，名字就冻结**（成员的 `TEAM_NAME`、会话目录与共享上下文路径在启动时已固化），之后只能结束会话重开。命名是建议，不是开工条件；`/team dynamic` 本身不接受名字参数。
+
 ### Agent 自主团队会话
 
 TL 还能自主开会：当它判断某个任务适合整队委派时（例如「帮我重构这个模块」），可直接调用 `start_team_session` 现场组建动态团队，全程自主——设计团队、派发任务、汇总结果，收尾用 `stop_team_session` 结束（会话目录同样保留，可 `/team resume` 恢复）。
@@ -344,11 +346,12 @@ git --git-dir ~/.pi/top-notch-team/teams/.git show <提交>:<名字>.yaml
 | `get_member_log(name, lines?, maxContentLength?)` | 通过 RPC 获取 Member 近期会话。`maxContentLength` 截断每条消息（默认 200 字符）。 |
 | `wait_and_get_member_status()` | 等待所有 Member 空闲后查看运行状态：idle/working/crashed/stopped。有 Member 在工作则阻塞。无参数。 |
 | `add_dynamic_member(name, label, systemPrompt, model?)` | 在 /team dynamic 模式下注册成员（name=标识符，label=中文显示名） |
+| `set_team_name(name)` | 给动态/自主团队起一个可读名字（设计阶段、启动成员前；改名会迁移会话目录并同步清单/状态栏/临时设置绑定）。模式工具，不属于上述 9 个 session-scoped tools；启动成员后名称冻结 |
 | `team_send_and_wait({tasks: [{to, content}], nextSteps})` | 向一个或多个成员发送消息并等待全部响应。tasks 数组支持向不同成员并发派发以并行执行；部分成员失败时返回部分结果。nextSteps 在 wait 结束后随结果返回。 |
 | `set_goal(text, criteria)` | 设定带可验证完成标准的会话目标；仅在 TL 一次运行完全结算（不会再自动重试、自动压缩或处理排队续跑）且目标未完成时提醒继续，`agent_end` 不会单独触发提醒。 |
 | `finish_goal()` | 标记当前目标完成，停止提醒系统。 |
 
-上述 9 个 session-scoped tools 在 fresh pi 进程中尚未注册；首次启动团队会话时按需注册并在会话期间激活。由于 pi 不提供 unregister API，teardown 后仍保留在 registry；会话外仅从 activeTools 移除，因此不可见且不可调用。`add_dynamic_member` 不属于上述 9 个 session-scoped tools，仅在 dynamic mode bootstrap 时按需注册，预定义 `/team start` 不会注册它。
+上述 9 个 session-scoped tools 在 fresh pi 进程中尚未注册；首次启动团队会话时按需注册并在会话期间激活。由于 pi 不提供 unregister API，teardown 后仍保留在 registry；会话外仅从 activeTools 移除，因此不可见且不可调用。`add_dynamic_member` 不属于上述 9 个 session-scoped tools，仅在 dynamic mode bootstrap 时按需注册，预定义 `/team start` 不会注册它。`set_team_name` 与 `add_dynamic_member` 同属模式工具：仅在动态/自主会话注册并激活（`/team resume` 会重新注册），不改变上述 9 个会话工具的数量。
 
 此外 `start_team_session(task)` 在扩展加载时即注册（agent 自主开会的入口），`stop_team_session()` 仅在自主会话中激活。
 
