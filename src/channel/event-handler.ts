@@ -746,11 +746,18 @@ function buildPromptMessage(msg: TeamMessage): string {
 }
 
 /**
- * 阶段 5（方案 §3.5.2）：只有「能查到状态且明确不是 running」才算明确未运行。
+ * 阶段 5（方案 §3.5.2）：只有「能查到状态且明确不是 running」才算**确定未运行**。
  *
- * 兼容性约束（必须在实现上守住的）：部分测试替身/最小装配的句柄根本没有
- * `getState`（运行时缺字段），查询也可能抛错——这些一律视为未知（fail-open），
- * 否则会误伤既有路径。
+ * 口径（何谓确定未运行）：
+ * - `running` 是唯一的「可能可达」值 → 不拦截；
+ * - `stopped` / `error` / 其它非 `running` 的字面值 → 确定未运行（不会再接受新回合）；
+ * - `stopped` 且 PID 还没清空（正在停止中）也归入：已置停止态 = 不会再接新任务，
+ *   此时派发要么被句柄拒绝、要么进了 pi 的退出流程而被丢弃——都不会变成一次
+ *   成功的派发。（重复启动守卫那边之所以把 stopped+PID 单列，是因为那里「稍后重试」
+ *   是有效出路；派发侧没有重试语义，所以与 stopped 等义。）
+ * - 未知（句柄缺 `getState`、查询抛错、状态不是字符串）→ **不拦截**（fail-open）：
+ *   部分测试替身/最小装配的句柄本来就没有状态查询，误伤比放过更贵；真正的发送失败
+ *   仍由调用方 catch 分支收尾（恢复状态 + 通知）。
  */
 export function isHandleDefinitelyNotRunning(handle: MemberProcessHandle): boolean {
   const getState = (handle as Partial<MemberProcessHandle>).getState;
@@ -1245,6 +1252,15 @@ export function createSendToMember(
   function dispatchWithAutoCompact(memberName: string, msg: TeamMessage): void {
     const handle = memberHandles.get(memberName);
     if (!handle) return; // entry point already checked; defensive
+
+    // 阶段 5 加固（审查建议 1）：目标**确定未运行**时不能走自动压缩流程——
+    // stats 查询失败 / 压缩失败的失败分支会写「已直接派发任务」的通知，而实际
+    // 发送会被发送层拦下（消息并未送达），那句话就是假话。这里直接回到共享的
+    // 发送层（它自己会走“未送达”收尾），不开始压缩、不发任何压缩相关通知。
+    if (isHandleDefinitelyNotRunning(handle)) {
+      dispatchPromptToMember(promptDeps, memberName, msg);
+      return;
+    }
     // 核对退回 1: a single-message dispatch is no longer "the most recent
     // merged-package dispatch" — clear the annotation count (a merged
     // package keeps it: it was just recorded by flush and a synchronous
