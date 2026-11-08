@@ -210,6 +210,32 @@ describe("/team clean（阶段 3）", () => {
     expect(existsSync(other)).toBe(true);
   });
 
+  it("只有非标准层级归档（成员名含分隔符）→ 报告条目，不输出「没有可清理的成员重启归档」", async () => {
+    const deep = join(
+      root,
+      "sessions",
+      "teamA",
+      "sid1",
+      "a",
+      ".member-resets",
+      "a",
+      "b",
+      "20261108-103000"
+    );
+    mkdirSync(deep, { recursive: true });
+    writeFileSync(join(deep, "s.jsonl"), "x");
+    const ctx = createMockContext();
+
+    await handleClean(ctx as any, "");
+
+    const text = notifications(ctx);
+    expect(text).not.toContain("没有可清理的成员重启归档");
+    expect(text).toContain("不合规或非标准条目");
+    expect(text).toContain(deep);
+    expect(ctx.ui.confirm).not.toHaveBeenCalled();
+    expect(existsSync(deep)).toBe(true);
+  });
+
   it("注入扫描依赖：预览与确认里的数字同源（scan 返回值）", async () => {
     const fakePath = join(root, "sessions", "teamX", "sid", ".member-resets", "m", "20261108-103000");
     const ctx = createMockContext();

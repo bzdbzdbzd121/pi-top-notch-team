@@ -53,15 +53,19 @@ export async function handleClean(
   const scan = scanArchives(rootDir, teamName ? { teamName } : undefined);
 
   if (scan.entries.length === 0) {
-    // 无归档 → 单条提示，不弹确认框（验收 3）。扫描阶段跳过的不合规条目
-    // 一并说明，否则用户会疑惑「目录明明在，为什么没清」。
+    // 无归档 → 单条提示，不弹确认框（验收 3）。但扫描阶段跳过/非标准条目必须报告，
+    // 且**不得说成「没有可清理的归档」**——否则用户会以为归档不存在（v3 验收 10）。
     const scope = teamName ? `（团队 "${teamName}"）` : "";
-    const lines = [`没有可清理的成员重启归档${scope}。`];
-    if (scan.skipped.length > 0) {
-      lines.push(`跳过 ${scan.skipped.length} 个不合规或不可读条目（未删除）：`);
+    const hasSkipped = scan.skipped.length > 0;
+    const lines = hasSkipped
+      ? [
+          `未发现可自动清理的成员重启归档${scope}；发现 ${scan.skipped.length} 个不合规或非标准条目（未删除）：`,
+        ]
+      : [`没有可清理的成员重启归档${scope}。`];
+    if (hasSkipped) {
       for (const item of scan.skipped) lines.push(`- ${item.path}（${item.reason}）`);
     }
-    ctx.ui.notify(lines.join("\n"), scan.skipped.length > 0 ? "warning" : "info");
+    ctx.ui.notify(lines.join("\n"), hasSkipped ? "warning" : "info");
     return;
   }
 

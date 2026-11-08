@@ -750,3 +750,98 @@ describe("formatArchiveScanPreview / formatArchiveCleanupResult", () => {
     expect(text).toContain(join(root, "bogus"));
   });
 });
+
+// ── 有界深度扫描（方案 v3：阶段 3 验收第 10 条 / §3.3.3）──
+// 完备性要求（深度上限内）：任何时间戳形状的归档目录「要么可删、要么进 skipped」，
+// 不存在静默漏见的第三种状态——包括成员名含路径分隔符产生的非标准层级。
+describe("scanMemberSessionArchives 有界深度完备性（v3 验收 10）", () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "member-archive-depth-"));
+  });
+
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  function stampDir(...segments: string[]): string {
+    const dir = join(root, "sessions", ...segments);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "s.jsonl"), "x");
+    return dir;
+  }
+
+  it("非标准层级的归档（成员名含分隔符 → 深一层归档根）计入 skipped，不进删除清单、不删除", () => {
+    // <团队>/<会话>/a/.member-resets/a/b/<时间戳>  ← 归档根在 sessions 下第 4 层
+    const deep = stampDir("t", "sid", "a", ".member-resets", "a", "b", "20261108-103000");
+
+    const scan = scanMemberSessionArchives(root);
+
+    expect(scan.entries).toEqual([]);
+    expect(scan.skipped.map((s) => s.path)).toContain(deep);
+    expect(scan.skipped.find((s) => s.path === deep)!.reason).toContain("非标准");
+    // 标准条目一个都没有，但报告里有它 —— 不会被说成「什么都没有」
+    expect(scan.teamCount).toBe(0);
+
+    const result = deleteMemberSessionArchives(scan);
+    expect(result.deleted).toEqual([]);
+    expect(existsSync(deep)).toBe(true);
+  });
+
+  it("扁平布局下成员名含分隔符（归档根位置看似标准、成员分组多一层）同样计入 skipped", () => {
+    // <团队>/a/.member-resets/a/b/<时间戳>  ← 根在第 3 层，但成员分组跨了 2 级
+    const nested = stampDir("t", "a", ".member-resets", "a", "b", "20261108-104500");
+
+    const scan = scanMemberSessionArchives(root);
+
+    expect(scan.entries).toEqual([]);
+    expect(scan.skipped.map((s) => s.path)).toContain(nested);
+    expect(scan.skipped.find((s) => s.path === nested)!.reason).toContain("非标准");
+    expect(deleteMemberSessionArchives(scan).deleted).toEqual([]);
+    expect(existsSync(nested)).toBe(true);
+  });
+
+  it("深度上限之内的标准归档仍正常发现（回归：与 skipped 共存）", () => {
+    const standard = stampDir("t", "sid", ".member-resets", "coder", "20261108-103000");
+    const deep = stampDir("t", "sid", "a", ".member-resets", "a", "b", "20261108-104500");
+
+    const scan = scanMemberSessionArchives(root);
+
+    expect(scan.entries.map((e) => e.path)).toEqual([standard]);
+    expect(scan.skipped.map((s) => s.path)).toContain(deep);
+    expect(scan.teamCount).toBe(1);
+    expect(scan.sessionCount).toBe(1);
+  });
+
+  it("深度上限之外的归档根不被发现、也不会被删除", () => {
+    // <团队>/<会话>/a/b/.member-resets/c/<时间戳>  ← 归档根在第 5 层，超出有界深度
+    const beyond = stampDir("t", "sid", "a", "b", ".member-resets", "c", "20261108-103000");
+
+    const scan = scanMemberSessionArchives(root);
+
+    expect(scan.entries).toEqual([]);
+    expect(scan.skipped.map((s) => s.path)).not.toContain(beyond);
+    const result = deleteMemberSessionArchives(scan);
+    expect(result.deleted).toEqual([]);
+    expect(result.failed).toEqual([]);
+    expect(existsSync(beyond)).toBe(true);
+    // 上限之内的标准归档不受影响（同一团队里再放一个）
+    const standard = stampDir("t", "sid", ".member-resets", "coder", "20261108-105500");
+    expect(scanMemberSessionArchives(root).entries.map((e) => e.path)).toEqual([standard]);
+  });
+
+  it("成员目录内的空/不合规子目录仍计入 skipped（不中断扫描）", () => {
+    const memberDir = join(root, "sessions", "t", "sid", ".member-resets", "coder");
+    mkdirSync(join(memberDir, "not-a-stamp"), { recursive: true });
+    mkdirSync(join(memberDir, "2026-11-08"), { recursive: true });
+    stampDir("t", "sid", ".member-resets", "coder", "20261108-103000");
+
+    const scan = scanMemberSessionArchives(root);
+
+    expect(scan.entries).toHaveLength(1);
+    expect(scan.skipped.map((s) => s.path)).toEqual(
+      expect.arrayContaining([join(memberDir, "not-a-stamp"), join(memberDir, "2026-11-08")])
+    );
+  });
+});

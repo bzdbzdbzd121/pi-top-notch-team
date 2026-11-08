@@ -10,7 +10,7 @@ import {
   statSync,
 } from "node:fs";
 import type { Dirent, Stats } from "node:fs";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep, basename } from "node:path";
 import type { MemberProcessHandle } from "./member-process";
 
 /**
@@ -331,9 +331,38 @@ export interface ArchiveScan {
 }
 
 /**
+ * 有界深度扫描（方案 v3：§3.3.3 / 阶段 3 验收 10）。
+ *
+ * `MEMBER_ARCHIVE_ROOT_MAX_DEPTH` = `.member-resets` 自身相对 `sessions/` 的**最大层级**
+ * （团队=1）：2 = 旧扁平布局 `<团队>/.member-resets`，3 = 标准 `<团队>/<会话>/.member-resets`，
+ * 4 = 成员名含一个路径分隔符产生的非标准层级 `<团队>/<会话>/<a>/.member-resets`。
+ * 更深的归档根（多级分隔符）不在扫描范围——**不假装覆盖**（属附录 I 第 5 条的已知限制）。
+ */
+export const MEMBER_ARCHIVE_ROOT_MAX_DEPTH = 4;
+
+/**
+ * 归档根之下的最大探测层级（成员分组可能因成员名含分隔符而多层）：
+ * 1 = 归档根直接含时间戳（无成员层，形状不合规 → skipped），
+ * 2 = 标准 `<成员>/<时间戳>`，3 = `<a>/<b>/<时间戳>`（一个分隔符）。
+ */
+export const MEMBER_ARCHIVE_STAMP_MAX_DEPTH = 3;
+
+/** 扫描上下文（保持递归签名的参数数量可控）。 */
+interface ArchiveScanContext {
+  rootDir: string;
+  teamName: string;
+  scan: ArchiveScan;
+  teams: Set<string>;
+  sessions: Set<string>;
+}
+
+/**
  * 只读扫描 `sessions/` 下的所有归档：支持 `<团队>/<会话>/.member-resets/…`
  * 与旧扁平布局 `<团队>/.member-resets/…`。不可读/形状不合规的条目记入
  * `skipped`，不中断扫描；扫描阶段零写操作（预览 = 干跑）。
+ *
+ * **完备性（深度上限内）**：遇到的每个时间戳形状目录「要么可删（两种合法形状）、
+ * 要么进 skipped」——包括成员名含分隔符产生的非标准层级，不存在静默漏见的第三种状态。
  */
 export function scanMemberSessionArchives(
   rootDir: string,
@@ -358,85 +387,117 @@ export function scanMemberSessionArchives(
   const sessions = new Set<string>();
 
   for (const teamName of teamNames) {
-    const teamRoot = join(sessionsRoot, teamName);
-    // 扁平布局（无 sessionId）+ 每个会话子目录各查一次归档根。
-    const sessionRoots: Array<{ sessionId: string | null; dir: string }> = [
-      { sessionId: null, dir: teamRoot },
-    ];
-    for (const child of listDirectoryNames(teamRoot)) {
-      if (child === MEMBER_ARCHIVE_ROOT) continue;
-      sessionRoots.push({ sessionId: child, dir: join(teamRoot, child) });
-    }
-
-    for (const { sessionId, dir } of sessionRoots) {
-      const archiveRoot = join(dir, MEMBER_ARCHIVE_ROOT);
-      const archiveRootStat = lstatOrNull(archiveRoot);
-      if (!archiveRootStat || !archiveRootStat.isDirectory() || archiveRootStat.isSymbolicLink()) {
-        if (archiveRootStat?.isSymbolicLink()) {
-          scan.skipped.push({
-            path: archiveRoot,
-            reason: "归档根是符号链接，已跳过",
-          });
-        }
-        continue;
-      }
-
-      for (const memberName of listDirectoryNames(archiveRoot, { includeSymlinks: true })) {
-        const memberDir = join(archiveRoot, memberName);
-        const memberStat = lstatOrNull(memberDir);
-        if (!memberStat) continue;
-        if (memberStat.isSymbolicLink()) {
-          scan.skipped.push({ path: memberDir, reason: "成员目录是符号链接，已跳过" });
-          continue;
-        }
-        if (!memberStat.isDirectory()) {
-          scan.skipped.push({ path: memberDir, reason: "成员条目不是目录，已跳过" });
-          continue;
-        }
-        if (!isSafeName(memberName)) {
-          scan.skipped.push({ path: memberDir, reason: "成员名不合规，已跳过" });
-          continue;
-        }
-
-        for (const stamp of listDirectoryNames(memberDir, { includeSymlinks: true })) {
-          const entryPath = join(memberDir, stamp);
-          const stampStat = lstatOrNull(entryPath);
-          if (!stampStat) continue;
-          if (stampStat.isSymbolicLink()) {
-            scan.skipped.push({ path: entryPath, reason: "归档条目是符号链接，已跳过" });
-            continue;
-          }
-          if (!stampStat.isDirectory()) {
-            scan.skipped.push({ path: entryPath, reason: "归档条目不是目录，已跳过" });
-            continue;
-          }
-          if (!ARCHIVE_DIR_PATTERN.test(stamp) || !isSafeArchiveEntry(rootDir, entryPath)) {
-            scan.skipped.push({
-              path: entryPath,
-              reason: "归档目录名或形状不合规（应为 YYYYMMDD-HHMMSS[-n]），已跳过",
-            });
-            continue;
-          }
-          const bytes = directoryBytes(entryPath);
-          scan.entries.push({
-            teamName,
-            sessionId,
-            memberName,
-            path: entryPath,
-            bytes,
-            mtimeMs: stampStat.mtimeMs,
-          });
-          scan.totalBytes += bytes;
-          teams.add(teamName);
-          sessions.add(`${teamName}\u0000${sessionId ?? ""}`);
-        }
-      }
-    }
+    // 团队目录相对 sessions/ 的层级 = 1；向下最多走到层级 3
+    // （它的 `.member-resets` 子目录正好是层级 4 = 深度上限）。
+    walkArchiveRoots(join(sessionsRoot, teamName), 1, {
+      rootDir,
+      teamName,
+      scan,
+      teams,
+      sessions,
+    });
   }
 
   scan.teamCount = teams.size;
   scan.sessionCount = sessions.size;
   return scan;
+}
+
+/**
+ * 从 `dir`（相对 sessions/ 的层级为 `depth`）开始发现归档根：
+ * 先看 `dir/.member-resets`，再在层级上限内下探子目录。
+ */
+function walkArchiveRoots(dir: string, depth: number, ctx: ArchiveScanContext): void {
+  const archiveRoot = join(dir, MEMBER_ARCHIVE_ROOT);
+  const archiveRootStat = lstatOrNull(archiveRoot);
+  if (archiveRootStat) {
+    if (archiveRootStat.isSymbolicLink() || !archiveRootStat.isDirectory()) {
+      ctx.scan.skipped.push({
+        path: archiveRoot,
+        reason: archiveRootStat.isSymbolicLink()
+          ? "归档根是符号链接，已跳过"
+          : "归档根不是目录，已跳过",
+      });
+    } else {
+      // 归档根层级：扁平团队 = 2，标准团队/会话 = 3，非标准（成员名含分隔符）= 4。
+      const rootDepth = depth + 1;
+      const sessionId = rootDepth === 3 ? basename(dir) : null;
+      collectArchiveStamps(archiveRoot, 1, rootDepth, sessionId, ctx);
+    }
+  }
+
+  // 下探到层级 3（root 层级 4）为止；更深不扫（有界深度，见常量注释）。
+  if (depth >= MEMBER_ARCHIVE_ROOT_MAX_DEPTH - 1) return;
+  for (const child of listDirectoryNames(dir)) {
+    if (child === MEMBER_ARCHIVE_ROOT) continue;
+    walkArchiveRoots(join(dir, child), depth + 1, ctx);
+  }
+}
+
+/**
+ * 在归档根之下枚举时间戳目录（最多 `MEMBER_ARCHIVE_STAMP_MAX_DEPTH` 层）：
+ * 符合两种合法形状 → 可删除清单；其余时间戳形状 → skipped（不删除、不静默）；
+ * 非时间戳空/无关子目录 → skipped（让用户知道归档根下有不合规内容）。
+ */
+function collectArchiveStamps(
+  dir: string,
+  level: number,
+  rootDepth: number,
+  sessionId: string | null,
+  ctx: ArchiveScanContext
+): void {
+  for (const name of listDirectoryNames(dir, { includeSymlinks: true })) {
+    const path = join(dir, name);
+    const stat = lstatOrNull(path);
+    if (!stat) continue;
+    if (stat.isSymbolicLink()) {
+      ctx.scan.skipped.push({ path, reason: "条目是符号链接，已跳过" });
+      continue;
+    }
+    if (!stat.isDirectory()) {
+      ctx.scan.skipped.push({ path, reason: "条目不是目录，已跳过" });
+      continue;
+    }
+
+    if (ARCHIVE_DIR_PATTERN.test(name)) {
+      if (rootDepth <= MEMBER_ARCHIVE_ROOT_MAX_DEPTH && isSafeArchiveEntry(ctx.rootDir, path)) {
+        const bytes = directoryBytes(path);
+        ctx.scan.entries.push({
+          teamName: ctx.teamName,
+          sessionId,
+          memberName: basename(dir),
+          path,
+          bytes,
+          mtimeMs: stat.mtimeMs,
+        });
+        ctx.scan.totalBytes += bytes;
+        ctx.teams.add(ctx.teamName);
+        ctx.sessions.add(`${ctx.teamName}\u0000${sessionId ?? ""}`);
+      } else {
+        ctx.scan.skipped.push({
+          path,
+          reason:
+            "归档路径非标准层级（可能来自含路径分隔符的成员名或超出扫描深度），已跳过不删除",
+        });
+      }
+      continue; // 不进入时间戳目录
+    }
+
+    if (level < MEMBER_ARCHIVE_STAMP_MAX_DEPTH) {
+      const before = ctx.scan.entries.length + ctx.scan.skipped.length;
+      collectArchiveStamps(path, level + 1, rootDepth, sessionId, ctx);
+      if (ctx.scan.entries.length + ctx.scan.skipped.length === before) {
+        // 非时间戳且内部没有任何归档 → 不合规条目（成员目录里的空/垃圾子目录）
+        ctx.scan.skipped.push({ path, reason: "不合规的归档条目（无时间戳子目录），已跳过" });
+      }
+    } else {
+      // 超出成员分组探测层级：可能是多级分隔符的成员名，报告但不删除。
+      ctx.scan.skipped.push({
+        path,
+        reason: "超出归档扫描深度（成员分组层级过多），已跳过不删除",
+      });
+    }
+  }
 }
 
 /**
