@@ -1,6 +1,16 @@
-import { existsSync, mkdirSync, readdirSync, renameSync, statSync } from "node:fs";
-import type { Dirent } from "node:fs";
-import { dirname, join, resolve, sep } from "node:path";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readdirSync,
+  realpathSync,
+  renameSync,
+  rmdirSync,
+  rmSync,
+  statSync,
+} from "node:fs";
+import type { Dirent, Stats } from "node:fs";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { MemberProcessHandle } from "./member-process";
 
 /**
@@ -289,5 +299,338 @@ export async function probeResumedSession(
     };
   } catch {
     return { status: "unknown" };
+  }
+}
+
+// ── 归档扫描与清理（阶段 3，方案 §3.3.3 / §3.3.4）────────────────
+// 只读扫描在 `sessions/` 下找 `.member-resets`；删除只听用户确认后的扫描结果，
+// 且逐条复核形状与真实路径。永不按「父目录整体删除」。
+
+export interface MemberSessionArchiveEntry {
+  teamName: string;
+  /** 会话目录名（sessionId）；旧格式扁平布局时为 null */
+  sessionId: string | null;
+  memberName: string;
+  /** 归档目录绝对路径（…/.member-resets/<成员>/<时间戳>） */
+  path: string;
+  bytes: number;
+  mtimeMs: number;
+}
+
+export interface ArchiveScan {
+  /** 数据根目录（删除阶段用它复核形状，防越界） */
+  rootDir: string;
+  /** 过滤的团队名（undefined = 全部团队） */
+  teamName?: string;
+  entries: MemberSessionArchiveEntry[];
+  totalBytes: number;
+  teamCount: number;
+  sessionCount: number;
+  /** 跳过/不可读的条目（不中断扫描） */
+  skipped: Array<{ path: string; reason: string }>;
+}
+
+/**
+ * 只读扫描 `sessions/` 下的所有归档：支持 `<团队>/<会话>/.member-resets/…`
+ * 与旧扁平布局 `<团队>/.member-resets/…`。不可读/形状不合规的条目记入
+ * `skipped`，不中断扫描；扫描阶段零写操作（预览 = 干跑）。
+ */
+export function scanMemberSessionArchives(
+  rootDir: string,
+  opts?: { teamName?: string }
+): ArchiveScan {
+  const sessionsRoot = join(rootDir, "sessions");
+  const scan: ArchiveScan = {
+    rootDir,
+    teamName: opts?.teamName,
+    entries: [],
+    totalBytes: 0,
+    teamCount: 0,
+    sessionCount: 0,
+    skipped: [],
+  };
+
+  const teamNames = opts?.teamName
+    ? [opts.teamName]
+    : listDirectoryNames(sessionsRoot).filter((name) => !name.startsWith("."));
+
+  const teams = new Set<string>();
+  const sessions = new Set<string>();
+
+  for (const teamName of teamNames) {
+    const teamRoot = join(sessionsRoot, teamName);
+    // 扁平布局（无 sessionId）+ 每个会话子目录各查一次归档根。
+    const sessionRoots: Array<{ sessionId: string | null; dir: string }> = [
+      { sessionId: null, dir: teamRoot },
+    ];
+    for (const child of listDirectoryNames(teamRoot)) {
+      if (child === MEMBER_ARCHIVE_ROOT) continue;
+      sessionRoots.push({ sessionId: child, dir: join(teamRoot, child) });
+    }
+
+    for (const { sessionId, dir } of sessionRoots) {
+      const archiveRoot = join(dir, MEMBER_ARCHIVE_ROOT);
+      const archiveRootStat = lstatOrNull(archiveRoot);
+      if (!archiveRootStat || !archiveRootStat.isDirectory() || archiveRootStat.isSymbolicLink()) {
+        if (archiveRootStat?.isSymbolicLink()) {
+          scan.skipped.push({
+            path: archiveRoot,
+            reason: "归档根是符号链接，已跳过",
+          });
+        }
+        continue;
+      }
+
+      for (const memberName of listDirectoryNames(archiveRoot, { includeSymlinks: true })) {
+        const memberDir = join(archiveRoot, memberName);
+        const memberStat = lstatOrNull(memberDir);
+        if (!memberStat) continue;
+        if (memberStat.isSymbolicLink()) {
+          scan.skipped.push({ path: memberDir, reason: "成员目录是符号链接，已跳过" });
+          continue;
+        }
+        if (!memberStat.isDirectory()) {
+          scan.skipped.push({ path: memberDir, reason: "成员条目不是目录，已跳过" });
+          continue;
+        }
+        if (!isSafeName(memberName)) {
+          scan.skipped.push({ path: memberDir, reason: "成员名不合规，已跳过" });
+          continue;
+        }
+
+        for (const stamp of listDirectoryNames(memberDir, { includeSymlinks: true })) {
+          const entryPath = join(memberDir, stamp);
+          const stampStat = lstatOrNull(entryPath);
+          if (!stampStat) continue;
+          if (stampStat.isSymbolicLink()) {
+            scan.skipped.push({ path: entryPath, reason: "归档条目是符号链接，已跳过" });
+            continue;
+          }
+          if (!stampStat.isDirectory()) {
+            scan.skipped.push({ path: entryPath, reason: "归档条目不是目录，已跳过" });
+            continue;
+          }
+          if (!ARCHIVE_DIR_PATTERN.test(stamp) || !isSafeArchiveEntry(rootDir, entryPath)) {
+            scan.skipped.push({
+              path: entryPath,
+              reason: "归档目录名或形状不合规（应为 YYYYMMDD-HHMMSS[-n]），已跳过",
+            });
+            continue;
+          }
+          const bytes = directoryBytes(entryPath);
+          scan.entries.push({
+            teamName,
+            sessionId,
+            memberName,
+            path: entryPath,
+            bytes,
+            mtimeMs: stampStat.mtimeMs,
+          });
+          scan.totalBytes += bytes;
+          teams.add(teamName);
+          sessions.add(`${teamName}\u0000${sessionId ?? ""}`);
+        }
+      }
+    }
+  }
+
+  scan.teamCount = teams.size;
+  scan.sessionCount = sessions.size;
+  return scan;
+}
+
+/**
+ * 形状校验（导出供单测）：只接受
+ *   <root>/sessions/<团队>/.member-resets/<成员>/<时间戳>
+ *   <root>/sessions/<团队>/<会话>/.member-resets/<成员>/<时间戳>
+ * 成员/会话段不得含路径分隔符；时间戳匹配 `^\d{8}-\d{6}(-\d+)?$`。
+ */
+export function isSafeArchiveEntry(rootDir: string, entryPath: string): boolean {
+  const sessionsRoot = resolve(join(rootDir, "sessions"));
+  const resolved = resolve(entryPath);
+  const rel = relative(sessionsRoot, resolved);
+  if (!rel || rel === "" || rel.startsWith("..") || isAbsolute(rel)) return false;
+
+  const parts = rel.split(sep);
+  let team: string;
+  let sessionId: string | undefined;
+  let member: string;
+  let stamp: string;
+  if (parts.length === 5) {
+    [team, sessionId, member, stamp] = [parts[0], parts[1], parts[3], parts[4]];
+    if (parts[2] !== MEMBER_ARCHIVE_ROOT) return false;
+  } else if (parts.length === 4) {
+    [team, member, stamp] = [parts[0], parts[2], parts[3]];
+    if (parts[1] !== MEMBER_ARCHIVE_ROOT) return false;
+  } else {
+    return false;
+  }
+
+  return (
+    isSafeName(team) &&
+    (sessionId === undefined || isSafeName(sessionId)) &&
+    isSafeName(member) &&
+    ARCHIVE_DIR_PATTERN.test(stamp)
+  );
+}
+
+function isSafeName(name: string): boolean {
+  return (
+    name.length > 0 &&
+    name !== "." &&
+    name !== ".." &&
+    !name.includes("/") &&
+    !name.includes("\\") &&
+    !name.includes(sep)
+  );
+}
+
+export interface ArchiveCleanupResult {
+  deleted: string[];
+  failed: Array<{ path: string; reason: string }>;
+  freedBytes: number;
+}
+
+/**
+ * 删除扫描结果中的归档目录。逐条复核形状、符号链接与真实路径（父目录可能被换成
+ * 链接）；单个失败只影响该条并在 `failed` 里给出原因，绝不抛出。空 `.member-resets`
+ * 与其下空成员目录顺手清理，非空父目录保留。
+ */
+export function deleteMemberSessionArchives(scan: ArchiveScan): ArchiveCleanupResult {
+  const deleted: string[] = [];
+  const failed: Array<{ path: string; reason: string }> = [];
+  let freedBytes = 0;
+
+  let sessionsRootReal = "";
+  try {
+    sessionsRootReal = realpathSync(join(scan.rootDir, "sessions"));
+  } catch {
+    sessionsRootReal = "";
+  }
+
+  for (const entry of scan.entries) {
+    try {
+      if (!isSafeArchiveEntry(scan.rootDir, entry.path)) {
+        failed.push({
+          path: entry.path,
+          reason: "路径形状不合规（不在 <数据目录>/sessions 的归档形状内），已跳过",
+        });
+        continue;
+      }
+      const stat = lstatSync(entry.path);
+      if (stat.isSymbolicLink()) {
+        failed.push({ path: entry.path, reason: "条目是符号链接，已跳过" });
+        continue;
+      }
+      if (!stat.isDirectory()) {
+        failed.push({ path: entry.path, reason: "条目不是目录，已跳过" });
+        continue;
+      }
+      const real = realpathSync(entry.path);
+      if (
+        !sessionsRootReal ||
+        !(real === sessionsRootReal || real.startsWith(sessionsRootReal + sep))
+      ) {
+        failed.push({ path: entry.path, reason: "真实路径不在 <数据目录>/sessions 内，已跳过" });
+        continue;
+      }
+      rmSync(entry.path, { recursive: true, force: false });
+      deleted.push(entry.path);
+      freedBytes += entry.bytes;
+      removeEmptyArchiveParents(entry.path);
+    } catch (err) {
+      failed.push({ path: entry.path, reason: errorReason(err) });
+    }
+  }
+
+  return { deleted, failed, freedBytes };
+}
+
+/** 只删空的 <成员> 目录与空 `.member-resets`；非空即保留（rmdir 抛错即止）。 */
+function removeEmptyArchiveParents(entryPath: string): void {
+  const memberDir = dirname(entryPath);
+  const archiveRoot = dirname(memberDir);
+  for (const dir of [memberDir, archiveRoot]) {
+    try {
+      rmdirSync(dir);
+    } catch {
+      /* 非空或已不存在：保留 */
+    }
+  }
+}
+
+/** 纯函数：预览文案（最多 maxLines 条路径，其余折叠）。 */
+export function formatArchiveScanPreview(scan: ArchiveScan, maxLines = 6): string {
+  const scope = scan.teamName ? `团队 "${scan.teamName}"` : "全部团队";
+  const lines = [
+    `成员重启归档（范围：${scope}）`,
+    `- ${scan.teamCount} 个团队 / ${scan.sessionCount} 个会话 / ${scan.entries.length} 个归档 / 合计 ${formatBytes(scan.totalBytes)}`,
+  ];
+  const shown = scan.entries.slice(0, Math.max(0, maxLines));
+  for (const entry of shown) lines.push(`- 目录：${entry.path}`);
+  const hidden = scan.entries.length - shown.length;
+  if (hidden > 0) lines.push(`- 目录：…（另有 ${hidden} 个）`);
+
+  if (scan.skipped.length > 0) {
+    lines.push(`- 跳过 ${scan.skipped.length} 个不合规或不可读条目（未删除）：`);
+    const shownSkipped = scan.skipped.slice(0, Math.max(0, maxLines));
+    for (const item of shownSkipped) lines.push(`  · ${item.path}（${item.reason}）`);
+    const hiddenSkipped = scan.skipped.length - shownSkipped.length;
+    if (hiddenSkipped > 0) lines.push(`  · …（另有 ${hiddenSkipped} 个）`);
+  }
+
+  lines.push("只清理 .member-resets 下的归档；团队定义、会话历史、共享上下文不受影响。");
+  return lines.join("\n");
+}
+
+/** 纯函数：清理结果文案（含失败明细与释放空间；`skipped` 可附带扫描阶段的跳过项）。 */
+export function formatArchiveCleanupResult(
+  result: ArchiveCleanupResult,
+  skipped: Array<{ path: string; reason: string }> = []
+): string {
+  const lines: string[] = [];
+  if (result.deleted.length === 0 && result.failed.length === 0) {
+    lines.push("没有可清理的成员重启归档。");
+  } else {
+    lines.push(
+      `✅ 已清理 ${result.deleted.length} 个归档目录，释放 ${formatBytes(result.freedBytes)}。`
+    );
+    if (result.failed.length > 0) {
+      lines.push(`⚠️ ${result.failed.length} 个未能删除：`);
+      for (const failure of result.failed) {
+        lines.push(`- ${failure.path}（${failure.reason}）`);
+      }
+    }
+  }
+  if (skipped.length > 0) {
+    lines.push(`跳过 ${skipped.length} 个不合规或不可读条目（未删除）：`);
+    for (const item of skipped) lines.push(`- ${item.path}（${item.reason}）`);
+  }
+  return lines.join("\n");
+}
+
+/** 列目录名（升序）；不存在/不可读 → []。默认只看真实目录，不跟符号链接；
+ * 归档候选枚举时打开 includeSymlinks——符号链接条目必须被看见才能跳过并报告。 */
+function listDirectoryNames(dir: string, opts?: { includeSymlinks?: boolean }): string[] {
+  let entries: Dirent[];
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  return entries
+    .filter(
+      (entry) =>
+        entry.isDirectory() || (opts?.includeSymlinks === true && entry.isSymbolicLink())
+    )
+    .map((entry) => entry.name)
+    .sort();
+}
+
+function lstatOrNull(path: string): Stats | null {
+  try {
+    return lstatSync(path);
+  } catch {
+    return null;
   }
 }

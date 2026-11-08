@@ -13,15 +13,21 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   archiveMemberSessionFiles,
+  deleteMemberSessionArchives,
+  formatArchiveCleanupResult,
+  formatArchiveScanPreview,
   formatBytes,
+  isSafeArchiveEntry,
   listMemberSessionFiles,
   probeResumedSession,
+  scanMemberSessionArchives,
 } from "./member-session";
 import { hasSessionFiles } from "./member-process";
 import type { MemberProcessHandle } from "./member-process";
@@ -388,5 +394,359 @@ describe("formatBytes", () => {
     // 防御：非法/负值按 0 处理，不输出 NaN
     expect(formatBytes(-1)).toBe("0 B");
     expect(formatBytes(Number.NaN)).toBe("0 B");
+  });
+});
+
+// ── 阶段 3：归档扫描 / 删除 / 纯函数格式化（方案 §3.3 / E.1 15-22）──
+
+/** 建一个归档目录：<root>/sessions/<team>[/<sessionId>]/.member-resets/<member>/<stamp>/ */
+function writeArchive(
+  rootDir: string,
+  opts: { team: string; sessionId?: string; member: string; stamp: string; bytes?: number }
+): string {
+  const base = opts.sessionId
+    ? join(rootDir, "sessions", opts.team, opts.sessionId, ".member-resets", opts.member, opts.stamp)
+    : join(rootDir, "sessions", opts.team, ".member-resets", opts.member, opts.stamp);
+  mkdirSync(base, { recursive: true });
+  writeFileSync(join(base, "s.jsonl"), "x".repeat(opts.bytes ?? 10));
+  return base;
+}
+
+describe("scanMemberSessionArchives", () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "member-archive-scan-"));
+  });
+
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  function countsFixture(): string[] {
+    return [
+      writeArchive(root, { team: "teamA", sessionId: "sid1", member: "coder", stamp: "20261108-103000", bytes: 10 }),
+      writeArchive(root, { team: "teamA", sessionId: "sid1", member: "coder", stamp: "20261108-104500", bytes: 20 }),
+      writeArchive(root, { team: "teamA", sessionId: "sid2", member: "coder", stamp: "20261108-110000", bytes: 5 }),
+      writeArchive(root, { team: "teamB", sessionId: "sid3", member: "worker", stamp: "20261108-120000", bytes: 7 }),
+      writeArchive(root, { team: "teamB", sessionId: "sid3", member: "worker", stamp: "20261108-130000", bytes: 3 }),
+    ];
+  }
+
+  it("跨团队跨会话统计：团队/会话/归档数与合计大小（含旧扁平布局）", () => {
+    countsFixture();
+    // 旧扁平布局（无 sessionId）
+    const flat = writeArchive(root, { team: "legacy", member: "old", stamp: "20261108-140000", bytes: 11 });
+
+    const scan = scanMemberSessionArchives(root);
+
+    expect(scan.entries).toHaveLength(6);
+    expect(scan.teamCount).toBe(3);
+    // teamA/sid1、teamA/sid2、teamB/sid3、legacy(扁平) = 4 个会话
+    expect(scan.sessionCount).toBe(4);
+    expect(scan.totalBytes).toBe(10 + 20 + 5 + 7 + 3 + 11);
+    const flatEntry = scan.entries.find((e) => e.path === flat)!;
+    expect(flatEntry.sessionId).toBeNull();
+    expect(flatEntry.teamName).toBe("legacy");
+    expect(flatEntry.memberName).toBe("old");
+    expect(flatEntry.bytes).toBe(11);
+    expect(flatEntry.mtimeMs).toBeGreaterThan(0);
+    expect(scan.skipped).toEqual([]);
+  });
+
+  it("只读：扫描前后目录快照一致（预览 = 干跑）", () => {
+    countsFixture();
+    const before = readdirSync(root, { recursive: true }).map(String).sort();
+    scanMemberSessionArchives(root);
+    const after = readdirSync(root, { recursive: true }).map(String).sort();
+    expect(after).toEqual(before);
+  });
+
+  it("不合规条目跳过并报告（不中断、不算入删除候选）", () => {
+    const memberDir = join(root, "sessions", "t", "sid", ".member-resets", "coder");
+    mkdirSync(join(memberDir, "not-a-stamp"), { recursive: true });
+    mkdirSync(join(memberDir, "2026-11-08"), { recursive: true });
+    writeArchive(root, { team: "t", sessionId: "sid", member: "coder", stamp: "20261108-103000" });
+
+    const scan = scanMemberSessionArchives(root);
+
+    expect(scan.entries).toHaveLength(1);
+    expect(scan.skipped.length).toBeGreaterThanOrEqual(2);
+    expect(scan.skipped.map((s) => s.path)).toEqual(
+      expect.arrayContaining([join(memberDir, "not-a-stamp"), join(memberDir, "2026-11-08")])
+    );
+    expect(scan.skipped.every((s) => s.reason.length > 0)).toBe(true);
+  });
+
+  it("符号链接：时间戳条目本身是链接、成员目录是链接 → 均跳过且不删除", () => {
+    const external = join(root, "external");
+    mkdirSync(external, { recursive: true });
+    writeFileSync(join(external, "s.jsonl"), "x");
+
+    // 条目本身是符号链接
+    const memberDirA = join(root, "sessions", "t", "sid", ".member-resets", "coder");
+    mkdirSync(memberDirA, { recursive: true });
+    symlinkSync(external, join(memberDirA, "20261108-103000"), "dir");
+
+    // 成员目录本身是符号链接
+    const archiveRootB = join(root, "sessions", "t2", "sid", ".member-resets");
+    mkdirSync(archiveRootB, { recursive: true });
+    const externalMember = join(root, "external-member", "deep", "20261108-104500");
+    mkdirSync(externalMember, { recursive: true });
+    writeFileSync(join(externalMember, "s.jsonl"), "y");
+    symlinkSync(join(root, "external-member", "deep"), join(archiveRootB, "worker"), "dir");
+
+    const scan = scanMemberSessionArchives(root);
+
+    expect(scan.entries).toEqual([]);
+    expect(scan.skipped.length).toBeGreaterThanOrEqual(2);
+    expect(scan.skipped.some((s) => s.path.includes("20261108-103000"))).toBe(true);
+    expect(scan.skipped.some((s) => s.path.includes("worker"))).toBe(true);
+    // 外部目录毫发无损
+    expect(existsSync(join(external, "s.jsonl"))).toBe(true);
+    expect(existsSync(join(externalMember, "s.jsonl"))).toBe(true);
+  });
+
+  it("按团队过滤：只返回该团队；不存在的团队 → 空结果", () => {
+    countsFixture();
+
+    const onlyA = scanMemberSessionArchives(root, { teamName: "teamA" });
+    expect(onlyA.entries).toHaveLength(3);
+    expect(onlyA.entries.every((e) => e.teamName === "teamA")).toBe(true);
+    expect(onlyA.teamCount).toBe(1);
+
+    const missing = scanMemberSessionArchives(root, { teamName: "nope" });
+    expect(missing.entries).toEqual([]);
+    expect(missing.totalBytes).toBe(0);
+    expect(missing.teamCount).toBe(0);
+
+    // 其他团队的归档仍在（扫描本身不删）
+    expect(existsSync(join(root, "sessions", "teamB", "sid3", ".member-resets"))).toBe(true);
+  });
+
+  it("没有 sessions 目录 → 空结果（不抛错）", () => {
+    const scan = scanMemberSessionArchives(join(root, "missing-root"));
+    expect(scan.entries).toEqual([]);
+    expect(scan.skipped).toEqual([]);
+  });
+});
+
+describe("isSafeArchiveEntry", () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "member-archive-safe-"));
+  });
+
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("合法形状通过（带 sessionId / 扁平布局）", () => {
+    expect(
+      isSafeArchiveEntry(root, join(root, "sessions", "t", "sid", ".member-resets", "coder", "20261108-103000"))
+    ).toBe(true);
+    expect(
+      isSafeArchiveEntry(root, join(root, "sessions", "t", "sid", ".member-resets", "coder", "20261108-103000-1"))
+    ).toBe(true);
+    expect(
+      isSafeArchiveEntry(root, join(root, "sessions", "t", ".member-resets", "coder", "20261108-103000"))
+    ).toBe(true);
+  });
+
+  it("拒绝：时间戳不合规 / 成员段不是归档根 / 段数不符", () => {
+    expect(
+      isSafeArchiveEntry(root, join(root, "sessions", "t", "sid", ".member-resets", "coder", "2026-11-08"))
+    ).toBe(false);
+    expect(
+      isSafeArchiveEntry(root, join(root, "sessions", "t", "sid", "not-archive", "coder", "20261108-103000"))
+    ).toBe(false);
+    // 成员段带分隔符 → 段数不符
+    expect(
+      isSafeArchiveEntry(root, join(root, "sessions", "t", "sid", ".member-resets", "a", "b", "20261108-103000"))
+    ).toBe(false);
+    // 少一段（指向成员目录而不是时间戳目录）
+    expect(isSafeArchiveEntry(root, join(root, "sessions", "t", "sid", ".member-resets", "coder"))).toBe(false);
+  });
+
+  it("拒绝：<数据目录>/sessions 之外的路径", () => {
+    expect(isSafeArchiveEntry(root, join(root, "teams", "t", ".member-resets", "coder", "20261108-103000"))).toBe(
+      false
+    );
+    expect(isSafeArchiveEntry(root, join(tmpdir(), "elsewhere", "20261108-103000"))).toBe(false);
+    // 指向 sessions 内但位于归档根之外的普通会话目录
+    expect(isSafeArchiveEntry(root, join(root, "sessions", "t", "sid", "coder", "20261108-103000"))).toBe(false);
+  });
+});
+
+describe("deleteMemberSessionArchives", () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "member-archive-delete-"));
+  });
+
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("删除归档并释放字节；空 .member-resets 与空成员目录一并清理", () => {
+    writeArchive(root, { team: "t", sessionId: "sid", member: "coder", stamp: "20261108-103000", bytes: 10 });
+    writeArchive(root, { team: "t", sessionId: "sid", member: "coder", stamp: "20261108-104500", bytes: 20 });
+    const sessionRoot = join(root, "sessions", "t", "sid");
+    const scan = scanMemberSessionArchives(root);
+
+    const result = deleteMemberSessionArchives(scan);
+
+    expect(result.deleted).toHaveLength(2);
+    expect(result.freedBytes).toBe(30);
+    expect(result.failed).toEqual([]);
+    expect(existsSync(join(sessionRoot, ".member-resets"))).toBe(false);
+    // 会话目录本身与活数据目录不删
+    expect(existsSync(sessionRoot)).toBe(true);
+  });
+
+  it("父目录非空时保留（只删时间戳目录）", () => {
+    const keep = writeArchive(root, { team: "t", sessionId: "sid", member: "worker", stamp: "20261108-110000" });
+    const gone = writeArchive(root, { team: "t", sessionId: "sid", member: "coder", stamp: "20261108-103000" });
+    mkdirSync(join(root, "sessions", "t", "sid", "coder"), { recursive: true });
+    writeFileSync(join(root, "sessions", "t", "sid", "coder", "live.jsonl"), "{}\n");
+    const scan = scanMemberSessionArchives(root);
+    const onlyGone = { ...scan, entries: scan.entries.filter((e) => e.path === gone) };
+
+    const result = deleteMemberSessionArchives(onlyGone);
+
+    expect(result.deleted).toEqual([gone]);
+    expect(existsSync(gone)).toBe(false);
+    expect(existsSync(keep)).toBe(true);
+    expect(existsSync(join(root, "sessions", "t", "sid", ".member-resets"))).toBe(true);
+  });
+
+  it("单个失败不中断：其余继续、失败有明细、不抛错", () => {
+    const real = writeArchive(root, { team: "t", sessionId: "sid", member: "coder", stamp: "20261108-103000" });
+    writeArchive(root, { team: "t", sessionId: "sid", member: "coder", stamp: "20261108-104500" });
+    const ghost = join(root, "sessions", "t", "sid", ".member-resets", "coder", "20261108-999999");
+    const scan = scanMemberSessionArchives(root);
+    // 注入一条已消失的条目（等价于删除失败/竞态）
+    const withGhost = {
+      ...scan,
+      entries: [
+        ...scan.entries,
+        { teamName: "t", sessionId: "sid", memberName: "coder", path: ghost, bytes: 0, mtimeMs: 0 },
+      ],
+    };
+
+    const result = deleteMemberSessionArchives(withGhost);
+
+    expect(result.deleted).toHaveLength(2);
+    expect(result.failed).toHaveLength(1);
+    expect(result.failed[0].path).toBe(ghost);
+    expect(result.failed[0].reason.length).toBeGreaterThan(0);
+    expect(existsSync(real)).toBe(false);
+  });
+
+  it("删除前复核形状：越界条目（不在归档根形状内）一律跳过并记入 failed", () => {
+    const outside = join(root, "teams", "t", "20261108-103000");
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(join(outside, "keep.txt"), "keep");
+    const scan = scanMemberSessionArchives(root); // 空扫描，entries=[]
+    const forged = {
+      ...scan,
+      entries: [
+        { teamName: "t", sessionId: null, memberName: "m", path: outside, bytes: 1, mtimeMs: 0 },
+      ],
+    };
+
+    const result = deleteMemberSessionArchives(forged);
+
+    expect(result.deleted).toEqual([]);
+    expect(result.failed).toHaveLength(1);
+    expect(existsSync(join(outside, "keep.txt"))).toBe(true);
+  });
+});
+
+describe("formatArchiveScanPreview / formatArchiveCleanupResult", () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "member-archive-format-"));
+  });
+
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  function scanOf(paths: string[], opts: { teamName?: string; skipped?: Array<{ path: string; reason: string }> } = {}) {
+    return {
+      rootDir: root,
+      teamName: opts.teamName,
+      entries: paths.map((path, index) => ({
+        teamName: "t",
+        sessionId: "sid",
+        memberName: "coder",
+        path,
+        bytes: 10,
+        mtimeMs: index,
+      })),
+      totalBytes: paths.length * 10,
+      teamCount: paths.length > 0 ? 1 : 0,
+      sessionCount: paths.length > 0 ? 1 : 0,
+      skipped: opts.skipped ?? [],
+    };
+  }
+
+  it("预览：范围、计数与大小、最多 6 条路径并折叠其余", () => {
+    const paths = Array.from({ length: 9 }, (_, i) => join(root, "sessions", "t", "sid", ".member-resets", "coder", `20261108-10${i}000`));
+    const text = formatArchiveScanPreview(scanOf(paths));
+
+    expect(text).toContain("成员重启归档（范围：全部团队）");
+    expect(text).toContain("1 个团队 / 1 个会话 / 9 个归档 / 合计 90 B");
+    expect(text).toContain(paths[0]);
+    expect(text).toContain(paths[5]);
+    expect(text).not.toContain(paths[6]);
+    expect(text).toContain("另有 3 个");
+    expect(text).toContain("只清理 .member-resets 下的归档；团队定义、会话历史、共享上下文不受影响。");
+  });
+
+  it("预览：指定团队范围 + 跳过条目提示", () => {
+    const text = formatArchiveScanPreview(
+      scanOf([join(root, "sessions", "t", "sid", ".member-resets", "coder", "20261108-103000")], {
+        teamName: "t",
+        skipped: [{ path: join(root, "sessions", "t", "sid", ".member-resets", "coder", "bad"), reason: "形状不合规" }],
+      })
+    );
+
+    expect(text).toContain('成员重启归档（范围：团队 "t"）');
+    expect(text).toContain("跳过 1 个不合规或不可读条目（未删除）");
+  });
+
+  it("结果文案：成功 / 含失败明细 / 无归档", () => {
+    expect(
+      formatArchiveCleanupResult({ deleted: [join(root, "a"), join(root, "b")], failed: [], freedBytes: 20 })
+    ).toContain("✅ 已清理 2 个归档目录，释放 20 B。");
+
+    const withFailure = formatArchiveCleanupResult({
+      deleted: [join(root, "a")],
+      failed: [{ path: join(root, "c"), reason: "EBUSY: resource busy" }],
+      freedBytes: 10,
+    });
+    expect(withFailure).toContain("已清理 1 个归档目录");
+    expect(withFailure).toContain("⚠️ 1 个未能删除");
+    expect(withFailure).toContain(join(root, "c"));
+    expect(withFailure).toContain("EBUSY: resource busy");
+
+    expect(formatArchiveCleanupResult({ deleted: [], failed: [], freedBytes: 0 })).toBe(
+      "没有可清理的成员重启归档。"
+    );
+  });
+
+  it("结果文案：附带扫描阶段跳过的条目", () => {
+    const text = formatArchiveCleanupResult(
+      { deleted: [join(root, "a")], failed: [], freedBytes: 10 },
+      [{ path: join(root, "bogus"), reason: "形状不合规" }]
+    );
+    expect(text).toContain("已清理 1 个归档目录");
+    expect(text).toContain("跳过 1 个不合规或不可读条目（未删除）");
+    expect(text).toContain(join(root, "bogus"));
   });
 });

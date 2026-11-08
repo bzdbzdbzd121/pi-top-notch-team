@@ -286,6 +286,7 @@ git --git-dir ~/.pi/top-notch-team/teams/.git show <提交>:<名字>.yaml
 | `/team show <name>` | 查看团队定义详情 |
 | `/team done` / `/team cancel` | 结束并退出当前创建/编辑模式 |
 | `/team delete <name>` | 删除团队定义（带确认） |
+| `/team clean [name]` | 清理成员重启归档（`fresh` 归档）：只删 `.member-resets`，不影响团队定义、会话历史与共享上下文；先预览、再确认；会话中也可用 |
 | `/team status` | 查看会话与成员状态 |
 | `/team sync` | 与云端私有仓库双向同步团队定义（冲突逐个决策，被放弃的一侧留档） |
 | `/team sync status` | 查看云同步状态（不推送、不改团队文件与工作区；读取云端并更新 `.git` 内对象/远端跟踪引用，不写 `FETCH_HEAD`） |

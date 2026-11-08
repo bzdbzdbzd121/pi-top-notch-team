@@ -649,6 +649,7 @@ printf '' | timeout 10 ./node_modules/.bin/pi --mode json --no-tools -e ./index.
 | `/team done`             | Finish and exit current create or edit mode |
 | `/team cancel`           | Alias for `/team done` (backward compatibility) |
 | `/team delete <name>` | Delete a team definition (with confirmation) |
+| `/team clean [团队名]` | 清理成员重启归档（`start_member({fresh:true})` 的产物）：只删除 `sessions/<团队>[/<会话>]/.member-resets/<成员>/<时间戳>/`，不影响团队定义、会话历史、共享上下文与成员会话目录。先只读扫描并预览（团队/会话/归档数 + 合计大小），确认后才删除（单个失败不中断并逐条报告）；无归档时只提示一句、不弹确认。会话进行中也可用。越界/符号链接/形状不合规条目一律跳过并报告（方案 §3.3.4） |
 | `/team status` | Show active session + member process statuses |
 | `/team sync` | 与云端私有仓库双向同步团队定义（ADR-0008）：首次运行引导配置 `sync.yaml`；无冲突同步零额外确认；冲突逐个决策（TUI 内置可滚动差异视图 / RPC 降级为选项 + 两侧信息）；被放弃的一侧留档到 `sync-conflicts/`；「两边都留」把云端版本导入为新团队。唯一允许的中间态是「本地已提交未推送」（摘要明确标注，重跑收敛）。**创建模式守卫**：create 落盘时目标 `teams/<name>.yaml` 已存在 → 拒绝创建并引导 `/team edit`（防止覆盖同步下载的同名团队）。**进行中反馈**：执行期间底部状态栏（键 `cloud-sync`）显示当前阶段与已用秒数，等待你确认/决策时显示等待态（无秒数），结束自动清除；不新增聊天区输出（`notify` 序列与文案不变，DESIGN.md §33.9） |
 | `/team sync status` | 查看云同步状态（不推送、不改团队文件与工作区；读取云端并更新 `.git` 内对象/远端跟踪引用，**不写 FETCH_HEAD**）：配置/分支/远端落后或领先/本机未提交与未推送/归档计数/非法 YAML/仓库需处理（`index.lock`）。**进行中反馈**：实际发起网络检查时底部状态栏显示「正在检查云端状态…（Ns）」，结束（成功/失败）自动清除；未配置/未启用/尚未接入分支不设置状态 |

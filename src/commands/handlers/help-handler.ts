@@ -17,6 +17,7 @@ const USAGE_TEXT = [
   `  /team sync             与云端双向同步（首次运行会引导配置仓库地址）`,
   `  /team sync status      查看云同步状态（不推送、不改团队文件与工作区；读取云端并更新 .git 内对象/远端跟踪引用，不写 FETCH_HEAD）`,
   `  /team setting          交互式设置菜单（成员默认模型等）`,
+  `  /team clean [名称]      清理成员重启归档（只删归档：.member-resets，不影响团队定义、会话历史与共享上下文）`,
   `  /team help             显示此帮助信息`,
 ].join("\n");
 

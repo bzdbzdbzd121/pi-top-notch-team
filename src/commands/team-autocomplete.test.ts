@@ -81,6 +81,8 @@ describe("/team autocomplete (getArgumentCompletions)", () => {
       expect(values).toContain("delete");
       expect(values).toContain("status");
       expect(values).toContain("help");
+      // 阶段 3：归档清理入口
+      expect(values).toContain("clean");
     });
 
     it("filters subcommands by prefix", () => {
@@ -115,16 +117,23 @@ describe("/team autocomplete (getArgumentCompletions)", () => {
       expect(isActive()).toBe(true);
     });
 
-    it("returns stop, status, sync, setting, help when prefix is empty", () => {
+    it("returns stop, status, sync, setting, clean, help when prefix is empty", () => {
       const result = getArgCompletions("") as any[];
       expect(Array.isArray(result)).toBe(true);
-      expect(result.length).toBe(5);
+      expect(result.length).toBe(6);
       const values = result.map((r: any) => r.value);
       expect(values).toContain("stop");
       expect(values).toContain("status");
       expect(values).toContain("sync");
       expect(values).toContain("setting");
+      expect(values).toContain("clean");
       expect(values).toContain("help");
+    });
+
+    it("shows clean when prefix is 'cl'（会话中也能用）", () => {
+      const result = getArgCompletions("cl") as any[];
+      expect(result.length).toBe(1);
+      expect(result[0].value).toBe("clean");
     });
 
     it("filters to stop+status+sync+setting when prefix is 's'", () => {
@@ -191,7 +200,8 @@ describe("/team autocomplete (getArgumentCompletions)", () => {
     });
 
     it("returns null for create prefix (not allowed during session)", () => {
-      const result = getArgCompletions("c");
+      // 用 "cr" 而不是 "c"：阶段 3 起 clean 在会话中可用，"c" 会命中 clean
+      const result = getArgCompletions("cr");
       expect(result).toBeNull();
     });
 

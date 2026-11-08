@@ -282,6 +282,44 @@ members:
       expect.stringContaining("/team sync"),
       "info"
     );
+    // 阶段 3：帮助里包含归档清理入口，并写明「只删归档」
+    const helpText = (ctx.ui.notify as any).mock.calls.map((c: unknown[]) => String(c[0])).join("\n");
+    expect(helpText).toContain("/team clean");
+    expect(helpText).toContain("只删归档");
+  });
+
+  it("/team clean 可分发（无归档 → 单条提示，不弹确认）", async () => {
+    const pi = createMockExtensionAPI();
+    const ctx = createMockContext();
+    let handler: Function = () => {};
+    pi.registerCommand = vi.fn((_name, opts) => { handler = opts.handler; });
+    registerTeamCommand(pi, createTeamContext());
+
+    await handler("clean", ctx);
+
+    const text = (ctx.ui.notify as any).mock.calls.map((c: unknown[]) => String(c[0])).join("\n");
+    expect(text).toContain("没有可清理的成员重启归档。");
+    expect(text).not.toContain("团队会话期间仅支持");
+    expect(ctx.ui.confirm).not.toHaveBeenCalled();
+  });
+
+  it("active session allows /team clean（会话中可用，不依赖会话状态）", async () => {
+    const pi = createMockExtensionAPI();
+    const ctx = createMockContext();
+    let handler: Function = () => {};
+    pi.registerCommand = vi.fn((_name, opts) => { handler = opts.handler; });
+    registerTeamCommand(pi, createTeamContext());
+    startSession({
+      name: "clean-session",
+      description: "d",
+      members: [{ name: "m", systemPrompt: "x" }],
+    });
+
+    await handler("clean", ctx);
+
+    const text = (ctx.ui.notify as any).mock.calls.map((c: unknown[]) => String(c[0])).join("\n");
+    expect(text).not.toContain("团队会话期间仅支持");
+    expect(text).toContain("没有可清理的成员重启归档。");
   });
 
   it("active session allows /team sync (D25) — 不再被会话守卫拦截", async () => {
