@@ -198,7 +198,7 @@ describe("registerTlTools", () => {
     callRegisterTlTools({ createMember, buildMemberConfig: buildConfig });
 
     const result = await executeFn("call-1", { name: "analyzer" });
-    expect(buildConfig).toHaveBeenCalledWith("analyzer");
+    expect(buildConfig).toHaveBeenCalledWith("analyzer", { fresh: false });
     expect(createMember).toHaveBeenCalled();
     expect(result.content[0].text).toContain("已启动");
   });

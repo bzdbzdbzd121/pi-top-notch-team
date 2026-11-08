@@ -11,6 +11,7 @@ import {
   SESSION_ENTRY_NOTICE_ANCHOR,
   SESSION_ENTRY_NOTICE_MAX_TURNS,
 } from "./prompts/session-transition-notice";
+import { MEMBER_RESTART_GUIDANCE } from "./prompts/member-restart-guidance";
 import { saveSyncConfig } from "./sync/config";
 
 // P2 集成测试：start_member 完整链路需要 mock 成员子进程 spawn（避免真实启动
@@ -1422,6 +1423,21 @@ describe("session entry notice", () => {
     const result = await runTurn();
     expect(result.message).toBeUndefined();
     expect(result.systemPrompt).toContain("团队会话已从中断中恢复");
+    // 阶段 4（§3.4.3）：横幅改条件式——不再断言「完整上下文已保留」
+    expect(result.systemPrompt).not.toContain("完整对话上下文已保留");
+    expect(result.systemPrompt).toContain("取决于该成员是否有可用的会话记录");
+  });
+
+  it("阶段 4：预定义提示词逐字节注入 MEMBER_RESTART_GUIDANCE，工具清单行含 fresh? 与「尝试续接」", async () => {
+    await startPredefined("guidance-team");
+    const result = await runTurn();
+
+    expect(result.systemPrompt).toContain(MEMBER_RESTART_GUIDANCE);
+    const toolLine = result.systemPrompt
+      .split("\n")
+      .find((line: string) => line.includes("start_member(name, fresh?)"));
+    expect(toolLine).toBeDefined();
+    expect(toolLine).toContain("尝试续接");
   });
 
   it("acceptance 7: agent-initiated sessions never get the notice", async () => {
@@ -2203,6 +2219,37 @@ describe("P2: TL thinking-level tracking（memberThinkingLevel follow 事件接�
     const r1 = await startMember.execute("id-3", { name: "coder" });
     expect(r1.content[0].text).toContain("思考强度：跟随 TL（TL 级别未知，保持默认）");
     expect(mockCreateMemberProcess.mock.calls[0][0].thinking).toBeUndefined();
+  });
+
+  // ── 阶段 2：fresh 透传（index → buildMemberConfig → spawn 配置）──
+  it("阶段 2：start_member(fresh:true) 经 index 透传到配置层（不续接 + 归档；普通启动的自动续接由配置层用例覆盖）", async () => {
+    await setupDynamicSession();
+    mockCreateMemberProcess.mockReturnValue(mockHandle());
+    const startMember = getToolDef("start_member");
+    const { getRootDir } = await import("./config");
+    const { getSessionState } = await import("./session/state");
+    const { listMemberSessionFiles } = await import("./process/member-session");
+
+    const session = getSessionState();
+    const sessionRoot = join(
+      getRootDir(),
+      "sessions",
+      session.teamDefinition!.name,
+      session.sessionId!,
+    );
+    // 模拟「上一次会话」留下的会话文件
+    const coderDir = join(sessionRoot, "coder");
+    mkdirSync(coderDir, { recursive: true });
+    writeFileSync(join(coderDir, "old.jsonl"), "{}\n");
+
+    const freshResult = await startMember.execute("id-fresh", { name: "coder", fresh: true });
+    expect(freshResult.content[0].text).toContain("全新会话");
+    expect(freshResult.content[0].text).toContain("已归档 1 个");
+    expect(freshResult.details.sessionMode).toBe("fresh");
+    // fresh → 配置不带续接（即使归档失败也保证这一次干净）
+    expect(mockCreateMemberProcess.mock.calls[0][0].resume).toBeUndefined();
+    // 真实归档：成员会话目录内不再有 .jsonl
+    expect(listMemberSessionFiles(coderDir)).toEqual([]);
   });
 });
 

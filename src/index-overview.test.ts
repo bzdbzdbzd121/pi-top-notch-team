@@ -198,6 +198,13 @@ describe("index overview session wiring", () => {
 
   it("records compaction and another stop after restarting without an agent turn", async () => {
     emit({ type: "process_exit", exitCode: 143, wasRunning: false });
+    // 替身保真度（阶段 1）：真实句柄在进程退出后是 stopped + PID 空；固定返回
+    // running 的替身会让重复启动守卫拒绝这次重启（断言语义不变）。
+    createProcess.mock.results.at(-1)!.value.getState = () => ({
+      name: "coder",
+      status: "stopped",
+      pid: null,
+    });
     await tool("start_member").execute("restart", { name: "coder" });
     emit({ type: "compaction_start" });
     emit({ type: "compaction_end" });
@@ -220,6 +227,12 @@ describe("index overview session wiring", () => {
 
   it("rejects callbacks from an older team session or a replaced member handle", async () => {
     const oldEmit = emit;
+    // 替身保真度（阶段 1）：同上——旧句柄已随 process_exit 变成 stopped。
+    createProcess.mock.results.at(-1)!.value.getState = () => ({
+      name: "coder",
+      status: "stopped",
+      pid: null,
+    });
     await tool("start_member").execute("replace", { name: "coder" });
     await open();
     oldEmit({ type: "agent_start" });

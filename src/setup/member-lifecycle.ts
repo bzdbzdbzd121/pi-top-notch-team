@@ -59,6 +59,50 @@ export interface MemberLifecycleDeps {
   coalescer?: MessageCoalescer;
 }
 
+// ── Duplicate-start guard (阶段 1, 方案 §3.1) ───────────────
+
+/**
+ * 重复启动判定的唯一实现（工具层 start_member 与下面的结构性兜底共用）。
+ *
+ * 只看进程句柄自己的状态：
+ *   - running            → 拒绝（避免两个同名进程同时运行）
+ *   - stopped + PID 非空 → 拒绝（正在停止中：已置停止态、进程仍在退出。
+ *                          把 stop_member 与 start_member 放进同一条消息并行
+ *                          执行时必现——旧进程退出会把新成员标成已停、清掉它
+ *                          名下的消息队列）
+ *   - 其余（stopped + PID 空 / error / idle / 无句柄）→ 放行
+ *     （崩溃后句柄是 stopped + PID 空，属「崩溃后可重试」的既有恢复路径）
+ *
+ * 刻意不看成员操作状态表（可能残留已停止成员的条目——表里有条目 ≠ 在运行）
+ * 与进程管理器状态（崩溃循环冻结会把仍在运行的成员报成错误态）。
+ * fail-open：句柄缺失或 getState 抛错 → 放行（结构性兜底仍在创建函数内）。
+ */
+export interface DuplicateStartBlock {
+  /** running = 已在运行；stopping = 正在停止中（已置停止态、进程仍在退出）。 */
+  reason: "running" | "stopping";
+  pid: number | null;
+}
+
+export function detectDuplicateStart(
+  handle: MemberProcessHandle | undefined
+): DuplicateStartBlock | null {
+  if (!handle) return null;
+  let state;
+  try {
+    state = handle.getState();
+  } catch {
+    return null;
+  }
+  if (!state) return null;
+  if (state.status === "running") {
+    return { reason: "running", pid: state.pid ?? null };
+  }
+  if (state.status === "stopped" && state.pid !== null && state.pid !== undefined) {
+    return { reason: "stopping", pid: state.pid };
+  }
+  return null;
+}
+
 // ── createAndRegisterMember ────────────────────────────────
 // Creates a member RPC process and wires event handling for:
 //   - Operational state transitions (agent_start/agent_end/process_exit/process_error)
@@ -72,6 +116,23 @@ export function createAndRegisterMember(
   config: MemberProcessConfig,
   deps: MemberLifecycleDeps
 ): MemberProcessHandle {
+  // 结构性重复启动兜底（阶段 1，方案 §3.1.2 第二层 / 不变式 E7）：
+  // 同时服务 start_member 与 /team resume 两条启动路径，工具层守卫缺接线时
+  // 仍然拦得住。必须放在下面「把成员操作状态重置为 idle」之前——那个写入
+  // 发生在注册句柄之前，挡在后面的话被拒绝的调用已经把运行中成员的状态改成
+  // 了 idle，all-idle 门控会提前放行。
+  // 刻意不在这里「顺手停掉旧进程」：旧进程的退出事件会把刚起来的新成员标成
+  // 已停、清掉它的消息队列，等于把要防的问题放大一份。
+  const blocked = detectDuplicateStart(deps.memberHandles?.get(config.name));
+  if (blocked) {
+    const pid = blocked.pid ?? "未知";
+    throw new Error(
+      blocked.reason === "running"
+        ? `成员 "${config.name}" 已在运行 (PID: ${pid})，拒绝重复创建进程。`
+        : `成员 "${config.name}" 正在停止中 (PID: ${pid})，请等 stop_member 返回后再启动。`
+    );
+  }
+
   const handle = createMemberProcess(config, spawn);
   deps.memberOpsStates.set(config.name, transitionState("idle", { type: "started" }));
 
@@ -107,6 +168,13 @@ export interface BuildMemberConfigOptions {
    * always resumed (context continuity on restart), a fresh dir starts fresh.
    */
   resume?: boolean;
+  /**
+   * 丢弃该成员此前的会话上下文（阶段 2，方案 §3.2.2）：不产生 resume 标记。
+   * 调用方（start_member）负责在此之前把旧会话文件归档，否则后续普通重启仍会
+   * 按「目录里有文件」续接旧上下文。**fresh 优先于一切续接来源**（包括显式
+   * `resume: true` 的 /team resume 路径）——参数负责「这一次干净」，归档负责「以后」。
+   */
+  fresh?: boolean;
   /**
    * Look up the thinking levels supported by a model ("provider/id").
    * Returns undefined when the model cannot be found / the registry is
@@ -197,7 +265,14 @@ export function buildMemberConfig(
     // Resume whenever this member already has persisted session files — covers
     // /team resume, TL-process restarts, and intentional stop/start cycles.
     // A fresh sessionId dir has no files and starts clean.
-    ...(options?.resume || hasSessionFiles(sessionDir) ? { resume: true } : {}),
+    // 阶段 2（方案 D.2）：fresh 优先于自动探测与显式 resume——归档失败时目录
+    // 里仍可能有旧文件，只有「不加 --continue」能保证这一次是干净会话。
+    // `resume: false` 保持既有「false ≡ 未指定」语义（仍走自动探测）。
+    ...(options?.fresh === true
+      ? {}
+      : options?.resume || hasSessionFiles(sessionDir)
+        ? { resume: true }
+        : {}),
     ...(resolved.model ? { model: resolved.model } : {}),
     ...(thinking ? { thinking } : {}),
   };

@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { readdirSync } from "node:fs";
+import { listMemberSessionFiles } from "./member-session";
 import type { PeerMessagingMode } from "../settings/resolve-peer-messaging";
 
 /** Maximum allowed serialized command size in bytes (1 MB). */
@@ -10,14 +10,14 @@ export const MAX_COMMAND_SIZE = 1024 * 1024;
  * (`*.jsonl`, possibly nested one level in pi's per-cwd subdirectory). Used to
  * decide whether `--continue` is safe: with no prior session file pi's
  * continueRecent would have nothing to resume and the member would exit.
+ *
+ * 阶段 2（方案附录 C 的 E8）：委托 member-session 的同一份遍历实现——「能不能
+ * 续接」与「fresh 归档哪些文件」必须基于同一个集合。**保留本导出位置**：
+ * src/setup/member-lifecycle.test.ts、src/index.test.ts、src/index-overview.test.ts
+ * 三处整模块替身都提供这个字段，挪走导入点会让替身静默失效。
  */
 export function hasSessionFiles(sessionDir: string): boolean {
-  try {
-    const entries = readdirSync(sessionDir, { withFileTypes: true, recursive: true });
-    return entries.some((e) => e.isFile() && e.name.endsWith(".jsonl"));
-  } catch {
-    return false;
-  }
+  return listMemberSessionFiles(sessionDir).length > 0;
 }
 
 /** Maximum number of pending writes before dropping oldest entries (OOM guard). */

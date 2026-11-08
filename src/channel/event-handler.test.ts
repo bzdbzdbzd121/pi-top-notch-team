@@ -531,6 +531,35 @@ describe("createMemberEventHandler", () => {
     );
   });
 
+  // 阶段 4（方案 §3.4.1 #4）：崩溃通知是「要不要重启」的决策点，必须当场说明
+  // 重启方式与两种重启的区别；正常停止通知不追加（无重启需求）。
+  it("崩溃通知追加重启指引（start_member / 默认续接 / fresh），正常停止通知不变", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const deps = createMockDeps();
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    handler({ type: "process_exit", memberName: "worker", exitCode: 1, wasRunning: true });
+    const crashText = (deps.pi.sendMessage as any).mock.calls
+      .map((call: unknown[]) => String((call[0] as any)?.content))
+      .join("\n");
+    expect(crashText).toContain("进程异常退出");
+    expect(crashText).toContain("start_member");
+    expect(crashText).toContain("默认尝试续接");
+    expect(crashText).toContain("以启动结果为准");
+    expect(crashText).toContain("fresh");
+    // 不得再写成无条件的结果断言
+    expect(crashText).not.toContain("默认续接");
+
+    (deps.pi.sendMessage as any).mockClear();
+    handler({ type: "process_exit", memberName: "worker", exitCode: 0, wasRunning: true });
+    const stopText = (deps.pi.sendMessage as any).mock.calls
+      .map((call: unknown[]) => String((call[0] as any)?.content))
+      .join("\n");
+    expect(stopText).toContain("进程已正常停止");
+    expect(stopText).not.toContain("重启方式");
+    expect(stopText).not.toContain("fresh");
+  });
+
   it("should resolve pending wait on abnormal process_exit", async () => {
     const { createMemberEventHandler } = await loadModule();
     const deps = createMockDeps();
@@ -1364,6 +1393,230 @@ describe("createSendToMember", () => {
         display: true,
       })
     );
+  });
+});
+
+// 阶段 5（方案 §3.5.2 第二/三层）：发送前的「明确未在运行」拦截，
+// 以及发送抛错时把乐观的「工作中」标记恢复为写入前的值。
+describe("createSendToMember 阶段 5: 派发前检查与失败恢复", () => {
+  const stoppedHandle = () => ({
+    sendCommand: vi.fn(),
+    getState: vi.fn().mockReturnValue({ name: "worker", pid: null, status: "stopped" }),
+  });
+  const runningHandle = () => ({
+    sendCommand: vi.fn(),
+    getState: vi.fn().mockReturnValue({ name: "worker", pid: 4321, status: "running" }),
+  });
+
+  function message(to = "worker", id = "msg-p5"): any {
+    return { id, from: "tl", to, content: "Hello", timestamp: Date.now() };
+  }
+
+  it("明确未在运行 → 不写「工作中」、通知未送达、标记等待失败、不发送", async () => {
+    const { createSendToMember } = await loadModule();
+    const deps = createMockDeps() as any;
+    const handle = stoppedHandle();
+    deps.memberHandles.set("worker", handle);
+    deps.lastPendingCorrId.set("worker", "corr-1");
+    deps.responseWaiter.resolveIfWaiting = vi.fn().mockReturnValue(true);
+
+    createSendToMember(deps)("worker", message());
+
+    expect(handle.sendCommand).not.toHaveBeenCalled();
+    expect(deps.memberOpsStates.get("worker")).toBeUndefined();
+    expect(deps.responseWaiter.resolveIfWaiting).toHaveBeenCalledWith(
+      "corr-1",
+      "worker",
+      expect.stringContaining("当前未在运行")
+    );
+    expect(deps.lastPendingCorrId.has("worker")).toBe(false);
+    const texts = (deps.pi.sendMessage as any).mock.calls.map((c: unknown[]) => String((c[0] as any).content));
+    expect(texts.join("\n")).toContain("消息未送达");
+  });
+
+  it("句柄缺状态查询（既有替身形态）→ fail-open：仍写「工作中」并发送", async () => {
+    const { createSendToMember } = await loadModule();
+    const deps = createMockDeps() as any;
+    const handle = { sendCommand: vi.fn() };
+    deps.memberHandles.set("worker", handle);
+
+    createSendToMember(deps)("worker", message());
+
+    expect(deps.memberOpsStates.get("worker")).toBe("working");
+    expect(handle.sendCommand).toHaveBeenCalledTimes(1);
+  });
+
+  it("广播（router to:\"all\"）：已停止成员不停留在「工作中」，其余成员照常", async () => {
+    const { createSendToMember } = await loadModule();
+    const { createRouter } = await import("./router");
+    const deps = createMockDeps() as any;
+    const stopped = stoppedHandle();
+    const alive = runningHandle();
+    deps.memberHandles.set("stopped-member", stopped);
+    deps.memberHandles.set("alive-member", alive);
+    deps.memberOpsStates.set("stopped-member", "idle");
+    deps.memberOpsStates.set("alive-member", "idle");
+    // 真 router：由它把 to:"all" 展开成逐成员 sendToMember（不再手工模拟）
+    const router = createRouter({
+      sendToMember: createSendToMember(deps),
+      sendToTl: vi.fn(),
+      memberNames: ["stopped-member", "alive-member"],
+    });
+
+    router.route({
+      id: "msg-broadcast",
+      from: "tl",
+      to: "all",
+      content: "广播",
+      timestamp: Date.now(),
+    } as any);
+
+    expect(stopped.sendCommand).not.toHaveBeenCalled();
+    expect(deps.memberOpsStates.get("stopped-member")).toBe("idle");
+    expect(alive.sendCommand).toHaveBeenCalledTimes(1);
+    expect(deps.memberOpsStates.get("alive-member")).toBe("working");
+  });
+
+  it("竞态：检查时 running、发送抛错 → 状态恢复为写入前的值，等待标记失败，通知发出", async () => {
+    const { createSendToMember } = await loadModule();
+    const deps = createMockDeps() as any;
+    deps.memberOpsStates.set("worker", "idle");
+    const handle = runningHandle();
+    handle.sendCommand = vi.fn(() => {
+      throw new Error('Member "worker" is not running');
+    });
+    deps.memberHandles.set("worker", handle);
+    deps.lastPendingCorrId.set("worker", "corr-2");
+    deps.responseWaiter.resolveIfWaiting = vi.fn().mockReturnValue(true);
+
+    createSendToMember(deps)("worker", message());
+
+    expect(deps.memberOpsStates.get("worker")).toBe("idle");
+    expect(deps.responseWaiter.resolveIfWaiting).toHaveBeenCalledWith(
+      "corr-2",
+      "worker",
+      expect.stringContaining("发送消息给成员")
+    );
+    const texts = (deps.pi.sendMessage as any).mock.calls.map((c: unknown[]) => String((c[0] as any).content));
+    expect(texts.join("\n")).toContain("发送消息给成员");
+  });
+
+  it("竞态且状态已被进程退出改成 stopped → 不覆盖真实状态（比较后写）", async () => {
+    const { createSendToMember } = await loadModule();
+    const deps = createMockDeps() as any;
+    deps.memberOpsStates.set("worker", "idle");
+    const handle = runningHandle();
+    handle.sendCommand = vi.fn(() => {
+      // 发送期间 process_exit 事件到达，写入「已停止」
+      deps.memberOpsStates.set("worker", "stopped");
+      throw new Error("send failed after exit");
+    });
+    deps.memberHandles.set("worker", handle);
+
+    createSendToMember(deps)("worker", message());
+
+    expect(deps.memberOpsStates.get("worker")).toBe("stopped");
+  });
+
+  it("正常派发仍写入「工作中」并成功发送（回归）", async () => {
+    const { createSendToMember } = await loadModule();
+    const deps = createMockDeps() as any;
+    const handle = runningHandle();
+    deps.memberHandles.set("worker", handle);
+
+    createSendToMember(deps)("worker", message());
+
+    expect(deps.memberOpsStates.get("worker")).toBe("working");
+    expect(handle.sendCommand).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "prompt", streamingBehavior: "followUp" })
+    );
+  });
+
+  // 审查建议 1：自动压缩流程（stats 查询失败 / 压缩失败）的失败分支会写
+  // 「已直接派发任务」——目标确定未运行时它必然是假话。早退到“未送达”路径。
+  it("自动压缩路径：目标确定未运行 → 不走压缩流程，不写「已直接派发任务」", async () => {
+    const { createSendToMember } = await loadModule();
+    const { createAutoCompactRuntime } = await import("./auto-compact");
+    const deps = createMockDeps() as any;
+    const handle = stoppedHandle();
+    deps.memberHandles.set("worker", handle);
+    deps.memberOpsStates.set("worker", "idle");
+    const runtime = createAutoCompactRuntime(deps.memberOpsStates);
+    deps.autoCompact = runtime;
+    const begin = vi.spyOn(runtime, "beginCompaction");
+    deps.getAutoCompact = () => ({
+      enabled: true,
+      thresholdPercent: 80,
+      thresholdTokens: undefined,
+      timeoutMinutes: 10,
+      percentIsDefaultFallback: false,
+    });
+    deps.getCoalescing = () => ({ enabled: false, maxBatchSize: 5, maxBatchChars: 4000 });
+
+    createSendToMember(deps)("worker", message());
+
+    expect(begin).not.toHaveBeenCalled();
+    expect(handle.sendCommand).not.toHaveBeenCalled();
+    const text = (deps.pi.sendMessage as any).mock.calls
+      .map((c: unknown[]) => String((c[0] as any).content))
+      .join("\n");
+    expect(text).toContain("当前未在运行");
+    expect(text).not.toContain("已直接派发任务");
+  });
+
+  // 审查建议 2（路径级）：合并包 flush 走的是 dispatchWithAutoCompact → 发送层；
+  // 目标已停止时必须进“未送达”，不能留下「工作中」等 deadline。
+  it("合并包 flush：目标确定未运行 → 走「未送达」，不写「工作中」、不发送", async () => {
+    const { createSendToMember } = await loadModule();
+    const { createMessageCoalescer } = await import("./message-coalescer");
+    const deps = createMockDeps() as any;
+    const limits = { enabled: true, maxBatchSize: 5, maxBatchChars: 4000 };
+    const coalescer = createMessageCoalescer(() => limits);
+    deps.coalescer = coalescer;
+    deps.getCoalescing = () => limits;
+    const handle = stoppedHandle();
+    deps.memberHandles.set("worker", handle);
+    createSendToMember(deps); // 注册 flusher（与 event-handler 共用同一实例）
+
+    coalescer.enqueue("worker", { sender: "member-a", content: "排队消息", at: Date.now() });
+    coalescer.flush("worker");
+
+    expect(handle.sendCommand).not.toHaveBeenCalled();
+    expect(deps.memberOpsStates.get("worker")).not.toBe("working");
+    const text = (deps.pi.sendMessage as any).mock.calls
+      .map((c: unknown[]) => String((c[0] as any).content))
+      .join("\n");
+    expect(text).toContain("当前未在运行");
+    expect(text).toContain("合并包含 1 条消息");
+  });
+
+  // 审查建议 2（路径级）：压缩结束后补发队列（closeCompactionAndFlush）也走同一
+  // 发送层；目标已停止时补发必须立刻进“未送达”，而不是把状态留在「工作中」。
+  it("压缩补发（closeCompactionAndFlush）：目标确定未运行 → 补发进「未送达」", async () => {
+    const { closeCompactionAndFlush } = await loadModule();
+    const { createAutoCompactRuntime } = await import("./auto-compact");
+    const deps = createMockDeps() as any;
+    const handle = stoppedHandle();
+    deps.memberHandles.set("worker", handle);
+    const runtime = createAutoCompactRuntime(deps.memberOpsStates);
+    deps.autoCompact = runtime;
+    deps.memberOpsStates.set("worker", "compacting");
+    runtime.queueDuringCompaction("worker", {
+      id: "queued-1",
+      from: "tl",
+      to: "worker",
+      content: "压缩期间排队的消息",
+      timestamp: Date.now(),
+    } as any);
+
+    closeCompactionAndFlush(deps as any, "worker");
+
+    expect(handle.sendCommand).not.toHaveBeenCalled();
+    expect(deps.memberOpsStates.get("worker")).not.toBe("working");
+    const text = (deps.pi.sendMessage as any).mock.calls
+      .map((c: unknown[]) => String((c[0] as any).content))
+      .join("\n");
+    expect(text).toContain("当前未在运行");
   });
 });
 

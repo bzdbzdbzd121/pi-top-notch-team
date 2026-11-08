@@ -537,7 +537,11 @@ export function createMemberEventHandler(
         }
         deps.pi.sendMessage({
           customType: "team-message",
-          content: `Member "${exitMemberName}" 进程异常退出（code: ${exitCode}），需检查崩溃原因。`,
+          content:
+            `Member "${exitMemberName}" 进程异常退出（code: ${exitCode}），需检查崩溃原因。` +
+            // 阶段 4（方案 §3.4.1 #4）：TL 收到崩溃通知的下一秒就在决定要不要重启，
+            // 这里必须当场说明重启方式与两种重启的区别。
+            `重启方式：start_member（默认尝试续接此前的上下文，实际是否续接以启动结果为准；需要干净上下文时传 fresh: true）。`,
           display: true,
           details: { crashEvent: event },
         });
@@ -742,6 +746,49 @@ function buildPromptMessage(msg: TeamMessage): string {
 }
 
 /**
+ * 阶段 5（方案 §3.5.2）：只有「能查到状态且明确不是 running」才算**确定未运行**。
+ *
+ * 口径（何谓确定未运行）：
+ * - `running` 是唯一的「可能可达」值 → 不拦截；
+ * - `stopped` / `error` / 其它非 `running` 的字面值 → 确定未运行（不会再接受新回合）；
+ * - `stopped` 且 PID 还没清空（正在停止中）也归入：已置停止态 = 不会再接新任务，
+ *   此时派发要么被句柄拒绝、要么进了 pi 的退出流程而被丢弃——都不会变成一次
+ *   成功的派发。（重复启动守卫那边之所以把 stopped+PID 单列，是因为那里「稍后重试」
+ *   是有效出路；派发侧没有重试语义，所以与 stopped 等义。）
+ * - 未知（句柄缺 `getState`、查询抛错、状态不是字符串）→ **不拦截**（fail-open）：
+ *   部分测试替身/最小装配的句柄本来就没有状态查询，误伤比放过更贵；真正的发送失败
+ *   仍由调用方 catch 分支收尾（恢复状态 + 通知）。
+ */
+export function isHandleDefinitelyNotRunning(handle: MemberProcessHandle): boolean {
+  const getState = (handle as Partial<MemberProcessHandle>).getState;
+  if (typeof getState !== "function") return false;
+  try {
+    const state = getState.call(handle);
+    if (!state || typeof state.status !== "string") return false;
+    return state.status !== "running";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 派发失败的统一收尾：标记等待失败（corrId 消费一次）+ 通知 TL。
+ * 阶段 5 的「派发前拦截」与「发送抛错」共用这一条通道，避免两处文案漂移。
+ */
+function failDispatchAndNotify(
+  deps: PromptDispatchDeps,
+  memberName: string,
+  reason: string
+): void {
+  const pendingCorrId = deps.lastPendingCorrId.get(memberName);
+  if (pendingCorrId) {
+    deps.responseWaiter.resolveIfWaiting(pendingCorrId, memberName, reason);
+    deps.lastPendingCorrId.delete(memberName);
+  }
+  deps.pi.sendMessage({ customType: "team-route", content: reason, display: true });
+}
+
+/**
  * Fire-and-forget prompt dispatch to a member handle: mark the member
  * working (task_started), then sendCommand with streamingBehavior followUp
  * (pi queues the prompt when the member is still streaming — a dispatch is
@@ -769,10 +816,31 @@ export function dispatchPromptTextToMember(
 ): void {
   const handle = deps.memberHandles.get(memberName);
   if (!handle) return;
-  // Mark member as working when we send a prompt
+
+  // ② 派发前检查（阶段 5，方案 §3.5.2）：真正发送前就明确知道句柄未在运行
+  // → 不写乐观的「工作中」标记，通知未送达 + 标记等待失败 + 直接返回。
+  // 这一层覆盖广播、合并包 flush、压缩结束后的补发等不经工具层校验的路径。
+  if (isHandleDefinitelyNotRunning(handle)) {
+    const mergedNote = deps.coalescer
+      ? (() => {
+          const n = deps.coalescer!.takeMergedCount(memberName);
+          return n !== undefined ? `（合并包含 ${n} 条消息）` : "";
+        })()
+      : "";
+    failDispatchAndNotify(
+      deps,
+      memberName,
+      `消息未送达：成员 "${memberName}" 当前未在运行（已停止或崩溃）${mergedNote}。` +
+        `请先 start_member("${memberName}") 后再派发。`
+    );
+    return;
+  }
+
+  // 写入乐观的「工作中」标记前记住原值：发送抛错时要恢复它（③）。
+  const previousState = deps.memberOpsStates.get(memberName) ?? "idle";
   deps.memberOpsStates.set(
     memberName,
-    transitionState(deps.memberOpsStates.get(memberName) ?? "idle", { type: "task_started" })
+    transitionState(previousState, { type: "task_started" })
   );
   try {
     handle.sendCommand({
@@ -785,6 +853,12 @@ export function dispatchPromptTextToMember(
       streamingBehavior: "followUp",
     });
   } catch (err) {
+    // ③ 失败恢复（阶段 5，方案 §3.5.2）：把刚才写入的「工作中」恢复为写入前的
+    // 值——但先比较再写：发送期间进程退出事件可能已写入真实状态
+    // （stopped/crashed），无条件恢复会覆盖真相。
+    if (deps.memberOpsStates.get(memberName) === "working") {
+      deps.memberOpsStates.set(memberName, previousState);
+    }
     // 核对退回 1: when the failed dispatch was the member's most recent
     // merged package, the notification states the batch size (「合并包含
     // N 条消息」) so the TL knows the blast radius of the loss. The count is
@@ -797,12 +871,7 @@ export function dispatchPromptTextToMember(
         })()
       : "";
     const reason = `发送消息给成员 "${memberName}" 失败${mergedNote}：${err instanceof Error ? err.message : String(err)}`;
-    const pendingCorrId = deps.lastPendingCorrId.get(memberName);
-    if (pendingCorrId) {
-      deps.responseWaiter.resolveIfWaiting(pendingCorrId, memberName, reason);
-      deps.lastPendingCorrId.delete(memberName);
-    }
-    deps.pi.sendMessage({ customType: "team-route", content: reason, display: true });
+    failDispatchAndNotify(deps, memberName, reason);
   }
 }
 
@@ -1183,6 +1252,15 @@ export function createSendToMember(
   function dispatchWithAutoCompact(memberName: string, msg: TeamMessage): void {
     const handle = memberHandles.get(memberName);
     if (!handle) return; // entry point already checked; defensive
+
+    // 阶段 5 加固（审查建议 1）：目标**确定未运行**时不能走自动压缩流程——
+    // stats 查询失败 / 压缩失败的失败分支会写「已直接派发任务」的通知，而实际
+    // 发送会被发送层拦下（消息并未送达），那句话就是假话。这里直接回到共享的
+    // 发送层（它自己会走“未送达”收尾），不开始压缩、不发任何压缩相关通知。
+    if (isHandleDefinitelyNotRunning(handle)) {
+      dispatchPromptToMember(promptDeps, memberName, msg);
+      return;
+    }
     // 核对退回 1: a single-message dispatch is no longer "the most recent
     // merged-package dispatch" — clear the annotation count (a merged
     // package keeps it: it was just recorded by flush and a synchronous

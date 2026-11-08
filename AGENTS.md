@@ -71,6 +71,7 @@ src/
 │   │   ├── setting-handler.ts   ← /team setting 交互式设置菜单（成员默认模型 / 思考强度 / 自动压缩 / 等待上限 / 消息合并 / **TL 亲自分析限制** / 成员互发 / 自主会话 / 云同步；临时 vs 全局作用域 + 字段级 pin）
 │   │   │   （菜单测试块：`setting-handler.test.ts` 的「TL 亲自分析限制 (阶段 4)」describe——顶层三态与位置、子菜单结构与标题、全局开关两向、临时单字段 pin、次数合法/非法矩阵含 1e30 上界、恢复默认保留开关、两处 Esc）
 │   │   ├── done-handler.ts
+│   │   ├── clean-handler.ts  ← `/team clean [团队名]`（阶段 3）：只读扫描 → 预览 → 确认 → 逐条删除 → 汇总；无归档不弹确认；rootDir/scan/remove 可注入
 │   │   └── help-handler.ts
 │   ├── shared/        ← Shared schemas, tool helpers, and extracted pure functions
 │   │   ├── workflow-schema.ts     ← workflowStageSchema + workflowSchema
@@ -93,6 +94,8 @@ src/
 │   └── event-handler.ts    ← Member RPC event handler (state machine, dedup, routing; N4 调用点隔离)；S1 接线：入桶判定 + agent_end flush + compaction_end 后 flush + process_exit drain（决策 #37）
 ├── process/          ← Member process lifecycle
 │   ├── member-process.ts  ← pi --mode rpc spawn wrapper (write queue, size guard)
+│   ├── member-session.ts  ← 成员会话文件（阶段 2/3）：递归枚举（hasSessionFiles 与归档共用）、同步归档到 .member-resets、累计统计、probeResumedSession（get_state，阶段 4 消费）、归档扫描/删除/纯函数格式化（/team clean）
+│   ├── member-session.test.ts ← 枚举一致性/归档各形态/失败注入/累计/probe 六态/扫描（符号链接·只读·团队过滤）/删除（空父目录·单条失败·越界）/预览与结果文案
 │   └── manager.ts    ← Multi-member lifecycle + operational state + auto-restart
 ├── tools/
 │   ├── tl-tools.ts   ← 6 TL process management tools (Deps-based DI)
@@ -127,6 +130,8 @@ src/
 │   ├── session-transition-notice.test.ts ← 三变体内容与互斥、历史断言范围（仅进入前 + 冲突）、合成团队名不渲染、Record 穷尽派发；通知判定表、两份文案硬要求与纪律矩阵、锚点前缀、窗口数字与常量联动
 │   ├── goal-closing-protocol.ts ← 共享「强制 Goal 关闭协议」提示词片段（预定义/dynamic/agent-initiated 三模式复用防漂移）
 │   ├── task-dispatch-protocol.ts ← 共享任务派发协议（决策 #43）：目标/非目标/修改范围/验收标准，三模式及 team_send_and_wait promptGuidelines 同源
+│   ├── member-restart-guidance.ts ← 成员进程与重启的共享提示词块（决策 #49）：三类重启理由 + 默认尝试续接（实际以结果附注为准）+ fresh 的代价与边界；预定义与 dynamic 执行阶段逐字节注入同一常量
+│   ├── member-restart-guidance.test.ts ← 内容矩阵（三类理由/默认续接/fresh 边界/旧口径已移除）+ dynamic 执行阶段注入与设计阶段不注入 + agent 自主会话不注入（D9）
 │   ├── task-dispatch-protocol.test.ts ← 协议语义与 dynamic/agent 两阶段注入测试
 │   ├── workflow-prompt.ts ← 预定义团队的工作流提示词构建（纯函数）：激活横幅 + 操作型执行协议，替代旧内联描述性注入
 │   ├── workflow-prompt.test.ts ← 工作流提示词测试
@@ -485,6 +490,15 @@ src/
     - **残余限制**：设置读取异常期间菜单显示磁盘值（可能为「关闭」）而运行时按「开启 + 3」工作——两者短暂不一致，属「误拦响亮、误放宽安静」的既定取舍（方案 §4.6）；次数调到极大不等于关闭（仍会计数与状态栏警示）。
     - **发布口径**（详见 DESIGN.md §35.8）：`57c60db`（`write_shared_context` 豁免修复）先进 `origin/main`；**阶段 2、3、4 必须同一版本**（只发其一会出现「设置生效但提示词仍写超过 3 次」或反向）；发布说明提示「升级后重启 pi 进程」（`/reload` 能否加载改动后 TS 未验证）。
 
+49. **成员重启：默认尝试续接 + `fresh` 干净重启 + 归档 + 只删归档的清理入口** — 背景：成员重启此前是一个盲区——重复调用 `start_member` 会起第二个同名进程；「重启后上下文还在吗」只能靠猜；没有「丢弃跑偏上下文」的手段；崩溃通知不提重启。交付：默认尝试续接语义显式化（实际是否续接以启动结果实测为准）+ `fresh` + 可恢复归档 + `/team clean` + 可发现性文案与文档。
+    - **重复启动保护（阶段 1）**：判定只看**进程句柄自身的状态**（不看成员操作状态表——它可能残留已停止成员的条目；不看进程管理器——崩溃循环冻结会把仍在运行的成员报成错误态）：`running` → 拒绝（附 PID + 三条出路）；`stopped + PID 非空` → 拒绝（正在停止中——把 stop 与 start 放进同一条消息并行执行时必现）；其余放行。两层：`start_member` 工具层（早于共享上下文门控与 `buildMemberConfig`，**命中零副作用**）+ `createAndRegisterMember` 顶部结构性兜底（早于操作状态重置，`/team resume` 同样受保护）。并发安全靠**同步段**：检查 → 建目录 → 登记句柄 → `start()` 的同步前缀（spawn 后立即置 running）之间不得插入 `await`。
+    - **归档布局与语义（阶段 2）**：`<团队会话目录>/.member-resets/<成员>/<YYYYMMDD-HHMMSS[-n]>/`，保持相对路径与原文件名（恢复 = 一次普通移动）；归档根与成员目录**同级**——扩展的续接探测是递归的，留在成员目录内（哪怕改后缀）仍会被当成「有历史」，同级是**结构性**排除。归档用**同步文件 API**且**先于启动**；任何错误只进 `failed`，**不阻断启动**（这一次的干净由配置层的 `fresh` 保证：fresh 优先于自动探测与显式 `resume: true`，`resume: false` 保持「≡ 未指定」）。被否替代：幂等成功（抹掉事实）、自动先停再起（未授权破坏）、自动保留上限/按时间过期（静默删除不可逆证据）、不归档直接删、归档放系统临时目录（跨盘移动失败 + 系统清理）、`fresh` 顺便删归档或 `delete --archives`（把不可逆动作塞进别处）。
+    - **清理入口（阶段 3）**：`/team clean [团队名]` = 唯一只删归档的入口（三段式：只读扫描 → 预览 + 确认「删除后不可恢复」→ 逐条删除 + 汇总）；**会话进行中也允许**（不碰任何活数据）；无归档时只提示一句、不弹确认。扫描为**有界深度**（`.member-resets` 相对 `sessions/` 最多 4 层，覆盖两种标准形状与「成员名含一个分隔符」产生的非标准层级），**上限内完备**：每个时间戳形状目录要么可删、要么进 `skipped` 报告（含非标准层级，此时不说「没有可清理的归档」）——无静默漏见；更深的归档根不在扫描范围（已知限制）。只删**形状完全匹配**的目录，符号链接/不合规时间戳/`<数据目录>/sessions` 之外的路径一律跳过并报告；删除前用 `lstat` + `realpath` 复核（父目录被换成链接也拦得住），空父目录顺手清理、非空保留。默认覆盖所有团队（不按 cwd 过滤）+ 可选团队名。
+    - **可发现性（阶段 4，只报事实）**：工具说明/指引写明默认**尝试**续接（实际结果以附注为准）与 `fresh` 边界；启动结果附**会话事实**——启动前扫目录 + 仅当「未 fresh 且有文件」时启动后查一次 `get_state`（3s，失败不阻断）：`已续接（历史 N 条）` / `⚠️ 未续接（查到 0 条，必须是告警语）` / `无法确认（查询失败）` / `全新会话（无历史）` / `全新会话（已归档 N 个 → 路径）` / `⚠️ 未能归档 M 个`；**请求了续接 ≠ 续接成功**（扩展递归扫、pi 只扫顶层，两者不一致会说假话）；`stop_member` 仅在确有会话文件时追加保留/续接提示；崩溃通知追加「重启方式」一句；两处系统提示词（预定义 / dynamic 执行阶段）从各自硬编码副本改为注入 `src/prompts/member-restart-guidance.ts` 的同一常量（三类可判定重启理由 + 默认尝试续接 + `fresh` 代价与边界），工具清单行补 `fresh?`；`/team resume` 横幅改为条件式（不再断言「完整上下文已保留」）；agent 自主会话提示词**不注入**（已很长，工具说明已覆盖）。
+    - **不变式**（E1-E10，均有测试覆盖）：守卫先于归档；归档先于启动；归档同步执行；归档失败不阻断；配置层 `fresh` 优先于自动探测；被拒绝的调用零副作用；结构性守卫早于操作状态重置；`hasSessionFiles` 导出位置不变（三处整模块替身依赖它）；`/team clean` 只删形状合规且真实路径位于 `sessions/` 内的归档；**派发失败绝不留下「工作中」**。
+    - **向已停止成员派发不再卡死（阶段 5，三层）**：① 工具层 `team_send_and_wait` 入队前校验显式目标（句柄存在且非 running → 立即拒绝，零副作用）；② 发送层 `dispatchPromptTextToMember` 派发前检查（明确非运行 → 不写「工作中」+ 通知未送达 + 标记等待失败；覆盖广播/合并包 flush/压缩补发）；③ 发送抛错时把「工作中」**恢复为写入前的值**（比较后写，不覆盖进程退出写入的真实状态）。句柄不存在（从未启动）与查询依赖未接线均保持旧行为（fail-open）。
+    - **文档**：DESIGN.md §5（`/team clean`）/§6（`start_member` / `stop_member`）/§12（自动重启关闭 + 重启语义）/§13（归档布局与清理）+ README 工具表/特性行 + AGENTS 命令表/工具表/Source Map + `docs/adr/0004` 增量说明。
+
 ## Dependency Injection Pattern
 
 The codebase uses an explicit Dependency Injection (DI) pattern to decouple modules and enable testability. Every subsystem receives its dependencies through a typed interface, rather than importing them directly.
@@ -649,6 +663,7 @@ printf '' | timeout 10 ./node_modules/.bin/pi --mode json --no-tools -e ./index.
 | `/team done`             | Finish and exit current create or edit mode |
 | `/team cancel`           | Alias for `/team done` (backward compatibility) |
 | `/team delete <name>` | Delete a team definition (with confirmation) |
+| `/team clean [团队名]` | 清理成员重启归档（`start_member({fresh:true})` 的产物）：只删除 `sessions/<团队>[/<会话>]/.member-resets/<成员>/<时间戳>/`，不影响团队定义、会话历史、共享上下文与成员会话目录。先只读扫描并预览（团队/会话/归档数 + 合计大小），确认后才删除（单个失败不中断并逐条报告）；无归档时只提示一句、不弹确认。会话进行中也可用。越界/符号链接/形状不合规条目一律跳过并报告（方案 §3.3.4） |
 | `/team status` | Show active session + member process statuses |
 | `/team sync` | 与云端私有仓库双向同步团队定义（ADR-0008）：首次运行引导配置 `sync.yaml`；无冲突同步零额外确认；冲突逐个决策（TUI 内置可滚动差异视图 / RPC 降级为选项 + 两侧信息）；被放弃的一侧留档到 `sync-conflicts/`；「两边都留」把云端版本导入为新团队。唯一允许的中间态是「本地已提交未推送」（摘要明确标注，重跑收敛）。**创建模式守卫**：create 落盘时目标 `teams/<name>.yaml` 已存在 → 拒绝创建并引导 `/team edit`（防止覆盖同步下载的同名团队）。**进行中反馈**：执行期间底部状态栏（键 `cloud-sync`）显示当前阶段与已用秒数，等待你确认/决策时显示等待态（无秒数），结束自动清除；不新增聊天区输出（`notify` 序列与文案不变，DESIGN.md §33.9） |
 | `/team sync status` | 查看云同步状态（不推送、不改团队文件与工作区；读取云端并更新 `.git` 内对象/远端跟踪引用，**不写 FETCH_HEAD**）：配置/分支/远端落后或领先/本机未提交与未推送/归档计数/非法 YAML/仓库需处理（`index.lock`）。**进行中反馈**：实际发起网络检查时底部状态栏显示「正在检查云端状态…（Ns）」，结束（成功/失败）自动清除；未配置/未启用/尚未接入分支不设置状态 |
@@ -670,12 +685,12 @@ printf '' | timeout 10 ./node_modules/.bin/pi --mode json --no-tools -e ./index.
 | `add_dynamic_member(name, label, systemPrompt, model?)` | Register a member in `/team dynamic` mode. Name is the identifier, label is Chinese display name, systemPrompt is role definition. Only available in dynamic mode. |
 | `set_goal(text, criteria)` | Set a session goal with verifiable completion criteria. The system reminds the TL only after one run is fully settled (with no automatic retry, compaction, or queued continuation) while the goal remains active (not yet closed); `agent_end` alone never sends a reminder. **可见性**：仅团队会话（`/team start`/`/team dynamic`）期间可见——`onSessionStart` 注册，`before_agent_start` 回合边界强制（见决策 #10）。 |
 | `finish_goal()` | Mark the current goal as completed and stop the reminder system. Call when all goal criteria are met, or when an unresolvable blocker is encountered. **仅条件全部满足或遇到不可解决阻塞时调用**——条件未满足且仍可推进时不得调用，继续派发任务；仅口头宣称完成不会停止提醒（提醒系统只认真实的 finish_goal 调用）。promptSnippet 区分于 set_goal（Finish 语义）。 |
-| `start_member(name)` | Launch a Member's pi RPC process. In dynamic mode, the first call triggers the design→execution phase transition. 结果附注：tl-only 态显示「成员间互发：禁用（只能回复 TL）」及设置来源（决策 #41；allowed 态不附注避免噪音）。 |
-| `stop_member(name)` | Gracefully terminate a Member process |
+| `start_member(name, fresh?)` | Launch a Member's pi RPC process (dynamic mode: the first call triggers the design→execution phase transition). **重启默认尝试续接**该成员持久化的会话（实际是否续接见会话附注，不承诺上下文已保留）；`fresh: true` 丢弃该成员的对话（旧会话文件归档到 `<会话目录>/.member-resets/<成员>/<时间戳>/`，可恢复、`/team clean` 清理），**不回滚**已改写文件、不动共享上下文。**重复启动被拒绝**（已 running → 返回 PID + 三条出路；`stopped + PID 非空` → 「正在停止中」；命中零副作用；`createAndRegisterMember` 内另有结构性兜底）。结果含**会话事实附注**（决策 #49）：`已续接（历史 N 条）` / `⚠️ 未续接（查询到 0 条）` / `无法确认` / `全新会话（无历史）` / `全新会话（已归档 N 个 → 路径）` / `⚠️ 未能归档 M 个`，并带 `details.sessionMode` 等结构化字段；另附 tl-only 态「成员间互发：禁用」与设置来源（决策 #41）。 |
+| `stop_member(name)` | Gracefully terminate a Member process。**仅当该成员确有会话文件**时结果追加「会话已保留；再次 start_member 会尝试续接它（实际是否续接见启动结果；需要全新上下文时传 fresh: true）」（决策 #49） |
 | `list_members()` | Show all member statuses |
 | `get_member_log(name, lines?, maxContentLength?)` | Query Member's recent session via RPC. `maxContentLength` truncates each message content (default 200 chars). Truncation uses `slice(0, max-3) + "..."` so total length = maxContentLength. |
 | `wait_and_get_member_status()` | 等待所有 member 空闲后查看所有 Member 的运行状态 (idle/working/crashed/stopped)。No parameters. 如果任何 member 仍在工作中会阻塞，和 team_send_and_wait 的 all-idle 门控完全一致（team_send_and_wait 同样必须等到全员空闲才结束等待，见决策 #38）。 |
-| `team_send_and_wait({tasks: [{to, content}], nextSteps})` | Send message(s) to **one or more** team members and WAIT until ALL members are idle（决策 #38：回复到达不结束等待——必须等到全员空闲，与 wait_and_get_member_status 一致）；等待期间到达的非回复 member→TL 消息并入工具结果一并返回（`[from message]` 段落，决策 #39 v2）. tasks 支持批量发送到不同 member 实现并发执行。Returns partial results if some members fail. nextSteps 在 wait 结束后随结果返回。
+| `team_send_and_wait({tasks: [{to, content}], nextSteps})` | Send message(s) to **one or more** team members and WAIT until ALL members are idle（决策 #38：回复到达不结束等待——必须等到全员空闲，与 wait_and_get_member_status 一致）；等待期间到达的非回复 member→TL 消息并入工具结果一并返回（`[from message]` 段落，决策 #39 v2）. tasks 支持批量发送到不同 member 实现并发执行。Returns partial results if some members fail. nextSteps 在 wait 结束后随结果返回。**派发前目标校验（决策 #49 阶段 5）**：显式目标句柄明确非运行（stopped/error）→ 立即返回可执行提示，零副作用（不入队、不注册等待、不写状态）；句柄不存在/查询未接线保持旧行为。
 >
 > **批屏障（统一开始）**：多 task 批次（tasks.length > 1）中若有成员需自动压缩，整批 prompt 在**最后一个需要的压缩完成后才统一派发**——一个都不先跑（压缩完成后任务间仍并发执行）。屏障对 TL **完全静默**（TL 无需感知压缩屏障，只感知更长的等待），受批预算限制（默认 15 分钟，`/team setting` 可调，0=不限）。单任务批次与 autoCompact 关闭时完全走旧路径，零预检。
 >

@@ -18,6 +18,19 @@ import {
 import type { MemberOperationalState } from "../session/context";
 import { getSessionState } from "../session/state";
 import { syncActiveManifest } from "../session/manifest";
+import { detectDuplicateStart, type DuplicateStartBlock } from "../setup/member-lifecycle";
+import { isHandleDefinitelyNotRunning } from "../channel/event-handler";
+import {
+  archiveMemberSessionFiles as archiveMemberSessionFilesImpl,
+  formatBytes,
+  listMemberSessionFiles,
+  probeResumedSession,
+  type ArchiveResult,
+  type MemberSessionFile,
+  type ResumedSessionProbe,
+} from "../process/member-session";
+import { getRootDir } from "../config";
+import { join } from "node:path";
 import { createMemberProcess } from "../process/member-process";
 import { spawn } from "node:child_process";
 import { TASK_DISPATCH_GUIDELINES } from "../prompts/task-dispatch-protocol";
@@ -73,10 +86,168 @@ export function describeSpawnThinkingAnnotation(
   return `思考强度：${resolved ?? "默认"}`;
 }
 
+/**
+ * 重复启动拒绝文案（阶段 1，方案 §3.1.3）：不发生启动，也不返回「错误」。
+ * 工具结果本来就没有独立错误标记（本项目对校验失败也一律返回文本），更重要的是
+ * 行为引导——一个「失败」的措辞会诱发模型换写法重试（直接 stop 再 start、或编一个
+ * 成员名），而这里其实什么都没发生，需要的是「事实 + 三条出路」。
+ */
+export function formatDuplicateStartText(name: string, block: DuplicateStartBlock): string {
+  const pid = block.pid ?? "未知";
+  if (block.reason === "stopping") {
+    return (
+      `成员 "${name}" 正在停止中 (PID: ${pid})，本次未启动。` +
+      `请等 stop_member 返回后再调用 start_member。`
+    );
+  }
+  return (
+    `成员 "${name}" 已在运行 (PID: ${pid})，本次未重复启动（避免两个同名进程同时运行）。\n` +
+    `- 继续使用它：直接 team_send_and_wait 派发任务。\n` +
+    `- 重启并保留上下文：先 stop_member，再 start_member。\n` +
+    `- 重启并丢弃上下文：先 stop_member，再 start_member({name:"${name}", fresh:true})。\n` +
+    `- 如果这是上一个团队会话遗留的进程（例如刚 /team start 了另一个团队）：先 stop_member 停止它，再启动。`
+  );
+}
+
+/**
+ * fresh 归一化（阶段 2，方案 §3.2.1 ①）：只认 true / "true"（LLM 可能把布尔写成
+ * 字符串，框架的转换层不一定救得回来）；其余值——null / false / 缺省 / 其它字符串
+ * ——一律视为未请求（默认尝试续接语义不能被一个含糊值改变）。
+ */
+export function normalizeFreshParam(raw: unknown): boolean {
+  return raw === true || raw === "true";
+}
+
+/**
+ * 阶段 4（方案 §3.4.2）：启动结果里的「会话事实」素材。
+ * 判定依据都是可观测事实：启动前目录里有没有 `.jsonl`、本次是否 fresh、归档成败，
+ * 以及（仅在请求了续接时）启动后向成员进程查询一次 `get_state` 的结果。
+ */
+export interface StartSessionFacts {
+  memberName: string;
+  fresh: boolean;
+  /** 启动前快照（递归列出的 `.jsonl`）里是否有会话文件 */
+  hadSessionFiles: boolean;
+  archive: ArchiveResult | null;
+  /** 仅当「未 fresh 且有文件」时查询（D6：请求了续接才需要实测） */
+  probe?: ResumedSessionProbe;
+  sessionDir: string;
+}
+
+/**
+ * 纯函数：会话附注行（七种事实分支，不猜）。
+ * 关键纪律：**请求了续接不等于续接成功**——查不到就写「无法确认」；
+ * 「有文件但查询到 0 条」是告警，不是成功（不得出现「已续接」）。
+ */
+export function formatStartSessionAnnotation(facts: StartSessionFacts): string[] {
+  const lines: string[] = [];
+  const archive = facts.archive;
+
+  if (facts.fresh) {
+    if (archive && archive.moved.length > 0) {
+      lines.push(
+        `会话：全新会话（已归档 ${archive.moved.length} 个旧会话文件 → ${archive.archiveDir}，` +
+          `可手工移回恢复；可随时用 /team clean 清理）。`
+      );
+      if (archive.memberArchiveCount >= 2) {
+        lines.push(
+          `该成员累计 ${archive.memberArchiveCount} 个归档，合计 ${formatBytes(archive.memberArchiveBytes)}。`
+        );
+      }
+      lines.push("该成员不记得此前的对话，且它已改写的文件不会回滚。");
+    } else if (!archive || archive.failed.length === 0) {
+      lines.push("会话：全新会话（该成员此前没有可续接的历史）。");
+    }
+
+    if (archive && archive.failed.length > 0) {
+      const reasons = [...new Set(archive.failed.map((failure) => failure.reason))].join("；");
+      const head = archive.moved.length > 0 ? "⚠️ 另有" : "⚠️ 会话：全新会话，但有";
+      lines.push(
+        `${head} ${archive.failed.length} 个旧会话文件未能归档（原因：${reasons}）。` +
+          `如果本成员此后没有产生新的会话记录就退出，下次启动可能续接旧会话。` +
+          `旧文件位置：${facts.sessionDir}。`
+      );
+    }
+    return lines;
+  }
+
+  if (!facts.hadSessionFiles) {
+    lines.push("会话：全新会话（该成员此前没有可续接的历史）。");
+    return lines;
+  }
+
+  const probe = facts.probe;
+  if (!probe || probe.status === "unknown") {
+    lines.push("会话：已请求续接此前的会话，但无法确认（成员未返回会话状态）。");
+  } else if (probe.status === "resumed") {
+    lines.push(
+      `会话：已续接此前的会话（历史 ${probe.messageCount ?? 0} 条消息）。` +
+        `需要丢弃上下文时用 start_member({name:"${facts.memberName}", fresh:true})。`
+    );
+  } else {
+    lines.push(
+      "⚠️ 会话：未续接（成员以全新会话启动）。可能原因：会话文件与当前工作目录不一致，" +
+        "或文件只在子目录里（pi 只扫目录顶层）。旧上下文不可用，请重新交代必要背景。"
+    );
+  }
+  return lines;
+}
+
+/** 纯函数：启动结果的结构化字段（方案附录 B）。 */
+export function startSessionDetails(facts: StartSessionFacts): Record<string, unknown> {
+  const archive = facts.archive;
+  const sessionMode = facts.fresh
+    ? "fresh"
+    : !facts.hadSessionFiles
+      ? "new"
+      : (facts.probe?.status ?? "unknown");
+  return {
+    sessionMode,
+    resumeRequested: !facts.fresh && facts.hadSessionFiles,
+    archivedFiles: archive?.moved.length ?? 0,
+    ...(archive?.archiveDir ? { archiveDir: archive.archiveDir } : {}),
+    ...(archive && archive.failed.length > 0
+      ? { archiveFailures: archive.failed.length }
+      : {}),
+    ...(archive
+      ? {
+          memberArchiveCount: archive.memberArchiveCount,
+          memberArchiveBytes: archive.memberArchiveBytes,
+        }
+      : {}),
+    ...(typeof facts.probe?.messageCount === "number"
+      ? { messageCount: facts.probe.messageCount }
+      : {}),
+  };
+}
+
+/**
+ * 成员会话目录（与 `buildMemberConfig` 同一布局：
+ * `sessions/<团队>[/<sessionId>]/<成员>`）。`stop_member` 的提示要判断「该成员确
+ * 有历史」，但 `buildMemberConfig` 会建目录/写共享上下文 stub——停止路径上只算路径。
+ */
+export function resolveMemberSessionDir(memberName: string): string | undefined {
+  const session = getSessionState();
+  const team = session.teamDefinition;
+  if (!session.active || !team) return undefined;
+  const sessionSubDir = session.sessionId ? join(team.name, session.sessionId) : team.name;
+  return join(getRootDir(), "sessions", sessionSubDir, memberName);
+}
+
 // ── Type aliases ───────────────────────────────────────────
 
 type CreateMemberFn = (config: MemberProcessConfig) => MemberProcessHandle;
-type BuildConfigFn = (memberName: string) => MemberProcessConfig | null;
+type BuildConfigFn = (
+  memberName: string,
+  options?: { fresh?: boolean }
+) => MemberProcessConfig | null;
+/** 归档实现（阶段 2）：同步、不抛错（失败只进 result.failed）。 */
+type ArchiveMemberSessionFn = (params: {
+  sessionDir: string;
+  memberName: string;
+  files?: MemberSessionFile[];
+  now?: Date;
+}) => ArchiveResult;
 type GetMemberLogFn = (memberName: string, maxLines: number, maxContentLength?: number) => Promise<string>;
 // ── TlToolsDeps ────────────────────────────────────────────
 
@@ -110,6 +281,11 @@ export interface TlToolsDeps {
   getTlThinkingLevel?: () => string | undefined;
   /** Resolve a member's process handle by name (batch barrier compact RPC). */
   getHandle?: (name: string) => MemberProcessHandle | undefined;
+  /**
+   * 归档实现（阶段 2）：默认 member-session 的同步实现。注入点仅用于测试断言
+   * 「未被调用」——生产不必传。
+   */
+  archiveMemberSessionFiles?: ArchiveMemberSessionFn;
   /**
    * Shared auto-compaction runtime (from createMessageChannel). The batch
    * barrier and the inline dispatch path share one pending/flush mechanism.
@@ -165,6 +341,7 @@ export function registerTlTools(deps: TlToolsDeps): void {
     createMember = (config) => createMemberProcess(config, spawn),
     buildMemberConfig,
     getMemberLog,
+    archiveMemberSessionFiles = archiveMemberSessionFilesImpl,
   } = deps;
 
   // ── start_member ────────────────────────────────────────
@@ -172,10 +349,19 @@ export function registerTlTools(deps: TlToolsDeps): void {
     name: "start_member",
     label: "Start Member",
     description:
-      "Launch a Member's pi RPC process. The Member will be available for task assignment via the message channel. " +
-      "Parameters: name (member identifier from the team definition).",
+      "Launch a Member's pi RPC process, or restart one that was stopped or crashed. " +
+      "Restarting ATTEMPTS to continue the member's previous session by default when one is persisted on disk " +
+      "(whether it actually resumed is reported in the start result — do not assume the context was kept). " +
+      "Pass fresh=true to discard that conversation: the old session files are archived " +
+      "(recoverable, not deleted) and the member starts with an empty context. " +
+      "fresh does NOT revert files the member edited and does NOT change the team shared context. " +
+      "Calling this on a member that is already running is refused (no second process). " +
+      "Parameters: name (member identifier from the team definition), fresh (optional boolean).",
     promptGuidelines: [
       "Use start_member to launch a Member RPC process after writing the Shared Context document.",
+      "Restarting a member (stop_member then start_member) attempts to continue its context by default — the start result reports whether it actually resumed.",
+      "Use fresh=true only when the member's own conversation is the problem (it went off track): it discards that member's history (old session files archived), not the shared context and not its file edits.",
+      "start_member on an already-running member is refused; a restart is stop_member followed by start_member.",
     ],
     parameters: {
       type: "object",
@@ -184,10 +370,46 @@ export function registerTlTools(deps: TlToolsDeps): void {
           type: "string",
           description: "Member name (as defined in the team)",
         },
+        fresh: {
+          type: "boolean",
+          description:
+            "Start this member with an empty context: discard its persisted conversation " +
+            "and archive the old session files (not deleted). Omit for the default behavior " +
+            "(resume the persisted conversation when one exists).",
+        },
       },
       required: ["name"],
     },
-    async execute(_toolCallId: string, params: { name: string }): Promise<ToolResult> {
+    async execute(
+      _toolCallId: string,
+      params: { name: string; fresh?: boolean | string }
+    ): Promise<ToolResult> {
+      // fresh 归一化先于一切（方案 §3.2.1 ①）：后续守卫与分支都只看这个布尔。
+      const fresh = normalizeFreshParam(params.fresh);
+      // ── 重复启动守卫（阶段 1，方案 §3.1）──
+      // 第一步读句柄状态，命中就返回提示且零副作用：buildMemberConfig 才会
+      // mkdir 会话目录，不写名册、不触发阶段切换，因此守卫必须在它之前。
+      // 刻意放在共享上下文门控之前：被拒绝的启动不该被误报成「请先写共享上下文」
+      // （两道检查都是零副作用，顺序只影响错误归因）。
+      // 检查→建目录→登记句柄→start() 的同步前缀之间不得插入 await（方案 §3.1.4）
+      // ——正是这个同步段让同一条消息里的并行 start_member 无法双重穿过。
+      // 句柄查询未接线时 fail-open（老测试/最小装配），结构性兜底仍在
+      // createAndRegisterMember 内部。
+      const duplicateStart = deps.getHandle
+        ? detectDuplicateStart(deps.getHandle(params.name))
+        : null;
+      if (duplicateStart) {
+        return {
+          details: {},
+          content: [
+            {
+              type: "text" as const,
+              text: formatDuplicateStartText(params.name, duplicateStart),
+            },
+          ],
+        };
+      }
+
       // ── Shared context gate ──
       // A member must never start before the TL has written the shared context
       // (members read .shared-context.md at startup). Only the
@@ -207,7 +429,7 @@ export function registerTlTools(deps: TlToolsDeps): void {
         };
       }
 
-      const config = buildMemberConfig?.(params.name);
+      const config = buildMemberConfig?.(params.name, { fresh });
       if (!config) {
         return {
           details: {},
@@ -218,6 +440,25 @@ export function registerTlTools(deps: TlToolsDeps): void {
             },
           ],
         };
+      }
+
+      // ── 旧会话归档（阶段 2，方案 §3.2.1 ⑤）──
+      // 必须同步且先于启动：启动前快照天然只含旧文件（不需要区分新会话文件），
+      // 同步则不给并行的第二个 start_member 留窗口（见上方守卫注释）。
+      // 归档失败不阻断（E4）：这一次的干净由配置层的 fresh 保证（不加 --continue），
+      // 归档负责「以后的重启不再把旧上下文接回来」。
+      // 阶段 4：非 fresh 也要这份快照——它决定「要不要查一次成员状态」与结果附注。
+      const memberSessionDir =
+        typeof config.sessionDir === "string" ? config.sessionDir : "";
+      const sessionFiles = memberSessionDir ? listMemberSessionFiles(memberSessionDir) : [];
+      const hadSessionFiles = sessionFiles.length > 0;
+      let archive: ArchiveResult | null = null;
+      if (fresh && sessionFiles.length > 0) {
+        archive = archiveMemberSessionFiles({
+          sessionDir: memberSessionDir,
+          memberName: params.name,
+          files: sessionFiles,
+        });
       }
 
       try {
@@ -235,25 +476,50 @@ export function registerTlTools(deps: TlToolsDeps): void {
         );
         // P3：互发策略快照附注（仅 tl-only 出现，避免噪音）
         const peerNote = describePeerMessagingSpawnAnnotation(config.peerMessaging);
+        // 阶段 4（D6）：只有「未 fresh 且启动前确有文件」才意味着请求了续接——
+        // 此时才向成员进程查询一次实际承载的历史条数（3s 超时，失败不阻断）。
+        let probe: ResumedSessionProbe | undefined;
+        if (!fresh && hadSessionFiles) {
+          probe = await probeResumedSession(handle);
+        }
+        const facts: StartSessionFacts = {
+          memberName: params.name,
+          fresh,
+          hadSessionFiles,
+          archive,
+          probe,
+          sessionDir: memberSessionDir,
+        };
+        const annotation = formatStartSessionAnnotation(facts);
+        const sessionBlock = annotation.length > 0 ? `\n${annotation.join("\n")}\n` : "";
         return {
-          details: {},
+          details: startSessionDetails(facts),
           content: [
             {
               type: "text" as const,
               text:
                 `成员 "${params.name}" 已启动 (PID: ${handle.getState().pid})。` +
                 `模型：${config.model ?? "默认"}；${thinkingNote}${peerNote}。` +
+                `${sessionBlock}` +
                 `${tempSourceAnnotation()}使用 list_members 查看状态，通过消息通道分配任务。`,
             },
           ],
         };
       } catch (err) {
+        // 方案 §3.2.4「归档成功但启动失败」：返回启动失败原文，并附归档路径
+        // （可手工移回）。不附的话用户会误以为旧上下文还在原处。
+        const failureText = `成员 "${params.name}" 启动失败：${err instanceof Error ? err.message : String(err)}`;
+        const archiveNote =
+          archive && archive.moved.length > 0
+            ? `\n旧会话文件已归档 ${archive.moved.length} 个 → ${archive.archiveDir}` +
+              `（可手工移回 ${memberSessionDir} 恢复）。`
+            : "";
         return {
           details: {},
           content: [
             {
               type: "text" as const,
-              text: `成员 "${params.name}" 启动失败：${err instanceof Error ? err.message : String(err)}`,
+              text: `${failureText}${archiveNote}`,
             },
           ],
         };
@@ -286,12 +552,19 @@ export function registerTlTools(deps: TlToolsDeps): void {
       // Intentional stop: remove from the manifest's started set so a later
       // /team resume does not revive a member the TL deliberately stopped.
       syncActiveManifest({ stoppedMember: params.name });
+      // 阶段 4（方案 §3.4.1 #5）：只有该成员确有会话文件时才说「已保留/尝试续接」——
+      // 对没有历史的成员说这句话是假话。
+      const sessionDir = resolveMemberSessionDir(params.name);
+      const hasHistory = sessionDir ? listMemberSessionFiles(sessionDir).length > 0 : false;
+      const hint = hasHistory
+        ? "该成员此前的会话已保留；再次 start_member 会尝试续接它（实际是否续接见启动结果；需要全新上下文时传 fresh: true）。"
+        : "";
       return {
         details: {},
         content: [
           {
             type: "text" as const,
-            text: `成员 "${params.name}" 已停止。`,
+            text: `成员 "${params.name}" 已停止。${hint}`,
           },
         ],
       };
@@ -1400,6 +1673,29 @@ function parseTasks(raw: unknown): ParsedTasks {
   return { tasks: [], recoveryNote: "", droppedDetails: [] };
 }
 
+/**
+ * 阶段 5（方案 §3.5.2 ①）：收集「句柄明确未在运行」的显式目标。
+ * - 广播（to:"all"）不参与：由通道层逐成员检查覆盖；
+ * - 句柄不存在（从未启动）不参与：保持既有「不存在或未启动」语义；
+ * - 查询依赖未接线 / 查询抛错 → 不参与（fail-open，旧行为不变）。
+ */
+function collectNotRunningTargets(
+  tasks: Array<{ to: string }>,
+  getHandle?: (name: string) => MemberProcessHandle | undefined
+): string[] {
+  if (!getHandle) return [];
+  const seen = new Set<string>();
+  const blocked: string[] = [];
+  for (const task of tasks) {
+    if (task.to === "all" || seen.has(task.to)) continue;
+    seen.add(task.to);
+    const handle = getHandle(task.to);
+    if (!handle) continue;
+    if (isHandleDefinitelyNotRunning(handle)) blocked.push(task.to);
+  }
+  return blocked;
+}
+
 async function sendAndWaitExecute(
   params: { tasks: unknown; nextSteps: string },
   ctx: SendAndWaitCtx
@@ -1481,6 +1777,24 @@ async function sendAndWaitExecute(
       content: [{
         type: "text" as const,
         text: `目标成员 ${names} 不存在或未启动。请先使用 start_member 启动这些成员。\n有效成员：${validNames.join(", ")}。${truncationHint}`,
+      }],
+    };
+  }
+
+  // ── 派发前目标校验（阶段 5，方案 §3.5.2 ①）──
+  // 目标句柄**明确**未在运行 → 立即拒绝，零副作用（不入队、不注册等待、不写状态）。
+  // 这是最早的一层：真正的发送层还有一层检查（覆盖广播 / 合并包 flush / 压缩补发）。
+  const notRunningTargets = collectNotRunningTargets(tasks, ctx.getHandle);
+  if (notRunningTargets.length > 0) {
+    const quoted = notRunningTargets.map((name) => `"${name}"`).join("、");
+    const starts = notRunningTargets.map((name) => `start_member("${name}")`).join("、");
+    return {
+      details: { notRunning: notRunningTargets },
+      content: [{
+        type: "text" as const,
+        text:
+          `无法派发：目标成员 ${quoted} 当前未在运行（已停止或崩溃）。` +
+          `请先 ${starts} 后再派发；本次没有发送任何任务。`,
       }],
     };
   }
