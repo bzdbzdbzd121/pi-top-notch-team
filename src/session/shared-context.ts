@@ -102,10 +102,15 @@ export type StubRewriteOutcome =
  * STRUCTURAL comparison, not a byte comparison against the current team state:
  * the stub is written at bootstrap with 0 members, and `add_dynamic_member`
  * later grows the roster without rewriting it — so the member block is allowed
- * to differ (only its shape is validated). Everything else (header with the
- * old name, the auto-created warning, description line, placeholder sections)
- * must still match byte-for-byte. `team` must carry the OLD team name.
+ * to differ (only its shape is validated). The description line may also drift:
+ * /team resume rebuilds dynamic teams with the placeholder description
+ * "（恢复的团队会话）" while the on-disk stub still holds "动态团队", so that one
+ * line is normalized away. Everything else (header + `- 名称：` with the OLD
+ * name, the auto-created warning, placeholder sections) must match byte-for-byte.
+ * `team` must carry the OLD team name.
  */
+const STUB_DESCRIPTION_PREFIX = "- 描述：";
+
 export function isSystemStub(content: string, team: TeamDefinition): boolean {
   function splitRoster(lines: string[]): { head: string[]; roster: string[]; tail: string[] } | null {
     const start = lines.indexOf("## 成员");
@@ -118,10 +123,18 @@ export function isSystemStub(content: string, team: TeamDefinition): boolean {
     };
   }
 
+  // The description is the ONLY head line allowed to differ (resume rewrites it).
+  const normalizeDescription = (lines: string[]) =>
+    lines.map((line) =>
+      line.startsWith(STUB_DESCRIPTION_PREFIX) ? `${STUB_DESCRIPTION_PREFIX}<任意>` : line
+    );
+
   const actual = splitRoster(content.split("\n"));
   const expected = splitRoster(buildStubContent(team).split("\n"));
   if (!actual || !expected) return false;
-  if (actual.head.join("\n") !== expected.head.join("\n")) return false;
+  if (normalizeDescription(actual.head).join("\n") !== normalizeDescription(expected.head).join("\n")) {
+    return false;
+  }
   if (actual.tail.join("\n") !== expected.tail.join("\n")) return false;
 
   // The roster block is the only mutable part: accept the empty marker or the

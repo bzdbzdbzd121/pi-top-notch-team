@@ -191,6 +191,25 @@ describe("set_team_name tool — 成功路径", () => {
     expect(stub).toContain("- analyst（分析员）");
   });
 
+  it("resume 后描述漂移（动态团队 → （恢复的团队会话））仍重写首行", async () => {
+    // The on-disk stub keeps the bootstrap description; resume rebuilt the
+    // session with a placeholder description.
+    startSession(
+      { name: OLD, description: "（恢复的团队会话）", members: [] },
+      { sessionId: SID, origin: "user" }
+    );
+    setManifestRuntimeContext({ isDynamic: true, dynamicPhase: "design", agentInitiatedTask: null });
+
+    const { tool } = register();
+    const result = await tool.execute("id", { name: "登录重构" }, undefined, undefined, ctx());
+
+    expect(result.content[0].text).toContain("已按新团队名重写");
+    expect(result.details.stubRewrite).toBe("rewritten");
+    const stub = readFileSync(join(sessionDir("登录重构"), ".shared-context.md"), "utf-8");
+    expect(stub.split("\n")[0]).toBe("# Shared Context — 登录重构");
+    expect(stub).not.toContain(OLD);
+  });
+
   it("共享上下文文件不存在 → 结果说明「不存在」（不虚构原因）", async () => {
     rmSync(join(sessionDir(OLD), ".shared-context.md"));
     const { tool } = register();

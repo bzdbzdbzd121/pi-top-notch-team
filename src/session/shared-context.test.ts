@@ -155,6 +155,24 @@ describe("rewriteStubIfUnchanged", () => {
     expect(rewritten).not.toContain("_dynamic_1");
   });
 
+  it("recognizes the stub after /team resume changed the description (动态团队 → （恢复的团队会话）)", () => {
+    // The stub is written at bootstrap with the bootstrap description; /team
+    // resume rebuilds dynamic teams with a placeholder description. The real
+    // stub still exists on disk — the rewrite must recognize it anyway.
+    const bootstrapTeam = createTeam({ name: "_dynamic_1", description: "动态团队" });
+    const resumedTeam = createTeam({ name: "_dynamic_1", description: "（恢复的团队会话）" });
+    const newTeam = createTeam({ name: "登录重构", description: "（恢复的团队会话）" });
+    const path = ensureSharedContextFile(bootstrapTeam, "sid-1");
+    expect(readFileSync(path, "utf-8")).toContain("- 描述：动态团队");
+    renameSync(join(tmpDir, "sessions", "_dynamic_1"), join(tmpDir, "sessions", "登录重构"));
+
+    expect(rewriteStubIfUnchanged(resumedTeam, newTeam, "sid-1")).toBe("rewritten");
+
+    const rewritten = readFileSync(getSharedContextPath("登录重构", "sid-1"), "utf-8");
+    expect(rewritten.split("\n")[0]).toBe("# Shared Context — 登录重构");
+    expect(rewritten).not.toContain("_dynamic_1");
+  });
+
   it("never touches a modified shared context", () => {
     const oldTeam = createTeam({ name: "_dynamic_1" });
     const newTeam = createTeam({ name: "登录重构" });

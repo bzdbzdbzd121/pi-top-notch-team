@@ -179,6 +179,29 @@ describe("applyTeamName — 成功路径", () => {
     expect(stub).not.toContain(OLD);
   });
 
+  it("resume 后描述漂移（动态团队 → （恢复的团队会话））仍识别系统 stub 并改写首行", () => {
+    // startDynamic() wrote the stub with description 动态团队; /team resume
+    // rebuilds the definition with the placeholder description while the file
+    // on disk keeps the bootstrap text.
+    const stubBefore = readFileSync(join(sessionDir(OLD), ".shared-context.md"), "utf-8");
+    expect(stubBefore.split("\n")[0]).toBe(`# Shared Context — ${OLD}`);
+    expect(stubBefore).toContain("- 描述：动态团队");
+
+    startSession(
+      { name: OLD, description: "（恢复的团队会话）", members: [] },
+      { sessionId: SID, origin: "user" }
+    );
+    setManifestRuntimeContext({ isDynamic: true, dynamicPhase: "design", agentInitiatedTask: null });
+
+    const out = applyTeamName(NEW, deps());
+
+    expect(out.ok).toBe(true);
+    if (out.ok) expect(out.stubRewrite).toBe("rewritten");
+    const stub = readFileSync(join(sessionDir(NEW), ".shared-context.md"), "utf-8");
+    expect(stub.split("\n")[0]).toBe(`# Shared Context — ${NEW}`);
+    expect(stub).not.toContain(OLD);
+  });
+
   it("共享上下文文件不存在 → stubRewrite=missing（不虚构原因）", () => {
     rmSync(join(sessionDir(OLD), ".shared-context.md"));
     const out = applyTeamName(NEW, deps());
@@ -333,5 +356,9 @@ describe("applyTeamName — 失败注入与回滚", () => {
     // otherwise a later settings write recreates a stray old-name directory.
     expect(onRenamed).toHaveBeenCalledTimes(1);
     expect(onRenamed).toHaveBeenCalledWith(NEW);
+    // Same post-move cleanup as the success path: the stub is rewritten too.
+    const stub = readFileSync(join(sessionDir(NEW), ".shared-context.md"), "utf-8");
+    expect(stub.split("\n")[0]).toBe(`# Shared Context — ${NEW}`);
+    expect(stub).not.toContain(OLD);
   });
 });

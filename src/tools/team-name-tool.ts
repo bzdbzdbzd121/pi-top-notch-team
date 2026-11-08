@@ -3,6 +3,7 @@ import type { TeamContext } from "../session/context";
 import { getRootDir } from "../config";
 import { getSessionState } from "../session/state";
 import { applyTeamName } from "../session/rename-team";
+import type { StubRewriteOutcome } from "../session/shared-context";
 import { ensureToolRegistered } from "../commands/shared/ensure-tool";
 import { SET_TEAM_NAME_TOOL_NAME } from "./team-name-tool-names";
 
@@ -18,7 +19,7 @@ interface SetTeamNameDetails {
 }
 
 /** Honest report for every shared-context stub outcome (no fabricated cause). */
-const STUB_REWRITE_NOTES: Record<string, string> = {
+const STUB_REWRITE_NOTES: Record<StubRewriteOutcome, string> = {
   rewritten: "共享上下文仍是系统占位文件，已按新团队名重写（首行为新名，成员名单保持当前状态）。",
   "not-attempted": "团队名未变化，未检查共享上下文。",
   "not-stub":
@@ -122,7 +123,7 @@ export function ensureSetTeamNameTool(pi: ExtensionAPI, teamCtx: TeamContext): v
           lines.push(`（输入「${requested}」已归一为「${outcome.name}」。）`);
         }
         if (outcome.moved) {
-          lines.push(STUB_REWRITE_NOTES[outcome.stubRewrite] ?? STUB_REWRITE_NOTES.undecidable);
+          lines.push(STUB_REWRITE_NOTES[outcome.stubRewrite]);
         }
 
         return {

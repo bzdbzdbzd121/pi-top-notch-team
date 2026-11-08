@@ -199,6 +199,19 @@ export function applyTeamName(rawName: unknown, deps: ApplyTeamNameDeps): TeamNa
   // plus the settings snapshot would look lost. Hence the rollback.
   const syncManifest =
     deps.syncManifest ?? (() => syncActiveManifest({ status: "active" }, deps.rootDir));
+  // Step 14 helper (defined early: the degraded partial path keeps the same
+  // post-move cleanup as the success path).
+  const rewriteStub =
+    deps.rewriteSharedContextStub ?? ((old: TeamDefinition, next: TeamDefinition) =>
+      rewriteStubIfUnchanged(old, next, sessionId));
+  const tryRewriteStub = (): StubRewriteOutcome => {
+    try {
+      return rewriteStub(oldTeam, newTeam);
+    } catch {
+      // fail-open — an old-name stub is cosmetic; never fail the rename for it.
+      return "undecidable";
+    }
+  };
   if (!syncManifest()) {
     renameTeamInSession(previousName);
     try {
@@ -224,6 +237,9 @@ export function applyTeamName(rawName: unknown, deps: ApplyTeamNameDeps): TeamNa
       } catch {
         // fail-open — the disk is already at the new name.
       }
+      // Same post-move cleanup as the success path: rewrite the stub so the
+      // file does not keep advertising the old name.
+      tryRewriteStub();
       return reject(
         "partial",
         `会话目录已改为「${name}」，但清单写入失败且回滚也失败。请执行 /team resume：恢复时以目录名为准，清单会被自动修正。`
@@ -246,16 +262,7 @@ export function applyTeamName(rawName: unknown, deps: ApplyTeamNameDeps): TeamNa
   }
 
   // ── Step 14: shared context stub (structural check — the roster may have grown) ──
-  const rewriteStub =
-    deps.rewriteSharedContextStub ?? ((old: TeamDefinition, next: TeamDefinition) =>
-      rewriteStubIfUnchanged(old, next, sessionId));
-  let stubRewrite: StubRewriteOutcome = "undecidable";
-  try {
-    stubRewrite = rewriteStub(oldTeam, newTeam);
-  } catch {
-    // fail-open — an old-name stub is cosmetic; never fail the rename for it.
-    stubRewrite = "undecidable";
-  }
+  const stubRewrite = tryRewriteStub();
 
   return {
     ok: true,
