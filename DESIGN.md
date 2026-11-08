@@ -69,7 +69,9 @@ pi-top-notch-team/
 │       ├── 0004-team-session-resume.md
 │       ├── 0005-pi-upstream-truncation-marking.md
 │       ├── 0006-pi-upstream-abort-compaction-rpc.md
-│       └── 0007-pi-upstream-context-usage-reason.md
+│       ├── 0007-pi-upstream-context-usage-reason.md
+│       ├── 0008-team-definition-cloud-sync.md
+│       └── 0009-dynamic-team-naming.md
 ├── package.json              ← pi package manifest (see below)
 ├── scripts/
 │   └── check-goal-reminder.mjs ← Stage 3 static lifecycle/wording/release guard
@@ -1042,7 +1044,7 @@ Dynamic sessions use the same `<team-name>/<sessionId>/` layout. Until the TL na
 Renaming moves the whole `<sessionId>` subtree under the new `<team-name>`（一次原子 `rename`，§36）。
 
 Member sessions use `pi --mode rpc --session-dir <path>` so session files are persisted and recoverable.
-On `/team stop` and `session_shutdown`, the session subdirectory (`<sessionId>`) is preserved and its manifest is marked `stopped` (or left `active` for an interrupted shutdown); use `/team resume` to restore it and `/team delete` for explicit disk cleanup.
+On `/team stop` and `session_shutdown`, the session subdirectory (`<sessionId>`) is preserved and its manifest is marked `stopped` (or left `active` for an interrupted shutdown); use `/team resume` to restore it. `/team delete <name>` is scoped to **pre-defined** teams: it removes the YAML definition and, after a separate confirmation, that team's `sessions/<name>/` directory. Dynamic sessions have no YAML definition, so `/team delete` does not apply to them — their directories are preserved for `/team resume`.
 
 ## 14. Shared Context
 
@@ -1446,7 +1448,10 @@ TL calls stop_team_session()               ← session-scoped; ACTIVATED only in
   └─ teardownTeamSession()                   src/session/teardown.ts — shared with
                                                /team stop: stop members, deactivate
                                                tools, widgets off, preserve resumable
-                                               dir; disk cleanup via /team delete;
+                                               dirs — disk cleanup via /team delete
+                                               applies only to pre-defined teams
+                                               (dynamic sessions have no YAML
+                                               definition; restore via /team resume);
                                                endSession + resetGoal
 ```
 

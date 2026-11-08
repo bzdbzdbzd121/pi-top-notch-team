@@ -29,7 +29,7 @@ pi 自身的会话支持 `--continue/--resume`，但团队会话无法恢复：T
 
 ### 4. 停止即保留（P1）
 
-`/team stop` 与 `session_shutdown` **不再删除 session 目录**，改为把 manifest 标记为 `stopped`（干净停止）或保留 `active`（= 中断语义，可恢复列表优先展示）。磁盘清理由 `/team delete` 显式负责——与 pi 自身"任何历史会话都可 resume"的语义对齐。`session_shutdown` 现在会 best-effort 停掉 member 进程（防止孤儿继续 append 会话文件，与将来 resume  reopen 冲突）。
+`/team stop` 与 `session_shutdown` **不再删除 session 目录**，改为把 manifest 标记为 `stopped`（干净停止）或保留 `active`（= 中断语义，可恢复列表优先展示）。磁盘清理需显式执行 `/team delete`——与 pi 自身"任何历史会话都可 resume"的语义对齐（作用域限定：`/team delete` 以 YAML 团队定义为入口，对预定义团队可连同 `sessions/<name>/` 一起删；动态会话没有 YAML 定义，其目录不由它清理，保留供 `/team resume`）。`session_shutdown` 现在会 best-effort 停掉 member 进程（防止孤儿继续 append 会话文件，与将来 resume  reopen 冲突）。
 
 ### 5. `/team resume`（P1）
 
@@ -38,7 +38,7 @@ pi 自身的会话支持 `--continue/--resume`，但团队会话无法恢复：T
 ## 权衡与边界
 
 - **进行中任务不重放**：member 恢复到中断前最后一条完整 entry，半条 tool call 丢弃，member 回到 idle。任务编排由 TL 重建（它是编排者，上下文也在）。这是刻意接受的语义。
-- **磁盘增长**：停止的会话目录不再自动清除，依赖 `/team delete` 或手动清理。换来的是与 pi 一致的恢复语义。
+- **磁盘增长**：停止的会话目录不再自动清除，依赖 `/team delete`（仅预定义团队；动态会话目录不在其作用域内）或手动清理。换来的是与 pi 一致的恢复语义。
 - **孤儿检测仅 Linux**（/proc）；其他平台跳过杀孤儿（新进程 reopen 会话文件是 append 语义，风险可接受）。
 - **预定义团队以 manifest 快照为准**而非实时 YAML：member 目录是按当时的名册构建的，YAML 之后可能被编辑。描述等展示字段仍取 YAML。
 
