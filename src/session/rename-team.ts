@@ -4,7 +4,7 @@ import { getSessionState, renameTeamInSession } from "./state";
 import { normalizeTeamName } from "../team/team-name";
 import { listTeams } from "../team/store";
 import { syncActiveManifest } from "./manifest";
-import { rewriteStubIfUnchanged } from "./shared-context";
+import { rewriteStubIfUnchanged, type StubRewriteOutcome } from "./shared-context";
 import type { TeamDefinition } from "../team/definition";
 
 /**
@@ -54,7 +54,7 @@ export interface ApplyTeamNameDeps {
   /** Failure injection (default syncActiveManifest against `rootDir`). */
   syncManifest?(): boolean;
   /** Failure injection (default rewriteStubIfUnchanged). */
-  rewriteSharedContextStub?(oldTeam: TeamDefinition, newTeam: TeamDefinition): boolean;
+  rewriteSharedContextStub?(oldTeam: TeamDefinition, newTeam: TeamDefinition): StubRewriteOutcome;
 }
 
 export type TeamNameOutcome =
@@ -66,8 +66,8 @@ export type TeamNameOutcome =
       adjusted: boolean;
       /** Absolute session directory after the rename (unchanged when moved=false). */
       dir: string;
-      /** True when the system stub was rewritten with the new name. */
-      stubRewritten: boolean;
+      /** What happened to the system shared-context stub (reported honestly). */
+      stubRewrite: StubRewriteOutcome;
     }
   | { ok: false; code: TeamNameRejection; message: string };
 
@@ -114,7 +114,10 @@ export function applyTeamName(rawName: unknown, deps: ApplyTeamNameDeps): TeamNa
   if (deps.hasRunningMember()) {
     return reject(
       "member-running",
-      "仍有成员进程在运行，无法改名。请先停止这些成员（stop_member 或 /team stop）后重试。"
+      "仍有成员进程在运行（start_member 正在启动），无法改名。名称会在第一个成员成功启动后冻结：" +
+        "成员的 TEAM_NAME、会话目录与共享上下文路径在启动时已固化，之后即使停止成员也无法在同一会话内改名。" +
+        "请等待该启动完成；如需改名，请结束本会话后重开（/team stop → /team dynamic 或 start_team_session），" +
+        "并在启动成员前命名。"
     );
   }
 
@@ -140,12 +143,22 @@ export function applyTeamName(rawName: unknown, deps: ApplyTeamNameDeps): TeamNa
       moved: false,
       adjusted: normalized.adjusted,
       dir: oldDir,
-      stubRewritten: false,
+      stubRewrite: "not-attempted",
     };
   }
 
   // ── Step 7: collisions (never overwrite) ──
-  const takenByTeam = listTeams(deps.rootDir).some(
+  let existingTeams: string[];
+  try {
+    existingTeams = listTeams(deps.rootDir);
+  } catch (err) {
+    // An unreadable teams/ directory must not surface as a thrown tool error.
+    return reject(
+      "io",
+      `改名失败（无法读取已有团队列表）：${errorMessage(err)}。团队名与会话目录未改变，可重试。`
+    );
+  }
+  const takenByTeam = existingTeams.some(
     (teamName) => teamName.toLowerCase() === name.toLowerCase()
   );
   if (takenByTeam) {
@@ -202,6 +215,15 @@ export function applyTeamName(rawName: unknown, deps: ApplyTeamNameDeps): TeamNa
       } catch {
         // Session may have been torn down in between — nothing else to do.
       }
+      // The directory HAS moved: rebind the per-session settings dir (and
+      // refresh the widget) even on this degraded path — otherwise a later
+      // settings write would recreate a stray old-name directory and
+      // /team resume would not find the snapshot.
+      try {
+        deps.onRenamed?.(name);
+      } catch {
+        // fail-open — the disk is already at the new name.
+      }
       return reject(
         "partial",
         `会话目录已改为「${name}」，但清单写入失败且回滚也失败。请执行 /team resume：恢复时以目录名为准，清单会被自动修正。`
@@ -223,15 +245,16 @@ export function applyTeamName(rawName: unknown, deps: ApplyTeamNameDeps): TeamNa
     // refresh / member event.
   }
 
-  // ── Step 14: shared context stub (only while it is still the system stub) ──
+  // ── Step 14: shared context stub (structural check — the roster may have grown) ──
   const rewriteStub =
     deps.rewriteSharedContextStub ?? ((old: TeamDefinition, next: TeamDefinition) =>
       rewriteStubIfUnchanged(old, next, sessionId));
-  let stubRewritten = false;
+  let stubRewrite: StubRewriteOutcome = "undecidable";
   try {
-    stubRewritten = rewriteStub(oldTeam, newTeam);
+    stubRewrite = rewriteStub(oldTeam, newTeam);
   } catch {
-    // fail-open — the old stub mentioning the old name is cosmetic only.
+    // fail-open — an old-name stub is cosmetic; never fail the rename for it.
+    stubRewrite = "undecidable";
   }
 
   return {
@@ -241,6 +264,6 @@ export function applyTeamName(rawName: unknown, deps: ApplyTeamNameDeps): TeamNa
     moved: true,
     adjusted: normalized.adjusted,
     dir: newDir,
-    stubRewritten,
+    stubRewrite,
   };
 }

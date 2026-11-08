@@ -126,7 +126,7 @@ describe("rewriteStubIfUnchanged", () => {
     // The rename transaction moves the directory first, then rewrites the stub.
     renameSync(join(tmpDir, "sessions", "_dynamic_1"), join(tmpDir, "sessions", "登录重构"));
 
-    expect(rewriteStubIfUnchanged(oldTeam, newTeam, "sid-1")).toBe(true);
+    expect(rewriteStubIfUnchanged(oldTeam, newTeam, "sid-1")).toBe("rewritten");
 
     const rewritten = readFileSync(getSharedContextPath("登录重构", "sid-1"), "utf-8");
     expect(rewritten).toContain("# Shared Context — 登录重构");
@@ -136,7 +136,26 @@ describe("rewriteStubIfUnchanged", () => {
     expect(existsSync(join(tmpDir, "sessions", "_dynamic_1"))).toBe(false);
   });
 
-  it("never touches a TL-written shared context (byte-identical)", () => {
+  it("recognizes the stub even after add_dynamic_member changed the roster", () => {
+    // The stub is written at bootstrap with 0 members; members are added later
+    // WITHOUT rewriting it. A byte comparison against the current roster would
+    // never match — the structural check must still recognize it.
+    const bootstrapTeam = createTeam({ name: "_dynamic_1", members: [] });
+    const oldTeam = createTeam({ name: "_dynamic_1" }); // roster now grown
+    const newTeam = createTeam({ name: "登录重构" });
+    const path = ensureSharedContextFile(bootstrapTeam, "sid-1");
+    expect(readFileSync(path, "utf-8")).toContain("（暂无成员）");
+    renameSync(join(tmpDir, "sessions", "_dynamic_1"), join(tmpDir, "sessions", "登录重构"));
+
+    expect(rewriteStubIfUnchanged(oldTeam, newTeam, "sid-1")).toBe("rewritten");
+
+    const rewritten = readFileSync(getSharedContextPath("登录重构", "sid-1"), "utf-8");
+    expect(rewritten.split("\n")[0]).toBe("# Shared Context — 登录重构");
+    expect(rewritten).toContain("- analyzer（分析员）");
+    expect(rewritten).not.toContain("_dynamic_1");
+  });
+
+  it("never touches a modified shared context", () => {
     const oldTeam = createTeam({ name: "_dynamic_1" });
     const newTeam = createTeam({ name: "登录重构" });
     const path = join(tmpDir, "sessions", "登录重构", "sid-1", ".shared-context.md");
@@ -144,14 +163,39 @@ describe("rewriteStubIfUnchanged", () => {
     const custom = "# TL 写的\n重要内容\n";
     writeFileSync(path, custom, "utf-8");
 
-    expect(rewriteStubIfUnchanged(oldTeam, newTeam, "sid-1")).toBe(false);
+    expect(rewriteStubIfUnchanged(oldTeam, newTeam, "sid-1")).toBe("not-stub");
     expect(readFileSync(path, "utf-8")).toBe(custom);
   });
 
-  it("is a no-op when the file is missing (never creates one)", () => {
+  it("treats a stub with an edited placeholder section as modified (never overwrites)", () => {
     const oldTeam = createTeam({ name: "_dynamic_1" });
     const newTeam = createTeam({ name: "登录重构" });
-    expect(rewriteStubIfUnchanged(oldTeam, newTeam, "sid-1")).toBe(false);
+    const path = ensureSharedContextFile(oldTeam, "sid-1");
+    const edited = readFileSync(path, "utf-8").replace(
+      "## 项目背景与目标\n（待 TL 补充）",
+      "## 项目背景与目标\n重构登录模块"
+    );
+    writeFileSync(path, edited, "utf-8");
+    renameSync(join(tmpDir, "sessions", "_dynamic_1"), join(tmpDir, "sessions", "登录重构"));
+
+    expect(rewriteStubIfUnchanged(oldTeam, newTeam, "sid-1")).toBe("not-stub");
+    expect(readFileSync(getSharedContextPath("登录重构", "sid-1"), "utf-8")).toBe(edited);
+  });
+
+  it("is a no-op when the file is missing (returns missing, never creates one)", () => {
+    const oldTeam = createTeam({ name: "_dynamic_1" });
+    const newTeam = createTeam({ name: "登录重构" });
+    expect(rewriteStubIfUnchanged(oldTeam, newTeam, "sid-1")).toBe("missing");
     expect(existsSync(getSharedContextPath("登录重构", "sid-1"))).toBe(false);
+  });
+
+  it("returns undecidable when the file cannot be read (no fabricated cause)", () => {
+    const oldTeam = createTeam({ name: "_dynamic_1" });
+    const newTeam = createTeam({ name: "登录重构" });
+    // A directory where the stub file is expected → readFileSync throws EISDIR.
+    mkdirSync(join(tmpDir, "sessions", "登录重构", "sid-1", ".shared-context.md"), {
+      recursive: true,
+    });
+    expect(rewriteStubIfUnchanged(oldTeam, newTeam, "sid-1")).toBe("undecidable");
   });
 });

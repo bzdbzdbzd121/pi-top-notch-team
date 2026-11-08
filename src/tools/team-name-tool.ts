@@ -14,7 +14,21 @@ interface SetTeamNameDetails {
   previousName?: string;
   moved?: boolean;
   dir?: string;
+  stubRewrite?: string;
 }
+
+/** Honest report for every shared-context stub outcome (no fabricated cause). */
+const STUB_REWRITE_NOTES: Record<string, string> = {
+  rewritten: "共享上下文仍是系统占位文件，已按新团队名重写（首行为新名，成员名单保持当前状态）。",
+  "not-attempted": "团队名未变化，未检查共享上下文。",
+  "not-stub":
+    "共享上下文不是系统自动生成的占位文件（可能已被写入），未自动改写其中的团队名；如需更新请再调用 write_shared_context。",
+  missing: "共享上下文文件不存在，未改写（start_member 时会按新名自动创建）。",
+  undecidable:
+    "无法判定共享上下文是否仍为系统占位文件（文件不可读），未改写；如需更新请再调用 write_shared_context。",
+  "write-failed":
+    "共享上下文仍是系统占位文件，但重写失败（文件系统错误），未改写；如需更新请再调用 write_shared_context。",
+};
 
 /**
  * `set_team_name` — name the current dynamic team during the design phase.
@@ -107,12 +121,8 @@ export function ensureSetTeamNameTool(pi: ExtensionAPI, teamCtx: TeamContext): v
         if (outcome.adjusted) {
           lines.push(`（输入「${requested}」已归一为「${outcome.name}」。）`);
         }
-        if (outcome.moved && outcome.stubRewritten) {
-          lines.push("共享上下文仍是系统占位文件，已同步为新团队名。");
-        } else if (outcome.moved) {
-          lines.push(
-            "共享上下文已被 TL 写入，未自动改写其中的团队名；如需更新请再调用 write_shared_context。"
-          );
+        if (outcome.moved) {
+          lines.push(STUB_REWRITE_NOTES[outcome.stubRewrite] ?? STUB_REWRITE_NOTES.undecidable);
         }
 
         return {
@@ -122,6 +132,7 @@ export function ensureSetTeamNameTool(pi: ExtensionAPI, teamCtx: TeamContext): v
             previousName: outcome.previousName,
             moved: outcome.moved,
             dir: outcome.dir,
+            stubRewrite: outcome.stubRewrite,
           } satisfies SetTeamNameDetails,
           content: [{ type: "text" as const, text: lines.join("\n") }],
         };

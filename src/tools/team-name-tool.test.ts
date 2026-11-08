@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { createMockExtensionAPI, createMockContext } from "../test/fixtures/mock-extension-api";
 import { ensureSetTeamNameTool } from "./team-name-tool";
 import { SET_TEAM_NAME_TOOL_NAME } from "./team-name-tool-names";
-import { endSession, getSessionState, startSession } from "../session/state";
+import { endSession, getSessionState, startSession, addMemberToSession } from "../session/state";
 import { ensureSharedContextFile } from "../session/shared-context";
 import {
   getManifestPath,
@@ -154,7 +154,7 @@ describe("set_team_name tool — 成功路径", () => {
     expect(result.content[0].text).toContain("归一");
   });
 
-  it("共享上下文已被 TL 写过 → 附注「不自动改写，需重新 write_shared_context」且内容不变", async () => {
+  it("共享上下文已被修改 → 附注「不是系统占位文件，未改写」且内容不变", async () => {
     const custom = "# 我写的共享上下文\n";
     writeFileSync(join(sessionDir(OLD), ".shared-context.md"), custom, "utf-8");
 
@@ -162,7 +162,51 @@ describe("set_team_name tool — 成功路径", () => {
     const result = await tool.execute("id", { name: "登录重构" }, undefined, undefined, ctx());
 
     expect(result.content[0].text).toContain("write_shared_context");
+    expect(result.content[0].text).toContain("不是系统自动生成的占位文件");
+    // Must NOT claim the TL wrote it when that cannot be known.
+    expect(result.content[0].text).not.toContain("TL 已写入");
+    expect(result.details.stubRewrite).toBe("not-stub");
     expect(readFileSync(join(sessionDir("登录重构"), ".shared-context.md"), "utf-8")).toBe(custom);
+  });
+
+  it("先 add_dynamic_member 再 set_team_name：stub 被识别并重写，首行为新名", async () => {
+    // Rebuild the exact review scenario: stub written at bootstrap with 0 members.
+    endSession();
+    resetManifestRuntimeContext();
+    const emptyTeam: TeamDefinition = { name: OLD, description: "动态团队", members: [] };
+    startSession(emptyTeam, { sessionId: SID, origin: "user" });
+    setManifestRuntimeContext({ isDynamic: true, dynamicPhase: "design", agentInitiatedTask: null });
+    mkdirSync(sessionDir(OLD), { recursive: true });
+    syncActiveManifest();
+    ensureSharedContextFile(emptyTeam, SID);
+    addMemberToSession({ name: "analyst", label: "分析员", systemPrompt: "负责分析" });
+
+    const { tool } = register();
+    const result = await tool.execute("id", { name: "登录重构" }, undefined, undefined, ctx());
+
+    expect(result.content[0].text).toContain("已按新团队名重写");
+    expect(result.details.stubRewrite).toBe("rewritten");
+    const stub = readFileSync(join(sessionDir("登录重构"), ".shared-context.md"), "utf-8");
+    expect(stub.split("\n")[0]).toBe("# Shared Context — 登录重构");
+    expect(stub).toContain("- analyst（分析员）");
+  });
+
+  it("共享上下文文件不存在 → 结果说明「不存在」（不虚构原因）", async () => {
+    rmSync(join(sessionDir(OLD), ".shared-context.md"));
+    const { tool } = register();
+    const result = await tool.execute("id", { name: "登录重构" }, undefined, undefined, ctx());
+    expect(result.content[0].text).toContain("不存在");
+    expect(result.details.stubRewrite).toBe("missing");
+  });
+
+  it("共享上下文不可读 → 结果如实说「无法判定」，不碰文件", async () => {
+    // Replace the stub file with a directory → readFileSync throws EISDIR.
+    rmSync(join(sessionDir(OLD), ".shared-context.md"));
+    mkdirSync(join(sessionDir(OLD), ".shared-context.md"));
+    const { tool } = register();
+    const result = await tool.execute("id", { name: "登录重构" }, undefined, undefined, ctx());
+    expect(result.content[0].text).toContain("无法判定");
+    expect(result.details.stubRewrite).toBe("undecidable");
   });
 
   it("start_member 失败残留 handle（非 running）之后仍可改名", async () => {
@@ -210,8 +254,11 @@ describe("set_team_name tool — 拒绝文案（每条含下一步）", () => {
     const handle = { getState: () => ({ status: "running", pid: 123 }) } as any;
     const { tool } = register({ memberHandles: new Map([["analyst", handle]]) as any });
     const result = await tool.execute("id", { name: "登录重构" }, undefined, undefined, ctx());
-    expect(result.content[0].text).toContain("运行");
-    expect(result.content[0].text).toContain("stop_member");
+    // Truthful constraint: the name freezes once a member starts — stopping the
+    // member does NOT unlock a rename in the same session (never suggest that).
+    expect(result.content[0].text).toContain("冻结");
+    expect(result.content[0].text).toContain("/team stop");
+    expect(result.content[0].text).not.toContain("stop_member");
     expect(getSessionState().teamDefinition!.name).toBe(OLD);
   });
 
@@ -229,6 +276,14 @@ describe("set_team_name tool — 拒绝文案（每条含下一步）", () => {
     const result = await tool.execute("id", { name: "登录重构" }, undefined, undefined, ctx());
     expect(result.content[0].text).toContain("同名");
     expect(result.content[0].text).toContain("重试");
+  });
+
+  it("已有团队列表读取失败 → 返回可读文案而不是抛异常", async () => {
+    writeFileSync(join(rootDir, "teams"), "not a directory", "utf-8");
+    const { tool } = register();
+    const result = await tool.execute("id", { name: "登录重构" }, undefined, undefined, ctx());
+    expect(result.content[0].text).toContain("无法读取已有团队列表");
+    expect(getSessionState().teamDefinition!.name).toBe(OLD);
   });
 
   it("缺少 name 参数时不崩且说明需要名字", async () => {

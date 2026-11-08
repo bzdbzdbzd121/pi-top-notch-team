@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, 
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { applyTeamName, type ApplyTeamNameDeps } from "./rename-team";
-import { endSession, getSessionState, startSession } from "./state";
+import { endSession, getSessionState, startSession, addMemberToSession } from "./state";
 import { ensureSharedContextFile } from "./shared-context";
 import {
   getManifestPath,
@@ -79,7 +79,7 @@ describe("applyTeamName — 成功路径", () => {
     expect(out.previousName).toBe(OLD);
     expect(out.moved).toBe(true);
     expect(out.adjusted).toBe(false);
-    expect(out.stubRewritten).toBe(true);
+    expect(out.stubRewrite).toBe("rewritten");
     expect(out.dir).toBe(sessionDir(NEW));
 
     // 内存状态（/team status、下一回合提示词均从这里重建）
@@ -116,7 +116,10 @@ describe("applyTeamName — 成功路径", () => {
     const out = applyTeamName(NEW, deps({ onRenamed }));
 
     expect(out.ok).toBe(true);
-    if (out.ok) expect(out.moved).toBe(false);
+    if (out.ok) {
+      expect(out.moved).toBe(false);
+      expect(out.stubRewrite).toBe("not-attempted");
+    }
     expect(onRenamed).not.toHaveBeenCalled();
     expect(readdirSync(join(rootDir, "sessions"))).toEqual(before);
     expect(getSessionState().teamDefinition!.name).toBe(NEW);
@@ -139,15 +142,49 @@ describe("applyTeamName — 成功路径", () => {
     expect(existsSync(join(rootDir, "sessions", OLD, "other-session"))).toBe(true);
   });
 
-  it("TL 已写过的共享上下文逐字节不变，并标记 stubRewritten=false", () => {
+  it("TL 已写过的共享上下文逐字节不变，并标记 stubRewrite=not-stub", () => {
     const path = join(sessionDir(OLD), ".shared-context.md");
     const custom = "# 自定义共享上下文\n目标：重构登录\n";
     writeFileSync(path, custom, "utf-8");
 
     const out = applyTeamName(NEW, deps());
     expect(out.ok).toBe(true);
-    if (out.ok) expect(out.stubRewritten).toBe(false);
+    if (out.ok) expect(out.stubRewrite).toBe("not-stub");
     expect(readFileSync(join(sessionDir(NEW), ".shared-context.md"), "utf-8")).toBe(custom);
+  });
+
+  it("先 add_dynamic_member 再改名：0 成员时生成的 stub 仍被识别，首行改为新名", () => {
+    // Reproduce the review finding: the stub is written at bootstrap with no
+    // members; add_dynamic_member grows the roster without rewriting it, so the
+    // old byte comparison never matched and the header kept the fallback name.
+    endSession();
+    resetManifestRuntimeContext();
+    const emptyTeam: TeamDefinition = { name: OLD, description: "动态团队", members: [] };
+    startSession(emptyTeam, { sessionId: SID, origin: "user" });
+    setManifestRuntimeContext({ isDynamic: true, dynamicPhase: "design", agentInitiatedTask: null });
+    mkdirSync(sessionDir(OLD), { recursive: true });
+    syncActiveManifest();
+    ensureSharedContextFile(emptyTeam, SID);
+    addMemberToSession({ name: "analyst", label: "分析员", systemPrompt: "负责分析" });
+    syncActiveManifest();
+
+    const out = applyTeamName(NEW, deps());
+
+    expect(out.ok).toBe(true);
+    if (out.ok) expect(out.stubRewrite).toBe("rewritten");
+    const stub = readFileSync(join(sessionDir(NEW), ".shared-context.md"), "utf-8");
+    expect(stub.split("\n")[0]).toBe(`# Shared Context — ${NEW}`);
+    expect(stub).toContain("- 名称：" + NEW);
+    expect(stub).toContain("- analyst（分析员）");
+    expect(stub).not.toContain(OLD);
+  });
+
+  it("共享上下文文件不存在 → stubRewrite=missing（不虚构原因）", () => {
+    rmSync(join(sessionDir(OLD), ".shared-context.md"));
+    const out = applyTeamName(NEW, deps());
+    expect(out.ok).toBe(true);
+    if (out.ok) expect(out.stubRewrite).toBe("missing");
+    expect(existsSync(join(sessionDir(NEW), ".shared-context.md"))).toBe(false);
   });
 
   it("改名后 buildMemberConfig 的 --session-dir 落在新目录", () => {
@@ -230,6 +267,14 @@ describe("applyTeamName — 拒绝矩阵（每条零副作用）", () => {
     }, "io", "已存在");
   });
 
+  it("listTeams 抛错（teams 不是目录）→ 可读的 io 文案，零副作用且不抛异常", () => {
+    expectRejected(NEW, () => {
+      // A regular file at <root>/teams makes listTeams' readdirSync throw ENOTDIR.
+      writeFileSync(join(rootDir, "teams"), "not a directory", "utf-8");
+      return deps();
+    }, "io", "无法读取已有团队列表");
+  });
+
   it("invalid 走名字规则：拒绝时附规则说明，可立即重试", () => {
     const out = applyTeamName("a/b", deps());
     expect(out.ok).toBe(false);
@@ -254,8 +299,9 @@ describe("applyTeamName — 失败注入与回滚", () => {
     expect(getSessionState().teamDefinition!.name).toBe(OLD);
   });
 
-  it("清单写入失败 → 目录与内存回滚到旧名", () => {
-    const out = applyTeamName(NEW, deps({ syncManifest: () => false }));
+  it("清单写入失败 → 目录与内存回滚到旧名（钩子不触发：目录未搬）", () => {
+    const onRenamed = vi.fn();
+    const out = applyTeamName(NEW, deps({ syncManifest: () => false, onRenamed }));
 
     expect(out.ok).toBe(false);
     if (out.ok) return;
@@ -265,6 +311,7 @@ describe("applyTeamName — 失败注入与回滚", () => {
     expect(existsSync(sessionDir(OLD))).toBe(true);
     expect(existsSync(join(rootDir, "sessions", NEW))).toBe(false);
     expect(readManifestFile(getManifestPath(rootDir, OLD, SID))?.teamName).toBe(OLD);
+    expect(onRenamed).not.toHaveBeenCalled();
   });
 
   it("回滚再失败 → partial，文案指向 /team resume 自愈，内存与磁盘目录一致（新名）", () => {
@@ -273,7 +320,8 @@ describe("applyTeamName — 失败注入与回滚", () => {
       .mockImplementationOnce((from: string, to: string) => renameSync(from, to))
       .mockImplementationOnce(() => { throw new Error("rollback denied"); });
 
-    const out = applyTeamName(NEW, deps({ syncManifest: () => false, moveDir }));
+    const onRenamed = vi.fn();
+    const out = applyTeamName(NEW, deps({ syncManifest: () => false, moveDir, onRenamed }));
 
     expect(out.ok).toBe(false);
     if (out.ok) return;
@@ -281,5 +329,9 @@ describe("applyTeamName — 失败注入与回滚", () => {
     expect(out.message).toContain("/team resume");
     expect(existsSync(sessionDir(NEW))).toBe(true);
     expect(getSessionState().teamDefinition!.name).toBe(NEW);
+    // The directory HAS moved → the settings binding + widget must follow,
+    // otherwise a later settings write recreates a stray old-name directory.
+    expect(onRenamed).toHaveBeenCalledTimes(1);
+    expect(onRenamed).toHaveBeenCalledWith(NEW);
   });
 });
