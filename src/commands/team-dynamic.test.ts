@@ -71,6 +71,31 @@ describe("/team dynamic", () => {
       expect.stringContaining("动态团队模式已启动"),
       "info"
     );
+    // Unnamed dynamic sessions hint that the team can still be named.
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("可以告诉 TL 你希望的团队名称"),
+      "info"
+    );
+  });
+
+  it("ignores a trailing name argument (no command parameter; no naming side effect)", async () => {
+    const pi = createMockExtensionAPI();
+    const teamCtx = createTeamContext();
+    teamCtx.onSessionStart = vi.fn();
+    registerTeamCommand(pi, teamCtx);
+    const cmdHandler = (pi.registerCommand as any).mock.calls[0][1];
+    const ctx = createMockContext();
+
+    await cmdHandler.handler("dynamic 订单并发重构", ctx);
+
+    const state = getSessionState();
+    expect(state.active).toBe(true);
+    expect(state.teamDefinition!.name).toMatch(/^_dynamic_/);
+    expect(existsSync(join(tmpDir, "sessions", "订单并发重构"))).toBe(false);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("可以告诉 TL 你希望的团队名称"),
+      "info"
+    );
   });
 
   it("rejects if session is already active", async () => {
