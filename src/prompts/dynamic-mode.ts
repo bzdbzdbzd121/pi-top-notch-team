@@ -8,6 +8,7 @@ import { DESIGN_READ_GUARD_THRESHOLD } from "../settings/tl-self-work-guard-cons
 import { buildTeamStateDeclaration } from "./session-transition-notice";
 import { GOAL_CLOSING_PROTOCOL_PROMPT } from "./goal-closing-protocol";
 import { TASK_DISPATCH_PROTOCOL_PROMPT } from "./task-dispatch-protocol";
+import { MEMBER_RESTART_GUIDANCE } from "./member-restart-guidance";
 import { getSharedContextPath } from "../session/shared-context";
 
 /**
@@ -256,8 +257,7 @@ ${buildFirstActionProtocolPrompt(guard)}
 
 > 🧠 记住：如果你在 read 代码文件或写代码，那你就是在做 Member 的工作。停下来，把任务分派出去。
 
-### 成员完成任务后不要主动停止其进程
-Member 进程保持运行以便继续接收新任务。仅当成员进程异常时（崩溃、无响应），才使用 stop_member 终止后重新启动。
+${MEMBER_RESTART_GUIDANCE}
 
 ### 工作流
 在 .shared-context.md（\`${sharedCtxPath}\`）中已定义了工作流，务必遵循：
@@ -275,7 +275,7 @@ Member 进程保持运行以便继续接收新任务。仅当成员进程异常�
 ### 可用工具
 1. **write_shared_context(content)** — 更新共享上下文到 \`${sharedCtxPath}\`（内容覆盖写入）。更新后通过 team_send_and_wait 通知所有成员重新阅读 .shared-context.md
 2. **write** — 编写其他 .md 文档（ADR 等；**.shared-context.md 必须用 write_shared_context 写入**）
-3. **start_member(name)** — 启动 Member 进程
+3. **start_member(name, fresh?)** — 启动 Member 进程；默认续接该成员已有的会话，\`fresh: true\` 丢弃该成员的会话上下文（旧会话归档）
 4. **team_send_and_wait({tasks: [{to, content}], nextSteps})** — 给 Member 发任务并等待回复。tasks 支持多个任务并发发送（如 [{to:"a", content:"..."}, {to:"b", content:"..."}]）。等待所有任务完成或有成员空闲后返回。\`team_send_and_wait\` 返回的 \`allIdle\` 状态表示所有成员空闲——检查工作成果后继续分配任务
 5. **list_members** — 查看各 Member 的运行状态
 6. **wait_and_get_member_status()** — **优先使用**。等待所有成员空闲后查看操作状态（idle/working/crashed/stopped）。如果有成员在工作会阻塞，和 team_send_and_wait 检测 all-idle 的方式相同

@@ -11,6 +11,7 @@ import {
   SESSION_ENTRY_NOTICE_ANCHOR,
   SESSION_ENTRY_NOTICE_MAX_TURNS,
 } from "./prompts/session-transition-notice";
+import { MEMBER_RESTART_GUIDANCE } from "./prompts/member-restart-guidance";
 import { saveSyncConfig } from "./sync/config";
 
 // P2 集成测试：start_member 完整链路需要 mock 成员子进程 spawn（避免真实启动
@@ -1422,6 +1423,21 @@ describe("session entry notice", () => {
     const result = await runTurn();
     expect(result.message).toBeUndefined();
     expect(result.systemPrompt).toContain("团队会话已从中断中恢复");
+    // 阶段 4（§3.4.3）：横幅改条件式——不再断言「完整上下文已保留」
+    expect(result.systemPrompt).not.toContain("完整对话上下文已保留");
+    expect(result.systemPrompt).toContain("取决于该成员是否有可用的会话记录");
+  });
+
+  it("阶段 4：预定义提示词逐字节注入 MEMBER_RESTART_GUIDANCE，工具清单行含 fresh? 与「默认续接」", async () => {
+    await startPredefined("guidance-team");
+    const result = await runTurn();
+
+    expect(result.systemPrompt).toContain(MEMBER_RESTART_GUIDANCE);
+    const toolLine = result.systemPrompt
+      .split("\n")
+      .find((line: string) => line.includes("start_member(name, fresh?)"));
+    expect(toolLine).toBeDefined();
+    expect(toolLine).toContain("默认续接");
   });
 
   it("acceptance 7: agent-initiated sessions never get the notice", async () => {

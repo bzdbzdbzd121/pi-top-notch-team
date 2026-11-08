@@ -53,6 +53,7 @@ import {
 } from "./src/prompts/session-transition-notice";
 import { GOAL_CLOSING_PROTOCOL_PROMPT } from "./src/prompts/goal-closing-protocol";
 import { TASK_DISPATCH_PROTOCOL_PROMPT } from "./src/prompts/task-dispatch-protocol";
+import { MEMBER_RESTART_GUIDANCE } from "./src/prompts/member-restart-guidance";
 import { buildWorkflowPrompt, WORKFLOW_ACTIVATION_BANNER } from "./src/prompts/workflow-prompt";
 import { createTlReadGuard, createDesignReadGuard } from "./src/session/tl-read-guard";
 import { enforceSessionToolVisibility, SESSION_TOOL_NAMES } from "./src/session/session-tool-visibility";
@@ -1268,9 +1269,12 @@ export default function (pi: ExtensionAPI) {
       resumeBanner = `
 ## ⚡ 团队会话已从中断中恢复（/team resume）
 
-此会话（${r.teamName} / ${r.sessionId}）刚从磁盘清单恢复。成员进程已用 \`--continue\` 重启，**成员的完整对话上下文已保留**：
-- 已带上下文重启的成员：${restarted}
+此会话（${r.teamName} / ${r.sessionId}）刚从磁盘清单恢复。成员进程已用 \`--continue\` 重启：
+- 已重启的成员：${restarted}
 - 重启失败的成员：${failed}${r.failedMembers.length > 0 ? "（可用 start_member 重试）" : ""}
+
+说明：是否真正续接此前的对话，取决于该成员是否有可用的会话记录（存在会话文件且工作目录一致）。
+有可用记录的成员会接着此前的对话；没有可用记录的成员会以全新上下文启动——如果某个成员不记得之前的事，请重新交代必要背景（见 start_member 的结果说明）。
 
 **恢复后的首要动作：**
 1. 用 \`list_members\` / \`wait_and_get_member_status\` 确认成员状态
@@ -1417,8 +1421,7 @@ ${workflowText}
 
 > 🧠 记住：如果你在 read 代码文件或写代码，那你就是在做 Member 的工作。停下来，把任务分派出去。
 
-### 成员完成任务后不要主动停止其进程
-Member 进程保持运行以便继续接收新任务。仅当成员进程异常时（崩溃、无响应），才使用 stop_member 终止后重新启动。
+${MEMBER_RESTART_GUIDANCE}
 
 ### 与用户讨论需求的方式
 
@@ -1448,7 +1451,7 @@ ${TASK_DISPATCH_PROTOCOL_PROMPT}
 你拥有 8 个团队管理工具：
 
 1. **write_shared_context(content)** — 写入团队共享上下文到 \`${sharedCtxPath}\`。**启动任何成员前必须至少调用一次**（未写入时 start_member 会被系统拦截）。内容应包含：项目背景与目标、成员分工、工作流、协作规则、术语表与关键决策。后续更新共享上下文时再次调用，并通知成员重新阅读
-2. **start_member(name)** — 启动一个 Member 进程
+2. **start_member(name, fresh?)** — 启动一个 Member 进程；默认续接该成员已有的会话，\`fresh: true\` 丢弃该成员的会话上下文（旧会话归档）
 3. **team_send_and_wait({tasks: [{to, content}], nextSteps})** — 给 Member 发任务并等待回复。tasks 支持多个任务并发发送（如多个独立检视任务可同时发出）。等待所有任务完成或有成员空闲后返回。必须传入 nextSteps（下一步计划），wait结束后该信息会随结果返回。**batch vs sequential 决策规则见下方提示**
 4. **list_members** — 查看各 Member 的运行状态
 5. **wait_and_get_member_status()** — **优先使用**。等待所有成员空闲后查看操作状态（idle/working/crashed/stopped）。如有成员在工作则阻塞，和 team_send_and_wait 检测 all-idle 的方式相同

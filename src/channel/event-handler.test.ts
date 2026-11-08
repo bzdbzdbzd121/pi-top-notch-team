@@ -531,6 +531,32 @@ describe("createMemberEventHandler", () => {
     );
   });
 
+  // 阶段 4（方案 §3.4.1 #4）：崩溃通知是「要不要重启」的决策点，必须当场说明
+  // 重启方式与两种重启的区别；正常停止通知不追加（无重启需求）。
+  it("崩溃通知追加重启指引（start_member / 默认续接 / fresh），正常停止通知不变", async () => {
+    const { createMemberEventHandler } = await loadModule();
+    const deps = createMockDeps();
+    const handler = createMemberEventHandler("worker", deps as any);
+
+    handler({ type: "process_exit", memberName: "worker", exitCode: 1, wasRunning: true });
+    const crashText = (deps.pi.sendMessage as any).mock.calls
+      .map((call: unknown[]) => String((call[0] as any)?.content))
+      .join("\n");
+    expect(crashText).toContain("进程异常退出");
+    expect(crashText).toContain("start_member");
+    expect(crashText).toContain("默认续接");
+    expect(crashText).toContain("fresh");
+
+    (deps.pi.sendMessage as any).mockClear();
+    handler({ type: "process_exit", memberName: "worker", exitCode: 0, wasRunning: true });
+    const stopText = (deps.pi.sendMessage as any).mock.calls
+      .map((call: unknown[]) => String((call[0] as any)?.content))
+      .join("\n");
+    expect(stopText).toContain("进程已正常停止");
+    expect(stopText).not.toContain("重启方式");
+    expect(stopText).not.toContain("fresh");
+  });
+
   it("should resolve pending wait on abnormal process_exit", async () => {
     const { createMemberEventHandler } = await loadModule();
     const deps = createMockDeps();

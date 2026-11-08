@@ -431,6 +431,23 @@ The TL follows the **Orchestration Playbook** (`src/prompts/orchestration-playbo
 - Delete the YAML file
 - Notify user
 
+### `/team clean [团队名]`
+
+只删除成员重启归档（`start_member({fresh:true})` 的产物），不碰任何活数据。**会话进行中也允许**（只删 `.member-resets`，与成员会话目录、名册、共享上下文、消息通道无关）。
+
+**Flow:**
+1. 只读扫描 `<数据目录>/sessions/` 下的所有 `.member-resets`（支持 `<团队>/<会话>/.member-resets/…` 与旧扁平布局 `<团队>/.member-resets/…`），统计团队数 / 会话数 / 归档目录数 / 合计字节；**预览 = 干跑，零写操作**
+2. 预览（`notify`，最多列 6 条路径，其余折叠为「另有 K 个」）：`成员重启归档（范围：全部团队）` + 计数行 + 目录行 + 「只清理 .member-resets 下的归档；团队定义、会话历史、共享上下文不受影响。」
+3. `ctx.ui.confirm("确认清理成员重启归档", "将删除 N 个归档目录（合计 X），删除后不可恢复。")`；取消 → 「已取消清理」
+4. 逐条删除（同步），空的 `<成员>` 目录与空 `.member-resets` 顺手清理，非空父目录保留；汇总「✅ 已清理 N 个归档目录，释放 X」，失败逐条列出并以 warning 呈现
+
+**安全约束（误删/越界防护）**
+- 只删形状完全匹配的目录：`.../sessions/<团队>[/<会话>]/.member-resets/<成员>/<时间戳>/`；时间戳必须匹配 `^\d{8}-\d{6}(-\d+)?$`，成员/会话段不得含路径分隔符；不匹配的条目**跳过并报告**，绝不按父目录整体删除
+- 符号链接：归档根 / 成员目录 / 时间戳条目为链接 → 跳过并报告；删除前用 `lstat` + `realpath` 复核，确认仍在 `<数据目录>/sessions` 之内（父目录被换成链接也拦得住）
+- 单个目录删除失败（占用/权限）只影响该条，其余继续，逐条列出原因
+- 无归档 → 单条提示，不弹确认框
+- `/team clean <团队>` 先确认团队存在（定义文件或会话目录任一存在），不存在 → 明确提示且不动其他团队
+
 ### `/team status`
 
 - Check if a team session is currently active
@@ -523,17 +540,23 @@ interface TlToolsDeps {
 ### `start_member`
 
 ```typescript
-start_member({ name: "analyzer" })
+start_member({ name: "analyzer" })                 // 首次启动（无旧会话 → 全新）
+start_member({ name: "analyzer" })                 // 重启 → 默认续接已有的会话
+start_member({ name: "analyzer", fresh: true })    // 重启并丢弃该成员的对话上下文
 ```
 
+- 重复启动守卫（方案 §3.1）：先读进程句柄状态——`running` → 拒绝（附 PID 与三条出路）；`stopped + PID 非空`（正在停止中）→ 拒绝；`stopped + PID 空` /`error`/`idle`/无句柄 → 放行。命中时**零副作用**（不建目录、不写名册、不归档、不触发阶段切换）。同一条消息里并行的两次 `start_member` 只会有一次通过（检查→建目录→登记句柄→`start()` 同步前缀内无 `await`）。`createAndRegisterMember` 内部另有一层结构性兜底（早于操作状态重置，`/team resume` 同样受保护）
+- 共享上下文门控（既有）：`write_shared_context` 未调用前拒绝
 - Reads the team definition for the named Member's config
+- `fresh`（阶段 2）：`true` 时配置层不产生 `resume` 标记（优先级高于自动探测与显式 `resume: true`），并在启动前把成员会话目录下的全部 `.jsonl` 归档到 `<团队会话目录>/.member-resets/<成员>/<YYYYMMDD-HHMMSS[-n]>/`（同步文件 API、失败不阻断启动）
 - Resolves the working directory (same as user's CWD)
 - Spawns: `pi --mode rpc -e <member-extension-path> --session-dir <session-dir>`
 - Sets environment variables on the subprocess (see §8)
 - Connects to RPC stdin/stdout
 - Adds the Member to the process manager's tracking
 - Registers RPC event listener for `tool_execution_end` to detect `team_send_message`
-- Returns status: `{ name: "analyzer", pid: 12345, status: "running" }`
+- 结果会话附注（阶段 4，只报事实）：启动前扫目录 + （仅「未 fresh 且有文件」时）启动后一次 `get_state`（3s 超时，失败不阻断）→ `已续接（历史 N 条）` / `⚠️ 未续接（查询到 0 条）` / `无法确认（查询失败）` / `全新会话（此前无可续接历史）` / `全新会话（已归档 N 个 → 路径）` / `⚠️ 有 M 个未能归档`；`details` 带 `sessionMode` / `resumeRequested` / `archivedFiles` / `archiveDir` / `archiveFailures` / `memberArchiveCount` / `memberArchiveBytes` / `messageCount`
+- 工具说明与 promptGuidelines 写明：默认续接、`fresh` 的代价与边界（不回滚文件、不动共享上下文）、已运行会被拒绝
 
 ### `stop_member`
 
@@ -544,7 +567,7 @@ stop_member({ name: "analyzer" })
 - Sends SIGTERM to the Member's process
 - If process doesn't exit within grace period, sends SIGKILL
 - Removes from process manager tracking
-- Returns status: `{ name: "analyzer", status: "stopped" }`
+- 结果：`{ name: "analyzer", status: "stopped" }`；**仅当该成员确有会话文件**时追加「此前的会话已保留；再次 start_member 会续接它（需要全新上下文时传 fresh: true）」——对没有历史的成员不说假话
 
 ### `list_members`
 
@@ -842,6 +865,8 @@ The `before_agent_start` handler injects different prompts depending on the sess
 - **Dynamic mode — design phase** (`/team dynamic`, phase="design"): A stripped-down prompt that focuses only on requirements discussion and team design. Explicitly lists forbidden actions. TL is told its "code abilities are in sleep mode". Defines a six-stage design process (A–F) with completion criteria, and appends the full **Orchestration Playbook** loaded from `src/prompts/orchestration-playbook.md` (runtime file read relative to the module, cached, with an inline fallback summary if missing). Includes the plan confirmation gate: TL is forbidden from calling `add_dynamic_member`/`start_member` before explicit user confirmation
 - **Dynamic mode — execution phase** (after first `start_member`): Similar to the normal team session prompt, with delegation principles and workflow guidance. Adds batched-dispatch guidance: when the workflow defines batches, TL dispatches batch-by-batch (verify each batch before sending the next) and reports progress as "批次 N/M"
 
+两种模式（预定义团队与 dynamic 执行阶段）都会注入**同一个**共享提示词块 `MEMBER_RESTART_GUIDANCE`（`src/prompts/member-restart-guidance.ts`，决策 #49）：三类可判定的重启理由（崩溃 / 长时间无响应 / 明显跑偏）+ 默认续接 + `fresh` 的代价与边界（不回滚文件、不动共享上下文）。此前两处各有一份逐字相同的硬编码副本，只改一处会留下相反指引；测试锁定两处注入的是同一常量。工具清单行同步为 `start_member(name, fresh?)`。agent 自主会话提示词**不注入**（已很长，工具说明与指引已覆盖）。
+
 The prompt builder function `buildDynamicModePrompt(team, phase)` in `src/prompts/dynamic-mode.ts` returns different content based on the `phase` parameter.
 
 When `/team start` creates a team session, the extension sets up a `before_agent_start` handler that injects a structured prompt with the following sections:
@@ -985,10 +1010,10 @@ Session state (active + team definition) is stored in `session/state.ts` as a mo
 
 1. The Member's `ChildProcess` emits `"exit"` with non-zero code
 2. `MemberProcessManager` detects the unexpected exit
-3. Manager logs the crash, notifies TL, and applies bounded auto-restart with exponential backoff; crash-loop detection freezes repeated failures
-4. TL is notified via a custom message: "Member 'analyzer' 进程异常退出（code: 1），需检查崩溃原因。"
+3. Manager logs the crash and notifies TL。**自动重启当前关闭**（`autoRestart: false`）：退避与崩溃循环冻结机制保留在管理器里，仅在打开该开关时生效
+4. TL is notified via a custom message: "Member 'analyzer' 进程异常退出（code: 1），需检查崩溃原因。重启方式：start_member（默认续接此前的上下文；需要干净上下文时传 fresh: true）。"
    - Exit code 143 (SIGTERM) is treated as normal stop via `stop_member`, no notification sent
-5. TL can use `stop_member` + `start_member` to intervene manually; a restarted Member resumes its persisted session when available
+5. 重启语义：默认续接该成员持久化的会话（有可用会话记录时）；需要丢弃上下文用 `start_member({name, fresh:true})`（旧会话归档到 `.member-resets`，可用 `/team clean` 清理）；对正在运行的成员重复调用会被拒绝（决策 #49 与方案阶段 1）
 
 ### Member process stuck / unresponsive
 
@@ -1017,6 +1042,11 @@ Each team session gets a unique `sessionId` (timestamp + random suffix) to isola
     └── refactoring/
         └── <sessionId>/            ← unique per session
             ├── .shared-context.md   ← shared context (session-scoped)
+            ├── session.json         ← manifest（/team resume 锚点）
+            ├── .member-resets/      ← 成员重启归档根（fresh 的产物；点号开头）
+            │   └── analyzer/
+            │       └── 20261108-103000/
+            │           └── 2026-11-08T02-30-00-000Z_ab12cd34.jsonl
             ├── analyzer/
             │   └── session.jsonl
             ├── mover/
@@ -1024,6 +1054,13 @@ Each team session gets a unique `sessionId` (timestamp + random suffix) to isola
             └── verifier/
                 └── session.jsonl
 ```
+
+**成员会话文件与归档**
+
+- 成员会话是 **pi 自己椎写的**（懒写盘：0.83.x 以第一条 assistant 为条件，1.5.x 认 user 或 assistant）；扩展只看两个可观测事实：目录里有没有 `.jsonl`（递归）、成员自报的历史条数（`get_state.messageCount`）
+- 续接判定（扩展）用递归扫描；pi 的 `--continue` 只扫目录顶层并做工作目录比对——两者不一致时会“请求了续接但实际新开”，所以结果文案必须实测而不是猜（§6 `start_member` 的会话附注）
+- `fresh: true` 把成员会话目录下的全部 `.jsonl` 移到 **同级** 的 `.member-resets/<成员>/<时间戳>/`（保持相对路径与原文件名；移回即可恢复）。归档根与成员目录同级是**结构性**排除：扩展的续接探测是递归的，留在成员目录内（哪怕改后缀）仍会被当成“有历史”；归档目录不被任何工具读取
+- 归档默认**保留不自动删**（它是唯一的事后现场）；用 `/team clean [团队名]` 显式清理（只删 `.member-resets`）；`/team delete` 删整个团队会话目录时归档一并清除
 
 Dynamic sessions (`_dynamic_<ts>`) use their unique team name for isolation:
 

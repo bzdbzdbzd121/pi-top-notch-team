@@ -204,7 +204,7 @@ describe("start_member fresh（阶段 2）", () => {
     expect(text).toContain("已启动");
     expect(text).toContain("未能归档");
     expect(text).toContain("EACCES: permission denied");
-    expect(text).toContain("旧文件仍在");
+    expect(text).toContain("旧文件位置：");
     expect(text).toContain(sessionDir);
     expect(text).toContain("下次启动可能续接旧会话");
     expect(result.details.archiveFailures).toBe(1);
@@ -258,17 +258,23 @@ describe("start_member fresh（阶段 2）", () => {
     }
   });
 
-  it("未传 fresh → 归档不调用，结果文案与改造前逐字节一致", async () => {
-    writeFileSync(join(sessionDir, "old.jsonl"), "{}\n");
-    const { archive, buildMemberConfig, startMember } = register();
+  it("未传 fresh + 无文件 → 不归档、不查询会话状态，主体文案不变并附「全新会话」行", async () => {
+    const { archive, buildMemberConfig, createMember, startMember } = register();
 
     const result = await startMember.execute("call-1", { name: "coder" });
 
     expect(buildMemberConfig).toHaveBeenCalledWith("coder", { fresh: false });
     expect(archive).not.toHaveBeenCalled();
-    expect(result.details).toEqual({});
+    // 无文件 → 不查询成员状态（D6：只在「请求了续接」时实测）
+    expect(createMember.mock.results[0].value.sendCommandAndWait).not.toHaveBeenCalled();
+    expect(result.details).toEqual({
+      sessionMode: "new",
+      resumeRequested: false,
+      archivedFiles: 0,
+    });
     expect(result.content[0].text).toBe(
-      '成员 "coder" 已启动 (PID: 4321)。模型：默认；思考强度：默认。' +
+      '成员 "coder" 已启动 (PID: 4321)。模型：默认；思考强度：默认。\n' +
+        "会话：全新会话（该成员此前没有可续接的历史）。\n" +
         "使用 list_members 查看状态，通过消息通道分配任务。"
     );
   });

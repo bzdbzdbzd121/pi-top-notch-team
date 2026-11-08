@@ -537,7 +537,11 @@ export function createMemberEventHandler(
         }
         deps.pi.sendMessage({
           customType: "team-message",
-          content: `Member "${exitMemberName}" 进程异常退出（code: ${exitCode}），需检查崩溃原因。`,
+          content:
+            `Member "${exitMemberName}" 进程异常退出（code: ${exitCode}），需检查崩溃原因。` +
+            // 阶段 4（方案 §3.4.1 #4）：TL 收到崩溃通知的下一秒就在决定要不要重启，
+            // 这里必须当场说明重启方式与两种重启的区别。
+            `重启方式：start_member（默认续接此前的上下文；需要干净上下文时传 fresh: true）。`,
           display: true,
           details: { crashEvent: event },
         });
