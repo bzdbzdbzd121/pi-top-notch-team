@@ -107,4 +107,27 @@ describe("teardownTeamSession — sessionEndedNotice", () => {
       expect(teamCtx.entryNoticeTurnsRemaining ?? 0).toBe(0);
     });
   });
+
+  it("removes set_team_name from the active tool set (no leak past the session)", async () => {
+    startSession({
+      name: "test-team",
+      description: "Test",
+      members: [{ name: "worker", systemPrompt: "do work" }],
+    });
+    (pi.getActiveTools as any).mockReturnValue([
+      "start_member",
+      "read",
+      "set_team_name",
+      "add_dynamic_member",
+      "stop_team_session",
+    ]);
+
+    await teardownTeamSession(pi, teamCtx);
+
+    const activated = (pi.setActiveTools as any).mock.calls.at(-1)![0] as string[];
+    expect(activated).not.toContain("set_team_name");
+    expect(activated).not.toContain("add_dynamic_member");
+    expect(activated).not.toContain("stop_team_session");
+    expect(activated).toContain("read");
+  });
 });

@@ -499,6 +499,21 @@ describe("拦截文案豁免清单与 MANAGEMENT_TOOLS 事实一致", () => {
   it("points at the settings entry", () => {
     expect(EXEMPT_ACTIONS_LINE).toContain("/team setting");
   });
+
+  it("set_team_name 不消耗派发预算，sticky 拦截期间仍可用", () => {
+    const g = createTlReadGuard();
+    // reach the sticky state (default threshold 3): 4th code read is blocked
+    for (const p of ["src/a.ts", "src/b.ts", "src/c.ts"]) {
+      expect(g.checkToolCall("read", p).block).toBe(false);
+    }
+    expect(g.checkToolCall("read", "src/d.ts").block).toBe(true);
+    // naming the team is management work: never counted, never blocked
+    for (let i = 0; i < 5; i++) {
+      expect(g.checkToolCall("set_team_name").block).toBe(false);
+    }
+    // still sticky for actual analysis work
+    expect(g.checkToolCall("read", "src/e.ts").block).toBe(true);
+  });
 });
 
 describe("设计阶段软提醒的对等入口", () => {

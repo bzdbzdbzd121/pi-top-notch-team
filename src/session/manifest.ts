@@ -189,11 +189,15 @@ export interface ManifestSyncPatch {
  * identity from getSessionState(), dynamic flags from the runtime context, and
  * accumulates startedMembers/memberPids from the existing on-disk manifest.
  * No-op when no session is active; fail-open on fs errors.
+ *
+ * @returns true = the manifest was written; false = no active session or the
+ * write failed. The rename transaction treats this as a hard condition
+ * (`set_team_name`), every other caller ignores the return value (fail-open).
  */
-export function syncActiveManifest(patch: ManifestSyncPatch = {}, rootDir: string = getRootDir()): void {
+export function syncActiveManifest(patch: ManifestSyncPatch = {}, rootDir: string = getRootDir()): boolean {
   try {
     const session = getSessionState();
-    if (!session.active || !session.teamDefinition || !session.sessionId) return;
+    if (!session.active || !session.teamDefinition || !session.sessionId) return false;
 
     const team = session.teamDefinition;
     const path = getManifestPath(rootDir, team.name, session.sessionId);
@@ -233,8 +237,10 @@ export function syncActiveManifest(patch: ManifestSyncPatch = {}, rootDir: strin
     };
 
     writeManifestFile(path, manifest);
+    return true;
   } catch {
     // Fail-open: manifest persistence must never break the session.
+    return false;
   }
 }
 

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getRootDir } from "../config";
 import type { TeamDefinition } from "../team/definition";
@@ -77,4 +77,30 @@ export function ensureSharedContextFile(
     }
   }
   return path;
+}
+
+/**
+ * Rewrite the system stub after a team rename — ONLY when the file is still
+ * byte-identical to the stub generated for the OLD team (the caller has
+ * already moved the session directory, so the file is read at the NEW path).
+ * A TL-written shared context is never touched.
+ *
+ * @returns true = the stub was rewritten with the new name; false = the file
+ * is missing or already TL-written (or the write failed — fail-open).
+ */
+export function rewriteStubIfUnchanged(
+  oldTeam: TeamDefinition,
+  newTeam: TeamDefinition,
+  sessionId: string | null
+): boolean {
+  const path = getSharedContextPath(newTeam.name, sessionId);
+  try {
+    if (!existsSync(path)) return false;
+    if (readFileSync(path, "utf-8") !== buildStubContent(oldTeam)) return false;
+    writeFileSync(path, buildStubContent(newTeam), "utf-8");
+    return true;
+  } catch {
+    // fail-open — the old stub mentions the old name, which is cosmetic only
+    return false;
+  }
 }

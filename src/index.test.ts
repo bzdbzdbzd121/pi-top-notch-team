@@ -776,6 +776,21 @@ describe("TL pre-dispatch guard in tool_call handler", () => {
     }
   });
 
+  it("set_team_name 在执行阶段白名单内，且不计入派发预算、sticky 期仍可用", async () => {
+    await startActiveSession();
+    const toolCall = getHandler("tool_call");
+    for (const p of ["src/a.ts", "src/b.ts", "src/c.ts"]) {
+      toolCall({ toolName: "read", input: { path: p } });
+    }
+    // sticky: code reads are blocked…
+    expect(toolCall({ toolName: "read", input: { path: "src/d.ts" } })).toEqual(
+      expect.objectContaining({ block: true })
+    );
+    // …but the naming tool is whitelisted AND exempt from the guard budget.
+    expect(toolCall({ toolName: "set_team_name", input: { name: "登录重构" } })).toBeUndefined();
+    expect(toolCall({ toolName: "set_team_name", input: { name: "登录重构2" } })).toBeUndefined();
+  });
+
   it("agent_start resets the per-turn budget", async () => {
     await startActiveSession();
     const toolCall = getHandler("tool_call");
@@ -903,6 +918,37 @@ describe("design-phase read limiter in tool_call handler", () => {
     // legitimate design-phase work — only code work is blocked there.
     expect(toolCall({ toolName: "ask_user_question", input: { questions: [] } })).toBeUndefined();
     expect(toolCall({ toolName: "todo", input: { action: "list" } })).toBeUndefined();
+  });
+
+  it("allows set_team_name in the design phase (naming must happen before members start)", () => {
+    const toolCall = getHandler("tool_call");
+    expect(toolCall({ toolName: "set_team_name", input: { name: "登录重构" } })).toBeUndefined();
+  });
+
+  it("session_shutdown removes set_team_name from the active set (no leak past the session)", () => {
+    // The dynamic bootstrap activated the tool (registered + extras).
+    const activatedByBootstrap = (pi.setActiveTools as ReturnType<typeof vi.fn>).mock.calls.at(-1)![0] as string[];
+    expect(activatedByBootstrap).toContain("set_team_name");
+
+    const shutdown = getHandler("session_shutdown");
+    (pi.getActiveTools as any).mockReturnValue(["read", "set_team_name", "add_dynamic_member", "start_member"]);
+    shutdown();
+
+    const remaining = (pi.setActiveTools as ReturnType<typeof vi.fn>).mock.calls.at(-1)![0] as string[];
+    expect(remaining).not.toContain("set_team_name");
+    expect(remaining).not.toContain("add_dynamic_member");
+    expect(remaining).toContain("read");
+  });
+
+  it("/new（全新会话）清理路径同样移除 set_team_name", () => {
+    const sessionStart = getHandler("session_start");
+    (pi.getActiveTools as any).mockReturnValue(["read", "set_team_name", "add_dynamic_member"]);
+
+    sessionStart({ type: "session_start", reason: "new" }, createMockContext());
+
+    const remaining = (pi.setActiveTools as ReturnType<typeof vi.fn>).mock.calls.at(-1)![0] as string[];
+    expect(remaining).not.toContain("set_team_name");
+    expect(remaining).toContain("read");
   });
 
   it("allows read, then soft-blocks every 4th code read with a reminder (next read passes again)", () => {

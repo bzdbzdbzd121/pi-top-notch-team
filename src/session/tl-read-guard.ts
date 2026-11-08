@@ -57,6 +57,9 @@ export const MANAGEMENT_TOOLS = new Set([
   "start_member", "stop_member", "list_members", "get_member_log",
   "wait_and_get_member_status", "team_send_and_wait",
   "set_goal", "finish_goal", "add_dynamic_member",
+  // Naming the team is a one-time management step of the design phase; it
+  // must never consume the pre-dispatch budget nor be blocked while sticky.
+  "set_team_name",
   // write_shared_context is step 1 of the first-action protocol. Counting it
   // would let the guard block the only legal way to satisfy the start_member
   // gate (start_member is refused until the shared context is written), so a
@@ -83,7 +86,7 @@ export const MANAGEMENT_TOOLS = new Set([
  * MANAGEMENT_TOOLS 的每一项都必须在这里出现——文案与事实不得分叉。
  */
 export const EXEMPT_ACTIONS_LINE =
-  `• 以下动作不受此限制（不计数、不会被拦）：write_shared_context、start_member、stop_member、list_members、get_member_log、wait_and_get_member_status、team_send_and_wait、set_goal、finish_goal、add_dynamic_member、start_team_session、stop_team_session、write/edit（仅 .md 文档）、ask_user_question、todo，以及读取 .md 文档（含 .shared-context.md）。\n` +
+  `• 以下动作不受此限制（不计数、不会被拦）：write_shared_context、start_member、stop_member、list_members、get_member_log、wait_and_get_member_status、team_send_and_wait、set_goal、finish_goal、add_dynamic_member、set_team_name、start_team_session、stop_team_session、write/edit（仅 .md 文档）、ask_user_question、todo，以及读取 .md 文档（含 .shared-context.md）。\n` +
   `• 上限可在 /team setting →「TL 亲自分析限制」中调整次数或关闭。`;
 
 export interface TlReadGuardConfig {

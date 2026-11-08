@@ -10,6 +10,8 @@ import { listTeams } from "../team/store";
 import { normalizeTeamName } from "../team/team-name";
 import { ensureToolRegistered } from "../commands/shared/ensure-tool";
 import { STOP_TEAM_SESSION_TOOL_NAME } from "../tools/agent-session-tool-names";
+import { SET_TEAM_NAME_TOOL_NAME } from "../tools/team-name-tool-names";
+import { ensureSetTeamNameTool } from "../tools/team-name-tool";
 import { SESSION_ENTRY_NOTICE_MAX_TURNS } from "../prompts/session-transition-notice";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
@@ -188,16 +190,23 @@ export function bootstrapDynamicSession(
   syncActiveManifest({ status: "active" });
 
   ensureAddDynamicMemberTool(pi, teamCtx);
+  // Naming is part of the same mode-tool family (design phase only; the tool
+  // itself rejects renames once a member process is running).
+  ensureSetTeamNameTool(pi, teamCtx);
 
   // Install team status widget (design phase — 0 members) and register ALL
   // session-only tools BEFORE activating them — pi.setActiveTools silently
   // ignores unregistered names.
   teamCtx.onSessionStart?.(ui);
 
-  // Activate TL tools (+ add_dynamic_member for dynamic mode; +
+  // Activate TL tools (+ add_dynamic_member and set_team_name for dynamic mode; +
   // stop_team_session for agent-initiated sessions only — user-initiated
   // sessions keep their lifecycle user-owned).
-  const extras = ["add_dynamic_member", ...(origin === "agent" ? [STOP_TEAM_SESSION_TOOL_NAME] : [])];
+  const extras = [
+    "add_dynamic_member",
+    SET_TEAM_NAME_TOOL_NAME,
+    ...(origin === "agent" ? [STOP_TEAM_SESSION_TOOL_NAME] : []),
+  ];
   const currentActive = pi.getActiveTools();
   const newActive = [...new Set([...currentActive, ...teamCtx.tlToolNames, ...extras])]
     .filter((t) => t !== "create_team_definition" && t !== "update_team_definition");

@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync, renameSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { getSharedContextPath, ensureSharedContextFile } from "./shared-context";
+import { getSharedContextPath, ensureSharedContextFile, rewriteStubIfUnchanged } from "./shared-context";
 import type { TeamDefinition } from "../team/definition";
 
 function createTeam(overrides?: Partial<TeamDefinition>): TeamDefinition {
@@ -97,5 +97,61 @@ describe("ensureSharedContextFile", () => {
     const result = ensureSharedContextFile(team, "abc123");
     expect(result).toBe(p);
     expect(readFileSync(p, "utf-8")).toBe("# 已有的共享上下文\n重要内容");
+  });
+});
+
+describe("rewriteStubIfUnchanged", () => {
+  let tmpDir: string;
+  const originalRoot = process.env.TOP_NOTCH_TEAM_ROOT;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "shared-context-rewrite-"));
+    process.env.TOP_NOTCH_TEAM_ROOT = tmpDir;
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+    if (originalRoot) {
+      process.env.TOP_NOTCH_TEAM_ROOT = originalRoot;
+    } else {
+      delete process.env.TOP_NOTCH_TEAM_ROOT;
+    }
+  });
+
+  it("rewrites the system stub with the new team name", () => {
+    const oldTeam = createTeam({ name: "_dynamic_1" });
+    const newTeam = createTeam({ name: "登录重构" });
+    const path = ensureSharedContextFile(oldTeam, "sid-1");
+    expect(readFileSync(path, "utf-8")).toContain("# Shared Context — _dynamic_1");
+    // The rename transaction moves the directory first, then rewrites the stub.
+    renameSync(join(tmpDir, "sessions", "_dynamic_1"), join(tmpDir, "sessions", "登录重构"));
+
+    expect(rewriteStubIfUnchanged(oldTeam, newTeam, "sid-1")).toBe(true);
+
+    const rewritten = readFileSync(getSharedContextPath("登录重构", "sid-1"), "utf-8");
+    expect(rewritten).toContain("# Shared Context — 登录重构");
+    expect(rewritten).not.toContain("_dynamic_1");
+    // No file left behind under the old name (the caller moves the directory).
+    expect(existsSync(getSharedContextPath("_dynamic_1", "sid-1"))).toBe(false);
+    expect(existsSync(join(tmpDir, "sessions", "_dynamic_1"))).toBe(false);
+  });
+
+  it("never touches a TL-written shared context (byte-identical)", () => {
+    const oldTeam = createTeam({ name: "_dynamic_1" });
+    const newTeam = createTeam({ name: "登录重构" });
+    const path = join(tmpDir, "sessions", "登录重构", "sid-1", ".shared-context.md");
+    mkdirSync(join(tmpDir, "sessions", "登录重构", "sid-1"), { recursive: true });
+    const custom = "# TL 写的\n重要内容\n";
+    writeFileSync(path, custom, "utf-8");
+
+    expect(rewriteStubIfUnchanged(oldTeam, newTeam, "sid-1")).toBe(false);
+    expect(readFileSync(path, "utf-8")).toBe(custom);
+  });
+
+  it("is a no-op when the file is missing (never creates one)", () => {
+    const oldTeam = createTeam({ name: "_dynamic_1" });
+    const newTeam = createTeam({ name: "登录重构" });
+    expect(rewriteStubIfUnchanged(oldTeam, newTeam, "sid-1")).toBe(false);
+    expect(existsSync(getSharedContextPath("登录重构", "sid-1"))).toBe(false);
   });
 });

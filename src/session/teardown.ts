@@ -3,6 +3,7 @@ import type { TeamContext } from "./context";
 import { getSessionState, endSession } from "./state";
 import { resetGoal } from "../tools/goal-tools";
 import { STOP_TEAM_SESSION_TOOL_NAME } from "../tools/agent-session-tool-names";
+import { SET_TEAM_NAME_TOOL_NAME } from "../tools/team-name-tool-names";
 import { markManifestStopped, resetManifestRuntimeContext } from "./manifest";
 
 /**
@@ -51,6 +52,7 @@ export async function teardownTeamSession(
   const toRemove = new Set([
     ...teamCtx.tlToolNames,
     "add_dynamic_member",
+    SET_TEAM_NAME_TOOL_NAME,
     "create_team_definition",
     "update_team_definition",
     STOP_TEAM_SESSION_TOOL_NAME,
