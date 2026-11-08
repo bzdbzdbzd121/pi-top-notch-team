@@ -48,6 +48,8 @@ describe("createTeamStatusWidget", () => {
   /** Build a widget + capture the last setWidget content (lines). */
   function build(opts: {
     teamName?: string;
+    /** Dynamic name source (overrides `teamName`) — lets a test rename mid-flight. */
+    getTeamName?: () => string;
     members: TeamMember[];
     opsStates: Record<string, MemberOperationalState>;
     teamCtx?: any;
@@ -64,7 +66,7 @@ describe("createTeamStatusWidget", () => {
       Object.entries(opts.opsStates)
     );
     const widget = widgetFactory({
-      teamName: opts.teamName ?? "test-team",
+      getTeamName: opts.getTeamName ?? (() => opts.teamName ?? "test-team"),
       getMembers: () => opts.members,
       teamCtx: opts.teamCtx ?? createMockTeamCtx(),
       memberOpsStates,
@@ -188,6 +190,84 @@ describe("createTeamStatusWidget", () => {
     h.setWidget.mockClear();
     h.widget.refresh();
     expect(h.lines()![0]).toContain("新成员");
+  });
+
+  // ── Team name display (stage 2: naming) ──────────────────
+
+  describe("team name display (阶段 2)", () => {
+    it("getter 驱动标题：名字变化 → 恰好一次 setWidget；名字与成员均未变 → 不重复 setWidget", () => {
+      let name = "_dynamic_1789456123456";
+      const h = build({
+        getTeamName: () => name,
+        members: [createTeamMember("coder", "编码员")],
+        opsStates: { coder: "idle" },
+      });
+      h.widget.install(h.ui, h.theme);
+      // Synthetic fallback name renders as the placeholder, never the timestamp.
+      expect(h.middle()).toContain("未命名团队");
+      expect(h.middle()).not.toContain("_dynamic_");
+
+      h.setWidget.mockClear();
+      h.widget.refresh(); // nothing changed → render-side gate skips
+      expect(h.setWidget).not.toHaveBeenCalled();
+
+      name = "登录重构";
+      h.widget.refresh();
+      // The title is part of the render key: the name change renders exactly once.
+      expect(h.setWidget).toHaveBeenCalledTimes(1);
+      expect(h.middle()).toContain("登录重构");
+      expect(h.middle()).not.toContain("未命名团队");
+
+      h.setWidget.mockClear();
+      h.widget.refresh(); // stable name + unchanged members → still deduped
+      expect(h.setWidget).not.toHaveBeenCalled();
+    });
+
+    it("refresh 只读取一次名字，且去重键与渲染使用同一个值", () => {
+      const names = ["第一次", "第二次", "第三次"];
+      let reads = 0;
+      const h = build({
+        getTeamName: () => names[Math.min(reads++, names.length - 1)],
+        members: [createTeamMember("coder", "编码员")],
+        opsStates: { coder: "idle" },
+      });
+      h.widget.install(h.ui, h.theme);
+      expect(h.middle()).toContain("第一次");
+
+      const before = reads;
+      h.widget.refresh();
+      expect(reads - before).toBe(1); // single read per refresh
+      expect(h.middle()).toContain("第二次");
+      expect(h.middle()).not.toContain("第三次");
+    });
+
+    it("0 成员 + 未命名 → 占位名 + 设计阶段文案；改名后显真名（布局保持一行）", () => {
+      let name = "_dynamic_1789456123456";
+      const h = build({ getTeamName: () => name, members: [], opsStates: {} });
+      h.widget.install(h.ui, h.theme);
+      expect(h.lines()).toHaveLength(1);
+      expect(h.middle()).toContain("👤 未命名团队");
+      expect(h.middle()).toContain("设计阶段 · 设计团队中");
+
+      name = "登录重构";
+      h.widget.refresh();
+      expect(h.lines()).toHaveLength(1);
+      expect(h.middle()).toContain("登录重构");
+      expect(h.middle()).toContain("设计阶段 · 设计团队中");
+      expect(h.middle()).not.toContain("未命名团队");
+    });
+
+    it("有成员的未命名会话：标题显示占位，成员段不变", () => {
+      const h = build({
+        teamName: "_dynamic_1789456123456",
+        members: [createTeamMember("coder", "编码员")],
+        opsStates: { coder: "working" },
+      });
+      h.widget.install(h.ui, h.theme);
+      expect(h.middle()).toContain("👤 未命名团队");
+      expect(h.middle()).not.toContain("_dynamic_");
+      expect(h.middle()).toContain("编码员");
+    });
   });
 
   describe("session origin marker (ADR-0003)", () => {

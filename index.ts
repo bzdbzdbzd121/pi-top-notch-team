@@ -1010,6 +1010,22 @@ export default function (pi: ExtensionAPI) {
   // ── Team status widget (team mode visual indicator) ─────
   let teamStatusWidget: ReturnType<typeof createTeamStatusWidget> | null = null;
 
+  // Team rename hook (set_team_name): the in-memory rename has already landed,
+  // so derive the new session directory from the CURRENT name. The per-session
+  // settings snapshot must follow the directory (otherwise later temporary
+  // settings would be written into the old one), and the widget needs a refresh
+  // because it is idle until the next member event/poll. Fail-open: without an
+  // active session or sessionId only the widget refresh happens.
+  teamCtx.onTeamRenamed = (newName: string) => {
+    const session = getSessionState();
+    setActiveSessionDir(
+      session.teamDefinition && session.sessionId
+        ? join(getRootDir(), "sessions", newName, session.sessionId)
+        : null
+    );
+    teamStatusWidget?.refresh();
+  };
+
   // Wire UI lifecycle hooks so commands/team.ts can install/uninstall immediately
   teamCtx.onSessionStart = (ui) => {
     // Per-session settings (临时设置) 写盘钩子（阶段 3）：团队会话活跃期间 overlay 变更
@@ -1053,7 +1069,7 @@ export default function (pi: ExtensionAPI) {
     if (!session.teamDefinition) return;
 
     teamStatusWidget = createTeamStatusWidget({
-      teamName: session.teamDefinition.name,
+      getTeamName: () => getSessionState().teamDefinition?.name ?? "",
       getMembers: () => getSessionState().teamDefinition?.members ?? [],
       teamCtx,
       memberOpsStates,
@@ -1177,7 +1193,7 @@ export default function (pi: ExtensionAPI) {
     // install it here. Also clean up if session ended without /team stop.
     if (session.active && session.teamDefinition && !teamStatusWidget) {
       teamStatusWidget = createTeamStatusWidget({
-        teamName: session.teamDefinition.name,
+        getTeamName: () => getSessionState().teamDefinition?.name ?? "",
         getMembers: () => getSessionState().teamDefinition?.members ?? [],
         teamCtx,
         memberOpsStates,
