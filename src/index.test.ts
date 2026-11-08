@@ -1428,7 +1428,7 @@ describe("session entry notice", () => {
     expect(result.systemPrompt).toContain("取决于该成员是否有可用的会话记录");
   });
 
-  it("阶段 4：预定义提示词逐字节注入 MEMBER_RESTART_GUIDANCE，工具清单行含 fresh? 与「默认续接」", async () => {
+  it("阶段 4：预定义提示词逐字节注入 MEMBER_RESTART_GUIDANCE，工具清单行含 fresh? 与「尝试续接」", async () => {
     await startPredefined("guidance-team");
     const result = await runTurn();
 
@@ -1437,7 +1437,7 @@ describe("session entry notice", () => {
       .split("\n")
       .find((line: string) => line.includes("start_member(name, fresh?)"));
     expect(toolLine).toBeDefined();
-    expect(toolLine).toContain("默认续接");
+    expect(toolLine).toContain("尝试续接");
   });
 
   it("acceptance 7: agent-initiated sessions never get the notice", async () => {

@@ -19,6 +19,7 @@ import type { MemberOperationalState } from "../session/context";
 import { getSessionState } from "../session/state";
 import { syncActiveManifest } from "../session/manifest";
 import { detectDuplicateStart, type DuplicateStartBlock } from "../setup/member-lifecycle";
+import { isHandleDefinitelyNotRunning } from "../channel/event-handler";
 import {
   archiveMemberSessionFiles as archiveMemberSessionFilesImpl,
   formatBytes,
@@ -111,7 +112,7 @@ export function formatDuplicateStartText(name: string, block: DuplicateStartBloc
 /**
  * fresh 归一化（阶段 2，方案 §3.2.1 ①）：只认 true / "true"（LLM 可能把布尔写成
  * 字符串，框架的转换层不一定救得回来）；其余值——null / false / 缺省 / 其它字符串
- * ——一律视为未请求（默认续接语义不能被一个含糊值改变）。
+ * ——一律视为未请求（默认尝试续接语义不能被一个含糊值改变）。
  */
 export function normalizeFreshParam(raw: unknown): boolean {
   return raw === true || raw === "true";
@@ -349,8 +350,8 @@ export function registerTlTools(deps: TlToolsDeps): void {
     label: "Start Member",
     description:
       "Launch a Member's pi RPC process, or restart one that was stopped or crashed. " +
-      "Restarting CONTINUES the member's previous session when one is persisted on disk " +
-      "(conversation, task history and earlier tool results are preserved) — that is the default. " +
+      "Restarting ATTEMPTS to continue the member's previous session by default when one is persisted on disk " +
+      "(whether it actually resumed is reported in the start result — do not assume the context was kept). " +
       "Pass fresh=true to discard that conversation: the old session files are archived " +
       "(recoverable, not deleted) and the member starts with an empty context. " +
       "fresh does NOT revert files the member edited and does NOT change the team shared context. " +
@@ -358,7 +359,7 @@ export function registerTlTools(deps: TlToolsDeps): void {
       "Parameters: name (member identifier from the team definition), fresh (optional boolean).",
     promptGuidelines: [
       "Use start_member to launch a Member RPC process after writing the Shared Context document.",
-      "Restarting a member (stop_member then start_member) keeps its context by default — prefer that when the process crashed or is stuck.",
+      "Restarting a member (stop_member then start_member) attempts to continue its context by default — the start result reports whether it actually resumed.",
       "Use fresh=true only when the member's own conversation is the problem (it went off track): it discards that member's history (old session files archived), not the shared context and not its file edits.",
       "start_member on an already-running member is refused; a restart is stop_member followed by start_member.",
     ],
@@ -551,12 +552,12 @@ export function registerTlTools(deps: TlToolsDeps): void {
       // Intentional stop: remove from the manifest's started set so a later
       // /team resume does not revive a member the TL deliberately stopped.
       syncActiveManifest({ stoppedMember: params.name });
-      // 阶段 4（方案 §3.4.1 #5）：只有该成员确有会话文件时才说「已保留/会续接」——
+      // 阶段 4（方案 §3.4.1 #5）：只有该成员确有会话文件时才说「已保留/尝试续接」——
       // 对没有历史的成员说这句话是假话。
       const sessionDir = resolveMemberSessionDir(params.name);
       const hasHistory = sessionDir ? listMemberSessionFiles(sessionDir).length > 0 : false;
       const hint = hasHistory
-        ? "该成员此前的会话已保留；再次 start_member 会续接它（需要全新上下文时传 fresh: true）。"
+        ? "该成员此前的会话已保留；再次 start_member 会尝试续接它（实际是否续接见启动结果；需要全新上下文时传 fresh: true）。"
         : "";
       return {
         details: {},
@@ -1672,6 +1673,29 @@ function parseTasks(raw: unknown): ParsedTasks {
   return { tasks: [], recoveryNote: "", droppedDetails: [] };
 }
 
+/**
+ * 阶段 5（方案 §3.5.2 ①）：收集「句柄明确未在运行」的显式目标。
+ * - 广播（to:"all"）不参与：由通道层逐成员检查覆盖；
+ * - 句柄不存在（从未启动）不参与：保持既有「不存在或未启动」语义；
+ * - 查询依赖未接线 / 查询抛错 → 不参与（fail-open，旧行为不变）。
+ */
+function collectNotRunningTargets(
+  tasks: Array<{ to: string }>,
+  getHandle?: (name: string) => MemberProcessHandle | undefined
+): string[] {
+  if (!getHandle) return [];
+  const seen = new Set<string>();
+  const blocked: string[] = [];
+  for (const task of tasks) {
+    if (task.to === "all" || seen.has(task.to)) continue;
+    seen.add(task.to);
+    const handle = getHandle(task.to);
+    if (!handle) continue;
+    if (isHandleDefinitelyNotRunning(handle)) blocked.push(task.to);
+  }
+  return blocked;
+}
+
 async function sendAndWaitExecute(
   params: { tasks: unknown; nextSteps: string },
   ctx: SendAndWaitCtx
@@ -1753,6 +1777,24 @@ async function sendAndWaitExecute(
       content: [{
         type: "text" as const,
         text: `目标成员 ${names} 不存在或未启动。请先使用 start_member 启动这些成员。\n有效成员：${validNames.join(", ")}。${truncationHint}`,
+      }],
+    };
+  }
+
+  // ── 派发前目标校验（阶段 5，方案 §3.5.2 ①）──
+  // 目标句柄**明确**未在运行 → 立即拒绝，零副作用（不入队、不注册等待、不写状态）。
+  // 这是最早的一层：真正的发送层还有一层检查（覆盖广播 / 合并包 flush / 压缩补发）。
+  const notRunningTargets = collectNotRunningTargets(tasks, ctx.getHandle);
+  if (notRunningTargets.length > 0) {
+    const quoted = notRunningTargets.map((name) => `"${name}"`).join("、");
+    const starts = notRunningTargets.map((name) => `start_member("${name}")`).join("、");
+    return {
+      details: { notRunning: notRunningTargets },
+      content: [{
+        type: "text" as const,
+        text:
+          `无法派发：目标成员 ${quoted} 当前未在运行（已停止或崩溃）。` +
+          `请先 ${starts} 后再派发；本次没有发送任何任务。`,
       }],
     };
   }

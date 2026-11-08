@@ -30,15 +30,18 @@ describe("MEMBER_RESTART_GUIDANCE", () => {
     expect(MEMBER_RESTART_GUIDANCE).toContain("3. 成员明显跑偏");
   });
 
-  it("写明默认续接与 fresh 的代价和边界", () => {
-    expect(MEMBER_RESTART_GUIDANCE).toContain("默认**续接**");
-    expect(MEMBER_RESTART_GUIDANCE).toContain("对话与任务历史都保留");
+  it("写明默认尝试续接与 fresh 的代价和边界", () => {
+    expect(MEMBER_RESTART_GUIDANCE).toContain("默认**尝试续接**");
+    expect(MEMBER_RESTART_GUIDANCE).toContain("实际是否续接以启动结果的会话附注为准");
     expect(MEMBER_RESTART_GUIDANCE).toContain("start_member({ name, fresh: true })");
     expect(MEMBER_RESTART_GUIDANCE).toContain("旧会话归档");
     expect(MEMBER_RESTART_GUIDANCE).toContain("/team clean");
     // fresh 的边界：不回滚文件、不动共享上下文
     expect(MEMBER_RESTART_GUIDANCE).toContain("**不回滚**");
     expect(MEMBER_RESTART_GUIDANCE).toContain("共享上下文照常生效");
+    // 不得出现无条件的结果断言（不再承诺上下文被保留）
+    expect(MEMBER_RESTART_GUIDANCE).not.toContain("不必担心丢上下文");
+    expect(MEMBER_RESTART_GUIDANCE).not.toContain("对话与任务历史都保留");
   });
 
   it("不再保留旧口径（仅当进程异常时才重启）", () => {
@@ -53,13 +56,13 @@ describe("MEMBER_RESTART_GUIDANCE", () => {
     expect(design).not.toContain(MEMBER_RESTART_GUIDANCE);
   });
 
-  it("两处工具清单行包含 fresh? 与「默认续接」（逐字一致）", () => {
+  it("两处工具清单行包含 fresh? 与「尝试续接」（逐字一致）", () => {
     const execution = dynamicPrompt("execution");
     const line = execution
       .split("\n")
       .find((entry) => entry.includes("start_member(name, fresh?)"));
     expect(line).toBeDefined();
-    expect(line).toContain("默认续接");
+    expect(line).toContain("尝试续接");
   });
 
   it("agent 自主会话提示词不注入该常量（D9：那两处提示词已很长，不重复）", async () => {

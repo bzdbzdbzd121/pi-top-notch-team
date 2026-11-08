@@ -32,7 +32,7 @@ import { handleSyncCommand } from "../sync/command";
  *   /team done            — 完成并退出创建或编辑模式
  *   /team start <name>    — 启动团队会话
  *   /team stop            — 终止团队会话
- *   /team resume [id]     — 恢复中断/已停止的团队会话（成员上下文完整保留）
+ *   /team resume [id]     — 恢复中断/已停止的团队会话（重启成员默认尝试续接上下文）
  *   /team list            — 列出所有已创建的团队
  *   /team show <name>     — 显示团队定义详情
  *   /team delete <name>   — 删除团队定义

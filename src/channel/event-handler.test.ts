@@ -544,8 +544,11 @@ describe("createMemberEventHandler", () => {
       .join("\n");
     expect(crashText).toContain("进程异常退出");
     expect(crashText).toContain("start_member");
-    expect(crashText).toContain("默认续接");
+    expect(crashText).toContain("默认尝试续接");
+    expect(crashText).toContain("以启动结果为准");
     expect(crashText).toContain("fresh");
+    // 不得再写成无条件的结果断言
+    expect(crashText).not.toContain("默认续接");
 
     (deps.pi.sendMessage as any).mockClear();
     handler({ type: "process_exit", memberName: "worker", exitCode: 0, wasRunning: true });
@@ -1389,6 +1392,131 @@ describe("createSendToMember", () => {
         customType: "team-route",
         display: true,
       })
+    );
+  });
+});
+
+// 阶段 5（方案 §3.5.2 第二/三层）：发送前的「明确未在运行」拦截，
+// 以及发送抛错时把乐观的「工作中」标记恢复为写入前的值。
+describe("createSendToMember 阶段 5: 派发前检查与失败恢复", () => {
+  const stoppedHandle = () => ({
+    sendCommand: vi.fn(),
+    getState: vi.fn().mockReturnValue({ name: "worker", pid: null, status: "stopped" }),
+  });
+  const runningHandle = () => ({
+    sendCommand: vi.fn(),
+    getState: vi.fn().mockReturnValue({ name: "worker", pid: 4321, status: "running" }),
+  });
+
+  function message(to = "worker", id = "msg-p5"): any {
+    return { id, from: "tl", to, content: "Hello", timestamp: Date.now() };
+  }
+
+  it("明确未在运行 → 不写「工作中」、通知未送达、标记等待失败、不发送", async () => {
+    const { createSendToMember } = await loadModule();
+    const deps = createMockDeps() as any;
+    const handle = stoppedHandle();
+    deps.memberHandles.set("worker", handle);
+    deps.lastPendingCorrId.set("worker", "corr-1");
+    deps.responseWaiter.resolveIfWaiting = vi.fn().mockReturnValue(true);
+
+    createSendToMember(deps)("worker", message());
+
+    expect(handle.sendCommand).not.toHaveBeenCalled();
+    expect(deps.memberOpsStates.get("worker")).toBeUndefined();
+    expect(deps.responseWaiter.resolveIfWaiting).toHaveBeenCalledWith(
+      "corr-1",
+      "worker",
+      expect.stringContaining("当前未在运行")
+    );
+    expect(deps.lastPendingCorrId.has("worker")).toBe(false);
+    const texts = (deps.pi.sendMessage as any).mock.calls.map((c: unknown[]) => String((c[0] as any).content));
+    expect(texts.join("\n")).toContain("消息未送达");
+  });
+
+  it("句柄缺状态查询（既有替身形态）→ fail-open：仍写「工作中」并发送", async () => {
+    const { createSendToMember } = await loadModule();
+    const deps = createMockDeps() as any;
+    const handle = { sendCommand: vi.fn() };
+    deps.memberHandles.set("worker", handle);
+
+    createSendToMember(deps)("worker", message());
+
+    expect(deps.memberOpsStates.get("worker")).toBe("working");
+    expect(handle.sendCommand).toHaveBeenCalledTimes(1);
+  });
+
+  it("广播场景：已停止成员不停留在「工作中」，其余成员照常", async () => {
+    const { createSendToMember } = await loadModule();
+    const deps = createMockDeps() as any;
+    const stopped = stoppedHandle();
+    const alive = runningHandle();
+    deps.memberHandles.set("stopped-member", stopped);
+    deps.memberHandles.set("alive-member", alive);
+    const fn = createSendToMember(deps);
+
+    // 模拟 router 的 to:"all" 逐成员派发
+    fn("stopped-member", message("stopped-member", "msg-b1"));
+    fn("alive-member", message("alive-member", "msg-b2"));
+
+    expect(deps.memberOpsStates.get("stopped-member")).toBeUndefined();
+    expect(stopped.sendCommand).not.toHaveBeenCalled();
+    expect(deps.memberOpsStates.get("alive-member")).toBe("working");
+    expect(alive.sendCommand).toHaveBeenCalledTimes(1);
+  });
+
+  it("竞态：检查时 running、发送抛错 → 状态恢复为写入前的值，等待标记失败，通知发出", async () => {
+    const { createSendToMember } = await loadModule();
+    const deps = createMockDeps() as any;
+    deps.memberOpsStates.set("worker", "idle");
+    const handle = runningHandle();
+    handle.sendCommand = vi.fn(() => {
+      throw new Error('Member "worker" is not running');
+    });
+    deps.memberHandles.set("worker", handle);
+    deps.lastPendingCorrId.set("worker", "corr-2");
+    deps.responseWaiter.resolveIfWaiting = vi.fn().mockReturnValue(true);
+
+    createSendToMember(deps)("worker", message());
+
+    expect(deps.memberOpsStates.get("worker")).toBe("idle");
+    expect(deps.responseWaiter.resolveIfWaiting).toHaveBeenCalledWith(
+      "corr-2",
+      "worker",
+      expect.stringContaining("发送消息给成员")
+    );
+    const texts = (deps.pi.sendMessage as any).mock.calls.map((c: unknown[]) => String((c[0] as any).content));
+    expect(texts.join("\n")).toContain("发送消息给成员");
+  });
+
+  it("竞态且状态已被进程退出改成 stopped → 不覆盖真实状态（比较后写）", async () => {
+    const { createSendToMember } = await loadModule();
+    const deps = createMockDeps() as any;
+    deps.memberOpsStates.set("worker", "idle");
+    const handle = runningHandle();
+    handle.sendCommand = vi.fn(() => {
+      // 发送期间 process_exit 事件到达，写入「已停止」
+      deps.memberOpsStates.set("worker", "stopped");
+      throw new Error("send failed after exit");
+    });
+    deps.memberHandles.set("worker", handle);
+
+    createSendToMember(deps)("worker", message());
+
+    expect(deps.memberOpsStates.get("worker")).toBe("stopped");
+  });
+
+  it("正常派发仍写入「工作中」并成功发送（回归）", async () => {
+    const { createSendToMember } = await loadModule();
+    const deps = createMockDeps() as any;
+    const handle = runningHandle();
+    deps.memberHandles.set("worker", handle);
+
+    createSendToMember(deps)("worker", message());
+
+    expect(deps.memberOpsStates.get("worker")).toBe("working");
+    expect(handle.sendCommand).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "prompt", streamingBehavior: "followUp" })
     );
   });
 });

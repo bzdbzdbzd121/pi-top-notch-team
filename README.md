@@ -13,7 +13,7 @@
 - **🧠 独立上下文** — 每个 Member 运行自己的 pi 会话，记忆持久化
 - **📨 实时消息通道** — Agent 之间通过内置消息总线通信（无需外部基础设施），成员互发可一键收紧为「仅限回复 TL」
 - **📋 共享上下文** — TL 维护一份 Markdown 文档，记录项目目标、术语、进展与协作规则
-- **💥 崩溃通知** — 成员崩溃时通知 TL（不会自动重启）；重启默认续接上下文，需要干净上下文时用 `fresh`
+- **💥 崩溃通知** — 成员崩溃时通知 TL（不会自动重启）；重启默认**尝试**续接上下文（实际是否续接以启动结果为准），需要干净上下文时用 `fresh`
 - **👥 自定义团队** — 通过 `/team create` 用自然语言定义团队
 - **☁️ 云同步** — 团队定义与自建私有 git 仓库双向同步（多机一致 / 云备份），冲突逐个决策、被放弃的一侧留档
 
@@ -339,13 +339,13 @@ git --git-dir ~/.pi/top-notch-team/teams/.git show <提交>:<名字>.yaml
 | 工具 | 说明 |
 |------|------|
 | `write_shared_context(content)` | 写入团队共享上下文 `.shared-context.md`。**必须在首次 `start_member` 之前调用**（硬门控）。 |
-| `start_member(name, fresh?)` | 启动 Member 的 pi RPC 进程。**重启默认续接**该成员已有的会话（对话与任务历史都保留）；`fresh: true` 丢弃该成员的对话上下文（旧会话文件归档到 `.member-resets`，可恢复、可用 `/team clean` 清理），**不回滚**它已改写的文件、不动共享上下文。对已运行的成员重复调用会被拒绝（不会起第二个进程） |
-| `stop_member(name)` | 优雅终止 Member 进程。该成员确有会话文件时，结果会提示「会话已保留、再次启动会续接」与 `fresh` 用法 |
+| `start_member(name, fresh?)` | 启动 Member 的 pi RPC 进程。**重启默认尝试续接**该成员已有的会话（实际是否续接以启动结果的会话附注为准，不承诺上下文已保留）；`fresh: true` 丢弃该成员的对话上下文（旧会话文件归档到 `.member-resets`，可恢复、可用 `/team clean` 清理），**不回滚**它已改写的文件、不动共享上下文。对已运行的成员重复调用会被拒绝（不会起第二个进程） |
+| `stop_member(name)` | 优雅终止 Member 进程。该成员确有会话文件时，结果会提示「会话已保留、再次启动会尝试续接（实际是否续接见启动结果）」与 `fresh` 用法 |
 | `list_members()` | 查看所有成员状态 |
 | `get_member_log(name, lines?, maxContentLength?)` | 通过 RPC 获取 Member 近期会话。`maxContentLength` 截断每条消息（默认 200 字符）。 |
 | `wait_and_get_member_status()` | 等待所有 Member 空闲后查看运行状态：idle/working/crashed/stopped。有 Member 在工作则阻塞。无参数。 |
 | `add_dynamic_member(name, label, systemPrompt, model?)` | 在 /team dynamic 模式下注册成员（name=标识符，label=中文显示名） |
-| `team_send_and_wait({tasks: [{to, content}], nextSteps})` | 向一个或多个成员发送消息并等待全部响应。tasks 数组支持向不同成员并发派发以并行执行；部分成员失败时返回部分结果。nextSteps 在 wait 结束后随结果返回。 |
+| `team_send_and_wait({tasks: [{to, content}], nextSteps})` | 向一个或多个成员发送消息并等待全部响应。tasks 数组支持向不同成员并发派发以并行执行；部分成员失败时返回部分结果。nextSteps 在 wait 结束后随结果返回。**目标已停止/崩溃 → 立即返回「当前未在运行，请先 start_member」**（不入队、不注册等待，不会再等到 15 分钟预算耗尽） |
 | `set_goal(text, criteria)` | 设定带可验证完成标准的会话目标；仅在 TL 一次运行完全结算（不会再自动重试、自动压缩或处理排队续跑）且目标未完成时提醒继续，`agent_end` 不会单独触发提醒。 |
 | `finish_goal()` | 标记当前目标完成，停止提醒系统。 |
 

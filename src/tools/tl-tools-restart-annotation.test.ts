@@ -300,6 +300,8 @@ describe("stop_member 条件提示（阶段 4，§3.4.1 #5）", () => {
 
     expect(text).toContain('成员 "coder" 已停止。');
     expect(text).toContain("已保留");
+    expect(text).toContain("尝试续接");
+    expect(text).toContain("见启动结果");
     expect(text).toContain("fresh");
     expect(existsSync(join(sessionDir, "prev.jsonl"))).toBe(true);
   });
@@ -349,18 +351,23 @@ describe("start_member 工具说明（阶段 4，§3.4.1 #1）", () => {
     });
     const def = tools.get("start_member");
 
-    expect(def.description).toContain("Restarting CONTINUES the member's previous session");
+    expect(def.description).toContain("ATTEMPTS to continue the member's previous session");
+    expect(def.description).toContain("whether it actually resumed is reported in the start result");
     expect(def.description).toContain("fresh=true");
     expect(def.description).toContain("archived (recoverable, not deleted)");
     expect(def.description).toContain("does NOT revert files");
     expect(def.description).toContain("does NOT change the team shared context");
     expect(def.description).toContain("already running is refused");
+    // 不再出现无条件的结果断言
+    expect(def.description).not.toContain("CONTINUES the member's previous session");
     expect(def.parameters.properties.fresh.type).toBe("boolean");
 
     const guidelines = def.promptGuidelines.join("\n");
     expect(guidelines).toContain("Shared Context");
-    expect(guidelines).toContain("keeps its context by default");
+    expect(guidelines).toContain("attempts to continue its context by default");
+    expect(guidelines).toContain("the start result reports whether it actually resumed");
     expect(guidelines).toContain("fresh=true only when");
     expect(guidelines).toContain("already-running member is refused");
+    expect(guidelines).not.toContain("keeps its context by default");
   });
 });

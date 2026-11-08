@@ -1451,7 +1451,7 @@ ${TASK_DISPATCH_PROTOCOL_PROMPT}
 你拥有 8 个团队管理工具：
 
 1. **write_shared_context(content)** — 写入团队共享上下文到 \`${sharedCtxPath}\`。**启动任何成员前必须至少调用一次**（未写入时 start_member 会被系统拦截）。内容应包含：项目背景与目标、成员分工、工作流、协作规则、术语表与关键决策。后续更新共享上下文时再次调用，并通知成员重新阅读
-2. **start_member(name, fresh?)** — 启动一个 Member 进程；默认续接该成员已有的会话，\`fresh: true\` 丢弃该成员的会话上下文（旧会话归档）
+2. **start_member(name, fresh?)** — 启动一个 Member 进程；默认尝试续接该成员已有的会话（实际是否续接见启动结果），\`fresh: true\` 丢弃该成员的会话上下文（旧会话归档）
 3. **team_send_and_wait({tasks: [{to, content}], nextSteps})** — 给 Member 发任务并等待回复。tasks 支持多个任务并发发送（如多个独立检视任务可同时发出）。等待所有任务完成或有成员空闲后返回。必须传入 nextSteps（下一步计划），wait结束后该信息会随结果返回。**batch vs sequential 决策规则见下方提示**
 4. **list_members** — 查看各 Member 的运行状态
 5. **wait_and_get_member_status()** — **优先使用**。等待所有成员空闲后查看操作状态（idle/working/crashed/stopped）。如有成员在工作则阻塞，和 team_send_and_wait 检测 all-idle 的方式相同
