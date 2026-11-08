@@ -2627,7 +2627,9 @@ resolver 矩阵 8（undefined/true/false/getter 异常/null·undefined settings 
 
 ### 36.4 改名窗口与事务（`src/session/rename-team.ts`）
 
-**窗口** = 会话活跃 ∧ 动态会话 ∧ `dynamicPhase === "design"` ∧ 无成员进程处于 running（防御纵深）。**冻结点是启动成员**：成员的 `TEAM_NAME`、绝对共享上下文路径、`--session-dir` 与已下发的系统提示词在 spawn 时固化；注册成员（`add_dynamic_member`）只改内存名册，不影响任何进程。执行阶段仍可调用 `set_team_name`（白名单刻意放行），但工具会以"执行阶段/名称已冻结"拒绝并给真实出路（结束会话后重开、在启动成员前命名）。
+**窗口** = 会话活跃 ∧ 动态会话 ∧ `dynamicPhase === "design"` ∧ 无成员进程处于 running（防御纵深）。**冻结点是启动成员**：成员的 `TEAM_NAME`、绝对共享上下文路径、`--session-dir` 与已下发的系统提示词在 spawn 时固化；注册成员（`add_dynamic_member`）只改内存名册，不影响任何进程。阶段在第一个成员**成功启动**时翻为 `execution` 并写入清单（`/team resume` 从清单恢复），而 `applyTeamName` **先判阶段、后判 running**，所以**崩溃或主动停止的成员不会重新打开窗口**（返回 `phase-execution`）；唯一不被阻断的成员相关失败是 `start_member` 启动失败（阶段未翻转、残留 handle 非 running）。执行阶段仍可调用 `set_team_name`（白名单刻意放行），但工具会以"执行阶段/名称已冻结"拒绝并给真实出路（结束会话后重开、在启动成员前命名）。
+
+**步骤对照**：下面 6 段是"步骤组"，对应 `src/session/rename-team.ts` 的 **14 个编号步骤**（Step 1-14；其中 Step 8-10 是一组目录搬迁动作：建父目录 / `rename` / 收拾旧父目录）。不以"15 步"表述（方案原文的第 15 项是本函数返回，实现中不是独立步骤）。
 
 **顺序（不可重排）**：
 
