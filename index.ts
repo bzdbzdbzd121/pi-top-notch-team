@@ -503,13 +503,15 @@ export default function (pi: ExtensionAPI) {
       teamCtx.setHandle(config.name, handle);
       return handle;
     },
-    buildMemberConfig: (memberName) =>
+    buildMemberConfig: (memberName, options) =>
       buildMemberConfig(memberName, getSessionState(), {
         tlCurrentModel,
         tlThinkingLevel,
         lookupSupportedThinkingLevels,
         // 临时设置覆盖层：spawn 时读取 merge 后的生效设置（模型/思考强度）
         settings: getEffectiveSettings(),
+        // 阶段 2：fresh 透传到配置层（fresh 优先于一切续接来源，见 BuildMemberConfigOptions）
+        fresh: options?.fresh,
       }),
     getMemberLog: async (memberName, maxLines, maxContentLength) => {
       const handle = teamCtx.getHandle(memberName);

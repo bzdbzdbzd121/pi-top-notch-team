@@ -19,6 +19,13 @@ import type { MemberOperationalState } from "../session/context";
 import { getSessionState } from "../session/state";
 import { syncActiveManifest } from "../session/manifest";
 import { detectDuplicateStart, type DuplicateStartBlock } from "../setup/member-lifecycle";
+import {
+  archiveMemberSessionFiles as archiveMemberSessionFilesImpl,
+  formatBytes,
+  listMemberSessionFiles,
+  type ArchiveResult,
+  type MemberSessionFile,
+} from "../process/member-session";
 import { createMemberProcess } from "../process/member-process";
 import { spawn } from "node:child_process";
 import { TASK_DISPATCH_GUIDELINES } from "../prompts/task-dispatch-protocol";
@@ -79,9 +86,6 @@ export function describeSpawnThinkingAnnotation(
  * 工具结果本来就没有独立错误标记（本项目对校验失败也一律返回文本），更重要的是
  * 行为引导——一个「失败」的措辞会诱发模型换写法重试（直接 stop 再 start、或编一个
  * 成员名），而这里其实什么都没发生，需要的是「事实 + 三条出路」。
- *
- * 说明：「丢弃上下文」那条出路的 fresh 参数由阶段 2 引入；文案按方案 §3.1.3 的
- * 定稿形式先给出，避免同一段文案在两个阶段各写一版。
  */
 export function formatDuplicateStartText(name: string, block: DuplicateStartBlock): string {
   const pid = block.pid ?? "未知";
@@ -100,10 +104,72 @@ export function formatDuplicateStartText(name: string, block: DuplicateStartBloc
   );
 }
 
+/**
+ * fresh 归一化（阶段 2，方案 §3.2.1 ①）：只认 true / "true"（LLM 可能把布尔写成
+ * 字符串，框架的转换层不一定救得回来）；其余值——null / false / 缺省 / 其它字符串
+ * ——一律视为未请求（默认续接语义不能被一个含糊值改变）。
+ */
+export function normalizeFreshParam(raw: unknown): boolean {
+  return raw === true || raw === "true";
+}
+
+/**
+ * fresh 的会话附注（阶段 2，方案 §3.2 / §5）：接在「已启动 (PID: …)」之后，
+ * 以逗号开头，未传 fresh 时调用方不拼接（保证旧文案逐字节不变）。
+ */
+export function formatFreshSessionNote(archive: ArchiveResult | null): string {
+  if (!archive) return "，全新会话（该成员此前没有可续接的历史）";
+  if (archive.moved.length > 0) {
+    return (
+      `，全新会话（已归档 ${archive.moved.length} 个 → ${archive.archiveDir}；` +
+      `归档可用 /team clean 清理）`
+    );
+  }
+  return "，全新会话";
+}
+
+/**
+ * fresh 的归档告警与累计统计（阶段 2，方案 §3.2.4 / §3.3.1）：
+ *  - 归档失败：给出失败数、原因、旧文件位置与残留风险（不阻断启动，E4）
+ *  - 累计 ≥ 2：附带数量与大小，并指向清理入口；累计 =1 不输出「累计」句（防噪音）
+ * 未传 fresh / 无异常时返回空串（旧文案逐字节不变）。
+ */
+export function formatFreshArchiveNotice(
+  archive: ArchiveResult | null,
+  sessionDir: string
+): string {
+  if (!archive) return "";
+  const lines: string[] = [];
+  if (archive.failed.length > 0) {
+    const reasons = [...new Set(archive.failed.map((failure) => failure.reason))].join("；");
+    lines.push(
+      `⚠️ ${archive.failed.length} 个旧会话文件未能归档（原因：${reasons}）。` +
+        `旧文件仍在 ${sessionDir}：如果本成员此后没有产生新的会话记录就退出，下次启动可能续接旧会话。`
+    );
+  }
+  if (archive.memberArchiveCount >= 2) {
+    lines.push(
+      `该成员累计 ${archive.memberArchiveCount} 个归档（合计 ${formatBytes(archive.memberArchiveBytes)}），` +
+        `可用 /team clean 清理。`
+    );
+  }
+  return lines.length > 0 ? `\n${lines.join("\n")}\n` : "";
+}
+
 // ── Type aliases ───────────────────────────────────────────
 
 type CreateMemberFn = (config: MemberProcessConfig) => MemberProcessHandle;
-type BuildConfigFn = (memberName: string) => MemberProcessConfig | null;
+type BuildConfigFn = (
+  memberName: string,
+  options?: { fresh?: boolean }
+) => MemberProcessConfig | null;
+/** 归档实现（阶段 2）：同步、不抛错（失败只进 result.failed）。 */
+type ArchiveMemberSessionFn = (params: {
+  sessionDir: string;
+  memberName: string;
+  files?: MemberSessionFile[];
+  now?: Date;
+}) => ArchiveResult;
 type GetMemberLogFn = (memberName: string, maxLines: number, maxContentLength?: number) => Promise<string>;
 // ── TlToolsDeps ────────────────────────────────────────────
 
@@ -137,6 +203,11 @@ export interface TlToolsDeps {
   getTlThinkingLevel?: () => string | undefined;
   /** Resolve a member's process handle by name (batch barrier compact RPC). */
   getHandle?: (name: string) => MemberProcessHandle | undefined;
+  /**
+   * 归档实现（阶段 2）：默认 member-session 的同步实现。注入点仅用于测试断言
+   * 「未被调用」——生产不必传。
+   */
+  archiveMemberSessionFiles?: ArchiveMemberSessionFn;
   /**
    * Shared auto-compaction runtime (from createMessageChannel). The batch
    * barrier and the inline dispatch path share one pending/flush mechanism.
@@ -192,6 +263,7 @@ export function registerTlTools(deps: TlToolsDeps): void {
     createMember = (config) => createMemberProcess(config, spawn),
     buildMemberConfig,
     getMemberLog,
+    archiveMemberSessionFiles = archiveMemberSessionFilesImpl,
   } = deps;
 
   // ── start_member ────────────────────────────────────────
@@ -211,10 +283,22 @@ export function registerTlTools(deps: TlToolsDeps): void {
           type: "string",
           description: "Member name (as defined in the team)",
         },
+        fresh: {
+          type: "boolean",
+          description:
+            "Start this member with an empty context: discard its persisted conversation " +
+            "and archive the old session files (not deleted). Omit for the default behavior " +
+            "(resume the persisted conversation when one exists).",
+        },
       },
       required: ["name"],
     },
-    async execute(_toolCallId: string, params: { name: string }): Promise<ToolResult> {
+    async execute(
+      _toolCallId: string,
+      params: { name: string; fresh?: boolean | string }
+    ): Promise<ToolResult> {
+      // fresh 归一化先于一切（方案 §3.2.1 ①）：后续守卫与分支都只看这个布尔。
+      const fresh = normalizeFreshParam(params.fresh);
       // ── 重复启动守卫（阶段 1，方案 §3.1）──
       // 第一步读句柄状态，命中就返回提示且零副作用：buildMemberConfig 才会
       // mkdir 会话目录，不写名册、不触发阶段切换，因此守卫必须在它之前。
@@ -258,7 +342,7 @@ export function registerTlTools(deps: TlToolsDeps): void {
         };
       }
 
-      const config = buildMemberConfig?.(params.name);
+      const config = buildMemberConfig?.(params.name, { fresh });
       if (!config) {
         return {
           details: {},
@@ -269,6 +353,25 @@ export function registerTlTools(deps: TlToolsDeps): void {
             },
           ],
         };
+      }
+
+      // ── 旧会话归档（阶段 2，方案 §3.2.1 ⑤）──
+      // 必须同步且先于启动：启动前快照天然只含旧文件（不需要区分新会话文件），
+      // 同步则不给并行的第二个 start_member 留窗口（见上方守卫注释）。
+      // 归档失败不阻断（E4）：这一次的干净由配置层的 fresh 保证（不加 --continue），
+      // 归档负责「以后的重启不再把旧上下文接回来」。
+      const memberSessionDir =
+        typeof config.sessionDir === "string" ? config.sessionDir : "";
+      let archive: ArchiveResult | null = null;
+      if (fresh && memberSessionDir) {
+        const files = listMemberSessionFiles(memberSessionDir);
+        if (files.length > 0) {
+          archive = archiveMemberSessionFiles({
+            sessionDir: memberSessionDir,
+            memberName: params.name,
+            files,
+          });
+        }
       }
 
       try {
@@ -286,14 +389,38 @@ export function registerTlTools(deps: TlToolsDeps): void {
         );
         // P3：互发策略快照附注（仅 tl-only 出现，避免噪音）
         const peerNote = describePeerMessagingSpawnAnnotation(config.peerMessaging);
+        // fresh 的会话附注与归档告警：非 fresh 时为空串——旧文案逐字节不变。
+        const sessionNote = fresh ? formatFreshSessionNote(archive) : "";
+        const archiveNotice =
+          fresh && memberSessionDir ? formatFreshArchiveNotice(archive, memberSessionDir) : "";
+        // 结构化字段（方案附录 B 的 fresh 分支）：非 fresh 保持 {}，续接事实由
+        // 阶段 4 的启动后查询补上（D6：只报实测，不猜目录）。
+        const details: Record<string, unknown> = fresh
+          ? {
+              sessionMode: "fresh",
+              resumeRequested: false,
+              archivedFiles: archive?.moved.length ?? 0,
+              ...(archive?.archiveDir ? { archiveDir: archive.archiveDir } : {}),
+              ...(archive && archive.failed.length > 0
+                ? { archiveFailures: archive.failed.length }
+                : {}),
+              ...(archive
+                ? {
+                    memberArchiveCount: archive.memberArchiveCount,
+                    memberArchiveBytes: archive.memberArchiveBytes,
+                  }
+                : {}),
+            }
+          : {};
         return {
-          details: {},
+          details,
           content: [
             {
               type: "text" as const,
               text:
-                `成员 "${params.name}" 已启动 (PID: ${handle.getState().pid})。` +
+                `成员 "${params.name}" 已启动 (PID: ${handle.getState().pid})${sessionNote}。` +
                 `模型：${config.model ?? "默认"}；${thinkingNote}${peerNote}。` +
+                `${archiveNotice}` +
                 `${tempSourceAnnotation()}使用 list_members 查看状态，通过消息通道分配任务。`,
             },
           ],

@@ -169,6 +169,13 @@ export interface BuildMemberConfigOptions {
    */
   resume?: boolean;
   /**
+   * 丢弃该成员此前的会话上下文（阶段 2，方案 §3.2.2）：不产生 resume 标记。
+   * 调用方（start_member）负责在此之前把旧会话文件归档，否则后续普通重启仍会
+   * 按「目录里有文件」续接旧上下文。**fresh 优先于一切续接来源**（包括显式
+   * `resume: true` 的 /team resume 路径）——参数负责「这一次干净」，归档负责「以后」。
+   */
+  fresh?: boolean;
+  /**
    * Look up the thinking levels supported by a model ("provider/id").
    * Returns undefined when the model cannot be found / the registry is
    * unavailable (fail-open → no `--thinking` flag, member keeps its default).
@@ -258,7 +265,14 @@ export function buildMemberConfig(
     // Resume whenever this member already has persisted session files — covers
     // /team resume, TL-process restarts, and intentional stop/start cycles.
     // A fresh sessionId dir has no files and starts clean.
-    ...(options?.resume || hasSessionFiles(sessionDir) ? { resume: true } : {}),
+    // 阶段 2（方案 D.2）：fresh 优先于自动探测与显式 resume——归档失败时目录
+    // 里仍可能有旧文件，只有「不加 --continue」能保证这一次是干净会话。
+    // `resume: false` 保持既有「false ≡ 未指定」语义（仍走自动探测）。
+    ...(options?.fresh === true
+      ? {}
+      : options?.resume || hasSessionFiles(sessionDir)
+        ? { resume: true }
+        : {}),
     ...(resolved.model ? { model: resolved.model } : {}),
     ...(thinking ? { thinking } : {}),
   };

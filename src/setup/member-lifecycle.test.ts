@@ -11,9 +11,12 @@ import { DEFAULT_SETTINGS } from "../settings/settings";
 // ── Mock the modules that member-lifecycle imports ──────────
 
 const mockCreateMemberProcess = vi.fn();
+// 可变桩（阶段 2）：fresh / 自动续接判定依赖「目录里有没有会话文件」，
+// 需要逐用例切换（原来恒返回 false 的桩覆盖不到自动续接分支）。
+const mockHasSessionFiles = vi.fn((_sessionDir: string) => false);
 vi.mock("../process/member-process", () => ({
   createMemberProcess: (...args: any[]) => mockCreateMemberProcess(...args),
-  hasSessionFiles: () => false,
+  hasSessionFiles: (sessionDir: string) => mockHasSessionFiles(sessionDir),
 }));
 
 // ── Test helpers ────────────────────────────────────────────
@@ -65,6 +68,7 @@ describe("buildMemberConfig", () => {
     tmpDir = mkdtempSync(join(tmpdir(), "member-lifecycle-test-"));
     mkdirSync(join(tmpDir, "sessions", "test-team"), { recursive: true });
     process.env.TOP_NOTCH_TEAM_ROOT = tmpDir;
+    mockHasSessionFiles.mockImplementation(() => false);
     session = {
       active: true,
       teamDefinition: createMockTeamDefinition(),
@@ -172,6 +176,50 @@ describe("buildMemberConfig", () => {
     const { buildMemberConfig } = await loadModule();
     const result = buildMemberConfig("analyzer", session);
     expect(result!.cwd).toBe(process.cwd());
+  });
+
+  // ── 阶段 2（方案 §3.2.2 / D.2）：fresh 与续接判定 ──
+  describe("fresh / 续接判定", () => {
+    it("fresh: true + 目录有会话文件 → 配置不含 resume", async () => {
+      mockHasSessionFiles.mockImplementation(() => true);
+      const { buildMemberConfig } = await loadModule();
+      const result = buildMemberConfig("worker", session, { fresh: true });
+      expect(result!.resume).toBeUndefined();
+    });
+
+    it("fresh 优先于强制续接：fresh: true + resume: true → 仍不含 resume", async () => {
+      mockHasSessionFiles.mockImplementation(() => true);
+      const { buildMemberConfig } = await loadModule();
+      const result = buildMemberConfig("worker", session, { fresh: true, resume: true });
+      expect(result!.resume).toBeUndefined();
+    });
+
+    it("resume: false + 有文件 → 仍续接（既有「false ≡ 未指定」语义不变）", async () => {
+      mockHasSessionFiles.mockImplementation(() => true);
+      const { buildMemberConfig } = await loadModule();
+      const result = buildMemberConfig("worker", session, { resume: false });
+      expect(result!.resume).toBe(true);
+    });
+
+    it("未传 fresh + 目录有文件 → 自动续接（既有分支，本阶段补上覆盖）", async () => {
+      mockHasSessionFiles.mockImplementation(() => true);
+      const { buildMemberConfig } = await loadModule();
+      const result = buildMemberConfig("worker", session);
+      expect(result!.resume).toBe(true);
+    });
+
+    it("未传 fresh + 目录无文件 → 不续接（与今日逐字节一致）", async () => {
+      const { buildMemberConfig } = await loadModule();
+      const result = buildMemberConfig("worker", session);
+      expect(result!.resume).toBeUndefined();
+    });
+
+    it("/team resume 路径（resume: true，无 fresh）→ 强制续接，行为不变", async () => {
+      mockHasSessionFiles.mockImplementation(() => false);
+      const { buildMemberConfig } = await loadModule();
+      const result = buildMemberConfig("worker", session, { resume: true });
+      expect(result!.resume).toBe(true);
+    });
   });
 
   it("should auto-create a shared context stub when the file is missing (no warning)", async () => {
