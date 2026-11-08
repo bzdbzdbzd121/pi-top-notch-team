@@ -1,11 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createMockExtensionAPI, createMockContext } from "../test/fixtures/mock-extension-api";
 import { registerTeamCommand } from "./team";
-import { endSession, getSessionState, startSession } from "../session/state";
+import { endSession, getSessionState, startSession, renameTeamInSession } from "../session/state";
 import { registerStartTeamSessionTool } from "../tools/agent-session-tools";
+import { ensureAddDynamicMemberTool } from "../setup/dynamic-session-bootstrap";
 import { DEFAULT_SETTINGS, type TeamSettings } from "../settings/settings";
 import type { TeamContext, SessionUI } from "../session/context";
 
@@ -268,5 +269,79 @@ describe("红线守护（beta A4）：禁用态下 /team dynamic 仍可正常开
     // 且未扰动进行中的 user 会话
     expect(getSessionState().active).toBe(true);
     expect(getSessionState().origin).toBe("user");
+  });
+});
+
+describe("add_dynamic_member 的未命名一次性提醒（阶段 5）", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "team-dynamic-naming-hint-"));
+    process.env.TOP_NOTCH_TEAM_ROOT = tmpDir;
+    endSession();
+  });
+
+  afterEach(() => {
+    endSession();
+    delete process.env.TOP_NOTCH_TEAM_ROOT;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  async function startDynamic(pi: ReturnType<typeof createMockExtensionAPI>, teamCtx: TeamContext) {
+    registerTeamCommand(pi, teamCtx);
+    const cmdHandler = (pi.registerCommand as any).mock.calls[0][1];
+    await cmdHandler.handler("dynamic", createMockContext());
+  }
+
+  function addTool(pi: ReturnType<typeof createMockExtensionAPI>): any {
+    const call = (pi.registerTool as any).mock.calls.find(
+      ([def]: any) => def.name === "add_dynamic_member"
+    );
+    if (!call) throw new Error("add_dynamic_member not registered");
+    return call[0];
+  }
+
+  const addMember = (tool: any, name: string, label: string) =>
+    tool.execute("id", { name, label, systemPrompt: "负责某项工作" }, undefined, undefined, createMockContext());
+
+  it("未命名动态会话：首个成员带一次提醒，第二个成员不再出现", async () => {
+    const pi = createMockExtensionAPI();
+    const teamCtx = createTeamContext();
+    await startDynamic(pi, teamCtx);
+    const tool = addTool(pi);
+
+    const first = await addMember(tool, "analyst", "分析员");
+    expect(first.content[0].text).toContain("set_team_name");
+    expect(first.content[0].text).toContain("系统默认名");
+    expect(first.content[0].text).toContain("成员启动后不能再改名");
+
+    const second = await addMember(tool, "coder", "编码员");
+    expect(second.content[0].text).not.toContain("set_team_name");
+    expect(second.content[0].text).not.toContain("系统默认名");
+  });
+
+  it("已命名的动态会话：首个成员不出现提醒", async () => {
+    const pi = createMockExtensionAPI();
+    const teamCtx = createTeamContext();
+    await startDynamic(pi, teamCtx);
+    renameTeamInSession("登录重构");
+
+    const first = await addMember(addTool(pi), "analyst", "分析员");
+    expect(first.content[0].text).not.toContain("set_team_name");
+  });
+
+  it("非动态会话：即使名字仍是兜底名也不出现提醒", async () => {
+    const pi = createMockExtensionAPI();
+    const teamCtx = createTeamContext(); // isDynamicSession = false
+    ensureAddDynamicMemberTool(pi, teamCtx);
+    startSession({ name: "_dynamic_9", description: "", members: [] });
+
+    const first = await addMember(addTool(pi), "analyst", "分析员");
+    expect(first.content[0].text).not.toContain("set_team_name");
+  });
+
+  it("start_member 实现中没有「请先 set_team_name」类死指令", () => {
+    const source = readFileSync(new URL("../tools/tl-tools.ts", import.meta.url), "utf-8");
+    expect(source).not.toContain("set_team_name");
   });
 });

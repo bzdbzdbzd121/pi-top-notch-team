@@ -7,7 +7,7 @@ import { setManifestRuntimeContext, syncActiveManifest } from "../session/manife
 import { getRootDir } from "../config";
 import type { TeamDefinition, TeamMember } from "../team/definition";
 import { listTeams } from "../team/store";
-import { normalizeTeamName } from "../team/team-name";
+import { normalizeTeamName, isSyntheticTeamName } from "../team/team-name";
 import { ensureToolRegistered } from "../commands/shared/ensure-tool";
 import { STOP_TEAM_SESSION_TOOL_NAME } from "../tools/agent-session-tool-names";
 import { SET_TEAM_NAME_TOOL_NAME } from "../tools/team-name-tool-names";
@@ -32,6 +32,7 @@ export function ensureAddDynamicMemberTool(pi: ExtensionAPI, teamCtx: TeamContex
         "Parameters: name (identifier), label (Chinese display name), systemPrompt (role definition), model (optional).",
       promptGuidelines: [
         "Use add_dynamic_member to register a team member after discussing the role with the user (or after designing the team autonomously in an agent-initiated session).",
+        "若团队还没有名字（仍是系统默认名），在注册成员之前先用 set_team_name 起一个可识别的名字——成员启动后不能再改名；命名是建议，不是开工条件。",
         "Call once per member role. After all members are added, call write_shared_context to write the shared context, then start members with start_member (blocked until the shared context is written).",
       ],
       parameters: {
@@ -56,6 +57,15 @@ export function ensureAddDynamicMemberTool(pi: ExtensionAPI, teamCtx: TeamContex
         };
 
         try {
+          // One-time naming reminder: only dynamic sessions, only while the team
+          // still carries the synthetic fallback name, and only for the FIRST
+          // member (members are never removed, so this fires at most once).
+          const before = getSessionState();
+          const firstMember = (before.teamDefinition?.members.length ?? 0) === 0;
+          const unnamed = before.teamDefinition
+            ? isSyntheticTeamName(before.teamDefinition.name)
+            : false;
+
           addMemberToSession(member);
           // Persist the updated roster — for dynamic teams this manifest is the
           // ONLY durable copy of the member definitions (no YAML on disk).
@@ -64,9 +74,13 @@ export function ensureAddDynamicMemberTool(pi: ExtensionAPI, teamCtx: TeamContex
           if (session.teamDefinition) {
             teamCtx.router!.updateMembers(session.teamDefinition.members.map((m) => m.name));
           }
+          const namingHint =
+            firstMember && unnamed && teamCtx.isDynamicSession
+              ? "\n💡 团队名仍是系统默认名：建议在启动成员前调用 set_team_name 给团队起一个可识别的名字（成员启动后不能再改名）。"
+              : "";
           return {
             details: {},
-            content: [{ type: "text" as const, text: `成员「${params.label}（${params.name}）」已添加到动态团队。使用 start_member ${params.name} 启动。` }],
+            content: [{ type: "text" as const, text: `成员「${params.label}（${params.name}）」已添加到动态团队。使用 start_member ${params.name} 启动。${namingHint}` }],
           };
         } catch (err) {
           return {
