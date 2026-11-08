@@ -115,6 +115,13 @@ describe("set_team_name tool — 注册", () => {
     expect(tool.promptGuidelines.join("\n")).toContain("set_team_name");
     expect(tool.promptGuidelines.join("\n")).toContain("不可改名");
   });
+
+  it("promptGuidelines 把「启动成员」而非「注册成员」作为冻结点", () => {
+    const { tool } = register();
+    const guidelines = tool.promptGuidelines.join("\n");
+    expect(guidelines).toContain("before starting members");
+    expect(guidelines).not.toContain("before registering members");
+  });
 });
 
 describe("set_team_name tool — 成功路径", () => {

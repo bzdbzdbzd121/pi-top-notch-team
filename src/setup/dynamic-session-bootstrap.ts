@@ -32,7 +32,7 @@ export function ensureAddDynamicMemberTool(pi: ExtensionAPI, teamCtx: TeamContex
         "Parameters: name (identifier), label (Chinese display name), systemPrompt (role definition), model (optional).",
       promptGuidelines: [
         "Use add_dynamic_member to register a team member after discussing the role with the user (or after designing the team autonomously in an agent-initiated session).",
-        "若团队还没有名字（仍是系统默认名），在注册成员之前先用 set_team_name 起一个可识别的名字——成员启动后不能再改名；命名是建议，不是开工条件。",
+        "若团队还没有名字（仍是系统默认名），建议在启动成员（start_member）之前用 set_team_name 起一个可识别的名字——名字在启动成员后才会冻结（注册成员不受影响）；命名是建议、不是开工条件。",
         "Call once per member role. After all members are added, call write_shared_context to write the shared context, then start members with start_member (blocked until the shared context is written).",
       ],
       parameters: {

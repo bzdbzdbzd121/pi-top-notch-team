@@ -310,6 +310,12 @@ describe("add_dynamic_member 的未命名一次性提醒（阶段 5）", () => {
     await startDynamic(pi, teamCtx);
     const tool = addTool(pi);
 
+    // The guideline's freeze point is start_member, never add_dynamic_member.
+    const guidelines = (tool.promptGuidelines as string[]).join("\n");
+    expect(guidelines).toContain("启动成员");
+    expect(guidelines).toContain("注册成员不受影响");
+    expect(guidelines).not.toContain("在注册成员之前先用");
+
     const first = await addMember(tool, "analyst", "分析员");
     expect(first.content[0].text).toContain("set_team_name");
     expect(first.content[0].text).toContain("系统默认名");

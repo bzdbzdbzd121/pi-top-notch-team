@@ -70,11 +70,12 @@ const DECLARATION_BUILDERS: Record<TeamStateDeclarationVariant, (teamName: strin
  * Build the persistent state declaration.
  *
  * @param variant - `predefined` / `execution` produce identical text; `design` differs.
- * @param teamName - Rendered into the execution-state text only. The design text
- *   omits it because the name may still be unassigned at that point (the
- *   session starts with the synthetic `_dynamic_<ts>` fallback until the TL
- *   names it, and the real name is already rendered by the dynamic prompt's
- *   `### 当前团队：X` line — repeating it here would add a second source).
+ * @param teamName - Rendered into the execution-state text only. The design
+ *   declaration takes no name at all: during the design phase the session may
+ *   still carry the synthetic `_dynamic_<ts>` fallback (asserting it would be
+ *   noise), and once the team is named the actual name is already rendered by
+ *   the dynamic prompt's separate `### 当前团队：X` line — repeating it here
+ *   would introduce a second source for the same fact.
  */
 export function buildTeamStateDeclaration(
   variant: TeamStateDeclarationVariant,

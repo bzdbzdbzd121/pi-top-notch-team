@@ -74,6 +74,38 @@ describe("buildDynamicModePrompt — design phase", () => {
     expect(prompt).toContain("成员启动后不能再改名");
   });
 
+  it("阶段 E 的字段枚举与 playbook 计划书模板一致（防漂移）", () => {
+    // Extract the fields the model is told to put in the plan document, then
+    // require every one of them to be enumerated at stage E — otherwise the
+    // confirmation gate would show a plan without that field (and the name
+    // freezes right after start_member).
+    const templateHeading = "### 计划书模板";
+    const template = prompt.slice(
+      prompt.indexOf(templateHeading) + templateHeading.length,
+      prompt.indexOf("### 规则")
+    );
+    const fields = template
+      .split("\n")
+      .filter((line) => line.startsWith("### "))
+      .map((line) => line.slice(4).trim());
+    expect(fields).toEqual([
+      "目标",
+      "任务拆分",
+      "工作流",
+      "团队分工",
+      "团队名（建议）",
+      "风险与应对",
+    ]);
+
+    const stageE = prompt.slice(
+      prompt.indexOf("#### 阶段 E：方案确认门"),
+      prompt.indexOf("#### 阶段 F：落地执行")
+    );
+    for (const field of fields) {
+      expect(stageE, `阶段 E 缺少计划书字段：${field}`).toContain(field);
+    }
+  });
+
   it("阶段 F 落地顺序：命名 → 注册成员 → 写共享上下文 → 启动成员（阶段 5）", () => {
     const fStart = prompt.indexOf("#### 阶段 F：落地执行");
     const fEnd = prompt.indexOf("#### 目标（可选）");
@@ -84,6 +116,8 @@ describe("buildDynamicModePrompt — design phase", () => {
     expect(fSection).toContain("set_team_name");
     expect(fSection).toContain("建议");
     expect(fSection).toContain("成员启动后不能再改名");
+    // The freeze point is start_member, never add_dynamic_member.
+    expect(fSection).toContain("启动成员之前");
 
     const setNameIdx = fSection.indexOf("set_team_name");
     const addIdx = fSection.indexOf("add_dynamic_member");

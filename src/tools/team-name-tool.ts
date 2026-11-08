@@ -56,7 +56,7 @@ export function ensureSetTeamNameTool(pi: ExtensionAPI, teamCtx: TeamContext): v
         "already fixed inside the running processes. Name rules: letters/digits/CJK, '-' and '_', at most 20 display " +
         "columns, and not the same as an existing pre-defined team. Parameters: name (required).",
       promptGuidelines: [
-        "Call set_team_name once after the plan is confirmed (or right after start_team_session) and before registering members: a readable name is what the user sees in the status bar, /team status and /team resume.",
+        "Call set_team_name once after the plan is confirmed (or right after start_team_session) and before starting members with start_member: a readable name is what the user sees in the status bar, /team status and /team resume.",
         "成员启动后不可改名——再调用会被拒绝并说明原因；请在 start_member 之前完成命名。",
         "命名失败不会破坏会话：名字非法或与预定义团队同名时目录与状态都不变，换一个名字重试即可。",
       ],
