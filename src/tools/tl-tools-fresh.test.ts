@@ -157,9 +157,9 @@ describe("start_member fresh（阶段 2）", () => {
     });
 
     expect(text).toContain("全新会话");
-    expect(text).toContain("已归档 1 个");
-    expect(text).toContain(".member-resets");
-    expect(text).toContain("/team clean");
+    expect(text).toContain("已归档 1 个旧会话文件");
+    expect(text).toContain("可手工移回恢复；可随时用 /team clean 清理");
+    expect(text).toContain("该成员不记得此前的对话，且它已改写的文件不会回滚。");
 
     expect(result.details).toMatchObject({
       sessionMode: "fresh",
@@ -180,6 +180,8 @@ describe("start_member fresh（阶段 2）", () => {
     expect(archive).not.toHaveBeenCalled();
     expect(result.content[0].text).toContain("全新会话");
     expect(result.content[0].text).toContain("此前没有可续接的历史");
+    // 无历史分支没有「丢弃了上下文」可讲（§3.4.2 表）：不输出不记得/不回滚句
+    expect(result.content[0].text).not.toContain("不记得此前的对话");
     expect(result.details).toMatchObject({ sessionMode: "fresh", archivedFiles: 0 });
     expect(existsSync(join(rootDir, "sessions", "test-team", "sid", ".member-resets"))).toBe(false);
   });
@@ -221,8 +223,8 @@ describe("start_member fresh（阶段 2）", () => {
     });
     const withTwo = register({ archive: cumulative });
     const first = await withTwo.startMember.execute("call-1", { name: "coder", fresh: true });
-    expect(first.content[0].text).toContain("累计 2 个归档");
-    expect(first.content[0].text).toContain("5.0 KB");
+    expect(first.content[0].text).toContain("该成员累计 2 个归档，合计 5.0 KB。");
+    expect(first.content[0].text).toContain("该成员不记得此前的对话，且它已改写的文件不会回滚。");
     expect(first.details).toMatchObject({ memberArchiveCount: 2, memberArchiveBytes: 5120 });
 
     const single = vi.fn().mockReturnValue({
@@ -288,6 +290,47 @@ describe("start_member fresh（阶段 2）", () => {
     expect(createMember).not.toHaveBeenCalled();
     // 绝不归档一个可能仍在写的目录
     expect(existsSync(join(sessionDir, "old.jsonl"))).toBe(true);
+  });
+
+  it("归档成功但启动失败 → 返回启动失败原文，并附归档路径（可手工移回，§3.2.4）", async () => {
+    writeFileSync(join(sessionDir, "old.jsonl"), "{}\n");
+    const createMember = vi.fn(() => {
+      const handle = createHandle("coder");
+      handle.start = vi.fn().mockRejectedValue(new Error("spawn pi ENOENT"));
+      return handle;
+    });
+    const { startMember } = register({ createMember });
+
+    const result = await startMember.execute("call-1", { name: "coder", fresh: true });
+    const text = result.content[0].text;
+
+    // 启动失败原文照旧披露
+    expect(text).toContain('成员 "coder" 启动失败');
+    expect(text).toContain("spawn pi ENOENT");
+    // 归档已发生，必须披露路径与「可手工移回」
+    expect(text).toContain("已归档 1 个");
+    expect(text).toContain(".member-resets");
+    expect(text).toContain("可手工移回");
+    expect(text).toContain(sessionDir);
+    // 归档确实执行了（旧文件已离开成员会话目录）
+    expect(listMemberSessionFiles(sessionDir)).toEqual([]);
+  });
+
+  it("未归档（非 fresh）启动失败 → 不附归档信息（回归）", async () => {
+    writeFileSync(join(sessionDir, "old.jsonl"), "{}\n");
+    const createMember = vi.fn(() => {
+      const handle = createHandle("coder");
+      handle.start = vi.fn().mockRejectedValue(new Error("spawn pi ENOENT"));
+      return handle;
+    });
+    const { startMember } = register({ createMember });
+
+    const result = await startMember.execute("call-1", { name: "coder" });
+    const text = result.content[0].text;
+
+    expect(text).toContain("启动失败");
+    expect(text).not.toContain("已归档");
+    expect(text).not.toContain("可手工移回");
   });
 
   it("归档先于启动（E2）：归档完成时进程尚未创建", async () => {

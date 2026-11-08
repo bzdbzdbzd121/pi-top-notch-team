@@ -114,24 +114,27 @@ export function normalizeFreshParam(raw: unknown): boolean {
 }
 
 /**
- * fresh 的会话附注（阶段 2，方案 §3.2 / §5）：接在「已启动 (PID: …)」之后，
+ * fresh 的会话附注（阶段 2，方案 §3.4.2）：接在「已启动 (PID: …)」之后，
  * 以逗号开头，未传 fresh 时调用方不拼接（保证旧文案逐字节不变）。
+ * 归档句必须同时说清「可手工移回恢复」与后续清理入口（§3.3.5）。
  */
 export function formatFreshSessionNote(archive: ArchiveResult | null): string {
   if (!archive) return "，全新会话（该成员此前没有可续接的历史）";
   if (archive.moved.length > 0) {
     return (
-      `，全新会话（已归档 ${archive.moved.length} 个 → ${archive.archiveDir}；` +
-      `归档可用 /team clean 清理）`
+      `，全新会话（已归档 ${archive.moved.length} 个旧会话文件 → ${archive.archiveDir}，` +
+      `可手工移回恢复；可随时用 /team clean 清理）`
     );
   }
   return "，全新会话";
 }
 
 /**
- * fresh 的归档告警与累计统计（阶段 2，方案 §3.2.4 / §3.3.1）：
+ * fresh 的归档告警、累计统计与语义边界（阶段 2，方案 §3.2.4 / §3.3.1 / §3.4.2）：
  *  - 归档失败：给出失败数、原因、旧文件位置与残留风险（不阻断启动，E4）
- *  - 累计 ≥ 2：附带数量与大小，并指向清理入口；累计 =1 不输出「累计」句（防噪音）
+ *  - 累计 ≥ 2：附带数量与大小；累计 =1 不输出「累计」句（防噪音）
+ *  - 确实丢弃了上下文（moved > 0）：明说成员不记得此前的对话、已改写的文件不回滚
+ *    （方案 §3.2.5 的语义边界）——无历史/归档全失败时没有「丢失」可言，不输出该句
  * 未传 fresh / 无异常时返回空串（旧文案逐字节不变）。
  */
 export function formatFreshArchiveNotice(
@@ -149,9 +152,11 @@ export function formatFreshArchiveNotice(
   }
   if (archive.memberArchiveCount >= 2) {
     lines.push(
-      `该成员累计 ${archive.memberArchiveCount} 个归档（合计 ${formatBytes(archive.memberArchiveBytes)}），` +
-        `可用 /team clean 清理。`
+      `该成员累计 ${archive.memberArchiveCount} 个归档，合计 ${formatBytes(archive.memberArchiveBytes)}。`
     );
+  }
+  if (archive.moved.length > 0) {
+    lines.push("该成员不记得此前的对话，且它已改写的文件不会回滚。");
   }
   return lines.length > 0 ? `\n${lines.join("\n")}\n` : "";
 }
@@ -426,12 +431,20 @@ export function registerTlTools(deps: TlToolsDeps): void {
           ],
         };
       } catch (err) {
+        // 方案 §3.2.4「归档成功但启动失败」：返回启动失败原文，并附归档路径
+        // （可手工移回）。不附的话用户会误以为旧上下文还在原处。
+        const failureText = `成员 "${params.name}" 启动失败：${err instanceof Error ? err.message : String(err)}`;
+        const archiveNote =
+          archive && archive.moved.length > 0
+            ? `\n旧会话文件已归档 ${archive.moved.length} 个 → ${archive.archiveDir}` +
+              `（可手工移回 ${memberSessionDir} 恢复）。`
+            : "";
         return {
           details: {},
           content: [
             {
               type: "text" as const,
-              text: `成员 "${params.name}" 启动失败：${err instanceof Error ? err.message : String(err)}`,
+              text: `${failureText}${archiveNote}`,
             },
           ],
         };
