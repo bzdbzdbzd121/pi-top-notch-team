@@ -18,6 +18,7 @@ import {
 import type { MemberOperationalState } from "../session/context";
 import { getSessionState } from "../session/state";
 import { syncActiveManifest } from "../session/manifest";
+import { detectDuplicateStart, type DuplicateStartBlock } from "../setup/member-lifecycle";
 import { createMemberProcess } from "../process/member-process";
 import { spawn } from "node:child_process";
 import { TASK_DISPATCH_GUIDELINES } from "../prompts/task-dispatch-protocol";
@@ -71,6 +72,32 @@ export function describeSpawnThinkingAnnotation(
       : "思考强度：跟随 TL，但模型不支持该级别，保持默认";
   }
   return `思考强度：${resolved ?? "默认"}`;
+}
+
+/**
+ * 重复启动拒绝文案（阶段 1，方案 §3.1.3）：不发生启动，也不返回「错误」。
+ * 工具结果本来就没有独立错误标记（本项目对校验失败也一律返回文本），更重要的是
+ * 行为引导——一个「失败」的措辞会诱发模型换写法重试（直接 stop 再 start、或编一个
+ * 成员名），而这里其实什么都没发生，需要的是「事实 + 三条出路」。
+ *
+ * 说明：「丢弃上下文」那条出路的 fresh 参数由阶段 2 引入；文案按方案 §3.1.3 的
+ * 定稿形式先给出，避免同一段文案在两个阶段各写一版。
+ */
+export function formatDuplicateStartText(name: string, block: DuplicateStartBlock): string {
+  const pid = block.pid ?? "未知";
+  if (block.reason === "stopping") {
+    return (
+      `成员 "${name}" 正在停止中 (PID: ${pid})，本次未启动。` +
+      `请等 stop_member 返回后再调用 start_member。`
+    );
+  }
+  return (
+    `成员 "${name}" 已在运行 (PID: ${pid})，本次未重复启动（避免两个同名进程同时运行）。\n` +
+    `- 继续使用它：直接 team_send_and_wait 派发任务。\n` +
+    `- 重启并保留上下文：先 stop_member，再 start_member。\n` +
+    `- 重启并丢弃上下文：先 stop_member，再 start_member({name:"${name}", fresh:true})。\n` +
+    `- 如果这是上一个团队会话遗留的进程（例如刚 /team start 了另一个团队）：先 stop_member 停止它，再启动。`
+  );
 }
 
 // ── Type aliases ───────────────────────────────────────────
@@ -188,6 +215,30 @@ export function registerTlTools(deps: TlToolsDeps): void {
       required: ["name"],
     },
     async execute(_toolCallId: string, params: { name: string }): Promise<ToolResult> {
+      // ── 重复启动守卫（阶段 1，方案 §3.1）──
+      // 第一步读句柄状态，命中就返回提示且零副作用：buildMemberConfig 才会
+      // mkdir 会话目录，不写名册、不触发阶段切换，因此守卫必须在它之前。
+      // 刻意放在共享上下文门控之前：被拒绝的启动不该被误报成「请先写共享上下文」
+      // （两道检查都是零副作用，顺序只影响错误归因）。
+      // 检查→建目录→登记句柄→start() 的同步前缀之间不得插入 await（方案 §3.1.4）
+      // ——正是这个同步段让同一条消息里的并行 start_member 无法双重穿过。
+      // 句柄查询未接线时 fail-open（老测试/最小装配），结构性兜底仍在
+      // createAndRegisterMember 内部。
+      const duplicateStart = deps.getHandle
+        ? detectDuplicateStart(deps.getHandle(params.name))
+        : null;
+      if (duplicateStart) {
+        return {
+          details: {},
+          content: [
+            {
+              type: "text" as const,
+              text: formatDuplicateStartText(params.name, duplicateStart),
+            },
+          ],
+        };
+      }
+
       // ── Shared context gate ──
       // A member must never start before the TL has written the shared context
       // (members read .shared-context.md at startup). Only the

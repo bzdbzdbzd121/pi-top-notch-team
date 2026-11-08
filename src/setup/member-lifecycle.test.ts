@@ -506,6 +506,113 @@ describe("createAndRegisterMember", () => {
     expect(mockHandle.onEvent).toHaveBeenCalledWith(expect.any(Function));
   });
 
+  // ── 阶段 1（方案 §3.1.2 第二层 / 不变式 E7）：结构性重复启动守卫 ──
+  // 置在函数最顶部，必须早于「把成员操作状态重置为 idle」——那个写入发生在
+  // 注册句柄之前，挡在后面的话被拒绝的调用已经把运行中成员的状态改成了 idle。
+  describe("结构性重复启动守卫", () => {
+    function makeConfig(): MemberProcessConfig {
+      return {
+        name: "worker",
+        role: "worker",
+        roleLabel: "编码员",
+        teamName: "test-team",
+        teamMembers: [],
+        memberDescription: "",
+        sessionDir: "/fake/sessions/test-team/worker",
+        memberExtensionPath: "/path/to/member.ts",
+        cwd: "/fake/project",
+      };
+    }
+
+    it("同名句柄仍在运行 → 抛错，且操作状态未被改写、句柄未被注册、进程未被创建", async () => {
+      const { createAndRegisterMember } = await loadModule();
+      mockCreateMemberProcess.mockClear();
+      const running = createMockHandle({
+        getState: vi.fn().mockReturnValue({ name: "worker", pid: 999, status: "running" }),
+      });
+      const manager = { addHandle: vi.fn() };
+      memberOpsStates.set("worker", "working");
+      const deps = {
+        pi: pi as any,
+        memberOpsStates,
+        messageQueue,
+        responseWaiter,
+        lastPendingCorrId,
+        recentlyProcessedMessages,
+        processManager: manager as any,
+        memberHandles: new Map([["worker", running]]),
+      };
+
+      expect(() => createAndRegisterMember(pi as any, makeConfig(), deps as any)).toThrow(
+        /已在运行/
+      );
+
+      // 门控依赖的操作状态必须保持原样（不能被重置成 idle 提前放行）
+      expect(memberOpsStates.get("worker")).toBe("working");
+      expect(manager.addHandle).not.toHaveBeenCalled();
+      expect(mockHandle.onEvent).not.toHaveBeenCalled();
+      expect(mockCreateMemberProcess).not.toHaveBeenCalled();
+    });
+
+    it("同名句柄正在停止中（stopped + PID 非空）→ 抛错", async () => {
+      const { createAndRegisterMember } = await loadModule();
+      mockCreateMemberProcess.mockClear();
+      const stopping = createMockHandle({
+        getState: vi.fn().mockReturnValue({ name: "worker", pid: 999, status: "stopped" }),
+      });
+      const deps = {
+        pi: pi as any,
+        memberOpsStates,
+        messageQueue,
+        responseWaiter,
+        lastPendingCorrId,
+        recentlyProcessedMessages,
+        memberHandles: new Map([["worker", stopping]]),
+      };
+
+      expect(() => createAndRegisterMember(pi as any, makeConfig(), deps as any)).toThrow(
+        /正在停止中/
+      );
+      expect(mockCreateMemberProcess).not.toHaveBeenCalled();
+    });
+
+    it("同名句柄已停止（stopped + PID 空）→ 放行（崩溃/主动停止后的既有恢复路径）", async () => {
+      const { createAndRegisterMember } = await loadModule();
+      mockCreateMemberProcess.mockClear();
+      const stopped = createMockHandle({
+        getState: vi.fn().mockReturnValue({ name: "worker", pid: null, status: "stopped" }),
+      });
+      const deps = {
+        pi: pi as any,
+        memberOpsStates,
+        messageQueue,
+        responseWaiter,
+        lastPendingCorrId,
+        recentlyProcessedMessages,
+        memberHandles: new Map([["worker", stopped]]),
+      };
+
+      const handle = createAndRegisterMember(pi as any, makeConfig(), deps as any);
+
+      expect(handle).toBe(mockHandle);
+      expect(memberOpsStates.get("worker")).toBe("idle");
+    });
+
+    it("未接线 memberHandles（最小装配）→ fail-open 不阻断", async () => {
+      const { createAndRegisterMember } = await loadModule();
+      const deps = {
+        pi: pi as any,
+        memberOpsStates,
+        messageQueue,
+        responseWaiter,
+        lastPendingCorrId,
+        recentlyProcessedMessages,
+      };
+
+      expect(() => createAndRegisterMember(pi as any, makeConfig(), deps as any)).not.toThrow();
+    });
+  });
+
   describe("event handling", () => {
     let config: MemberProcessConfig;
 
