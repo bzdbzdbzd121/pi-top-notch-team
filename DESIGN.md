@@ -2754,7 +2754,7 @@ TeamModeEditor.render(width)
 | `FRAME_MS` | 80 | 同上 | 心跳间隔（12.5 fps）——量化预算内最省 |
 | `STALE_MS` | 1000 | 同上 | 看门狗阈值：超过该时长没有真实渲染即暂停请求 |
 | `DEFAULT_GRADIENT_STOPS` | 32 | `border-gradient.ts` | 每行色标数上限（clamp 到 `[1, width]`） |
-| `BORDER_ANIMATION_ENV` | `TOP_NOTCH_TEAM_BORDER_ANIMATION` | 同上 | `0`/`false`/`off` 关闭动效 |
+| `BORDER_ANIMATION_ENV` | `TOP_NOTCH_TEAM_BORDER_ANIMATION` | `border-animator.ts` | `0`/`false`/`off` 关闭动效（常量定义与 `borderAnimationEnabled` 读取都在该文件） |
 
 阈值、色标数、帧间隔都是常量，真机观感不合适时集中调整。
 

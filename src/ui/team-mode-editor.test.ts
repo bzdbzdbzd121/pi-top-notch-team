@@ -21,12 +21,13 @@
  */
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { Editor, visibleWidth } from "@earendil-works/pi-tui";
-import { rgbToAnsi256, type Rgb } from "./border-gradient";
+import { ansiAtCyclePosition, rgbToAnsi256, type Rgb } from "./border-gradient";
 import {
   BORDER_ANIMATION_ENV,
   CYCLE_MS,
   FRAME_MS,
   createBorderAnimator,
+  sharedBorderAnimator,
   type BorderAnimator,
 } from "./border-animator";
 
@@ -112,6 +113,11 @@ function makeTheme(init: ThemeInit = {}): Theme {
 }
 
 const TRUE_ACCENT = fgAnsi("accent", ANCHOR_RGB, "truecolor");
+
+/** The theme anchors in the order the gradient walks them. */
+const ANCHORS_IN_ORDER: Rgb[] = ["error", "syntaxKeyword", "warning", "accent", "syntaxType", "success"].map(
+  (name) => ANCHOR_RGB[name]!,
+);
 
 interface EditorInit {
   text?: string;
@@ -643,7 +649,54 @@ describe("TeamModeEditor.render — fail-open", () => {
 describe("TeamModeEditor.render — heartbeat", () => {
   afterEach(() => {
     delete process.env[BORDER_ANIMATION_ENV];
+    // Tests that exercise the DEFAULT wiring share the process-wide animator;
+    // always drop its timer so the next test starts from a quiet process.
+    sharedBorderAnimator.dispose();
     vi.useRealTimers();
+  });
+
+  it("uses one process-wide heartbeat when no animator is injected", () => {
+    vi.useFakeTimers();
+    const theme = makeTheme();
+    const first = new TeamModeEditor({ requestRender: vi.fn() } as never, {} as never, {} as never, theme);
+    const second = new TeamModeEditor({ requestRender: vi.fn() } as never, {} as never, {} as never, theme);
+
+    first.setTeamMode(true);
+    second.setTeamMode(true);
+    // Default constructor argument = the module-level singleton: two editors,
+    // one timer (pi keeps old editor instances alive, so per-instance timers
+    // would repaint forever).
+    expect(vi.getTimerCount()).toBe(1);
+    expect(sharedBorderAnimator.active).toBe(true);
+
+    first.setTeamMode(false);
+    second.setTeamMode(false);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(sharedBorderAnimator.active).toBe(false);
+  });
+
+  it("advances one full lap per CYCLE_MS, independent of how many frames render", () => {
+    const clock = { t: 0 };
+    const editor = createEditor({ text: "", animator: createTestAnimator(clock) });
+    const width = 120;
+
+    const atStart = editor.render(width)[0]!;
+
+    // One lap later the picture repeats exactly (rate = 1 / CYCLE_MS).
+    clock.t = CYCLE_MS;
+    expect(editor.render(width)[0]).toBe(atStart);
+
+    // A quarter lap is exactly phase 0.25 — half the rate would land on 0.125.
+    clock.t = CYCLE_MS / 4;
+    const quarter = editor.render(width)[0]!;
+    expect(dashColors(quarter)[0]).toBe(ansiAtCyclePosition(0.5 / 32 + 0.25, ANCHORS_IN_ORDER, "truecolor"));
+    expect(quarter).not.toBe(atStart);
+
+    // Frames do not accumulate: at a fixed instant every render is identical.
+    const repeated = editor.render(width)[0]!;
+    editor.render(width);
+    editor.render(width);
+    expect(editor.render(width)[0]).toBe(repeated);
   });
 
   it("starts exactly one heartbeat with team mode and stops it afterwards", () => {
@@ -726,15 +779,16 @@ describe("TeamModeEditor.render — heartbeat", () => {
     expect(editor.render(120)).toEqual(base);
     expect(editor.render(120)).toEqual(base);
 
-    // The heartbeat keeps asking for repaints (the watchdog stays fed) …
-    for (let frame = 0; frame < 5; frame++) {
+    // 15 frames = 1200 ms, i.e. past STALE_MS. Every bash-mode render must still
+    // feed the watchdog (noteRendered before the bash early return), otherwise the
+    // heartbeat would pause after a second and the border would stop repainting.
+    const frames = 15;
+    for (let frame = 0; frame < frames; frame++) {
       clock.t += FRAME_MS;
       vi.advanceTimersByTime(FRAME_MS);
+      expect(editor.render(120)).toEqual(base);
     }
-    expect(tui.requestRender).toHaveBeenCalledTimes(5);
-
-    // … and the output is constant, so the terminal writes nothing.
-    expect(editor.render(120)).toEqual(base);
+    expect(tui.requestRender).toHaveBeenCalledTimes(frames);
 
     // Leaving bash mode restores the gradient on the very next render.
     editor.setText("ls");
