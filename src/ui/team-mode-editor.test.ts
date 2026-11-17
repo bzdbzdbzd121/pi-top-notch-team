@@ -19,9 +19,16 @@
  * validated against the real pinned editor (see the fidelity test), so a fixture
  * cannot drift into a shape no pi version renders.
  */
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import { Editor, visibleWidth } from "@earendil-works/pi-tui";
 import { rgbToAnsi256, type Rgb } from "./border-gradient";
+import {
+  BORDER_ANIMATION_ENV,
+  CYCLE_MS,
+  FRAME_MS,
+  createBorderAnimator,
+  type BorderAnimator,
+} from "./border-animator";
 
 vi.mock("@earendil-works/pi-coding-agent", () => {
   const stripAnsiLocal = (text: string) => text.replace(/\x1b\[[\d;]*m/g, "");
@@ -112,10 +119,26 @@ interface EditorInit {
   topBorder?: string;
   bottomBorder?: string;
   theme?: Theme;
+  animator?: BorderAnimator;
+  tui?: { requestRender: () => void };
+}
+
+/**
+ * Deterministic animator for assertions: injected clock, no real timer. Colours
+ * therefore depend only on the clock value a test sets.
+ */
+function createTestAnimator(clock: { t: number } = { t: 0 }): BorderAnimator {
+  return createBorderAnimator({
+    now: () => clock.t,
+    setInterval: () => 0,
+    clearInterval: () => {},
+  });
 }
 
 function createEditor(init: EditorInit = {}): TeamModeEditor {
-  const editor = new TeamModeEditor({} as never, {} as never, {} as never, init.theme ?? makeTheme());
+  const animator = init.animator ?? createTestAnimator();
+  const tui = init.tui ?? { requestRender: () => {} };
+  const editor = new TeamModeEditor(tui as never, {} as never, {} as never, init.theme ?? makeTheme(), animator);
   if (init.text !== undefined) editor.setText(init.text);
   const internals = editor as unknown as { autocompleteLines: string[]; topBorder?: string; bottomBorder?: string };
   if (init.autocompleteLines) internals.autocompleteLines = init.autocompleteLines;
@@ -562,7 +585,9 @@ describe("TeamModeEditor.render — inactive", () => {
   });
 
   it("does not paint anything before team mode is enabled", () => {
-    const editor = new TeamModeEditor({} as never, {} as never, {} as never, makeTheme());
+    const animator = createTestAnimator();
+    const tui = { requestRender: () => {} };
+    const editor = new TeamModeEditor(tui as never, {} as never, {} as never, makeTheme(), animator);
     editor.setText("/team s");
     expect(editor.render(40)).toEqual(baseRender(editor, 40));
   });
@@ -615,19 +640,127 @@ describe("TeamModeEditor.render — fail-open", () => {
   });
 });
 
-describe("TeamModeEditor.render — timers", () => {
-  it("creates no timers when entering and leaving team mode", () => {
+describe("TeamModeEditor.render — heartbeat", () => {
+  afterEach(() => {
+    delete process.env[BORDER_ANIMATION_ENV];
+    vi.useRealTimers();
+  });
+
+  it("starts exactly one heartbeat with team mode and stops it afterwards", () => {
     vi.useFakeTimers();
-    try {
-      const editor = createEditor({ text: "/team s" });
-      editor.render(80);
-      editor.setTeamMode(false);
-      editor.render(80);
-      editor.setTeamMode(true);
-      editor.render(80);
-      expect(vi.getTimerCount()).toBe(0);
-    } finally {
-      vi.useRealTimers();
+    const clock = { t: 0 };
+    const animator = createBorderAnimator({ now: () => clock.t });
+    const tui = { requestRender: vi.fn() };
+    const editor = createEditor({ text: "", animator, tui });
+
+    expect(animator.active).toBe(true);
+    expect(vi.getTimerCount()).toBe(1);
+
+    clock.t += FRAME_MS;
+    vi.advanceTimersByTime(FRAME_MS);
+    expect(tui.requestRender).toHaveBeenCalledTimes(1);
+
+    editor.setTeamMode(false);
+    expect(animator.active).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
+
+    clock.t += FRAME_MS;
+    vi.advanceTimersByTime(FRAME_MS);
+    expect(tui.requestRender).toHaveBeenCalledTimes(1);
+  });
+
+  it("shares one heartbeat between two editor instances", () => {
+    vi.useFakeTimers();
+    const clock = { t: 0 };
+    const animator = createBorderAnimator({ now: () => clock.t });
+    const first = createEditor({ text: "", animator, tui: { requestRender: vi.fn() } });
+    const second = createEditor({ text: "", animator, tui: { requestRender: vi.fn() } });
+
+    expect(vi.getTimerCount()).toBe(1);
+
+    second.setTeamMode(false);
+    expect(vi.getTimerCount()).toBe(0);
+    first.setTeamMode(false);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("keeps the border static and creates no timer when the animation is disabled", () => {
+    process.env[BORDER_ANIMATION_ENV] = "0";
+    vi.useFakeTimers();
+    const clock = { t: 0 };
+    const animator = createBorderAnimator({ now: () => clock.t });
+    const editor = createEditor({ text: "", animator });
+
+    expect(animator.active).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
+
+    const before = editor.render(120)[0]!;
+    clock.t += CYCLE_MS / 3;
+    const after = editor.render(120)[0]!;
+
+    expect(before).toContain("\x1b[38;2;"); // still the gradient
+    expect(after).toBe(before); // but frozen
+  });
+
+  it("flows over time when the animation is enabled", () => {
+    const clock = { t: 0 };
+    const editor = createEditor({ text: "", animator: createTestAnimator(clock) });
+
+    const before = editor.render(120)[0]!;
+    clock.t = CYCLE_MS / 4;
+    const after = editor.render(120)[0]!;
+
+    expect(plainOf(after)).toBe(plainOf(before)); // characters never change
+    expect(after).not.toBe(before); // colours did
+  });
+
+  it("keeps rendering (and repainting) in bash mode, then restores the gradient", () => {
+    vi.useFakeTimers();
+    const clock = { t: 0 };
+    const animator = createBorderAnimator({ now: () => clock.t });
+    const tui = { requestRender: vi.fn() };
+    const editor = createEditor({ text: "!ls", animator, tui });
+    const base = baseRender(editor, 120);
+
+    // Bash mode: the border is pi's single colour, byte-identical to the base render.
+    expect(editor.render(120)).toEqual(base);
+    expect(editor.render(120)).toEqual(base);
+
+    // The heartbeat keeps asking for repaints (the watchdog stays fed) …
+    for (let frame = 0; frame < 5; frame++) {
+      clock.t += FRAME_MS;
+      vi.advanceTimersByTime(FRAME_MS);
     }
+    expect(tui.requestRender).toHaveBeenCalledTimes(5);
+
+    // … and the output is constant, so the terminal writes nothing.
+    expect(editor.render(120)).toEqual(base);
+
+    // Leaving bash mode restores the gradient on the very next render.
+    editor.setText("ls");
+    const painted = editor.render(120);
+    expect(painted[0]).toContain("\x1b[38;2;");
+    expect(plainOf(painted[0]!)).toBe("─".repeat(120));
+    expect(painted).not.toEqual(base);
+  });
+
+  it("keeps the watchdog fed from render(), so repaints resume after a pause", () => {
+    vi.useFakeTimers();
+    const clock = { t: 0 };
+    const animator = createBorderAnimator({ now: () => clock.t });
+    const tui = { requestRender: vi.fn() };
+    const editor = createEditor({ text: "", animator, tui });
+
+    // No render for longer than the stale window → the heartbeat pauses.
+    clock.t = 5000;
+    vi.advanceTimersByTime(FRAME_MS);
+    expect(tui.requestRender).not.toHaveBeenCalled();
+
+    // A real render feeds the watchdog (render → noteRendered) …
+    editor.render(120);
+    // … and the very next tick asks for a repaint again.
+    clock.t += FRAME_MS;
+    vi.advanceTimersByTime(FRAME_MS);
+    expect(tui.requestRender).toHaveBeenCalledTimes(1);
   });
 });

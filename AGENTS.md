@@ -216,12 +216,19 @@ src/
 │   ├── member-overview-state.ts / .test.ts ← 无表头总览与标签窗口纯函数：占用条+百分比、轨迹左侧当前状态、最新在左最多20图标与(N)隐藏计数、稳定名册、窄屏/CJK/emoji精确列宽
 │   ├── member-inspector.overview.test.ts ← 默认总览、页面导航、stats并发与陈旧值、风暴、小高度、关闭清理回归
 │   ├── pi-key-decode.ts      ← decodePrintableKey 本地实现（decodeKittyPrintable 主入口导入 + modifyOtherKeys 回退按上游 keys.js 复刻；不能深导入 pi-tui/dist/keys.js——loader jiti alias 前缀替换会拼坏子路径，见 DESIGN.md §17）
-│   └── pi-key-decode.test.ts ← 本地解码器单元测试（kitty CSI-u / modifyOtherKeys / legacy 三协议 + 修饰拒绝 + Caps Lock 掩码）
+│   ├── pi-key-decode.test.ts ← 本地解码器单元测试（kitty CSI-u / modifyOtherKeys / legacy 三协议 + 修饰拒绝 + Caps Lock 掩码）
+│   ├── team-mode-editor.ts   ← 团队会话输入框边框着色（决策 #51）：render() 后处理上下两条横线；逐列上色（破折号取渐变、其余字符取 accent）→ 同色合并 → 行尾 `\x1b[39m`；上边框恒着色、下边框用「仅边框字符且含 ≥1 个 `─`」向上扫（自动补全行在边框之后）；bash 模式（`isBashModeText`，等价 `text.trimStart().startsWith("!")`）直接交回 pi 的单色提示；着色段 fail-open（先算后写，抛错保留基类渲染）；`setTeamMode` 同步心跳（`active && 未禁用`）；构造时 `animator.attachTui(tui)`
+│   ├── team-mode-editor.test.ts ← 真实 `visibleWidth` 宽度矩阵 / 真实 pi-tui 0.83 滚动提示形状（保真性用例对撞真实 `Editor` 输出）/ 段映射 floor 边界与段中心取样 / 自动补全保持 / bash 边界 / 非团队态逐字节相同 / fail-open / 心跳与看门狗接线 / 环境变量关闭
+│   ├── border-gradient.ts    ← 渐变颜色数学（纯函数、零 IO）：`parseAnsiFg`（`38;2` / `38;5`，xterm 16..255）、`rgbToAnsi256`（逐行复刻 pi-tui `colors.js`：6×6×6 立方 + 24 级灰阶 + 加权距离 + 仅极差 <10 才用灰阶）、`ansiAtCyclePosition`（锚点环 smoothstep 插值，越界/负相位绕环、非有限值取起点）、`paintBorderLine`（逐列取色 + 同色合并 + 行尾复位；`DEFAULT_GRADIENT_STOPS = 32` clamp 到 `[1, width]`）
+│   ├── border-gradient.test.ts ← 锚点还原（≤2/通道）/ 段内取样精确值 / 相位越界与 clamp / 真彩与 256 互斥 / 量化几何锁（16..255 全索引往返、立方体↔灰阶交接区间、tie 取低档）/ 段数与字节上界（含最坏 3 位通道）/ 列→段映射边界
+│   ├── border-animator.ts    ← 边框心跳（决策 #51）：进程级单例 `sharedBorderAnimator` + 看门狗；`createBorderAnimator({ now, setInterval, clearInterval, frameMs=80, staleMs=1000 })` 提供 `attachTui` / `setActive`（幂等）/ `noteRendered` / `dispose` / `now` / `active`；每 tick 至多 1 次 `requestRender`（异常 fail-open）；`> staleMs` 未渲染只跳过请求不销毁定时器；定时器 `unref`；常量 `CYCLE_MS=8000` / `FRAME_MS=80` / `STALE_MS=1000` / `BORDER_ANIMATION_ENV`
+│   └── border-animator.test.ts ← 环境变量矩阵 / 恰 1 个定时器与幂等 / 每 tick 恰 1 次 requestRender / unref / 看门狗暂停恢复与窗口边界 / 抛错 fail-open / 单例与 attachTui 目标切换 / dispose 归零
 ├── config.ts         ← getRootDir() via env var or ~/.pi/top-notch-team
 ├── config.test.ts    ← getRootDir() env var tests
 ├── static-scan.test.ts ← 阶段 5 防退化守卫（R4）：静态扫描全仓 loadSettings( 调用点，除白名单（settings.ts / session-settings.ts / setting-handler.ts）外必须经合并层；负例 fixture 锁定「人为新增绕过 → 测试红」。决策 #47 起另扫绝对化历史断言：范围 index.ts（退场横幅）+ src/prompts/*.ts，三种模式（进入前断言 / 前置量词 / 后置量词），排除 *.test.ts，零文件级豁免
 ├── index-session-entry.agent-session.test.ts ← 会话切换请求级断言（决策 #47）：真实 pi AgentSession 夹具——通知在出站请求中位于用户消息之后、系统提示含团队块、持久化为 custom_message、/team start 零模型请求
 ├── index-guard-fallback.test.ts ← 决策 #48 回归：`vi.mock` 注入设置读取抛错 → agent_start 不抛（无 Extension failed）且回落「开启 + 默认次数」；再下一回合恢复文件配置（回落非粘性）
+├── index-editor-wiring.test.ts ← 边框心跳接线（决策 #51，`TeamModeEditor` 整模块替身）：`/team start` 后的编辑器被 `setTeamMode(true)`；`/team stop` 先 `setTeamMode(false)` 再 `setEditorComponent(undefined)`（顺序断言）；`session_shutdown`（含 `/reload`）停表；普通 `session_start` 不动编辑器
 ├── static-scan-child-process.test.ts ← 阶段 5 静态守卫：child_process 白名单（sync/git-runner.ts + 三个成员进程模块），同步模块绕过统一 git 执行器 → 测试红；含 `src/sync/` 目录专项检查
 └── test/fixtures/    ← Test YAML files + mock-extension-api.ts
 ```
@@ -518,6 +525,16 @@ src/
     - **明确不做**：不改 `/team delete`（仍以 YAML 团队定义为入口，不清理动态会话目录）；不加 `/team dynamic <名字>` 参数；不做执行阶段改名（需要时唯一可行路线是 ADR-0009 的方案 B）；无数据迁移（旧 `_dynamic_*` 会话按未命名处理）。
     - **测试与守卫**：命名规则矩阵/列宽/保留名/合成名不变量；事务成功/幂等/7 类拒绝零副作用/失败注入回滚/partial 重绑；stub 结构判定（名册变化、description 漂移、TL 内容不动、不可读）；resume 注册激活 + 自愈 + 改名后临时设置经 stop→resume 仍生效；白名单/守卫/清理集合；提示词结构断言 + 负例锁（无硬门控措辞、阶段 E 枚举与 playbook 模板一致防漂移）。
 
+51. **团队会话输入框的流动渐变边框（决策 #51，阶段 1–3 收口）** — 团队会话期间输入框上下两条横线由本扩展着色。它曾经是「按宽度等分 6 段、段间硬切、逐行重建」的静态彩条，且长输入出现滚动提示时整条退化成单色。现在它是**逐列着色的平滑渐变，并按时间缓慢流动**（8 秒一圈）。完整机制、参数、成本实测、生命周期、关闭方式、边界与待真机验收清单见 DESIGN.md §37。
+    - **只换颜色不动字符**（阶段 1）：`paintBorderLine` 从基类渲染结果剥色后逐字符上色（`─` 取渐变、其余字符取 accent），同色相邻字符合并为一段，行尾补 `\x1b[39m`（不发射 `\x1b[0m`，不污染同行其它属性）。宽度、光标、自动补全、滚动提示天然不受影响；上边框恒为 `lines[0]`，下边框从末尾向上找「仅由边框字符组成且含至少一个 `─`」的行（补全行在边框之后，绝不能盲改最后一行）。
+    - **bash 模式交回 pi**：`isBashModeText` 等价上游 `text.trimStart().startsWith("!")`（只扫前导空白，O(1) 不复制），命中即返回基类结果——边框保持 pi 的 `bashMode` 单色提示。判定与颜色都以 pi 为单一事实来源，本扩展不另读一份 `bashMode` 主题色。
+    - **颜色数学独立成纯模块**（阶段 2）：`border-gradient.ts` 解析 `theme.getFgAnsi` 的 `38;2`/`38;5` 为 RGB，按 6 个主题语义色锚点做环形 smoothstep 插值；256 色量化逐行复刻 pi-tui `colors.js`（6×6×6 立方 + 24 级灰阶 + 加权距离 + 灰度仅用于极差 <10 的近中性色），保证与 pi 自身观感一致。每行最多 32 个色标（可 clamp 到 `[1,width]`），120 列实测 693 B（真彩）/ 340 B（256 色），相对逐字符上色省约 2/3 字节。锚点每次渲染现读（无缓存 → 换主题立即生效）；取色与发射共用 `getColorMode()`，不混模式；解析失败的锚点回中性灰 `#888`。
+    - **流动与心跳**（阶段 3）：颜色是时间的纯函数（`phase = (now / CYCLE_MS) % 1`），所以「流动」只需有人请求重绘。`border-animator.ts` 提供**进程级单例**心跳（80ms ≈ 12.5 fps，`unref` 不持事件循环），全部编辑器实例共享一个定时器（pi 每次会话新建实例且从不销毁旧实例，实例自带定时器会泄漏）。**看门狗**：连续 `>1000ms` 没有真实渲染（编辑器被别的扩展替换、或被 selector/对话框占位）就只跳过请求、不销毁定时器，任意一次真实渲染立即恢复——浮窗（overlay）不卸载编辑器，因此不会触发暂停（已知成本，见 §37）。
+    - **生命周期与关闭**：心跳只在团队会话期间运行——`setTeamMode(active)` 同步 `animator.setActive(active && borderAnimationEnabled())`；`/team stop` 与 `session_shutdown`（含 `/reload`）先 `setTeamMode(false)` 再换回默认编辑器（顺序有接线测试锁定）。环境变量 `TOP_NOTCH_TEAM_BORDER_ANIMATION=0|false|off` 关闭动效（保留静态渐变，不创建定时器）；不提供 `/team setting` 菜单开关（顶层菜单容量阈值，已裁决）。
+    - **bash × 心跳不变式**：bash 分支位于 `noteRendered()` 之后、上色之前——心跳照常请求重绘（看门狗保持喂食），但两行输出恒定 ⇒ 终端按行差分零字节写出；删掉 `!` 后下一帧自然恢复渐变（相位按当前时间接上，不从零开始），无需额外状态机。
+    - **fail-open**：取锚点/上色的整段包 `try/catch`，且「先算完两条线再赋值」——`theme.getFgAnsi` 对未知色名会 throw，而 pi 的 `render` 循环没有边界保护，异常会直接 `process.exit(1)`；失败时保留基类渲染（不上色）而不是留下半着色帧。
+    - **成本**（合成基准，本机、真实 pi-tui 0.83 + 真实 `Theme`）：上色增量 0.034 ms/帧（短输入）、0.192 ms/帧（8000 行历史；整帧 0.70→0.89 ms，整屏重绘主要是上游成本）；边框字节 120 列 1386 B/帧 ⇒ 12.5 fps 下约 16.9 KB/s（256 色 8.3 KB/s）。真机会话 CPU 与字节率、鼠标选择/tmux/SSH 观感待用户验收（清单见 DESIGN.md §37.7）。
+
 ## Dependency Injection Pattern
 
 The codebase uses an explicit Dependency Injection (DI) pattern to decouple modules and enable testability. Every subsystem receives its dependencies through a typed interface, rather than importing them directly.
@@ -666,6 +683,7 @@ printf '' | timeout 10 ./node_modules/.bin/pi --mode json --no-tools -e ./index.
 | `TEAM_SESSION_DIR` | Member process | Session file storage path (`sessions/<team-name>/<sessionId>/<memberName>/`) |
 | `TEAM_SHARED_CONTEXT_PATH` | Member process | Shared context file path (`sessions/<team-name>/<sessionId>/.shared-context.md`) |
 | `TEAM_PEER_MESSAGING` | Member process | Peer-messaging policy snapshot (决策 #41：`"allowed" \| "tl-only"`，缺省 "allowed"；tl-only 收缩 validTargets / 工具描述两态 / 提示词两态) |
+| `TOP_NOTCH_TEAM_BORDER_ANIMATION` | TL process | 边框动效开关（决策 #51）：`0` / `false` / `off`（大小写与首尾空白不敏感）关闭流动，保留静态渐变且不创建定时器；缺省/空值/其它值 = 开启。这是本扩展唯一新增的持续重绘源（成本、边界与真机验收清单见 DESIGN.md §37）|
 
 ## Commands Reference
 
@@ -869,4 +887,4 @@ TL: 监控进展、协调异常、write_shared_context 更新共享上下文（�
 
 ## Design Document
 
-See [DESIGN.md](./DESIGN.md) for the full design specification (36 sections), including the Goal reminder lifecycle, the TL self-work limit（§35：可配置 + 可关闭、排障判别表、发布检查清单）, dynamic/agent team naming（§36：命名规则、设计期改名事务、恢复自愈）and release verification checklists.
+See [DESIGN.md](./DESIGN.md) for the full design specification (37 sections), including the Goal reminder lifecycle, the TL self-work limit（§35：可配置 + 可关闭、排障判别表、发布检查清单）, dynamic/agent team naming（§36：命名规则、设计期改名事务、恢复自愈）, the flowing border（§37：边框着色与心跳、成本预算、生命周期、关闭方式、待真机验收清单）and release verification checklists.

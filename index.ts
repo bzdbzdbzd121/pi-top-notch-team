@@ -1091,10 +1091,11 @@ export default function (pi: ExtensionAPI) {
     // Hint: Member Inspector shortcut
     ui.setStatus("team-inspector-hint", "alt+t 打开成员检视浮窗");
 
-    // Activate team mode editor border
+    // Activate team mode editor border. The border animation runs on the
+    // extension's own heartbeat (src/ui/border-animator.ts); setTeamMode starts
+    // and stops it, so no extra repaint request is needed here.
     if (teamModeEditorInstance) {
       teamModeEditorInstance.setTeamMode(true);
-      try { (ui as any).requestRender?.(); } catch {}
     }
   };
   teamCtx.onSessionEnd = () => {

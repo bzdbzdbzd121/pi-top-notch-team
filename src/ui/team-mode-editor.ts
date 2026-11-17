@@ -1,5 +1,11 @@
 import { CustomEditor, type Theme } from "@earendil-works/pi-coding-agent";
 import {
+  CYCLE_MS,
+  borderAnimationEnabled,
+  sharedBorderAnimator,
+  type BorderAnimator,
+} from "./border-animator";
+import {
   BORDER_DASH,
   DEFAULT_GRADIENT_STOPS,
   NEUTRAL_RGB,
@@ -22,8 +28,10 @@ import {
  * zero gradient dashes, so the border degraded to one accent-coloured line as
  * soon as the input overflowed the visible area.
  *
- * Phase 2 paints a static gradient (cycle position 0); phase 3 will drive the
- * position from the clock. No timers exist in this file.
+ * Phase 2 paints a static gradient; phase 3 makes it flow: the colour phase is
+ * `now / CYCLE_MS` and a shared heartbeat asks the TUI for a repaint every frame
+ * while the team border is on screen (`border-animator.ts`). No timer lives in
+ * this class.
  */
 
 /** Border glyph used by the editor for its horizontal lines. */
@@ -69,20 +77,38 @@ export function isBashModeText(text: string | undefined | null): boolean {
 export class TeamModeEditor extends CustomEditor {
   private teamModeActive = false;
   private fullTheme: Theme;
+  private readonly animator: BorderAnimator;
 
-  constructor(tui: any, theme: any, keybindings: any, fullTheme: Theme) {
+  constructor(
+    tui: any,
+    theme: any,
+    keybindings: any,
+    fullTheme: Theme,
+    animator: BorderAnimator = sharedBorderAnimator,
+  ) {
     super(tui, theme, keybindings);
     this.fullTheme = fullTheme;
+    this.animator = animator;
+    // The heartbeat is shared by every editor instance; it always repaints the
+    // most recently attached one (the live editor).
+    this.animator.attachTui(tui);
   }
 
   setTeamMode(active: boolean): void {
     if (this.teamModeActive === active) return;
     this.teamModeActive = active;
+    // The heartbeat runs only while the team border is on screen. With the
+    // animation switched off no timer is created and the border stays static.
+    this.animator.setActive(active && borderAnimationEnabled());
     this.invalidate();
   }
 
   render(width: number): string[] {
     const lines = super.render(width);
+    // Feed the watchdog before any early return: bash mode still renders every
+    // frame (with constant output), and a heartbeat paused by the watchdog
+    // resumes on the first real render without any extra state.
+    this.animator.noteRendered();
     if (!this.teamModeActive || lines.length < 2) return lines;
 
     // Bash mode: pi paints the border with its single-colour `bashMode` hint and
@@ -119,8 +145,10 @@ export class TeamModeEditor extends CustomEditor {
     const anchors = BORDER_COLORS.map((name) => parseAnsiFg(theme.getFgAnsi(name)) ?? NEUTRAL_RGB);
     const context: PaintContext = {
       width,
-      // Static in phase 2; phase 3 feeds `(now / CYCLE_MS) % 1` in here.
-      phase: 0,
+      // Colour is a pure function of time: every frame shows the phase of the
+      // current instant, so any repaint source draws the same picture. Disabled
+      // animation (or no heartbeat) freezes the picture at the start of the ring.
+      phase: this.animator.active ? (this.animator.now() / CYCLE_MS) % 1 : 0,
       anchors,
       mode,
       // Raw theme sequence, so the hint keeps the theme's own encoding even when
