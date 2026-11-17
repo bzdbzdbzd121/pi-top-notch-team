@@ -16,11 +16,12 @@
  *    clock read plus a comparison per frame — so the next real render resumes the
  *    heartbeat with no extra state to unwind.
  *
- * Cost, measured on 120 columns with one colour per character: two border lines
- * at 10 fps ≈ 45 KB/s in truecolor (≈ 23 KB/s with 256 colours) and ≈ 75 KB/s in
- * truecolor at 200 columns, plus one full repaint per frame (well under 1 ms in
- * the synthetic benchmark; CPU is not the constraint, bytes are). See DESIGN.md
- * §37.4 for the measured table.
+ * Cost, measured with the built-in dark theme and UTF-8 byte counting (see
+ * DESIGN.md §37.4): two border lines at 10 fps ≈ 50.8 KB/s in truecolor at 120
+ * columns (24.6 KB/s with 256 colours) and ≈ 84.6 KB/s in truecolor at 200
+ * columns, plus one full repaint per frame (0.04–0.24 ms in the synthetic
+ * benchmark; CPU is not the constraint, bytes are). Note that `─` is three bytes
+ * in UTF-8, so string length understates the traffic by ~10% (truecolor).
  */
 
 import { CYCLE_CHARS } from "./border-gradient";

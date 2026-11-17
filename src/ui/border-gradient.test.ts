@@ -237,6 +237,18 @@ describe("ansiAtCyclePosition", () => {
     expect(Math.abs(midway.b - (a.b + b.b) / 2)).toBeLessThanOrEqual(1);
   });
 
+  it("eases with smoothstep, not linearly (hand-computed quarter point)", () => {
+    // u = 1/24 → x = 0.25 → t = smoothstep(0.25) = 0.25² × (3 − 0.5) = 0.15625,
+    // i.e. 15.6 % of the way from (204,0,0) to (170,102,204):
+    //   r = 204 − 34 × 0.15625 = 198.69 → 199
+    //   g = 102 × 0.15625      = 15.94  → 16
+    //   b = 204 × 0.15625      = 31.88  → 32
+    // A linear easing would give (196, 26, 51), so this literal pins the shape
+    // instead of asking the implementation what the answer should be.
+    expect(parseAnsiFg(ansiAtCyclePosition(1 / 24, ANCHORS, "truecolor"))).toEqual({ r: 199, g: 16, b: 32 });
+    expect(parseAnsiFg(ansiAtCyclePosition(1 / 24, ANCHORS, "truecolor"))).not.toEqual({ r: 196, g: 26, b: 51 });
+  });
+
   it("wraps at u = 1 and stays continuous across the seam", () => {
     expect(ansiAtCyclePosition(1, ANCHORS, "truecolor")).toBe(ansiAtCyclePosition(0, ANCHORS, "truecolor"));
     const beforeSeam = parseAnsiFg(ansiAtCyclePosition(1 - 1e-6, ANCHORS, "truecolor"))!;
@@ -322,6 +334,20 @@ describe("paintBorderLine (gradient)", () => {
     const indexed = paintBorderLine("─".repeat(120), makeCtx({ mode: "256color" }));
     expect(indexed.length).toBeLessThanOrEqual(120 * 12 + 4);
     expect(sgrRuns(indexed)).toBeLessThanOrEqual(120);
+  });
+
+  it("paints each column with the smoothstep shape (hand-computed, phase 0)", () => {
+    // Column c sits at u = c / 16, so x = 6u, i = floor(x) % 6, t = smoothstep(x - floor(x)).
+    // Column 1: u = 0.0625 → x = 0.375 → t = 0.31640625 → (193, 32, 65)
+    // Column 2: u = 0.125  → x = 0.75  → t = 0.84375    → (175, 86, 172)
+    // Column 3: u = 0.1875 → x = 1.125 → t = 0.04296875 (anchors 1→2) → (172, 104, 195)
+    const perColumn = cells(paintBorderLine("─".repeat(4), makeCtx())).map((cell) => parseAnsiFg(cell.ansi));
+    expect(perColumn).toEqual([
+      { r: 204, g: 0, b: 0 },
+      { r: 193, g: 32, b: 65 },
+      { r: 175, g: 86, b: 172 },
+      { r: 172, g: 104, b: 195 },
+    ]);
   });
 
   it("is deterministic for identical inputs", () => {
