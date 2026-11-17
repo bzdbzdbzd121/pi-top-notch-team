@@ -167,6 +167,27 @@ const dashColors = (line: string): string[] => [
 
 const sgrRuns = (line: string): number => (line.match(/\x1b\[38;[25];/g) ?? []).length;
 
+/** Lengths of consecutive same-colour runs (the visible stop geometry). */
+function runLengths(line: string): number[] {
+  const tokens = line.match(/\x1b\[[\d;]*m|[^\x1b]/gu) ?? [];
+  const lengths: number[] = [];
+  let ansi = "";
+  let previous: string | undefined;
+  for (const token of tokens) {
+    if (token.startsWith("\x1b")) {
+      ansi = token;
+      continue;
+    }
+    if (ansi === previous) {
+      lengths[lengths.length - 1] = lengths[lengths.length - 1]! + 1;
+    } else {
+      lengths.push(1);
+      previous = ansi;
+    }
+  }
+  return lengths;
+}
+
 /** ANSI active for every character of `label` on this line (assumes label appears once). */
 function labelColors(line: string, label: string): string[] {
   const perChar = cells(line);
@@ -289,15 +310,25 @@ describe("TeamModeEditor.render — gradient", () => {
     for (const color of colors) expect(color).toMatch(/^\x1b\[38;2;\d{1,3};\d{1,3};\d{1,3}m$/);
   });
 
-  it("starts the gradient at the first theme anchor", () => {
-    // Column 0 sits at cycle position 0.5/32, i.e. just past `error`; the first
-    // stop is therefore the error anchor nudged a couple of percent along.
+  it("samples the first stop at its centre, just past the error anchor", () => {
+    // 32 stops over 120 columns: the first stop is sampled at u = 0.5/32, i.e.
+    // 9.4% into the error → syntaxKeyword segment. smoothstep(0.09375) = 0.0247,
+    // so the colour is 2.5% of the way: (204,0,0) → (203,3,5). Sampling the start
+    // of the stop would return the raw anchor (204,0,0) instead.
     const [first] = dashColors(createEditor({ text: "" }).render(120)[0]!);
-    const rgb = /^\x1b\[38;2;(\d+);(\d+);(\d+)m$/.exec(first!)!;
-    const anchor = ANCHOR_RGB.error!;
-    expect(Math.abs(Number(rgb[1]) - anchor.r)).toBeLessThanOrEqual(6);
-    expect(Math.abs(Number(rgb[2]) - anchor.g)).toBeLessThanOrEqual(6);
-    expect(Math.abs(Number(rgb[3]) - anchor.b)).toBeLessThanOrEqual(6);
+    const rgb = /^\x1b\[38;2;(\d+);(\d+);(\d+)m$/.exec(first!);
+    expect([Number(rgb![1]), Number(rgb![2]), Number(rgb![3])]).toEqual([203, 3, 5]);
+  });
+
+  it("gives every stop an equal interval of the line (floor boundaries)", () => {
+    // 32 stops over 120 columns → 3.75 columns per stop, so stops take 4 columns
+    // until the accumulated boundary crosses a column. Rounding the mapping would
+    // shrink the first stop to 2 columns.
+    const lengths = runLengths(createEditor({ text: "" }).render(120)[0]!);
+    expect(lengths.length).toBe(32);
+    expect(lengths[0]).toBe(4);
+    expect(Math.max(...lengths) - Math.min(...lengths)).toBeLessThanOrEqual(1);
+    expect(lengths.reduce((sum, length) => sum + length, 0)).toBe(120);
   });
 
   it("emits only the theme's colour mode (no mixed 38;2; and 38;5;)", () => {

@@ -27,6 +27,48 @@ const SGR_RE = /\x1b\[[\d;]*m/g;
 const plainOf = (line: string): string => line.replace(SGR_RE, "");
 const sgrRuns = (line: string): number => (line.match(/\x1b\[38;[25];/g) ?? []).length;
 
+interface Cell {
+  ansi: string;
+  ch: string;
+}
+
+/** Per-character view of a rendered line: the visible char plus the SGR in force. */
+function cells(line: string): Cell[] {
+  const tokens = line.match(/\x1b\[[\d;]*m|[^\x1b]/gu) ?? [];
+  const out: Cell[] = [];
+  let ansi = "";
+  for (const token of tokens) {
+    if (token.startsWith("\x1b")) {
+      ansi = token;
+      continue;
+    }
+    out.push({ ansi, ch: token });
+  }
+  return out;
+}
+
+/** ANSI of every dash column, left to right. */
+function columnAnsi(line: string): string[] {
+  return cells(line)
+    .filter((cell) => cell.ch === "─")
+    .map((cell) => cell.ansi);
+}
+
+/** Lengths of consecutive same-colour runs (the visible stop geometry). */
+function runLengths(line: string): number[] {
+  const lengths: number[] = [];
+  let previous: string | undefined;
+  for (const cell of cells(line)) {
+    if (cell.ansi === previous) {
+      lengths[lengths.length - 1] = lengths[lengths.length - 1]! + 1;
+    } else {
+      lengths.push(1);
+      previous = cell.ansi;
+    }
+  }
+  return lengths;
+}
+
 const TRUE_COLOR = /^\x1b\[38;2;\d{1,3};\d{1,3};\d{1,3}m$/;
 const INDEXED_COLOR = /^\x1b\[38;5;\d{1,3}m$/;
 
@@ -41,6 +83,19 @@ const ANCHORS: Rgb[] = [
 ];
 
 const LABEL_ANSI = "\x1b[38;2;51;153;255m";
+
+/**
+ * Anchors with hand-checkable numbers, used where the expected stop colours are
+ * spelled out as literals (see the stop-mapping and centre-sampling tests).
+ */
+const STOP_ANCHORS: Rgb[] = [
+  { r: 200, g: 0, b: 0 },
+  { r: 0, g: 100, b: 200 },
+  { r: 40, g: 160, b: 40 },
+  { r: 240, g: 240, b: 0 },
+  { r: 0, g: 0, b: 0 },
+  { r: 255, g: 255, b: 255 },
+];
 
 const makeCtx = (over: Partial<PaintContext> = {}): PaintContext => ({
   width: 120,
@@ -131,6 +186,28 @@ describe("rgbToAnsi256 — quantisation geometry (pi-tui parity)", () => {
     }
     // Documented parity case: basic red is approximated by the cube.
     expect(rgbToAnsi256({ r: 128, g: 0, b: 0 })).toBe(88);
+  });
+
+  it("locks the cube/grey handover (spread < 10 and the grey must be closer)", () => {
+    // Near-mid grey: the cube step 135 is 2 away per channel (weighted 4), the
+    // grey ramp can only offer 128 (weighted 25) → the cube wins even though the
+    // colour is neutral.
+    expect(rgbToAnsi256({ r: 133, g: 133, b: 133 })).toBe(102);
+    expect(rgbToAnsi256({ r: 140, g: 140, b: 140 })).toBe(245);
+
+    // Same colour, one channel moved: spread 9 is still eligible for the grey
+    // ramp (128 is closer than the cube's 135) …
+    expect(rgbToAnsi256({ r: 120, g: 129, b: 120 })).toBe(244);
+    // … while spread 10 is not, even though the grey would be closer, so the
+    // cube step 135 wins. These two differ only by the handover guard.
+    expect(rgbToAnsi256({ r: 120, g: 130, b: 120 })).toBe(102);
+
+    // Darkest greys stay on the cube: the cube entry is nearer than grey 8.
+    expect(rgbToAnsi256({ r: 3, g: 3, b: 3 })).toBe(16);
+
+    // Channel exactly halfway between two cube steps: the lower step wins, not
+    // the higher one (115 is 20 away from both 95 and 135).
+    expect(rgbToAnsi256({ r: 115, g: 0, b: 0 })).toBe(52);
   });
 });
 
@@ -300,5 +377,98 @@ describe("paintBorderLine (gradient)", () => {
     expect(sgrRuns(indexed)).toBeGreaterThanOrEqual(16);
     expect(sgrRuns(indexed)).toBeLessThanOrEqual(DEFAULT_GRADIENT_STOPS);
     expect(indexed.length).toBeLessThanOrEqual(500);
+  });
+});
+
+describe("paintBorderLine — column → stop mapping", () => {
+  it("gives every stop an equal interval, using floor boundaries (width 8, 4 stops)", () => {
+    // Stops are intervals of the line: [0,2) [2,4) [4,6) [6,8), i.e. floor(c*4/8).
+    // `Math.round` would shift column 1 into stop 1 and grow the last stop, so the
+    // per-column colours and the run lengths below both pin the mapping.
+    const line = paintBorderLine("─".repeat(8), makeCtx({ width: 8, stops: 4, anchors: STOP_ANCHORS }));
+
+    // Each stop is sampled at its centre, so these are the four colours of
+    // u = (k + 0.5) / 4 (hand-computed in the next test).
+    const stop0 = { r: 31, g: 84, b: 169 };
+    const stop1 = { r: 71, g: 173, b: 34 };
+    const stop2 = { r: 38, g: 38, b: 0 };
+    const stop3 = { r: 246, g: 215, b: 215 };
+    expect(columnAnsi(line).map((ansi) => parseAnsiFg(ansi))).toEqual([
+      stop0,
+      stop0,
+      stop1,
+      stop1,
+      stop2,
+      stop2,
+      stop3,
+      stop3,
+    ]);
+    expect(runLengths(line)).toEqual([2, 2, 2, 2]);
+    expect(plainOf(line)).toBe("─".repeat(8));
+  });
+
+  it("puts the interval boundary where the floor maths says (width 10, 3 stops)", () => {
+    // floor(c*3/10) → [0,0,0,0, 1,1,1, 2,2,2]; rounding would give [0,0,1,1,1,2,2,2,2,2].
+    const line = paintBorderLine("─".repeat(10), makeCtx({ width: 10, stops: 3, anchors: STOP_ANCHORS }));
+    const perColumn = columnAnsi(line);
+    const stopColor = (stop: number) => ansiAtCyclePosition((stop + 0.5) / 3, STOP_ANCHORS, "truecolor");
+
+    expect(runLengths(line)).toEqual([4, 3, 3]);
+    expect(perColumn[3]).toBe(stopColor(0)); // last column of stop 0
+    expect(perColumn[4]).toBe(stopColor(1)); // first column of stop 1
+    expect(perColumn[6]).toBe(stopColor(1)); // last column of stop 1
+    expect(perColumn[7]).toBe(stopColor(2)); // first column of stop 2
+  });
+
+  it("still maps the last column to the last stop when width is not a multiple of stops", () => {
+    for (const [width, stops] of [
+      [7, 3],
+      [13, 4],
+      [120, 32],
+      [201, 32],
+    ] as const) {
+      const line = paintBorderLine("─".repeat(width), makeCtx({ width, stops, anchors: STOP_ANCHORS }));
+      const lengths = runLengths(line);
+      expect(lengths.reduce((sum, length) => sum + length, 0)).toBe(width);
+      expect(Math.max(...lengths) - Math.min(...lengths)).toBeLessThanOrEqual(1);
+      expect(lengths.length).toBe(Math.min(stops, width));
+    }
+  });
+});
+
+describe("paintBorderLine — stop centre sampling", () => {
+  it("samples a stop at its centre, not at its start (width 8, 4 stops)", () => {
+    const stops = 4;
+    const line = paintBorderLine("─".repeat(8), makeCtx({ width: 8, stops, anchors: STOP_ANCHORS }));
+    const firstOfStop = [0, 2, 4, 6].map((column) => columnAnsi(line)[column]);
+
+    // Hosting the sample at the centre of the stop: u = (k + 0.5) / stops.
+    for (let stop = 0; stop < stops; stop++) {
+      expect(firstOfStop[stop]).toBe(ansiAtCyclePosition((stop + 0.5) / stops, STOP_ANCHORS, "truecolor"));
+    }
+
+    // Hand-computed proof that the first stop is NOT the raw anchor: with
+    // u = 0.125 the position sits 75% into the first segment, so smoothstep gives
+    // 0.84375 and the colour is 84% of the way from (200,0,0) to (0,100,200).
+    expect(parseAnsiFg(firstOfStop[0]!)).toEqual({ r: 31, g: 84, b: 169 });
+    // Sampling the start of the stop would return the anchor itself, 0.5/stops
+    // earlier in the cycle.
+    expect(parseAnsiFg(firstOfStop[0]!)).not.toEqual(STOP_ANCHORS[0]);
+    expect(parseAnsiFg(ansiAtCyclePosition(0, STOP_ANCHORS, "truecolor"))).toEqual(STOP_ANCHORS[0]);
+  });
+
+  it("keeps the centre offset when a phase is applied", () => {
+    const stops = 4;
+    const phase = 0.125;
+    const line = paintBorderLine("─".repeat(8), makeCtx({ width: 8, stops, phase, anchors: STOP_ANCHORS }));
+    const perColumn = columnAnsi(line);
+    const stopColor = (stop: number) => ansiAtCyclePosition((stop + 0.5) / stops + phase, STOP_ANCHORS, "truecolor");
+
+    expect(perColumn[0]).toBe(stopColor(0));
+    expect(perColumn[2]).toBe(stopColor(1));
+    expect(perColumn[4]).toBe(stopColor(2));
+    expect(perColumn[6]).toBe(stopColor(3));
+    // A start-of-stop sample would land on the anchors instead (u = phase + k/stops).
+    expect(perColumn[0]).not.toBe(ansiAtCyclePosition(phase, STOP_ANCHORS, "truecolor"));
   });
 });
