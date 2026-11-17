@@ -124,6 +124,28 @@ export class TeamModeEditor extends CustomEditor {
     // the text is not addressed to the agent. Hand the border back untouched.
     if (isBashModeText(this.currentText())) return lines;
 
+    // Fail-open: colouring must never escape render(). pi calls its render loop
+    // without a boundary guard, so a throw here terminates the whole process
+    // (a theme rejecting a colour name — `theme.fg` throws on unknown colours —
+    // is the realistic trigger). Lines are assigned only after every paint
+    // succeeded, so a failure leaves the untouched base render: no half-painted
+    // frame, just an uncoloured border. Same guard style as currentText().
+    try {
+      for (const [index, painted] of this.paintedBorders(lines, width)) lines[index] = painted;
+    } catch {
+      // Keep the base render.
+    }
+
+    return lines;
+  }
+
+  /**
+   * Colour both horizontal borders.
+   *
+   * Returns `[lineIndex, paintedLine]` pairs instead of mutating in place so the
+   * caller can discard a partial result when the theme throws.
+   */
+  private paintedBorders(lines: string[], width: number): Array<[number, string]> {
     const theme = this.fullTheme;
     const segmentWidth = Math.max(1, Math.ceil(width / BORDER_COLORS.length));
     const paint: BorderPaint = {
@@ -135,20 +157,16 @@ export class TeamModeEditor extends CustomEditor {
 
     // The first rendered line is always the top border, with or without a
     // scroll hint (`─── ↑ N more ───…`), so paint it directly.
-    lines[0] = paintBorderLine(stripAnsi(lines[0]!), paint);
+    const painted: Array<[number, string]> = [[0, paintBorderLine(stripAnsi(lines[0]!), paint)]];
 
     // Bottom border: when autocomplete is visible the base editor appends the
     // candidate rows AFTER the bottom border, so scan upward for the first line
     // that is made of border glyphs only. (Rewriting the last line blindly
     // destroyed the last candidate on every keystroke.)
-    for (let i = lines.length - 1; i >= 1; i--) {
-      const plain = stripAnsi(lines[i]!);
-      if (!looksLikeBorder(plain)) continue;
-      lines[i] = paintBorderLine(plain, paint);
-      break;
-    }
+    const bottom = findBottomBorderLine(lines);
+    if (bottom >= 0) painted.push([bottom, paintBorderLine(stripAnsi(lines[bottom]!), paint)]);
 
-    return lines;
+    return painted;
   }
 
   /** `getText()` must never break rendering: fall back to "unknown" (not bash). */
@@ -164,4 +182,15 @@ export class TeamModeEditor extends CustomEditor {
 /** Tight border-line test: border glyphs only, and at least one dash. */
 function looksLikeBorder(plain: string): boolean {
   return plain.includes(HORIZONTAL) && BORDER_LINE_RE.test(plain);
+}
+
+/**
+ * Index of the bottom border line, or -1 when the render has none (starts at 1:
+ * line 0 is the top border).
+ */
+function findBottomBorderLine(lines: string[]): number {
+  for (let i = lines.length - 1; i >= 1; i--) {
+    if (looksLikeBorder(stripAnsi(lines[i]!))) return i;
+  }
+  return -1;
 }
