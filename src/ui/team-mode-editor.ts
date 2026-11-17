@@ -1,5 +1,105 @@
 import { CustomEditor, type Theme } from "@earendil-works/pi-coding-agent";
-import { visibleWidth } from "@earendil-works/pi-tui";
+
+/**
+ * Team-mode input border colouring.
+ *
+ * The editor renders its two horizontal borders with a single theme colour. In a
+ * team session this subclass repaints them after the base render: the dashes get
+ * a palette colour, everything else (scroll hints such as `↑ 3 more`, spaces)
+ * keeps the accent colour.
+ *
+ * Phase 1 invariant: **only colours change, characters never do**. Painting per
+ * column (instead of rebuilding the line) is what keeps scroll hints intact —
+ * the old implementation took the hint text length as the whole line width and
+ * emitted zero gradient dashes, so the border degraded to one accent-coloured
+ * line as soon as the input overflowed the visible area.
+ */
+
+/** Border glyph used by the editor for its horizontal lines. */
+const HORIZONTAL = "─";
+
+/**
+ * Six theme semantic colours, in cycle order. Phase 2 replaces this hard-cut
+ * palette with a per-column interpolated gradient; the painting structure below
+ * stays the same.
+ */
+const BORDER_COLORS = ["error", "syntaxKeyword", "warning", "accent", "syntaxType", "success"] as const;
+
+export type BorderColorName = (typeof BORDER_COLORS)[number];
+
+/**
+ * A line counts as an editor border line when it consists solely of border
+ * glyphs, blanks, scroll-hint characters (`↑ N more`, `↓ N more`, `...` / `…`)
+ * and digits. Requiring at least one `─` keeps a blank content line (all
+ * padding) from being mistaken for the bottom border — see `looksLikeBorder`.
+ */
+const BORDER_LINE_RE = /^[─\s↑↓mor.e…\d]+$/;
+
+const SGR_RE = /\x1b\[[\d;]*m/g;
+
+/** Drop SGR colour sequences; keeps the visible character sequence. */
+function stripAnsi(text: string): string {
+  return text.replace(SGR_RE, "");
+}
+
+/**
+ * pi's shell-mode trigger, mirrored from `interactive-mode.js`:
+ * `isBashMode = text.trimStart().startsWith("!")`.
+ *
+ * Implemented as a scan for the first non-whitespace character (no copy of a
+ * potentially very long input). Missing text is treated as "not bash mode"
+ * (fail-open: the border keeps its colour).
+ */
+export function isBashModeText(text: string | undefined | null): boolean {
+  if (typeof text !== "string") return false;
+  // `\S|$` = first non-whitespace char, or the end of the string.
+  const firstContent = text.search(/\S|$/);
+  return text[firstContent] === "!";
+}
+
+export interface BorderPaint {
+  /** 0-based column → theme colour name for a border dash. */
+  colorAtColumn: (column: number) => BorderColorName;
+  /** Theme colour name for every non-dash character (scroll hint text, spaces). */
+  labelColor: BorderColorName;
+  /** Theme colouring function, usually `theme.fg`. */
+  fg: (color: BorderColorName, text: string) => string;
+}
+
+/**
+ * Colour a plain (uncoloured) border line column by column.
+ *
+ * Only foreground colours are emitted: adjacent characters sharing a colour are
+ * merged into one run, and the line ends with `\x1b[39m` so the terminal's
+ * foreground colour does not leak into whatever the TUI writes next.
+ *
+ * Implementation assumption: border lines contain single-column characters only
+ * (dashes, blanks, `↑`/`↓`, ASCII hint text), so the character index equals the
+ * column. If a future version seeds the border with wide characters (CJK/emoji),
+ * columns must be accumulated with `visibleWidth` instead of counting characters.
+ */
+export function paintBorderLine(plain: string, paint: BorderPaint): string {
+  if (plain.length === 0) return plain;
+
+  let out = "";
+  let runColor: BorderColorName | undefined;
+  let runText = "";
+  let column = 0;
+
+  for (const ch of plain) {
+    const color = ch === HORIZONTAL ? paint.colorAtColumn(column) : paint.labelColor;
+    if (color !== runColor) {
+      if (runText.length > 0 && runColor !== undefined) out += paint.fg(runColor, runText);
+      runColor = color;
+      runText = "";
+    }
+    runText += ch;
+    column += 1;
+  }
+  if (runText.length > 0 && runColor !== undefined) out += paint.fg(runColor, runText);
+
+  return `${out}\x1b[39m`;
+}
 
 export class TeamModeEditor extends CustomEditor {
   private teamModeActive = false;
@@ -20,65 +120,48 @@ export class TeamModeEditor extends CustomEditor {
     const lines = super.render(width);
     if (!this.teamModeActive || lines.length < 2) return lines;
 
-    const theme = this.fullTheme;
-    const colors = ["error", "syntaxKeyword", "warning", "accent", "syntaxType", "success"] as const;
-    const segLen = Math.ceil(width / colors.length);
+    // Bash mode: pi paints the border with its single-colour `bashMode` hint and
+    // the text is not addressed to the agent. Hand the border back untouched.
+    if (isBashModeText(this.currentText())) return lines;
 
-    const buildRainbow = (len: number): string => {
-      let result = "";
-      let remaining = len;
-      for (let i = 0; i < colors.length && remaining > 0; i++) {
-        const seg = Math.min(segLen, remaining);
-        result += theme.fg(colors[i], "─".repeat(seg));
-        remaining -= seg;
-      }
-      return result;
+    const theme = this.fullTheme;
+    const segmentWidth = Math.max(1, Math.ceil(width / BORDER_COLORS.length));
+    const paint: BorderPaint = {
+      colorAtColumn: (column) =>
+        BORDER_COLORS[Math.min(BORDER_COLORS.length - 1, Math.floor(column / segmentWidth))]!,
+      labelColor: "accent",
+      fg: (color, text) => theme.fg(color, text),
     };
 
-    // Rebuild top border line
-    const first = lines[0]!;
-    const plainFirst = first.replace(/\x1b\[[\d;]*m/g, "");
-    const isScrollIndicator = plainFirst.includes("more");
-    if (!isScrollIndicator) {
-      lines[0] = buildRainbow(width);
-    } else {
-      // Scroll indicator: color text with accent, dashes with rainbow
-      const plain = first.replace(/\x1b\[[\d;]*m/g, "");
-      const indicatorMatch = plain.match(/^([─↑↓\s\dmore]+)/);
-      const indicatorText = indicatorMatch?.[1] ?? "";
-      const indicatorLen = visibleWidth(indicatorText);
-      const dashLen = Math.max(0, width - indicatorLen);
-      lines[0] = theme.fg("accent", indicatorText) + buildRainbow(dashLen);
-    }
+    // The first rendered line is always the top border, with or without a
+    // scroll hint (`─── ↑ N more ───…`), so paint it directly.
+    lines[0] = paintBorderLine(stripAnsi(lines[0]!), paint);
 
-    // Rebuild bottom border line.
-    // NOTE: when autocomplete suggestions are visible, the base Editor appends
-    // suggestion rows AFTER the bottom border (see pi-tui editor render), so the
-    // last line is then a candidate row — not the border. Blindly rewriting
-    // lines[last] destroys the last autocomplete item on every keystroke
-    // (observed: candidates vanish one by one while typing "/team s" → "/team st").
-    // Instead, scan upward for the first line made solely of border glyphs and
-    // treat only that line as the bottom border.
+    // Bottom border: when autocomplete is visible the base editor appends the
+    // candidate rows AFTER the bottom border, so scan upward for the first line
+    // that is made of border glyphs only. (Rewriting the last line blindly
+    // destroyed the last candidate on every keystroke.)
     for (let i = lines.length - 1; i >= 1; i--) {
-      const plain = lines[i]!.replace(/\x1b\[[\d;]*m/g, "");
-      const isPureBorder = /^[─\s]+$/.test(plain);
-      const isScrollIndicator = plain.includes("more") && /^[─↑↓\s\dmore]+$/.test(plain);
-      if (isPureBorder) {
-        lines[i] = buildRainbow(width);
-        break;
-      }
-      if (isScrollIndicator) {
-        // Scroll indicator: color text with accent, dashes with rainbow
-        const indicatorMatch = plain.match(/^([─↑↓\s\dmore]+)/);
-        const indicatorText = indicatorMatch?.[1] ?? "";
-        const indicatorLen = visibleWidth(indicatorText);
-        const dashLen = Math.max(0, width - indicatorLen);
-        lines[i] = theme.fg("accent", indicatorText) + buildRainbow(dashLen);
-        break;
-      }
-      // Non-border content line (autocomplete row or text): keep scanning up.
+      const plain = stripAnsi(lines[i]!);
+      if (!looksLikeBorder(plain)) continue;
+      lines[i] = paintBorderLine(plain, paint);
+      break;
     }
 
     return lines;
   }
+
+  /** `getText()` must never break rendering: fall back to "unknown" (not bash). */
+  private currentText(): string | undefined {
+    try {
+      return typeof this.getText === "function" ? this.getText() : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+}
+
+/** Tight border-line test: border glyphs only, and at least one dash. */
+function looksLikeBorder(plain: string): boolean {
+  return plain.includes(HORIZONTAL) && BORDER_LINE_RE.test(plain);
 }
