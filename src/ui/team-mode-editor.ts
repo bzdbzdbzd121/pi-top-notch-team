@@ -1,39 +1,48 @@
 import { CustomEditor, type Theme } from "@earendil-works/pi-coding-agent";
+import {
+  BORDER_DASH,
+  DEFAULT_GRADIENT_STOPS,
+  NEUTRAL_RGB,
+  paintBorderLine,
+  parseAnsiFg,
+  type PaintContext,
+} from "./border-gradient";
 
 /**
  * Team-mode input border colouring.
  *
  * The editor renders its two horizontal borders with a single theme colour. In a
- * team session this subclass repaints them after the base render: the dashes get
- * a palette colour, everything else (scroll hints such as `↑ 3 more`, spaces)
- * keeps the accent colour.
+ * team session this subclass repaints them after the base render: the dashes take
+ * a gradient computed from six theme semantic colours, everything else (scroll
+ * hints such as `↑ 3 more`, blanks) keeps the accent colour.
  *
- * Phase 1 invariant: **only colours change, characters never do**. Painting per
- * column (instead of rebuilding the line) is what keeps scroll hints intact —
- * the old implementation took the hint text length as the whole line width and
- * emitted zero gradient dashes, so the border degraded to one accent-coloured
- * line as soon as the input overflowed the visible area.
+ * Invariant: **only colours change, characters never do**. Painting per column
+ * (instead of rebuilding the line) is what keeps scroll hints intact — an earlier
+ * implementation took the hint text length as the whole line width and emitted
+ * zero gradient dashes, so the border degraded to one accent-coloured line as
+ * soon as the input overflowed the visible area.
+ *
+ * Phase 2 paints a static gradient (cycle position 0); phase 3 will drive the
+ * position from the clock. No timers exist in this file.
  */
 
 /** Border glyph used by the editor for its horizontal lines. */
-const HORIZONTAL = "─";
+const HORIZONTAL = BORDER_DASH;
 
 /**
- * Six theme semantic colours, in cycle order. Phase 2 replaces this hard-cut
- * palette with a per-column interpolated gradient; the painting structure below
- * stays the same.
+ * Six theme semantic colours, in cycle order: the gradient anchors. Each render
+ * re-reads them from the theme, so switching themes needs no cache invalidation.
  */
 const BORDER_COLORS = ["error", "syntaxKeyword", "warning", "accent", "syntaxType", "success"] as const;
-
-export type BorderColorName = (typeof BORDER_COLORS)[number];
 
 /**
  * A line counts as an editor border line when it consists solely of border
  * glyphs, blanks, scroll-hint characters (`↑ N more`, `↓ N more`, `...` / `…`)
- * and digits. Requiring at least one `─` keeps a blank content line (all
+ * and digits. Requiring at least one dash keeps a blank content line (all
  * padding) from being mistaken for the bottom border — see `looksLikeBorder`.
+ * The dash comes from `BORDER_DASH` so painting and detection cannot drift.
  */
-const BORDER_LINE_RE = /^[─\s↑↓mor.e…\d]+$/;
+const BORDER_LINE_RE = new RegExp(`^[${HORIZONTAL}\\s↑↓mor.e…\\d]+$`);
 
 const SGR_RE = /\x1b\[[\d;]*m/g;
 
@@ -55,50 +64,6 @@ export function isBashModeText(text: string | undefined | null): boolean {
   // `\S|$` = first non-whitespace char, or the end of the string.
   const firstContent = text.search(/\S|$/);
   return text[firstContent] === "!";
-}
-
-export interface BorderPaint {
-  /** 0-based column → theme colour name for a border dash. */
-  colorAtColumn: (column: number) => BorderColorName;
-  /** Theme colour name for every non-dash character (scroll hint text, spaces). */
-  labelColor: BorderColorName;
-  /** Theme colouring function, usually `theme.fg`. */
-  fg: (color: BorderColorName, text: string) => string;
-}
-
-/**
- * Colour a plain (uncoloured) border line column by column.
- *
- * Only foreground colours are emitted: adjacent characters sharing a colour are
- * merged into one run, and the line ends with `\x1b[39m` so the terminal's
- * foreground colour does not leak into whatever the TUI writes next.
- *
- * Implementation assumption: border lines contain single-column characters only
- * (dashes, blanks, `↑`/`↓`, ASCII hint text), so the character index equals the
- * column. If a future version seeds the border with wide characters (CJK/emoji),
- * columns must be accumulated with `visibleWidth` instead of counting characters.
- */
-export function paintBorderLine(plain: string, paint: BorderPaint): string {
-  if (plain.length === 0) return plain;
-
-  let out = "";
-  let runColor: BorderColorName | undefined;
-  let runText = "";
-  let column = 0;
-
-  for (const ch of plain) {
-    const color = ch === HORIZONTAL ? paint.colorAtColumn(column) : paint.labelColor;
-    if (color !== runColor) {
-      if (runText.length > 0 && runColor !== undefined) out += paint.fg(runColor, runText);
-      runColor = color;
-      runText = "";
-    }
-    runText += ch;
-    column += 1;
-  }
-  if (runText.length > 0 && runColor !== undefined) out += paint.fg(runColor, runText);
-
-  return `${out}\x1b[39m`;
 }
 
 export class TeamModeEditor extends CustomEditor {
@@ -126,10 +91,10 @@ export class TeamModeEditor extends CustomEditor {
 
     // Fail-open: colouring must never escape render(). pi calls its render loop
     // without a boundary guard, so a throw here terminates the whole process
-    // (a theme rejecting a colour name — `theme.fg` throws on unknown colours —
-    // is the realistic trigger). Lines are assigned only after every paint
-    // succeeded, so a failure leaves the untouched base render: no half-painted
-    // frame, just an uncoloured border. Same guard style as currentText().
+    // (`theme.getFgAnsi` throws on an unknown colour name, for instance). Lines
+    // are assigned only after every paint succeeded, so a failure leaves the
+    // untouched base render: no half-painted frame, just an uncoloured border.
+    // Same guard style as currentText().
     try {
       for (const [index, painted] of this.paintedBorders(lines, width)) lines[index] = painted;
     } catch {
@@ -147,24 +112,33 @@ export class TeamModeEditor extends CustomEditor {
    */
   private paintedBorders(lines: string[], width: number): Array<[number, string]> {
     const theme = this.fullTheme;
-    const segmentWidth = Math.max(1, Math.ceil(width / BORDER_COLORS.length));
-    const paint: BorderPaint = {
-      colorAtColumn: (column) =>
-        BORDER_COLORS[Math.min(BORDER_COLORS.length - 1, Math.floor(column / segmentWidth))]!,
-      labelColor: "accent",
-      fg: (color, text) => theme.fg(color, text),
+    // One colour source for both parsing and emission: `getColorMode()` decides
+    // whether `getFgAnsi` hands back `38;2;` or `38;5;`, and the gradient must
+    // emit the same form or a truecolor anchor would be printed as a 256 index.
+    const mode = theme.getColorMode();
+    const anchors = BORDER_COLORS.map((name) => parseAnsiFg(theme.getFgAnsi(name)) ?? NEUTRAL_RGB);
+    const context: PaintContext = {
+      width,
+      // Static in phase 2; phase 3 feeds `(now / CYCLE_MS) % 1` in here.
+      phase: 0,
+      anchors,
+      mode,
+      // Raw theme sequence, so the hint keeps the theme's own encoding even when
+      // it cannot be parsed into RGB (e.g. a token set to the terminal default).
+      labelAnsi: theme.getFgAnsi("accent"),
+      stops: DEFAULT_GRADIENT_STOPS,
     };
 
     // The first rendered line is always the top border, with or without a
     // scroll hint (`─── ↑ N more ───…`), so paint it directly.
-    const painted: Array<[number, string]> = [[0, paintBorderLine(stripAnsi(lines[0]!), paint)]];
+    const painted: Array<[number, string]> = [[0, paintBorderLine(stripAnsi(lines[0]!), context)]];
 
     // Bottom border: when autocomplete is visible the base editor appends the
     // candidate rows AFTER the bottom border, so scan upward for the first line
     // that is made of border glyphs only. (Rewriting the last line blindly
     // destroyed the last candidate on every keystroke.)
     const bottom = findBottomBorderLine(lines);
-    if (bottom >= 0) painted.push([bottom, paintBorderLine(stripAnsi(lines[bottom]!), paint)]);
+    if (bottom >= 0) painted.push([bottom, paintBorderLine(stripAnsi(lines[bottom]!), context)]);
 
     return painted;
   }
