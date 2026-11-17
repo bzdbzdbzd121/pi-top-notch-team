@@ -16,10 +16,11 @@
  *    clock read plus a comparison per frame — so the next real render resumes the
  *    heartbeat with no extra state to unwind.
  *
- * Cost, measured on 120 columns: two border lines, 32 colour stops, 12.5 fps
- * ≈ 16 KB/s of terminal traffic in truecolor (≈ 7.6 KB/s with 256 colours), plus
- * one full repaint per frame (~0.2 ms short session, ~2 ms with 8000 lines of
- * history in the synthetic benchmark).
+ * Cost, measured on 120 columns with one colour per character: two border lines
+ * at 10 fps ≈ 45 KB/s in truecolor (≈ 23 KB/s with 256 colours) and ≈ 75 KB/s in
+ * truecolor at 200 columns, plus one full repaint per frame (well under 1 ms in
+ * the synthetic benchmark; CPU is not the constraint, bytes are). See DESIGN.md
+ * §37.4 for the measured table.
  */
 
 import { CYCLE_CHARS } from "./border-gradient";
@@ -40,15 +41,23 @@ export const CHARS_PER_SECOND = 10;
  * Derived, not tuned: the pattern spans `CYCLE_CHARS` (= 16, see
  * `border-gradient.ts`) columns, and the login screen moves it at
  * `CHARS_PER_SECOND` = 10 characters per second, so one lap takes
- * 16 / 10 = 1.6 s. Under the 80 ms heartbeat the pattern shifts
- * 10 × 0.08 = 0.8 characters per frame (pi's own screen renders every 50 ms,
- * i.e. 0.5 characters per frame): same speed, coarser sampling, which is why the
- * colour is interpolated per column instead of stepping band by band.
+ * 16 / 10 = 1.6 s. The heartbeat is set so the pattern advances exactly one
+ * character per frame (`CHARS_PER_SECOND × FRAME_MS / 1000` = 10 × 0.1 = 1),
+ * which is the coarsest sampling that still scrolls evenly at this speed; one
+ * frame of jitter is a full column, so do not raise the interval without
+ * lowering `CHARS_PER_SECOND` too.
  */
 export const CYCLE_MS = (CYCLE_CHARS / CHARS_PER_SECOND) * 1000;
 
-/** Heartbeat interval: 12.5 frames per second, the cheapest smooth-looking rate. */
-export const FRAME_MS = 80;
+/**
+ * Heartbeat interval: 10 frames per second.
+ *
+ * Sized by the pattern, not by taste: at `CHARS_PER_SECOND` = 10 a 100 ms frame
+ * advances exactly one character, so the shimmer scrolls in even one-column
+ * steps. Shorter intervals only add bytes (the terminal is diffed per line, so
+ * every frame rewrites both borders); longer ones would skip columns.
+ */
+export const FRAME_MS = 100;
 
 /** No render for this long ⇒ the border is not visible ⇒ stop requesting repaints. */
 export const STALE_MS = 1000;

@@ -788,7 +788,7 @@ describe("TeamModeEditor.render — heartbeat", () => {
     expect(editor.render(120)).toEqual(base);
     expect(editor.render(120)).toEqual(base);
 
-    // 15 frames = 1200 ms, i.e. past STALE_MS. Every bash-mode render must still
+    // 15 frames = 1500 ms, i.e. past STALE_MS. Every bash-mode render must still
     // feed the watchdog (noteRendered before the bash early return), otherwise the
     // heartbeat would pause after a second and the border would stop repainting.
     const frames = 15;

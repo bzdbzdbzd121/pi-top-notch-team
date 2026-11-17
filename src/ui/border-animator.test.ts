@@ -155,13 +155,19 @@ describe("createBorderAnimator — lifecycle", () => {
   });
 
   it("derives the lap time from the spatial period and pi's shimmer speed", () => {
-    expect(FRAME_MS).toBe(80);
+    expect(FRAME_MS).toBe(100);
     expect(STALE_MS).toBe(1000);
     expect(CHARS_PER_SECOND).toBe(10); // pi's provider-brand.js
     expect(CYCLE_CHARS).toBe(16);
     // 16 columns per lap at 10 characters per second = 1.6 s per lap.
     expect(CYCLE_MS).toBe(1600);
     expect(CYCLE_MS).toBe((CYCLE_CHARS / CHARS_PER_SECOND) * 1000);
+  });
+
+  it("advances exactly one character per frame (the reason the interval is 100 ms)", () => {
+    // One character per frame is the coarsest sampling that still scrolls evenly;
+    // raising FRAME_MS without lowering CHARS_PER_SECOND would skip columns.
+    expect((CHARS_PER_SECOND * FRAME_MS) / 1000).toBe(1);
   });
 });
 
@@ -240,15 +246,15 @@ describe("createBorderAnimator — watchdog", () => {
 
     // Fresh renders keep the heartbeat asking for repaints.
     h.beat();
-    h.animator.noteRendered(); // last rendered at t = 80
+    h.animator.noteRendered(); // last rendered at t = FRAME_MS
     expect(h.tui.requestRender).toHaveBeenCalledTimes(1);
 
     // Renders stop (a dialog took the layout slot): inside the window it keeps going.
-    h.clock.t = 80 + STALE_MS; // exactly 1000 ms since the last render
+    h.clock.t = FRAME_MS + STALE_MS; // exactly STALE_MS since the last render
     h.beat(0);
     expect(h.tui.requestRender).toHaveBeenCalledTimes(2);
 
-    h.clock.t = 80 + STALE_MS + 1; // just past it → paused
+    h.clock.t = FRAME_MS + STALE_MS + 1; // just past it → paused
     h.beat(0);
     expect(h.tui.requestRender).toHaveBeenCalledTimes(2);
     h.clock.t = 5000;

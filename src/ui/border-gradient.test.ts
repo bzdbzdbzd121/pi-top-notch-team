@@ -9,7 +9,7 @@
  *  - the 256-colour quantisation geometry (cube + grey ramp, weighted distance),
  *    which must stay identical to pi-tui's so both renderers agree;
  *  - the per-line budget (stops, SGR runs, bytes), which is the only reason the
- *    gradient is affordable at 12.5 fps in phase 3.
+ *    gradient is affordable at the configured frame rate in phase 3.
  */
 import { describe, it, expect } from "vitest";
 import {
