@@ -22,11 +22,30 @@
  * history in the synthetic benchmark).
  */
 
+import { CYCLE_CHARS } from "./border-gradient";
+
 /** Set to `0`, `false` or `off` to keep the static gradient and create no timer. */
 export const BORDER_ANIMATION_ENV = "TOP_NOTCH_TEAM_BORDER_ANIMATION";
 
-/** Time for one full lap around the palette. */
-export const CYCLE_MS = 8000;
+/**
+ * Characters per second the pattern advances — taken from pi's own brand
+ * shimmer (`pi-coding-agent/dist/modes/interactive/components/provider-brand.js`
+ * in the 1.5.x release: `const CHARS_PER_SECOND = 10;`).
+ */
+export const CHARS_PER_SECOND = 10;
+
+/**
+ * Time for one full lap around the palette.
+ *
+ * Derived, not tuned: the pattern spans `CYCLE_CHARS` (= 16, see
+ * `border-gradient.ts`) columns, and the login screen moves it at
+ * `CHARS_PER_SECOND` = 10 characters per second, so one lap takes
+ * 16 / 10 = 1.6 s. Under the 80 ms heartbeat the pattern shifts
+ * 10 × 0.08 = 0.8 characters per frame (pi's own screen renders every 50 ms,
+ * i.e. 0.5 characters per frame): same speed, coarser sampling, which is why the
+ * colour is interpolated per column instead of stepping band by band.
+ */
+export const CYCLE_MS = (CYCLE_CHARS / CHARS_PER_SECOND) * 1000;
 
 /** Heartbeat interval: 12.5 frames per second, the cheapest smooth-looking rate. */
 export const FRAME_MS = 80;

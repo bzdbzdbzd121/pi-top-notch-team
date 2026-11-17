@@ -10,19 +10,29 @@
  *   → ring interpolation at a cycle position → ANSI foreground sequence
  *   (`38;2;r;g;b` in truecolor, `38;5;N` in 256-colour terminals).
  *
- * Phase 2 keeps the picture static: the cycle position (`phase`) is an input, so
- * phase 3 can drive it from the clock without touching this module.
+ * The colour pattern is **spatial**: one full lap of the anchors spans a fixed
+ * `CYCLE_CHARS` columns, independent of the terminal width, so a character only
+ * ever sees a small slice of the palette and neighbouring characters differ (the
+ * login-screen look). The `phase` input shifts that pattern along the line; the
+ * editor feeds it from the clock, so the picture flows without any state here.
  */
 
 /** Border glyph the editor draws its horizontal lines with. */
 export const BORDER_DASH = "─";
 
 /**
- * Colour stops per border line. Terminal output is diffed per line, so the only
- * levers on traffic are frame rate and the number of colour runs; 32 stops cut a
- * 120-column line from ~2.1 KB (per-character) to ~0.7 KB with no visible loss.
+ * Columns per full lap of the anchor palette — the spatial period of the
+ * gradient.
+ *
+ * 16 is the scale of pi's own brand shimmer (`provider-brand.js` in the 1.5.x
+ * release: four logo colours × `CHARS_PER_COLOR = 4` characters = a 16-character
+ * cycle). Because the period is a fixed number of characters instead of the
+ * terminal width, the pattern looks the same on 40 and 200 columns and adjacent
+ * characters always differ — the reason this is no longer quantised into a few
+ * colour stops. The time rate that moves this pattern lives in
+ * `border-animator.ts` (`CHARS_PER_SECOND`, `CYCLE_MS`).
  */
-export const DEFAULT_GRADIENT_STOPS = 32;
+export const CYCLE_CHARS = 16;
 
 /** Anchor used when a theme token cannot be parsed (e.g. set to the terminal default). */
 export const NEUTRAL_RGB: Rgb = { r: 0x88, g: 0x88, b: 0x88 };
@@ -193,26 +203,31 @@ export function ansiAtCyclePosition(u: number, anchors: Rgb[], mode: GradientCol
 }
 
 export interface PaintContext {
-  /** Line width in columns (border lines are one character per column). */
-  width: number;
-  /** Cycle position; 0 in phase 2 (static), `(now / CYCLE_MS) % 1` in phase 3. */
+  /** Pattern offset in laps (0 = static); the animator drives it from the clock. */
   phase: number;
   /** Anchor colours in cycle order. */
   anchors: Rgb[];
   mode: GradientColorMode;
   /** Colour for every non-dash character (scroll hint text, blanks). */
   labelAnsi: string;
-  /** Colour stops per line; defaults to `DEFAULT_GRADIENT_STOPS`, clamped to `[1, width]`. */
-  stops?: number;
 }
 
 /**
  * Colour a plain (uncoloured) border line.
  *
- * Only foreground colours are emitted: dashes take the gradient colour of their
- * stop, everything else takes `labelAnsi`, adjacent characters sharing a colour
- * are merged into one run, and the line ends with `\x1b[39m` so the terminal's
- * foreground colour does not leak into whatever the TUI writes next.
+ * Every dash gets its own colour: column `c` sits at cycle position
+ * `c / CYCLE_CHARS + phase`, so adjacent characters are `1/CYCLE_CHARS` of a lap
+ * apart and no wide uniform block can appear. Everything else (scroll-hint text,
+ * blanks) takes `labelAnsi`. Adjacent characters that resolve to the same colour
+ * are still merged into one run — that matters in 256-colour mode, where the
+ * quantiser regularly maps neighbouring tones onto the same palette entry.
+ *
+ * Only foreground colours are emitted, and the line ends with `\x1b[39m` so the
+ * terminal's foreground colour does not leak into whatever the TUI writes next.
+ *
+ * Cost note: one SGR prefix per column (15–19 bytes in truecolor) is what "one
+ * colour per character" costs; DESIGN.md §37.4 records the measured bytes per
+ * frame. The heartbeat interval is not lowered to hide that.
  *
  * Implementation assumption: border lines contain single-column characters only
  * (dashes, blanks, `↑`/`↓`, ASCII hint text), so the character index equals the
@@ -222,29 +237,16 @@ export interface PaintContext {
 export function paintBorderLine(plain: string, paint: PaintContext): string {
   if (plain.length === 0) return "";
 
-  const width = Math.max(1, Math.floor(paint.width) || 1);
-  const requestedStops = Number.isFinite(paint.stops) ? Math.floor(paint.stops as number) : DEFAULT_GRADIENT_STOPS;
-  const stops = Math.min(Math.max(1, requestedStops), width);
-
-  // One colour lookup per stop, reused by every column inside that stop.
-  const stopColors: Array<string | undefined> = new Array(stops);
-  const colorForColumn = (column: number): string => {
-    const stop = Math.min(stops - 1, Math.floor((column * stops) / width));
-    let ansi = stopColors[stop];
-    if (ansi === undefined) {
-      ansi = ansiAtCyclePosition((stop + 0.5) / stops + paint.phase, paint.anchors, paint.mode);
-      stopColors[stop] = ansi;
-    }
-    return ansi;
-  };
-
   let out = "";
   let runColor: string | undefined;
   let runText = "";
   let column = 0;
 
   for (const ch of plain) {
-    const color = ch === BORDER_DASH ? colorForColumn(column) : paint.labelAnsi;
+    const color =
+      ch === BORDER_DASH
+        ? ansiAtCyclePosition(column / CYCLE_CHARS + paint.phase, paint.anchors, paint.mode)
+        : paint.labelAnsi;
     if (color !== runColor) {
       if (runText.length > 0 && runColor !== undefined) out += `${runColor}${runText}`;
       runColor = color;

@@ -13,12 +13,14 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import {
   BORDER_ANIMATION_ENV,
+  CHARS_PER_SECOND,
   CYCLE_MS,
   FRAME_MS,
   STALE_MS,
   borderAnimationEnabled,
   createBorderAnimator,
 } from "./border-animator";
+import { CYCLE_CHARS } from "./border-gradient";
 
 interface Harness {
   animator: ReturnType<typeof createBorderAnimator>;
@@ -152,10 +154,14 @@ describe("createBorderAnimator — lifecycle", () => {
     expect(handle.unref).toHaveBeenCalledTimes(1);
   });
 
-  it("exposes the frame, cycle and watchdog constants", () => {
+  it("derives the lap time from the spatial period and pi's shimmer speed", () => {
     expect(FRAME_MS).toBe(80);
     expect(STALE_MS).toBe(1000);
-    expect(CYCLE_MS).toBe(8000);
+    expect(CHARS_PER_SECOND).toBe(10); // pi's provider-brand.js
+    expect(CYCLE_CHARS).toBe(16);
+    // 16 columns per lap at 10 characters per second = 1.6 s per lap.
+    expect(CYCLE_MS).toBe(1600);
+    expect(CYCLE_MS).toBe((CYCLE_CHARS / CHARS_PER_SECOND) * 1000);
   });
 });
 

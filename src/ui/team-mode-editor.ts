@@ -7,7 +7,6 @@ import {
 } from "./border-animator";
 import {
   BORDER_DASH,
-  DEFAULT_GRADIENT_STOPS,
   NEUTRAL_RGB,
   paintBorderLine,
   parseAnsiFg,
@@ -122,7 +121,7 @@ export class TeamModeEditor extends CustomEditor {
     // untouched base render: no half-painted frame, just an uncoloured border.
     // Same guard style as currentText().
     try {
-      for (const [index, painted] of this.paintedBorders(lines, width)) lines[index] = painted;
+      for (const [index, painted] of this.paintedBorders(lines)) lines[index] = painted;
     } catch {
       // Keep the base render.
     }
@@ -136,7 +135,7 @@ export class TeamModeEditor extends CustomEditor {
    * Returns `[lineIndex, paintedLine]` pairs instead of mutating in place so the
    * caller can discard a partial result when the theme throws.
    */
-  private paintedBorders(lines: string[], width: number): Array<[number, string]> {
+  private paintedBorders(lines: string[]): Array<[number, string]> {
     const theme = this.fullTheme;
     // One colour source for both parsing and emission: `getColorMode()` decides
     // whether `getFgAnsi` hands back `38;2;` or `38;5;`, and the gradient must
@@ -144,17 +143,17 @@ export class TeamModeEditor extends CustomEditor {
     const mode = theme.getColorMode();
     const anchors = BORDER_COLORS.map((name) => parseAnsiFg(theme.getFgAnsi(name)) ?? NEUTRAL_RGB);
     const context: PaintContext = {
-      width,
       // Colour is a pure function of time: every frame shows the phase of the
       // current instant, so any repaint source draws the same picture. Disabled
       // animation (or no heartbeat) freezes the picture at the start of the ring.
+      // The spatial period is a fixed number of characters (CYCLE_CHARS), so the
+      // width does not enter the colour at all.
       phase: this.animator.active ? (this.animator.now() / CYCLE_MS) % 1 : 0,
       anchors,
       mode,
       // Raw theme sequence, so the hint keeps the theme's own encoding even when
       // it cannot be parsed into RGB (e.g. a token set to the terminal default).
       labelAnsi: theme.getFgAnsi("accent"),
-      stops: DEFAULT_GRADIENT_STOPS,
     };
 
     // The first rendered line is always the top border, with or without a

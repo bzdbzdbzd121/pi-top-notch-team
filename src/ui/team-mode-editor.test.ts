@@ -21,7 +21,7 @@
  */
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { Editor, visibleWidth } from "@earendil-works/pi-tui";
-import { ansiAtCyclePosition, rgbToAnsi256, type Rgb } from "./border-gradient";
+import { CYCLE_CHARS, ansiAtCyclePosition, rgbToAnsi256, type Rgb } from "./border-gradient";
 import {
   BORDER_ANIMATION_ENV,
   CYCLE_MS,
@@ -330,34 +330,41 @@ describe("TeamModeEditor.render — width", () => {
 });
 
 describe("TeamModeEditor.render — gradient", () => {
-  it("paints a smooth gradient from the theme anchors (many distinct colours)", () => {
+  it("paints one colour per character from the theme anchors", () => {
     const lines = createEditor({ text: "/team s" }).render(201);
     const colors = dashColors(lines[0]!);
-    expect(colors.length).toBeGreaterThanOrEqual(16);
-    expect(colors.length).toBeLessThanOrEqual(32);
-    // Every colour is a truecolor sequence in a truecolor theme.
+    // The 16-character period repeats, so the whole line holds CYCLE_CHARS
+    // distinct colours — and no character shares a colour with its neighbour.
+    expect(colors.length).toBe(CYCLE_CHARS);
+    expect(runLengths(lines[0]!)).toEqual(Array(201).fill(1));
     for (const color of colors) expect(color).toMatch(/^\x1b\[38;2;\d{1,3};\d{1,3};\d{1,3}m$/);
   });
 
-  it("samples the first stop at its centre, just past the error anchor", () => {
-    // 32 stops over 120 columns: the first stop is sampled at u = 0.5/32, i.e.
-    // 9.4% into the error → syntaxKeyword segment. smoothstep(0.09375) = 0.0247,
-    // so the colour is 2.5% of the way: (204,0,0) → (203,3,5). Sampling the start
-    // of the stop would return the raw anchor (204,0,0) instead.
-    const [first] = dashColors(createEditor({ text: "" }).render(120)[0]!);
-    const rgb = /^\x1b\[38;2;(\d+);(\d+);(\d+)m$/.exec(first!);
-    expect([Number(rgb![1]), Number(rgb![2]), Number(rgb![3])]).toEqual([203, 3, 5]);
+  it("starts the pattern at the phase of that instant (column 0, no offset)", () => {
+    const clock = { t: 0 };
+    const editor = createEditor({ text: "", animator: createTestAnimator(clock) });
+    clock.t = CYCLE_MS / 4; // phase 0.25
+
+    const line = editor.render(120)[0]!;
+    // Column 0 sits at cycle position 0 + phase = 0.25 exactly (no centre offset).
+    expect(dashColors(line)[0]).toBe(ansiAtCyclePosition(0.25, ANCHORS_IN_ORDER, "truecolor"));
   });
 
-  it("gives every stop an equal interval of the line (floor boundaries)", () => {
-    // 32 stops over 120 columns → 3.75 columns per stop, so stops take 4 columns
-    // until the accumulated boundary crosses a column. Rounding the mapping would
-    // shrink the first stop to 2 columns.
-    const lengths = runLengths(createEditor({ text: "" }).render(120)[0]!);
-    expect(lengths.length).toBe(32);
-    expect(lengths[0]).toBe(4);
-    expect(Math.max(...lengths) - Math.min(...lengths)).toBeLessThanOrEqual(1);
-    expect(lengths.reduce((sum, length) => sum + length, 0)).toBe(120);
+  it("uses a fixed 16-character period at any width", () => {
+    const narrow = createEditor({ text: "" }).render(40)[0]!;
+    const wide = createEditor({ text: "" }).render(200)[0]!;
+    const colorsOf = (line: string): string[] => line.match(/\x1b\[38;2;\d{1,3};\d{1,3};\d{1,3}m/g) ?? [];
+
+    // Same spatial period and same colours on both widths (no width-dependent
+    // scaling): the first two cycles are identical.
+    expect(colorsOf(wide).slice(0, CYCLE_CHARS)).toEqual(colorsOf(narrow).slice(0, CYCLE_CHARS));
+    expect(colorsOf(wide).slice(CYCLE_CHARS, CYCLE_CHARS * 2)).toEqual(
+      colorsOf(narrow).slice(CYCLE_CHARS, CYCLE_CHARS * 2),
+    );
+    // Column 0 and column 16 share a colour; column 8 does not.
+    const wideColors = colorsOf(wide);
+    expect(wideColors[0]).toBe(wideColors[CYCLE_CHARS]);
+    expect(wideColors[0]).not.toBe(wideColors[CYCLE_CHARS / 2]);
   });
 
   it("emits only the theme's colour mode (no mixed 38;2; and 38;5;)", () => {
@@ -381,14 +388,16 @@ describe("TeamModeEditor.render — gradient", () => {
     expect(dashColors(second)).not.toEqual(dashColors(first));
   });
 
-  it("keeps the per-line budget at 120 columns", () => {
+  it("stays inside the per-column format budget at 120 columns", () => {
+    // One colour per character: the cap is the SGR format's worst case (19-byte
+    // truecolor prefix, 11-byte 256-colour prefix) plus one byte per column.
     const truecolor = createEditor({ text: "" }).render(120)[0]!;
-    expect(sgrRuns(truecolor)).toBeLessThanOrEqual(32);
-    expect(truecolor.length).toBeLessThanOrEqual(800);
+    expect(sgrRuns(truecolor)).toBeLessThanOrEqual(120);
+    expect(truecolor.length).toBeLessThanOrEqual(120 * 20 + 4);
 
     const indexed = createEditor({ text: "", theme: makeTheme({ mode: "256color" }) }).render(120)[0]!;
-    expect(sgrRuns(indexed)).toBeLessThanOrEqual(32);
-    expect(indexed.length).toBeLessThanOrEqual(500);
+    expect(sgrRuns(indexed)).toBeLessThanOrEqual(120);
+    expect(indexed.length).toBeLessThanOrEqual(120 * 12 + 4);
   });
 
   it("is deterministic (phase 2 has no time input)", () => {
@@ -689,7 +698,7 @@ describe("TeamModeEditor.render — heartbeat", () => {
     // A quarter lap is exactly phase 0.25 — half the rate would land on 0.125.
     clock.t = CYCLE_MS / 4;
     const quarter = editor.render(width)[0]!;
-    expect(dashColors(quarter)[0]).toBe(ansiAtCyclePosition(0.5 / 32 + 0.25, ANCHORS_IN_ORDER, "truecolor"));
+    expect(dashColors(quarter)[0]).toBe(ansiAtCyclePosition(0.25, ANCHORS_IN_ORDER, "truecolor"));
     expect(quarter).not.toBe(atStart);
 
     // Frames do not accumulate: at a fixed instant every render is identical.

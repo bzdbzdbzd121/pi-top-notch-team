@@ -13,7 +13,7 @@
  */
 import { describe, it, expect } from "vitest";
 import {
-  DEFAULT_GRADIENT_STOPS,
+  CYCLE_CHARS,
   NEUTRAL_RGB,
   ansiAtCyclePosition,
   paintBorderLine,
@@ -98,7 +98,6 @@ const STOP_ANCHORS: Rgb[] = [
 ];
 
 const makeCtx = (over: Partial<PaintContext> = {}): PaintContext => ({
-  width: 120,
   phase: 0,
   anchors: ANCHORS,
   mode: "truecolor",
@@ -297,12 +296,11 @@ describe("paintBorderLine (gradient)", () => {
     const line = paintBorderLine(plain, makeCtx());
     expect(plainOf(line)).toBe(plain);
     const labelStart = plain.indexOf(" ↑ 3 more ");
-    const cells = [...line.matchAll(/\x1b\[[\d;]*m|[^\x1b]/g)].map((m) => m[0]);
-    // Rebuild per-character ANSI to check the label run without a parser here.
+    const tokens = [...line.matchAll(/\x1b\[[\d;]*m|[^\x1b]/gu)].map((m) => m[0]);
     let ansi = "";
     const labelAnsi: string[] = [];
     let column = 0;
-    for (const token of cells) {
+    for (const token of tokens) {
       if (token.startsWith("\x1b")) {
         ansi = token;
         continue;
@@ -313,162 +311,138 @@ describe("paintBorderLine (gradient)", () => {
     expect(new Set(labelAnsi)).toEqual(new Set([LABEL_ANSI]));
   });
 
-  it(`keeps ≤ steps runs and ≤ 800 bytes at 120 columns (truecolor)`, () => {
-    const line = paintBorderLine("─".repeat(120), makeCtx());
-    expect(sgrRuns(line)).toBeLessThanOrEqual(DEFAULT_GRADIENT_STOPS);
-    expect(line.length).toBeLessThanOrEqual(800);
-  });
+  it("stays inside the per-column byte format at 120 columns", () => {
+    // One SGR prefix per column is the point of "one colour per character"; the
+    // caps below are the format's worst case (19-byte truecolor prefix, 11-byte
+    // 256-colour prefix), so a regression to longer sequences shows up here.
+    const truecolor = paintBorderLine("─".repeat(120), makeCtx());
+    expect(truecolor.length).toBeLessThanOrEqual(120 * 20 + 4);
+    expect(sgrRuns(truecolor)).toBeLessThanOrEqual(120);
 
-  it(`keeps ≤ steps runs and ≤ 500 bytes at 120 columns (256 colour)`, () => {
-    const line = paintBorderLine("─".repeat(120), makeCtx({ mode: "256color" }));
-    expect(sgrRuns(line)).toBeLessThanOrEqual(DEFAULT_GRADIENT_STOPS);
-    expect(line.length).toBeLessThanOrEqual(500);
-  });
-
-  it("allows one extra run for the hint label on top of the stop budget", () => {
-    const plain = `${"─".repeat(15)} ↑ 3 more ${"─".repeat(95)}`;
-    const line = paintBorderLine(plain, makeCtx());
-    expect(sgrRuns(line)).toBeLessThanOrEqual(DEFAULT_GRADIENT_STOPS + 1);
-  });
-
-  it("clamps the stop budget to [1, width]", () => {
-    const wide = paintBorderLine("─".repeat(20), makeCtx({ width: 20, stops: 10_000 }));
-    expect(sgrRuns(wide)).toBeLessThanOrEqual(20);
-
-    const single = paintBorderLine("─".repeat(20), makeCtx({ width: 20, stops: 0 }));
-    expect(sgrRuns(single)).toBe(1);
-    expect(plainOf(single)).toBe("─".repeat(20));
+    const indexed = paintBorderLine("─".repeat(120), makeCtx({ mode: "256color" }));
+    expect(indexed.length).toBeLessThanOrEqual(120 * 12 + 4);
+    expect(sgrRuns(indexed)).toBeLessThanOrEqual(120);
   });
 
   it("is deterministic for identical inputs", () => {
-    expect(paintBorderLine("─".repeat(80), makeCtx({ width: 80 }))).toBe(
-      paintBorderLine("─".repeat(80), makeCtx({ width: 80 })),
-    );
+    expect(paintBorderLine("─".repeat(80), makeCtx())).toBe(paintBorderLine("─".repeat(80), makeCtx()));
   });
 
   it("changes colours but not characters when the phase advances", () => {
-    const a = paintBorderLine("─".repeat(80), makeCtx({ width: 80, phase: 0 }));
-    const b = paintBorderLine("─".repeat(80), makeCtx({ width: 80, phase: 0.05 }));
+    const a = paintBorderLine("─".repeat(80), makeCtx({ phase: 0 }));
+    const b = paintBorderLine("─".repeat(80), makeCtx({ phase: 0.05 }));
     expect(plainOf(a)).toBe(plainOf(b));
     expect(a).not.toBe(b);
   });
 
   it("keeps the character count for every width in the matrix", () => {
     for (const width of [1, 2, 3, 5, 20, 80, 137, 201]) {
-      const line = paintBorderLine("─".repeat(width), makeCtx({ width }));
+      const line = paintBorderLine("─".repeat(width), makeCtx());
       expect(plainOf(line)).toBe("─".repeat(width));
     }
   });
-
-  it("stays inside the byte cap in the worst case (every channel three digits)", () => {
-    // Alternating extremes keep all 32 stops distinct while forcing the longest
-    // possible `38;2;r;g;b` prefixes: 32 runs x 19 bytes + 120 columns + reset.
-    const wideAnchors: Rgb[] = Array.from({ length: 6 }, (_, index) =>
-      index % 2 === 0 ? { r: 255, g: 255, b: 255 } : { r: 100, g: 100, b: 100 },
-    );
-    const truecolor = paintBorderLine("─".repeat(120), makeCtx({ anchors: wideAnchors }));
-    // Adjacent stops may round to the same RGB (rounding merges that pair), so the
-    // run count is bounded by the stop budget rather than exactly equal to it.
-    expect(sgrRuns(truecolor)).toBeGreaterThanOrEqual(24);
-    expect(sgrRuns(truecolor)).toBeLessThanOrEqual(DEFAULT_GRADIENT_STOPS);
-    expect(truecolor.length).toBeLessThanOrEqual(800);
-
-    const indexed = paintBorderLine("─".repeat(120), makeCtx({ anchors: wideAnchors, mode: "256color" }));
-    expect(sgrRuns(indexed)).toBeGreaterThanOrEqual(16);
-    expect(sgrRuns(indexed)).toBeLessThanOrEqual(DEFAULT_GRADIENT_STOPS);
-    expect(indexed.length).toBeLessThanOrEqual(500);
-  });
 });
 
-describe("paintBorderLine — column → stop mapping", () => {
-  it("gives every stop an equal interval, using floor boundaries (width 8, 4 stops)", () => {
-    // Stops are intervals of the line: [0,2) [2,4) [4,6) [6,8), i.e. floor(c*4/8).
-    // `Math.round` would shift column 1 into stop 1 and grow the last stop, so the
-    // per-column colours and the run lengths below both pin the mapping.
-    const line = paintBorderLine("─".repeat(8), makeCtx({ width: 8, stops: 4, anchors: STOP_ANCHORS }));
-
-    // Each stop is sampled at its centre, so these are the four colours of
-    // u = (k + 0.5) / 4 (hand-computed in the next test).
-    const stop0 = { r: 31, g: 84, b: 169 };
-    const stop1 = { r: 71, g: 173, b: 34 };
-    const stop2 = { r: 38, g: 38, b: 0 };
-    const stop3 = { r: 246, g: 215, b: 215 };
-    expect(columnAnsi(line).map((ansi) => parseAnsiFg(ansi))).toEqual([
-      stop0,
-      stop0,
-      stop1,
-      stop1,
-      stop2,
-      stop2,
-      stop3,
-      stop3,
-    ]);
-    expect(runLengths(line)).toEqual([2, 2, 2, 2]);
-    expect(plainOf(line)).toBe("─".repeat(8));
+describe("paintBorderLine — spatial period (CYCLE_CHARS)", () => {
+  it("uses a fixed 16-character cycle", () => {
+    expect(CYCLE_CHARS).toBe(16);
   });
 
-  it("puts the interval boundary where the floor maths says (width 10, 3 stops)", () => {
-    // floor(c*3/10) → [0,0,0,0, 1,1,1, 2,2,2]; rounding would give [0,0,1,1,1,2,2,2,2,2].
-    const line = paintBorderLine("─".repeat(10), makeCtx({ width: 10, stops: 3, anchors: STOP_ANCHORS }));
-    const perColumn = columnAnsi(line);
-    const stopColor = (stop: number) => ansiAtCyclePosition((stop + 0.5) / 3, STOP_ANCHORS, "truecolor");
-
-    expect(runLengths(line)).toEqual([4, 3, 3]);
-    expect(perColumn[3]).toBe(stopColor(0)); // last column of stop 0
-    expect(perColumn[4]).toBe(stopColor(1)); // first column of stop 1
-    expect(perColumn[6]).toBe(stopColor(1)); // last column of stop 1
-    expect(perColumn[7]).toBe(stopColor(2)); // first column of stop 2
-  });
-
-  it("still maps the last column to the last stop when width is not a multiple of stops", () => {
-    for (const [width, stops] of [
-      [7, 3],
-      [13, 4],
-      [120, 32],
-      [201, 32],
-    ] as const) {
-      const line = paintBorderLine("─".repeat(width), makeCtx({ width, stops, anchors: STOP_ANCHORS }));
-      const lengths = runLengths(line);
-      expect(lengths.reduce((sum, length) => sum + length, 0)).toBe(width);
-      expect(Math.max(...lengths) - Math.min(...lengths)).toBeLessThanOrEqual(1);
-      expect(lengths.length).toBe(Math.min(stops, width));
-    }
-  });
-});
-
-describe("paintBorderLine — stop centre sampling", () => {
-  it("samples a stop at its centre, not at its start (width 8, 4 stops)", () => {
-    const stops = 4;
-    const line = paintBorderLine("─".repeat(8), makeCtx({ width: 8, stops, anchors: STOP_ANCHORS }));
-    const firstOfStop = [0, 2, 4, 6].map((column) => columnAnsi(line)[column]);
-
-    // Hosting the sample at the centre of the stop: u = (k + 0.5) / stops.
-    for (let stop = 0; stop < stops; stop++) {
-      expect(firstOfStop[stop]).toBe(ansiAtCyclePosition((stop + 0.5) / stops, STOP_ANCHORS, "truecolor"));
+  it("repeats the pattern every CYCLE_CHARS columns at a fixed phase", () => {
+    const perColumn: string[] = [];
+    const line = paintBorderLine("─".repeat(48), makeCtx({ phase: 0.3 }));
+    const tokens = [...line.matchAll(/\x1b\[[\d;]*m|[^\x1b]/gu)].map((m) => m[0]);
+    let ansi = "";
+    for (const token of tokens) {
+      if (token.startsWith("\x1b")) {
+        ansi = token;
+        continue;
+      }
+      perColumn.push(ansi);
     }
 
-    // Hand-computed proof that the first stop is NOT the raw anchor: with
-    // u = 0.125 the position sits 75% into the first segment, so smoothstep gives
-    // 0.84375 and the colour is 84% of the way from (200,0,0) to (0,100,200).
-    expect(parseAnsiFg(firstOfStop[0]!)).toEqual({ r: 31, g: 84, b: 169 });
-    // Sampling the start of the stop would return the anchor itself, 0.5/stops
-    // earlier in the cycle.
-    expect(parseAnsiFg(firstOfStop[0]!)).not.toEqual(STOP_ANCHORS[0]);
-    expect(parseAnsiFg(ansiAtCyclePosition(0, STOP_ANCHORS, "truecolor"))).toEqual(STOP_ANCHORS[0]);
+    // Column 0 and column 16 are the same spot of the ring; column 8 is halfway.
+    expect(perColumn[0]).toBe(perColumn[CYCLE_CHARS]);
+    expect(perColumn[0]).toBe(perColumn[CYCLE_CHARS * 2]);
+    expect(perColumn[0]).not.toBe(perColumn[CYCLE_CHARS / 2]);
+    for (let column = 0; column < CYCLE_CHARS; column++) {
+      expect(perColumn[column]).toBe(perColumn[column + CYCLE_CHARS]);
+    }
   });
 
-  it("keeps the centre offset when a phase is applied", () => {
-    const stops = 4;
-    const phase = 0.125;
-    const line = paintBorderLine("─".repeat(8), makeCtx({ width: 8, stops, phase, anchors: STOP_ANCHORS }));
-    const perColumn = columnAnsi(line);
-    const stopColor = (stop: number) => ansiAtCyclePosition((stop + 0.5) / stops + phase, STOP_ANCHORS, "truecolor");
+  it("wraps the ring with the phase, so a phase shift moves the whole pattern", () => {
+    const atZero = paintBorderLine("─".repeat(CYCLE_CHARS), makeCtx({ phase: 0 }));
+    const atOneLap = paintBorderLine("─".repeat(CYCLE_CHARS), makeCtx({ phase: 1 }));
+    expect(atOneLap).toBe(atZero);
 
-    expect(perColumn[0]).toBe(stopColor(0));
-    expect(perColumn[2]).toBe(stopColor(1));
-    expect(perColumn[4]).toBe(stopColor(2));
-    expect(perColumn[6]).toBe(stopColor(3));
-    // A start-of-stop sample would land on the anchors instead (u = phase + k/stops).
-    expect(perColumn[0]).not.toBe(ansiAtCyclePosition(phase, STOP_ANCHORS, "truecolor"));
+    // One column of phase == one column of space: shifting the phase by 1/16
+    // reproduces the same picture shifted by one column.
+    const shifted = paintBorderLine("─".repeat(CYCLE_CHARS * 2), makeCtx({ phase: 1 / CYCLE_CHARS }));
+    const plainShift = paintBorderLine("─".repeat(CYCLE_CHARS * 2), makeCtx({ phase: 0 }));
+    const colorsOf = (line: string): string[] => {
+      const tokens = [...line.matchAll(/\x1b\[[\d;]*m|[^\x1b]/gu)].map((m) => m[0]);
+      const out: string[] = [];
+      let ansi = "";
+      for (const token of tokens) {
+        if (token.startsWith("\x1b")) {
+          ansi = token;
+          continue;
+        }
+        out.push(ansi);
+      }
+      return out;
+    };
+    const a = colorsOf(plainShift);
+    const b = colorsOf(shifted);
+    for (let column = 0; column < CYCLE_CHARS; column++) {
+      expect(b[column]).toBe(a[(column + 1) % CYCLE_CHARS]);
+    }
+  });
+
+  it("does not depend on the line width (width 40 vs 200)", () => {
+    const narrow = paintBorderLine("─".repeat(40), makeCtx({ phase: 0.2 }));
+    const wide = paintBorderLine("─".repeat(200), makeCtx({ phase: 0.2 }));
+    const cellsOf = (line: string): Array<{ ansi: string; ch: string }> => {
+      const tokens = [...line.matchAll(/\x1b\[[\d;]*m|[^\x1b]/gu)].map((m) => m[0]);
+      const out: Array<{ ansi: string; ch: string }> = [];
+      let ansi = "";
+      for (const token of tokens) {
+        if (token.startsWith("\x1b")) {
+          ansi = token;
+          continue;
+        }
+        out.push({ ansi, ch: token });
+      }
+      return out;
+    };
+    const narrowCells = cellsOf(narrow);
+    const wideCells = cellsOf(wide);
+    // The first full cycle is identical; only the length differs.
+    expect(wideCells.slice(0, CYCLE_CHARS)).toEqual(narrowCells.slice(0, CYCLE_CHARS));
+    expect(wideCells.slice(CYCLE_CHARS, CYCLE_CHARS * 2)).toEqual(narrowCells.slice(CYCLE_CHARS, CYCLE_CHARS * 2));
+  });
+
+  it("never paints a wide uniform block in truecolor (one colour per character)", () => {
+    const line = paintBorderLine("─".repeat(120), makeCtx());
+    const columnColors = cells(line)
+      .filter((cell) => cell.ch === "─")
+      .map((cell) => cell.ansi);
+
+    // Adjacent columns are 1/16 lap apart, so their RGB differs: every run is a
+    // single character (no block), which is exactly what the quantised
+    // stop-based version could not promise. The period still repeats, so the
+    // whole line only holds CYCLE_CHARS distinct colours.
+    expect(runLengths(line)).toEqual(Array(120).fill(1));
+    expect(new Set(columnColors).size).toBe(CYCLE_CHARS);
+  });
+
+  it("keeps blocks short in 256 colours (quantisation may merge neighbours)", () => {
+    const line = paintBorderLine("─".repeat(120), makeCtx({ mode: "256color" }));
+    const lengths = runLengths(line);
+
+    // Quantisation collapses nearby tones onto the same palette entry, so single
+    // columns are not guaranteed here — but no block may swallow a whole band.
+    expect(Math.max(...lengths)).toBeLessThanOrEqual(4);
+    expect(new Set(cells(line).filter((c) => c.ch === "─").map((c) => c.ansi)).size).toBeGreaterThanOrEqual(8);
   });
 });
