@@ -14,11 +14,16 @@
 import { describe, it, expect } from "vitest";
 import {
   CYCLE_CHARS,
+  MIN_ANCHOR_HUE_GAP_DEG,
   NEUTRAL_RGB,
   ansiAtCyclePosition,
+  oklchToRgb,
   paintBorderLine,
   parseAnsiFg,
+  prepareAnchors,
   rgbToAnsi256,
+  rgbToOklch,
+  type Oklch,
   type PaintContext,
   type Rgb,
 } from "./border-gradient";
@@ -84,6 +89,22 @@ const ANCHORS: Rgb[] = [
 
 const LABEL_ANSI = "\x1b[38;2;51;153;255m";
 
+/** The anchor ring the gradient actually walks: sorted by hue, near-duplicates collapsed. */
+const RING = prepareAnchors(ANCHORS);
+
+/**
+ * OKLCH of the synthetic anchors, computed by hand from Ottosson's matrices
+ * (independent of the implementation, so order/dedupe assertions do not ask the
+ * code what the answer is):
+ *   error        (204,0,0)     L 0.5308 C 0.2178 h  29.23
+ *   warning      (214,140,0)   L 0.6987 C 0.1495 h  72.07
+ *   syntaxType   (102,204,102) L 0.7603 C 0.1696 h 143.68
+ *   success      ( 51,204,102) L 0.7450 C 0.1897 h 149.57  ← 5.89° from syntaxType → dropped
+ *   accent       ( 51,153,255) L 0.6755 C 0.1765 h 252.26
+ *   syntaxKeyword(170,102,204) L 0.6261 C 0.1620 h 313.37
+ */
+const EXPECTED_RING_HUES = [29.23, 72.07, 143.68, 252.26, 313.37];
+
 /**
  * Anchors with hand-checkable numbers, used where the expected stop colours are
  * spelled out as literals (see the stop-mapping and centre-sampling tests).
@@ -99,7 +120,7 @@ const STOP_ANCHORS: Rgb[] = [
 
 const makeCtx = (over: Partial<PaintContext> = {}): PaintContext => ({
   phase: 0,
-  anchors: ANCHORS,
+  anchors: RING,
   mode: "truecolor",
   labelAnsi: LABEL_ANSI,
   ...over,
@@ -210,11 +231,90 @@ describe("rgbToAnsi256 — quantisation geometry (pi-tui parity)", () => {
   });
 });
 
+describe("prepareAnchors — hue sort + de-duplication", () => {
+  it("sorts by hue and drops an anchor closer than the threshold (hand-computed hues)", () => {
+    // success sits 5.89° from syntaxType, i.e. below MIN_ANCHOR_HUE_GAP_DEG = 6,
+    // so the ring keeps syntaxType (first in sorted order) and drops success.
+    expect(MIN_ANCHOR_HUE_GAP_DEG).toBe(6);
+    expect(RING).toHaveLength(5);
+
+    const hues = RING.map((anchor) => anchor.h);
+    for (let i = 0; i < hues.length; i++) {
+      expect(Math.abs(hues[i]! - EXPECTED_RING_HUES[i]!)).toBeLessThanOrEqual(0.5);
+    }
+    // Strictly ascending: no revisit, no back-tracking.
+    for (let i = 1; i < hues.length; i++) expect(hues[i]!).toBeGreaterThan(hues[i - 1]!);
+  });
+
+  it("collapses a repeated anchor (the built-in themes ship accent = syntaxType)", () => {
+    const duplicated: Rgb[] = [
+      { r: 204, g: 0, b: 0 },
+      { r: 170, g: 102, b: 204 },
+      { r: 51, g: 153, b: 255 },
+      { r: 51, g: 153, b: 255 }, // accent repeated as syntaxType
+      { r: 102, g: 204, b: 102 },
+      { r: 51, g: 204, b: 102 },
+    ];
+    const ring = prepareAnchors(duplicated);
+    expect(ring).toHaveLength(4); // accent duplicate and success (5.89° from syntaxType) dropped
+    for (let i = 1; i < ring.length; i++) expect(ring[i]!.h).toBeGreaterThan(ring[i - 1]!.h);
+  });
+
+  it("falls back to the neutral anchor for an empty input", () => {
+    const ring = prepareAnchors([]);
+    expect(ring).toHaveLength(1);
+    expect(ring[0]!.h).toBeCloseTo(rgbToOklch(NEUTRAL_RGB).h, 6);
+  });
+});
+
+describe("rgbToOklch / oklchToRgb", () => {
+  it.each([
+    [{ r: 204, g: 0, b: 0 }, { l: 0.5308, c: 0.2178, h: 29.23 }],
+    [{ r: 102, g: 204, b: 102 }, { l: 0.7603, c: 0.1696, h: 143.68 }],
+    [{ r: 255, g: 255, b: 255 }, { l: 1, c: 0, h: 0 }],
+  ])("converts %j to OKLCH within rounding (%j)", (rgb, expected) => {
+    const got = rgbToOklch(rgb as Rgb);
+    expect(Math.abs(got.l - (expected as Oklch).l)).toBeLessThanOrEqual(0.002);
+    expect(Math.abs(got.c - (expected as Oklch).c)).toBeLessThanOrEqual(0.002);
+    if ((expected as Oklch).c > 0.01) expect(Math.abs(got.h - (expected as Oklch).h)).toBeLessThanOrEqual(0.5);
+  });
+
+  it("round-trips sRGB colours within one unit per channel", () => {
+    for (const rgb of [
+      { r: 204, g: 0, b: 0 },
+      { r: 51, g: 153, b: 255 },
+      { r: 51, g: 204, b: 102 },
+      { r: 18, g: 52, b: 86 },
+      { r: 238, g: 238, b: 238 },
+    ] as Rgb[]) {
+      const back = oklchToRgb(rgbToOklch(rgb));
+      expect(Math.abs(back.r - rgb.r)).toBeLessThanOrEqual(1);
+      expect(Math.abs(back.g - rgb.g)).toBeLessThanOrEqual(1);
+      expect(Math.abs(back.b - rgb.b)).toBeLessThanOrEqual(1);
+    }
+  });
+
+  it("keeps lightness and hue when the colour leaves the sRGB gamut", () => {
+    // Very high chroma at mid lightness is outside sRGB: the mapper must reduce
+    // chroma only, keeping L and h (so a light theme stays light).
+    const request: Oklch = { l: 0.716, c: 0.4, h: 150 };
+    const rgb = oklchToRgb(request);
+    for (const channel of [rgb.r, rgb.g, rgb.b]) {
+      expect(channel).toBeGreaterThanOrEqual(0);
+      expect(channel).toBeLessThanOrEqual(255);
+    }
+    const got = rgbToOklch(rgb);
+    expect(Math.abs(got.l - request.l)).toBeLessThanOrEqual(0.01);
+    expect(Math.abs(got.h - request.h)).toBeLessThanOrEqual(1.5);
+    expect(got.c).toBeLessThan(request.c);
+  });
+});
+
 describe("ansiAtCyclePosition", () => {
-  it("reproduces every anchor at its own cycle position (≤2 per channel)", () => {
-    for (let i = 0; i < ANCHORS.length; i++) {
-      const rgb = parseAnsiFg(ansiAtCyclePosition(i / ANCHORS.length, ANCHORS, "truecolor"))!;
-      const anchor = ANCHORS[i]!;
+  it("reproduces every ring anchor at its own cycle position (≤2 per channel)", () => {
+    for (let i = 0; i < RING.length; i++) {
+      const rgb = parseAnsiFg(ansiAtCyclePosition(i / RING.length, RING, "truecolor"))!;
+      const anchor = oklchToRgb(RING[i]!);
       expect(Math.abs(rgb.r - anchor.r)).toBeLessThanOrEqual(2);
       expect(Math.abs(rgb.g - anchor.g)).toBeLessThanOrEqual(2);
       expect(Math.abs(rgb.b - anchor.b)).toBeLessThanOrEqual(2);
@@ -222,62 +322,75 @@ describe("ansiAtCyclePosition", () => {
   });
 
   it("emits the quantised anchor in 256-colour mode", () => {
-    for (let i = 0; i < ANCHORS.length; i++) {
-      const ansi = ansiAtCyclePosition(i / ANCHORS.length, ANCHORS, "256color");
-      expect(ansi).toBe(`\x1b[38;5;${rgbToAnsi256(ANCHORS[i]!)}m`);
+    for (let i = 0; i < RING.length; i++) {
+      const ansi = ansiAtCyclePosition(i / RING.length, RING, "256color");
+      expect(ansi).toBe(`\x1b[38;5;${rgbToAnsi256(oklchToRgb(RING[i]!))}m`);
     }
   });
 
-  it("interpolates with smoothstep (halfway between two anchors is their midpoint)", () => {
-    const midway = parseAnsiFg(ansiAtCyclePosition(0.5 / ANCHORS.length, ANCHORS, "truecolor"))!;
-    const a = ANCHORS[0]!;
-    const b = ANCHORS[1]!;
-    expect(Math.abs(midway.r - (a.r + b.r) / 2)).toBeLessThanOrEqual(1);
-    expect(Math.abs(midway.g - (a.g + b.g) / 2)).toBeLessThanOrEqual(1);
-    expect(Math.abs(midway.b - (a.b + b.b) / 2)).toBeLessThanOrEqual(1);
+  it("interpolates linearly in OKLCH (quarter of a segment, not smoothstep)", () => {
+    // t = 0.125 of segment 0: linear hue = h0 + 0.125 × Δh; smoothstep would give
+    // 0.0429 × Δh. L and C also move linearly, which is what keeps a long period
+    // from dwelling at the anchors and rushing through the middle.
+    const from = RING[0]!;
+    const to = RING[1]!;
+    const expectedHue = from.h + (to.h - from.h) * 0.125;
+    const got = rgbToOklch(parseAnsiFg(ansiAtCyclePosition(0.125 / RING.length, RING, "truecolor"))!);
+
+    expect(Math.abs(got.h - expectedHue)).toBeLessThanOrEqual(0.5);
+    expect(Math.abs(got.l - (from.l + (to.l - from.l) * 0.125))).toBeLessThanOrEqual(0.01);
+    // A smoothstep easing would land at h0 + 0.0429 × Δh, i.e. well outside this.
+    expect(Math.abs(got.h - (from.h + (to.h - from.h) * 0.0429))).toBeGreaterThan(1);
   });
 
-  it("eases with smoothstep, not linearly (hand-computed quarter point)", () => {
-    // u = 1/24 → x = 0.25 → t = smoothstep(0.25) = 0.25² × (3 − 0.5) = 0.15625,
-    // i.e. 15.6 % of the way from (204,0,0) to (170,102,204):
-    //   r = 204 − 34 × 0.15625 = 198.69 → 199
-    //   g = 102 × 0.15625      = 15.94  → 16
-    //   b = 204 × 0.15625      = 31.88  → 32
-    // A linear easing would give (196, 26, 51), so this literal pins the shape
-    // instead of asking the implementation what the answer should be.
-    expect(parseAnsiFg(ansiAtCyclePosition(1 / 24, ANCHORS, "truecolor"))).toEqual({ r: 199, g: 16, b: 32 });
-    expect(parseAnsiFg(ansiAtCyclePosition(1 / 24, ANCHORS, "truecolor"))).not.toEqual({ r: 196, g: 26, b: 51 });
+  it("keeps the hue ramp monotone and covers one lap (no back-tracking)", () => {
+    const steps = CYCLE_CHARS * 2;
+    let previous: number | undefined;
+    let travel = 0;
+    for (let step = 0; step < steps; step++) {
+      const hue = rgbToOklch(parseAnsiFg(ansiAtCyclePosition(step / CYCLE_CHARS, RING, "truecolor"))!).h;
+      if (previous !== undefined) {
+        // The ring wraps at 360°, so unwrap before comparing.
+        let delta = hue - previous;
+        if (delta < -180) delta += 360;
+        expect(delta).toBeGreaterThan(0);
+        travel += delta;
+      }
+      previous = hue;
+    }
+    // Two laps ⇒ ≈720° of hue travel (the ring's own gaps sum to 360 per lap),
+    // never reversing. Gamut clipping shifts the measured hue by a fraction of a
+    // degree per step, so allow ~1.5% drift.
+    expect(Math.abs(travel - 720)).toBeLessThanOrEqual(12);
   });
 
   it("wraps at u = 1 and stays continuous across the seam", () => {
-    expect(ansiAtCyclePosition(1, ANCHORS, "truecolor")).toBe(ansiAtCyclePosition(0, ANCHORS, "truecolor"));
-    const beforeSeam = parseAnsiFg(ansiAtCyclePosition(1 - 1e-6, ANCHORS, "truecolor"))!;
-    const seam = ANCHORS[0]!;
-    expect(Math.abs(beforeSeam.r - seam.r)).toBeLessThanOrEqual(2);
-    expect(Math.abs(beforeSeam.g - seam.g)).toBeLessThanOrEqual(2);
-    expect(Math.abs(beforeSeam.b - seam.b)).toBeLessThanOrEqual(2);
+    expect(ansiAtCyclePosition(1, RING, "truecolor")).toBe(ansiAtCyclePosition(0, RING, "truecolor"));
+    const beforeSeam = rgbToOklch(parseAnsiFg(ansiAtCyclePosition(1 - 1e-6, RING, "truecolor"))!);
+    const seam = rgbToOklch(parseAnsiFg(ansiAtCyclePosition(0, RING, "truecolor"))!);
+    expect(Math.abs(beforeSeam.l - seam.l)).toBeLessThanOrEqual(0.01);
+    expect(Math.abs(beforeSeam.c - seam.c)).toBeLessThanOrEqual(0.01);
   });
 
   it.each([-1e-6, -0.25, -42.75, 1 + 1e-6, 42.5, 1e6 + 0.3])(
     "clamps/interpolates an out-of-range position (%s) instead of throwing",
     (u) => {
-      const ansi = ansiAtCyclePosition(u, ANCHORS, "truecolor");
-      expect(ansi).toMatch(TRUE_COLOR);
+      expect(ansiAtCyclePosition(u, RING, "truecolor")).toMatch(TRUE_COLOR);
     },
   );
 
   it("treats a non-finite position as the start of the cycle", () => {
-    const start = ansiAtCyclePosition(0, ANCHORS, "truecolor");
+    const start = ansiAtCyclePosition(0, RING, "truecolor");
     for (const u of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
-      expect(ansiAtCyclePosition(u, ANCHORS, "truecolor")).toBe(start);
+      expect(ansiAtCyclePosition(u, RING, "truecolor")).toBe(start);
     }
   });
 
   it("keeps the two colour modes mutually exclusive", () => {
     for (let step = 0; step < 64; step++) {
       const u = step / 64;
-      expect(ansiAtCyclePosition(u, ANCHORS, "truecolor")).toMatch(TRUE_COLOR);
-      expect(ansiAtCyclePosition(u, ANCHORS, "256color")).toMatch(INDEXED_COLOR);
+      expect(ansiAtCyclePosition(u, RING, "truecolor")).toMatch(TRUE_COLOR);
+      expect(ansiAtCyclePosition(u, RING, "256color")).toMatch(INDEXED_COLOR);
     }
   });
 
@@ -285,9 +398,10 @@ describe("ansiAtCyclePosition", () => {
     expect(parseAnsiFg(ansiAtCyclePosition(0.3, [], "truecolor"))).toEqual(NEUTRAL_RGB);
   });
 
-  it("handles a single anchor", () => {
-    const only = { r: 10, g: 20, b: 30 };
-    expect(parseAnsiFg(ansiAtCyclePosition(0.37, [only], "truecolor"))).toEqual(only);
+  it("stays a single colour with a single anchor (no invented rainbow)", () => {
+    const only = prepareAnchors([{ r: 10, g: 20, b: 30 }]);
+    const colors = [0, 0.13, 0.5, 0.87].map((u) => ansiAtCyclePosition(u, only, "truecolor"));
+    expect(new Set(colors).size).toBe(1);
   });
 });
 
@@ -308,19 +422,10 @@ describe("paintBorderLine (gradient)", () => {
     const line = paintBorderLine(plain, makeCtx());
     expect(plainOf(line)).toBe(plain);
     const labelStart = plain.indexOf(" ↑ 3 more ");
-    const tokens = [...line.matchAll(/\x1b\[[\d;]*m|[^\x1b]/gu)].map((m) => m[0]);
-    let ansi = "";
-    const labelAnsi: string[] = [];
-    let column = 0;
-    for (const token of tokens) {
-      if (token.startsWith("\x1b")) {
-        ansi = token;
-        continue;
-      }
-      if (column >= labelStart && column < labelStart + 10) labelAnsi.push(ansi);
-      column += 1;
-    }
-    expect(new Set(labelAnsi)).toEqual(new Set([LABEL_ANSI]));
+    const perChar = cells(line);
+    expect(perChar.slice(labelStart, labelStart + 10).map((cell) => cell.ansi)).toEqual(
+      Array(10).fill(LABEL_ANSI),
+    );
   });
 
   it("stays inside the per-column byte format at 120 columns", () => {
@@ -334,20 +439,6 @@ describe("paintBorderLine (gradient)", () => {
     const indexed = paintBorderLine("─".repeat(120), makeCtx({ mode: "256color" }));
     expect(indexed.length).toBeLessThanOrEqual(120 * 12 + 4);
     expect(sgrRuns(indexed)).toBeLessThanOrEqual(120);
-  });
-
-  it("paints each column with the smoothstep shape (hand-computed, phase 0)", () => {
-    // Column c sits at u = c / 16, so x = 6u, i = floor(x) % 6, t = smoothstep(x - floor(x)).
-    // Column 1: u = 0.0625 → x = 0.375 → t = 0.31640625 → (193, 32, 65)
-    // Column 2: u = 0.125  → x = 0.75  → t = 0.84375    → (175, 86, 172)
-    // Column 3: u = 0.1875 → x = 1.125 → t = 0.04296875 (anchors 1→2) → (172, 104, 195)
-    const perColumn = cells(paintBorderLine("─".repeat(4), makeCtx())).map((cell) => parseAnsiFg(cell.ansi));
-    expect(perColumn).toEqual([
-      { r: 204, g: 0, b: 0 },
-      { r: 193, g: 32, b: 65 },
-      { r: 175, g: 86, b: 172 },
-      { r: 172, g: 104, b: 195 },
-    ]);
   });
 
   it("is deterministic for identical inputs", () => {
@@ -367,27 +458,66 @@ describe("paintBorderLine (gradient)", () => {
       expect(plainOf(line)).toBe("─".repeat(width));
     }
   });
+
+  it("never paints two adjacent columns the same colour in truecolor", () => {
+    // Anchors are sorted and de-duplicated, so every column step moves the hue;
+    // one lap holds CYCLE_CHARS distinct colours and the pattern repeats.
+    const line = paintBorderLine("─".repeat(120), makeCtx());
+    expect(runLengths(line)).toEqual(Array(120).fill(1));
+    expect(new Set(columnAnsi(line)).size).toBe(CYCLE_CHARS);
+  });
+
+  it("keeps blocks short in 256 colours (quantisation may merge neighbours)", () => {
+    const line = paintBorderLine("─".repeat(120), makeCtx({ mode: "256color" }));
+    const lengths = runLengths(line);
+
+    // Quantisation collapses nearby tones onto the same palette entry, so single
+    // columns are not guaranteed here (measured: max run 5, 22 distinct colours at
+    // 120 columns). A dead span from a repeated anchor would be far longer, and in
+    // truecolor it is caught by the "every run is one character" assertion.
+    expect(Math.max(...lengths)).toBeLessThanOrEqual(6);
+    expect(new Set(columnAnsi(line)).size).toBeGreaterThanOrEqual(8);
+  });
+});
+
+describe("paintBorderLine — per-column colour step", () => {
+  /** OKLab Euclidean distance (L, a, b) between two OKLCH colours. */
+  const deltaE = (first: Oklch, second: Oklch): number => {
+    const toLab = (color: Oklch): [number, number, number] => {
+      const radians = (color.h * Math.PI) / 180;
+      return [color.l, color.c * Math.cos(radians), color.c * Math.sin(radians)];
+    };
+    const [l1, a1, b1] = toLab(first);
+    const [l2, a2, b2] = toLab(second);
+    return Math.hypot(l1 - l2, a1 - a2, b1 - b2);
+  };
+
+  it("keeps every column step small at 48 characters per lap (max ΔE ≤ 0.05)", () => {
+    // Measured on a 120-column line: max 0.040, median 0.023. The threshold sits
+    // in the analysis report's magnitude (maxColΔE ≈ 0.028 for the built-in
+    // themes) with headroom for this synthetic ring's wider wrap leg. Shortening
+    // the period (e.g. back to 16) triples the step and turns this red.
+    const colors = columnAnsi(paintBorderLine("─".repeat(120), makeCtx())).map(
+      (ansi) => rgbToOklch(parseAnsiFg(ansi)!)!,
+    );
+    let maximum = 0;
+    for (let i = 1; i < colors.length; i++) {
+      maximum = Math.max(maximum, deltaE(colors[i - 1]!, colors[i]!));
+    }
+    expect(maximum).toBeLessThanOrEqual(0.05);
+    expect(maximum).toBeGreaterThan(0); // the gradient actually moves
+  });
 });
 
 describe("paintBorderLine — spatial period (CYCLE_CHARS)", () => {
-  it("uses a fixed 16-character cycle", () => {
-    expect(CYCLE_CHARS).toBe(16);
+  it("uses a fixed 48-character cycle", () => {
+    expect(CYCLE_CHARS).toBe(48);
   });
 
   it("repeats the pattern every CYCLE_CHARS columns at a fixed phase", () => {
-    const perColumn: string[] = [];
-    const line = paintBorderLine("─".repeat(48), makeCtx({ phase: 0.3 }));
-    const tokens = [...line.matchAll(/\x1b\[[\d;]*m|[^\x1b]/gu)].map((m) => m[0]);
-    let ansi = "";
-    for (const token of tokens) {
-      if (token.startsWith("\x1b")) {
-        ansi = token;
-        continue;
-      }
-      perColumn.push(ansi);
-    }
+    const perColumn = columnAnsi(paintBorderLine("─".repeat(CYCLE_CHARS * 3), makeCtx({ phase: 0.3 })));
 
-    // Column 0 and column 16 are the same spot of the ring; column 8 is halfway.
+    // Column 0 and column CYCLE_CHARS are the same spot of the ring; halfway is not.
     expect(perColumn[0]).toBe(perColumn[CYCLE_CHARS]);
     expect(perColumn[0]).toBe(perColumn[CYCLE_CHARS * 2]);
     expect(perColumn[0]).not.toBe(perColumn[CYCLE_CHARS / 2]);
@@ -401,74 +531,21 @@ describe("paintBorderLine — spatial period (CYCLE_CHARS)", () => {
     const atOneLap = paintBorderLine("─".repeat(CYCLE_CHARS), makeCtx({ phase: 1 }));
     expect(atOneLap).toBe(atZero);
 
-    // One column of phase == one column of space: shifting the phase by 1/16
+    // One column of phase == one column of space: shifting the phase by 1/48
     // reproduces the same picture shifted by one column.
-    const shifted = paintBorderLine("─".repeat(CYCLE_CHARS * 2), makeCtx({ phase: 1 / CYCLE_CHARS }));
-    const plainShift = paintBorderLine("─".repeat(CYCLE_CHARS * 2), makeCtx({ phase: 0 }));
-    const colorsOf = (line: string): string[] => {
-      const tokens = [...line.matchAll(/\x1b\[[\d;]*m|[^\x1b]/gu)].map((m) => m[0]);
-      const out: string[] = [];
-      let ansi = "";
-      for (const token of tokens) {
-        if (token.startsWith("\x1b")) {
-          ansi = token;
-          continue;
-        }
-        out.push(ansi);
-      }
-      return out;
-    };
-    const a = colorsOf(plainShift);
-    const b = colorsOf(shifted);
+    const shifted = columnAnsi(paintBorderLine("─".repeat(CYCLE_CHARS * 2), makeCtx({ phase: 1 / CYCLE_CHARS })));
+    const plain = columnAnsi(paintBorderLine("─".repeat(CYCLE_CHARS * 2), makeCtx({ phase: 0 })));
     for (let column = 0; column < CYCLE_CHARS; column++) {
-      expect(b[column]).toBe(a[(column + 1) % CYCLE_CHARS]);
+      expect(shifted[column]).toBe(plain[(column + 1) % CYCLE_CHARS]);
     }
   });
 
-  it("does not depend on the line width (width 40 vs 200)", () => {
-    const narrow = paintBorderLine("─".repeat(40), makeCtx({ phase: 0.2 }));
-    const wide = paintBorderLine("─".repeat(200), makeCtx({ phase: 0.2 }));
-    const cellsOf = (line: string): Array<{ ansi: string; ch: string }> => {
-      const tokens = [...line.matchAll(/\x1b\[[\d;]*m|[^\x1b]/gu)].map((m) => m[0]);
-      const out: Array<{ ansi: string; ch: string }> = [];
-      let ansi = "";
-      for (const token of tokens) {
-        if (token.startsWith("\x1b")) {
-          ansi = token;
-          continue;
-        }
-        out.push({ ansi, ch: token });
-      }
-      return out;
-    };
-    const narrowCells = cellsOf(narrow);
-    const wideCells = cellsOf(wide);
-    // The first full cycle is identical; only the length differs.
-    expect(wideCells.slice(0, CYCLE_CHARS)).toEqual(narrowCells.slice(0, CYCLE_CHARS));
-    expect(wideCells.slice(CYCLE_CHARS, CYCLE_CHARS * 2)).toEqual(narrowCells.slice(CYCLE_CHARS, CYCLE_CHARS * 2));
-  });
+  it("does not depend on the line width (width 96 vs 200)", () => {
+    const narrow = cells(paintBorderLine("─".repeat(96), makeCtx({ phase: 0.2 })));
+    const wide = cells(paintBorderLine("─".repeat(200), makeCtx({ phase: 0.2 })));
 
-  it("never paints a wide uniform block in truecolor (one colour per character)", () => {
-    const line = paintBorderLine("─".repeat(120), makeCtx());
-    const columnColors = cells(line)
-      .filter((cell) => cell.ch === "─")
-      .map((cell) => cell.ansi);
-
-    // Adjacent columns are 1/16 lap apart, so their RGB differs: every run is a
-    // single character (no block), which is exactly what the quantised
-    // stop-based version could not promise. The period still repeats, so the
-    // whole line only holds CYCLE_CHARS distinct colours.
-    expect(runLengths(line)).toEqual(Array(120).fill(1));
-    expect(new Set(columnColors).size).toBe(CYCLE_CHARS);
-  });
-
-  it("keeps blocks short in 256 colours (quantisation may merge neighbours)", () => {
-    const line = paintBorderLine("─".repeat(120), makeCtx({ mode: "256color" }));
-    const lengths = runLengths(line);
-
-    // Quantisation collapses nearby tones onto the same palette entry, so single
-    // columns are not guaranteed here — but no block may swallow a whole band.
-    expect(Math.max(...lengths)).toBeLessThanOrEqual(4);
-    expect(new Set(cells(line).filter((c) => c.ch === "─").map((c) => c.ansi)).size).toBeGreaterThanOrEqual(8);
+    // The first two laps are identical; only the length differs.
+    expect(wide.slice(0, CYCLE_CHARS)).toEqual(narrow.slice(0, CYCLE_CHARS));
+    expect(wide.slice(CYCLE_CHARS, CYCLE_CHARS * 2)).toEqual(narrow.slice(CYCLE_CHARS, CYCLE_CHARS * 2));
   });
 });

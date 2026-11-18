@@ -21,7 +21,7 @@
  */
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { Editor, visibleWidth } from "@earendil-works/pi-tui";
-import { CYCLE_CHARS, ansiAtCyclePosition, rgbToAnsi256, type Rgb } from "./border-gradient";
+import { CYCLE_CHARS, ansiAtCyclePosition, prepareAnchors, rgbToAnsi256, type Rgb } from "./border-gradient";
 import {
   BORDER_ANIMATION_ENV,
   CYCLE_MS,
@@ -118,6 +118,9 @@ const TRUE_ACCENT = fgAnsi("accent", ANCHOR_RGB, "truecolor");
 const ANCHORS_IN_ORDER: Rgb[] = ["error", "syntaxKeyword", "warning", "accent", "syntaxType", "success"].map(
   (name) => ANCHOR_RGB[name]!,
 );
+
+/** The ring the editor actually walks (sorted by hue, near-duplicates collapsed). */
+const THEME_RING = prepareAnchors(ANCHORS_IN_ORDER);
 
 interface EditorInit {
   text?: string;
@@ -333,9 +336,10 @@ describe("TeamModeEditor.render — gradient", () => {
   it("paints one colour per character from the theme anchors", () => {
     const lines = createEditor({ text: "/team s" }).render(201);
     const colors = dashColors(lines[0]!);
-    // The 16-character period repeats, so the whole line holds CYCLE_CHARS
-    // distinct colours — and no character shares a colour with its neighbour.
-    expect(colors.length).toBe(CYCLE_CHARS);
+    // One lap is CYCLE_CHARS columns and repeats, so the line holds at most that
+    // many distinct colours — and no character shares a colour with its neighbour.
+    expect(colors.length).toBeLessThanOrEqual(CYCLE_CHARS);
+    expect(colors.length).toBeGreaterThanOrEqual(40);
     expect(runLengths(lines[0]!)).toEqual(Array(201).fill(1));
     for (const color of colors) expect(color).toMatch(/^\x1b\[38;2;\d{1,3};\d{1,3};\d{1,3}m$/);
   });
@@ -347,24 +351,31 @@ describe("TeamModeEditor.render — gradient", () => {
 
     const line = editor.render(120)[0]!;
     // Column 0 sits at cycle position 0 + phase = 0.25 exactly (no centre offset).
-    expect(dashColors(line)[0]).toBe(ansiAtCyclePosition(0.25, ANCHORS_IN_ORDER, "truecolor"));
+    expect(dashColors(line)[0]).toBe(ansiAtCyclePosition(0.25, THEME_RING, "truecolor"));
   });
 
-  it("uses a fixed 16-character period at any width", () => {
-    const narrow = createEditor({ text: "" }).render(40)[0]!;
+  it("uses a fixed 48-character period at any width", () => {
+    const narrow = createEditor({ text: "" }).render(96)[0]!;
     const wide = createEditor({ text: "" }).render(200)[0]!;
     const colorsOf = (line: string): string[] => line.match(/\x1b\[38;2;\d{1,3};\d{1,3};\d{1,3}m/g) ?? [];
 
     // Same spatial period and same colours on both widths (no width-dependent
-    // scaling): the first two cycles are identical.
+    // scaling): the first two laps are identical.
     expect(colorsOf(wide).slice(0, CYCLE_CHARS)).toEqual(colorsOf(narrow).slice(0, CYCLE_CHARS));
     expect(colorsOf(wide).slice(CYCLE_CHARS, CYCLE_CHARS * 2)).toEqual(
       colorsOf(narrow).slice(CYCLE_CHARS, CYCLE_CHARS * 2),
     );
-    // Column 0 and column 16 share a colour; column 8 does not.
+    // Column 0 and column CYCLE_CHARS share a colour; the halfway column does not.
     const wideColors = colorsOf(wide);
     expect(wideColors[0]).toBe(wideColors[CYCLE_CHARS]);
     expect(wideColors[0]).not.toBe(wideColors[CYCLE_CHARS / 2]);
+  });
+
+  it("leaves no flat span when a theme repeats an anchor (accent = syntaxType)", () => {
+    // The built-in dark/light themes map both tokens to the same violet.
+    const duplicate = makeTheme({ anchors: { syntaxType: ANCHOR_RGB.accent! } });
+    const line = createEditor({ text: "", theme: duplicate }).render(120)[0]!;
+    expect(runLengths(line)).toEqual(Array(120).fill(1));
   });
 
   it("emits only the theme's colour mode (no mixed 38;2; and 38;5;)", () => {
@@ -698,7 +709,7 @@ describe("TeamModeEditor.render — heartbeat", () => {
     // A quarter lap is exactly phase 0.25 — half the rate would land on 0.125.
     clock.t = CYCLE_MS / 4;
     const quarter = editor.render(width)[0]!;
-    expect(dashColors(quarter)[0]).toBe(ansiAtCyclePosition(0.25, ANCHORS_IN_ORDER, "truecolor"));
+    expect(dashColors(quarter)[0]).toBe(ansiAtCyclePosition(0.25, THEME_RING, "truecolor"));
     expect(quarter).not.toBe(atStart);
 
     // Frames do not accumulate: at a fixed instant every render is identical.

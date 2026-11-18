@@ -15,6 +15,13 @@
  * ever sees a small slice of the palette and neighbouring characters differ (the
  * login-screen look). The `phase` input shifts that pattern along the line; the
  * editor feeds it from the clock, so the picture flows without any state here.
+ *
+ * Anchors are processed before use (see `prepareAnchors`): converted to OKLCH,
+ * sorted by hue and de-duplicated, so the ring is a monotone hue ramp with no
+ * revisit and no flat span (the built-in themes ship `accent` and `syntaxType` in
+ * the same colour; without de-duplication that produces a dead, desaturated
+ * stretch). Interpolation then runs in OKLCH and is mapped back to sRGB, keeping
+ * lightness and hue and only reducing chroma when the colour leaves the gamut.
  */
 
 /** Border glyph the editor draws its horizontal lines with. */
@@ -24,15 +31,27 @@ export const BORDER_DASH = "─";
  * Columns per full lap of the anchor palette — the spatial period of the
  * gradient.
  *
- * 16 is the scale of pi's own brand shimmer (`provider-brand.js` in the 1.5.x
- * release: four logo colours × `CHARS_PER_COLOR = 4` characters = a 16-character
- * cycle). Because the period is a fixed number of characters instead of the
- * terminal width, the pattern looks the same on 40 and 200 columns and adjacent
- * characters always differ — the reason this is no longer quantised into a few
- * colour stops. The time rate that moves this pattern lives in
- * `border-animator.ts` (`CHARS_PER_SECOND`, `CYCLE_MS`).
+ * 48, not 16: pi's brand shimmer builds a 16-character cycle (`provider-brand.js`
+ * in the 1.5.x release: four logo colours × `CHARS_PER_COLOR = 4` characters) but
+ * paints a ~16-character *label*, i.e. one lap per label. A border is 120–200
+ * columns wide, so a 16-character cycle would repeat the whole palette 7.5–12
+ * times per line (~15 hue turns) and read as confetti. 48 columns keeps it at
+ * ~2.5 hue turns on a 120-column line while still giving every character a small
+ * step (≈7.5° of hue), which is what makes the band look continuous.
+ *
+ * The period is a fixed number of characters, not a fraction of the width: the
+ * pattern looks the same on 96 and 200 columns. The time rate that moves it lives
+ * in `border-animator.ts` (`CHARS_PER_SECOND`, `CYCLE_MS` = 48 / 10 s = 4.8 s per lap).
  */
-export const CYCLE_CHARS = 16;
+export const CYCLE_CHARS = 48;
+
+/**
+ * Anchors closer than this in OKLCH hue are treated as the same colour and
+ * collapsed (analysis report /tmp/gap-20261118-012804.md §3, 方案 B: threshold 6°).
+ * The built-in dark/light themes map `accent` and `syntaxType` to the identical
+ * violet, which without de-duplication leaves a dead 2–3 column span.
+ */
+export const MIN_ANCHOR_HUE_GAP_DEG = 6;
 
 /** Anchor used when a theme token cannot be parsed (e.g. set to the terminal default). */
 export const NEUTRAL_RGB: Rgb = { r: 0x88, g: 0x88, b: 0x88 };
@@ -165,37 +184,171 @@ function clamp01(value: number): number {
   return value;
 }
 
-const smoothstep = (t: number): number => t * t * (3 - 2 * t);
+// ── sRGB ↔ Oklab ↔ OKLCH ────────────────────────────────────────────────────
+// Ottosson's matrices, the same ones pi-tui's `oklab.js` uses, so a colour takes
+// the same path here as in pi's own renderer.
+const LINEAR_SRGB_TO_LMS = [
+  [0.4122214694707629, 0.5363325372617349, 0.0514459932675022],
+  [0.2119034958178251, 0.6806995506452344, 0.1073969535369405],
+  [0.0883024591900564, 0.2817188391361215, 0.6299787016738222],
+] as const;
+const LMS_TO_LAB = [
+  [0.210454268309314, 0.793617774702305, -0.0040720430116193],
+  [1.9779985324311684, -2.42859224204858, 0.450593709617411],
+  [0.0259040424655478, 0.7827717124575296, -0.8086757549230774],
+] as const;
+const LAB_TO_LMS = [
+  [1, 0.3963377773761749, 0.2158037573099136],
+  [1, -0.1055613458156586, -0.0638541728258133],
+  [1, -0.0894841775298119, -1.2914855480194092],
+] as const;
+const LMS_TO_LINEAR_SRGB = [
+  [4.0767416360759583, -3.3077115392580629, 0.2309699031821043],
+  [-1.2684379732850315, 2.6097573492876882, -0.341319376002657],
+  [-0.0041960761386756, -0.7034186179359362, 1.7076146940746117],
+] as const;
 
-function mixChannel(from: number, to: number, t: number): number {
-  return Math.round(from + (to - from) * t);
+type Triple = [number, number, number];
+
+const multiply3 = (matrix: readonly (readonly number[])[], [x, y, z]: Triple): Triple => [
+  matrix[0]![0]! * x + matrix[0]![1]! * y + matrix[0]![2]! * z,
+  matrix[1]![0]! * x + matrix[1]![1]! * y + matrix[1]![2]! * z,
+  matrix[2]![0]! * x + matrix[2]![1]! * y + matrix[2]![2]! * z,
+];
+
+const srgbToLinear = (value: number): number =>
+  value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+
+const linearToSrgb = (value: number): number =>
+  value > 0.0031308 ? 1.055 * value ** (1 / 2.4) - 0.055 : 12.92 * value;
+
+/** OKLCH: perceptual lightness, chroma, hue in degrees `[0, 360)`. */
+export interface Oklch {
+  l: number;
+  c: number;
+  h: number;
+}
+
+/** sRGB (0–255) → OKLCH. */
+export function rgbToOklch(rgb: Rgb): Oklch {
+  const linear: Triple = [rgb.r / 255, rgb.g / 255, rgb.b / 255].map(srgbToLinear) as Triple;
+  const lms = multiply3(LINEAR_SRGB_TO_LMS, linear).map((value) => Math.cbrt(value)) as Triple;
+  const [l, a, b] = multiply3(LMS_TO_LAB, lms);
+  return { l, c: Math.hypot(a, b), h: ((Math.atan2(b, a) * 180) / Math.PI + 360) % 360 };
+}
+
+function oklchToLinearSrgb({ l, c, h }: Oklch): Triple {
+  const radians = (h * Math.PI) / 180;
+  const lab: Triple = [l, c * Math.cos(radians), c * Math.sin(radians)];
+  const lms = multiply3(LAB_TO_LMS, lab).map((value) => value ** 3) as Triple;
+  return multiply3(LMS_TO_LINEAR_SRGB, lms);
+}
+
+const isInGamut = (linear: Triple): boolean => linear.every((value) => value >= -1e-4 && value <= 1 + 1e-4);
+
+/**
+ * OKLCH → sRGB (0–255), gamut-mapped.
+ *
+ * Lightness and hue are kept; if the colour leaves the sRGB gamut the chroma is
+ * reduced by bisection until it fits (the achromatic colour always fits, so it
+ * is the fallback). That keeps the lightness semantics of the theme tokens —
+ * a light theme stays light even where the hue would otherwise clip.
+ */
+export function oklchToRgb(color: Oklch): Rgb {
+  const l = clamp01(color.l);
+  const chroma = Number.isFinite(color.c) ? Math.max(0, color.c) : 0;
+  const h = Number.isFinite(color.h) ? ((color.h % 360) + 360) % 360 : 0;
+
+  let linear = oklchToLinearSrgb({ l, c: chroma, h });
+  if (!isInGamut(linear)) {
+    linear = oklchToLinearSrgb({ l, c: 0, h });
+    let low = 0;
+    let high = chroma;
+    for (let step = 0; step < 20; step++) {
+      const middle = (low + high) / 2;
+      const candidate = oklchToLinearSrgb({ l, c: middle, h });
+      if (isInGamut(candidate)) {
+        low = middle;
+        linear = candidate;
+      } else {
+        high = middle;
+      }
+    }
+  }
+
+  const [r, g, b] = linear.map((value) => Math.round(clamp01(linearToSrgb(value)) * 255)) as Triple;
+  return { r, g, b };
 }
 
 /**
- * Colour at position `u` on the anchor ring, as an ANSI foreground sequence.
+ * Turn theme anchors into the ring the gradient walks: convert to OKLCH, sort by
+ * hue, collapse anchors closer than `MIN_ANCHOR_HUE_GAP_DEG` (adjacent in the
+ * sorted order, plus the wrap-around seam).
+ *
+ * Sorting removes the back-and-forth a theme's token order can produce; the
+ * de-duplication removes flat, desaturated spans (built-in themes repeat
+ * `accent` as `syntaxType`). The first anchor of a collapsed pair wins.
+ */
+export function prepareAnchors(anchors: Rgb[]): Oklch[] {
+  const converted = anchors
+    .map(rgbToOklch)
+    .filter((anchor) => Number.isFinite(anchor.l) && Number.isFinite(anchor.c) && Number.isFinite(anchor.h));
+  if (converted.length === 0) return [rgbToOklch(NEUTRAL_RGB)];
+
+  const sorted = [...converted].sort((left, right) => left.h - right.h);
+  const ring: Oklch[] = [];
+  for (const anchor of sorted) {
+    const previous = ring[ring.length - 1];
+    if (previous && Math.abs(anchor.h - previous.h) < MIN_ANCHOR_HUE_GAP_DEG) continue;
+    ring.push(anchor);
+  }
+
+  // The wrap segment is "adjacent" too: 359° and 1° are neighbours on the ring.
+  while (ring.length > 2) {
+    const first = ring[0]!;
+    const last = ring[ring.length - 1]!;
+    if (360 - (last.h - first.h) < MIN_ANCHOR_HUE_GAP_DEG) ring.pop();
+    else break;
+  }
+
+  return ring;
+}
+
+/**
+ * Colour at position `u` on the prepared anchor ring, as an ANSI foreground
+ * sequence.
  *
  * `u` is a cycle position: `floor(u)` selects the lap, the fraction selects the
  * spot, so `0`, `1` and `-1` are the same colour and any value (including a
- * negative phase or a non-finite number) is safe. The interpolation parameter is
- * clamped internally; `NaN`/`±Infinity` are treated as the start of the cycle.
+ * negative phase or a non-finite number) is safe. Interpolation is **linear in
+ * OKLCH** (not smoothstep, not per-channel sRGB): a long period makes smoothstep
+ * dwell at the anchors and rush through the middle, and sRGB mixing dips through
+ * grey on wide hue legs.
  *
- * `anchors` may be any non-empty length; the editor passes six theme colours.
+ * Hue is monotone across the whole cycle: the ring is sorted by hue and the wrap
+ * segment adds 360°, so the ramp never reverses. `NaN`/`±Infinity` are treated as
+ * the start of the cycle.
  */
-export function ansiAtCyclePosition(u: number, anchors: Rgb[], mode: GradientColorMode): string {
-  const ring = anchors.length > 0 ? anchors : [NEUTRAL_RGB];
+export function ansiAtCyclePosition(u: number, anchors: Oklch[], mode: GradientColorMode): string {
+  const ring = anchors.length > 0 ? anchors : [rgbToOklch(NEUTRAL_RGB)];
   const position = Number.isFinite(u) ? u - Math.floor(u) : 0;
 
-  const scaled = position * ring.length;
-  const index = Math.floor(scaled) % ring.length;
-  const t = smoothstep(clamp01(scaled - Math.floor(scaled)));
+  const count = ring.length;
+  const scaled = position * count;
+  const index = Math.floor(scaled) % count;
+  const t = clamp01(scaled - Math.floor(scaled));
 
   const from = ring[index]!;
-  const to = ring[(index + 1) % ring.length]!;
-  const rgb: Rgb = {
-    r: mixChannel(from.r, to.r, t),
-    g: mixChannel(from.g, to.g, t),
-    b: mixChannel(from.b, to.b, t),
-  };
+  const to = ring[(index + 1) % count]!;
+  // Sorted hues ascend; the wrap leg continues upwards by 360 instead of
+  // running backwards, so the whole ramp is monotone.
+  const toHue = count === 1 ? from.h : index === count - 1 ? to.h + 360 : to.h;
+
+  const rgb = oklchToRgb({
+    l: from.l + (to.l - from.l) * t,
+    c: from.c + (to.c - from.c) * t,
+    h: from.h + (toHue - from.h) * t,
+  });
 
   return mode === "truecolor"
     ? `\x1b[38;2;${rgb.r};${rgb.g};${rgb.b}m`
@@ -205,8 +358,8 @@ export function ansiAtCyclePosition(u: number, anchors: Rgb[], mode: GradientCol
 export interface PaintContext {
   /** Pattern offset in laps (0 = static); the animator drives it from the clock. */
   phase: number;
-  /** Anchor colours in cycle order. */
-  anchors: Rgb[];
+  /** Prepared anchor ring (`prepareAnchors`): OKLCH, sorted by hue, de-duplicated. */
+  anchors: Oklch[];
   mode: GradientColorMode;
   /** Colour for every non-dash character (scroll hint text, blanks). */
   labelAnsi: string;

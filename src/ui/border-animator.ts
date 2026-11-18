@@ -16,12 +16,12 @@
  *    clock read plus a comparison per frame — so the next real render resumes the
  *    heartbeat with no extra state to unwind.
  *
- * Cost, measured with the built-in dark theme and UTF-8 byte counting (see
- * DESIGN.md §37.4): two border lines at 10 fps ≈ 50.8 KB/s in truecolor at 120
- * columns (24.6 KB/s with 256 colours) and ≈ 84.6 KB/s in truecolor at 200
- * columns, plus one full repaint per frame (0.04–0.24 ms in the synthetic
- * benchmark; CPU is not the constraint, bytes are). Note that `─` is three bytes
- * in UTF-8, so string length understates the traffic by ~10% (truecolor).
+ * Cost, measured with the built-in dark theme, a 48-character period and UTF-8
+ * byte counting (see DESIGN.md §37.4): two border lines at 10 fps ≈ 50.6 KB/s in
+ * truecolor at 120 columns (16.1 KB/s with 256 colours) and ≈ 84.2 KB/s in
+ * truecolor at 200 columns, plus one full repaint per frame (0.04–0.24 ms in the
+ * synthetic benchmark; CPU is not the constraint, bytes are). Note that `─` is
+ * three bytes in UTF-8, so string length understates the traffic by ~10%.
  */
 
 import { CYCLE_CHARS } from "./border-gradient";
@@ -39,14 +39,14 @@ export const CHARS_PER_SECOND = 10;
 /**
  * Time for one full lap around the palette.
  *
- * Derived, not tuned: the pattern spans `CYCLE_CHARS` (= 16, see
+ * Derived, not tuned: the pattern spans `CYCLE_CHARS` (= 48, see
  * `border-gradient.ts`) columns, and the login screen moves it at
  * `CHARS_PER_SECOND` = 10 characters per second, so one lap takes
- * 16 / 10 = 1.6 s. The heartbeat is set so the pattern advances exactly one
+ * 48 / 10 = 4.8 s. The heartbeat is set so the pattern advances exactly one
  * character per frame (`CHARS_PER_SECOND × FRAME_MS / 1000` = 10 × 0.1 = 1),
  * which is the coarsest sampling that still scrolls evenly at this speed; one
  * frame of jitter is a full column, so do not raise the interval without
- * lowering `CHARS_PER_SECOND` too.
+ * lowering `CHARS_PER_SECOND` too (both relations are asserted in tests).
  */
 export const CYCLE_MS = (CYCLE_CHARS / CHARS_PER_SECOND) * 1000;
 

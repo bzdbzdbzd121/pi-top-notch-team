@@ -10,6 +10,7 @@ import {
   NEUTRAL_RGB,
   paintBorderLine,
   parseAnsiFg,
+  prepareAnchors,
   type PaintContext,
 } from "./border-gradient";
 
@@ -141,7 +142,11 @@ export class TeamModeEditor extends CustomEditor {
     // whether `getFgAnsi` hands back `38;2;` or `38;5;`, and the gradient must
     // emit the same form or a truecolor anchor would be printed as a 256 index.
     const mode = theme.getColorMode();
-    const anchors = BORDER_COLORS.map((name) => parseAnsiFg(theme.getFgAnsi(name)) ?? NEUTRAL_RGB);
+    // Theme tokens → RGB → OKLCH ring (sorted by hue, near-duplicates collapsed).
+    // Done once per render: six conversions, then every column reuses the ring.
+    const anchors = prepareAnchors(
+      BORDER_COLORS.map((name) => parseAnsiFg(theme.getFgAnsi(name)) ?? NEUTRAL_RGB),
+    );
     const context: PaintContext = {
       // Colour is a pure function of time: every frame shows the phase of the
       // current instant, so any repaint source draws the same picture. Disabled

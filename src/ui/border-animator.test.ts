@@ -158,9 +158,9 @@ describe("createBorderAnimator — lifecycle", () => {
     expect(FRAME_MS).toBe(100);
     expect(STALE_MS).toBe(1000);
     expect(CHARS_PER_SECOND).toBe(10); // pi's provider-brand.js
-    expect(CYCLE_CHARS).toBe(16);
-    // 16 columns per lap at 10 characters per second = 1.6 s per lap.
-    expect(CYCLE_MS).toBe(1600);
+    expect(CYCLE_CHARS).toBe(48);
+    // 48 columns per lap at 10 characters per second = 4.8 s per lap.
+    expect(CYCLE_MS).toBe(4800);
     expect(CYCLE_MS).toBe((CYCLE_CHARS / CHARS_PER_SECOND) * 1000);
   });
 
