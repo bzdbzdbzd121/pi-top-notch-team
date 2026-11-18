@@ -284,6 +284,68 @@ describe("prepareAnchors — hue sort + perceptual de-duplication", () => {
     }
   });
 
+  it("keeps the ring sorted when the seam survivor is the high-hue anchor", () => {
+    // (210,132,155) h 0.891 C 0.0996 and (214,129,157) h 359.120 C 0.1096 are the
+    // same colour to the eye (ΔE 0.0105) and straddle 0°/360°. The brighter-chroma
+    // anchor is the one on the *high* side of the seam. Replacing the first element
+    // with it (instead of dropping the loser) leaves the ring unsorted — the ramp
+    // then walks 359° → 142° → 264° and `ansiAtCyclePosition`'s "sorted ascending,
+    // wrap adds 360°" premise breaks.
+    const lowSide = { r: 210, g: 132, b: 155 };
+    const highSide = { r: 214, g: 129, b: 157 };
+    const green = { r: 0, g: 128, b: 0 };
+    const blue = { r: 0, g: 0, b: 200 };
+    expect(anchorDeltaE(rgbToOklch(lowSide), rgbToOklch(highSide))).toBeLessThan(MIN_ANCHOR_DELTA_E);
+
+    const ring = prepareAnchors([lowSide, highSide, green, blue]);
+
+    // Three survivors (the seam pair collapsed to one) — above the fallback floor,
+    // so this really is the merged ring and not an evenly spaced substitute.
+    expect(ring).toHaveLength(3);
+    const hues = ring.map((anchor) => anchor.h);
+    for (let i = 1; i < hues.length; i++) expect(hues[i]!).toBeGreaterThan(hues[i - 1]!);
+
+    // The survivor is the higher-chroma anchor, and it stayed at its own hue.
+    const survivor = ring.filter((anchor) => anchor.h > 340 || anchor.h < 20);
+    expect(survivor).toHaveLength(1);
+    expect(survivor[0]!.c).toBeCloseTo(rgbToOklch(highSide).c, 5);
+
+    // Downstream symptom the unsorted ring caused: hue must never step backwards.
+    const stepHues = columnAnsi(paintBorderLine("─".repeat(CYCLE_CHARS), { ...makeCtx(), anchors: ring }))
+      .map((ansi) => rgbToOklch(parseAnsiFg(ansi)!))
+      .map((color) => color.h);
+    for (let i = 1; i < stepHues.length; i++) {
+      let delta = stepHues[i]! - stepHues[i - 1]!;
+      if (delta < -180) delta += 360; // the single legal wrap lives between the last and first column
+      expect(delta).toBeGreaterThanOrEqual(0);
+    }
+  });
+
+  it("anchors the fallback ring on the chroma-weighted circular mean hue", () => {
+    // Two survivors — h 320 (C 0.20) and h 30 (C 0.04, dark) — with no near-duplicate
+    // to merge, so both reach the fallback. The arithmetic mean would give 174.9°
+    // (the opposite side of the circle); the chroma-weighted circular mean is pulled
+    // towards the vivid anchor: by hand, x = 0.2006·cos 320° + 0.0405·cos 29.8°,
+    // y = 0.2006·sin 320° + 0.0405·sin 29.8° ⇒ atan2 = 330.02°. The candidates differ
+    // by 155° (35° mod 60°), so the rings they produce are genuinely different sets,
+    // not a rotation of the same hexagon.
+    const vivid = oklchToRgb({ l: 0.7, c: 0.2, h: 320 });
+    const faint = oklchToRgb({ l: 0.45, c: 0.04, h: 30 });
+    const ring = prepareAnchors([vivid, faint]);
+
+    expect(ring).toHaveLength(FALLBACK_RING_SIZE);
+    const sorted = ring.map((anchor) => anchor.h).sort((left, right) => left - right);
+    const base = 330.02;
+    const expected = Array.from({ length: FALLBACK_RING_SIZE }, (_, index) => (base + (360 * index) / FALLBACK_RING_SIZE) % 360)
+      .sort((left, right) => left - right);
+    for (let i = 0; i < sorted.length; i++) expect(Math.abs(sorted[i]! - expected[i]!)).toBeLessThanOrEqual(0.5);
+
+    // The base hue is the last element once the ring is sorted ascending; the
+    // arithmetic mean (174.9°) is not present at all.
+    expect(Math.abs(sorted[sorted.length - 1]! - 330.02)).toBeLessThanOrEqual(0.5);
+    expect(sorted.some((hue) => Math.abs(hue - 174.89) <= 1)).toBe(false);
+  });
+
   it("derives an evenly spaced fallback ring when the theme has too little variety", () => {
     // All six tokens the same colour: painting that would be a flat border, so the
     // fallback keeps the theme's L/C but spreads the hue.

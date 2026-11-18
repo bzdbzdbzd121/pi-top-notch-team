@@ -358,12 +358,16 @@ export function prepareAnchors(anchors: Rgb[]): Oklch[] {
     ring.push(anchor);
   }
 
-  // The wrap segment is adjacent too, so the seam gets the same treatment.
+  // The wrap segment is adjacent too, so the seam gets the same treatment: the
+  // winner stays where it is and the loser is dropped. Moving the seam survivor
+  // into slot 0 instead (`ring[0] = last`) would put a high-hue anchor in front of
+  // low-hue ones and leave the ring unsorted, which breaks the "hues ascend, the
+  // wrap adds 360°" premise the interpolation below relies on.
   while (ring.length > 1 && anchorDeltaE(ring[0]!, ring[ring.length - 1]!) < MIN_ANCHOR_DELTA_E) {
     const first = ring[0]!;
     const last = ring[ring.length - 1]!;
-    if (last.c > first.c) ring[0] = last;
-    ring.pop();
+    if (last.c > first.c) ring.shift();
+    else ring.pop();
   }
 
   if (ring.length >= MIN_RING_ANCHORS) return ring;
