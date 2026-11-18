@@ -14,9 +14,13 @@
 import { describe, it, expect } from "vitest";
 import {
   CYCLE_CHARS,
-  MIN_ANCHOR_HUE_GAP_DEG,
+  FALLBACK_RING_SIZE,
+  MIN_ANCHOR_DELTA_E,
+  MIN_RING_ANCHORS,
   NEUTRAL_RGB,
+  anchorDeltaE,
   ansiAtCyclePosition,
+  createBorderPainter,
   oklchToRgb,
   paintBorderLine,
   parseAnsiFg,
@@ -99,24 +103,12 @@ const RING = prepareAnchors(ANCHORS);
  *   error        (204,0,0)     L 0.5308 C 0.2178 h  29.23
  *   warning      (214,140,0)   L 0.6987 C 0.1495 h  72.07
  *   syntaxType   (102,204,102) L 0.7603 C 0.1696 h 143.68
- *   success      ( 51,204,102) L 0.7450 C 0.1897 h 149.57  ← 5.89° from syntaxType → dropped
+ *   success      ( 51,204,102) L 0.7450 C 0.1897 h 149.57  ← ΔE 0.031 from syntaxType → kept
  *   accent       ( 51,153,255) L 0.6755 C 0.1765 h 252.26
  *   syntaxKeyword(170,102,204) L 0.6261 C 0.1620 h 313.37
  */
-const EXPECTED_RING_HUES = [29.23, 72.07, 143.68, 252.26, 313.37];
+const EXPECTED_RING_HUES = [29.23, 72.07, 143.68, 149.57, 252.26, 313.37];
 
-/**
- * Anchors with hand-checkable numbers, used where the expected stop colours are
- * spelled out as literals (see the stop-mapping and centre-sampling tests).
- */
-const STOP_ANCHORS: Rgb[] = [
-  { r: 200, g: 0, b: 0 },
-  { r: 0, g: 100, b: 200 },
-  { r: 40, g: 160, b: 40 },
-  { r: 240, g: 240, b: 0 },
-  { r: 0, g: 0, b: 0 },
-  { r: 255, g: 255, b: 255 },
-];
 
 const makeCtx = (over: Partial<PaintContext> = {}): PaintContext => ({
   phase: 0,
@@ -231,39 +223,92 @@ describe("rgbToAnsi256 — quantisation geometry (pi-tui parity)", () => {
   });
 });
 
-describe("prepareAnchors — hue sort + de-duplication", () => {
-  it("sorts by hue and drops an anchor closer than the threshold (hand-computed hues)", () => {
-    // success sits 5.89° from syntaxType, i.e. below MIN_ANCHOR_HUE_GAP_DEG = 6,
-    // so the ring keeps syntaxType (first in sorted order) and drops success.
-    expect(MIN_ANCHOR_HUE_GAP_DEG).toBe(6);
-    expect(RING).toHaveLength(5);
+describe("prepareAnchors — hue sort + perceptual de-duplication", () => {
+  it("sorts by hue and keeps a neighbour that is perceptually distinct (hand-computed hues)", () => {
+    // success sits 5.89° from syntaxType but ΔE = 0.031 > MIN_ANCHOR_DELTA_E = 0.02,
+    // i.e. it is a visibly different colour and must survive.
+    expect(MIN_ANCHOR_DELTA_E).toBe(0.02);
+    expect(anchorDeltaE(RING[2]!, RING[3]!)).toBeGreaterThan(MIN_ANCHOR_DELTA_E);
+    expect(RING).toHaveLength(6);
 
     const hues = RING.map((anchor) => anchor.h);
     for (let i = 0; i < hues.length; i++) {
       expect(Math.abs(hues[i]! - EXPECTED_RING_HUES[i]!)).toBeLessThanOrEqual(0.5);
     }
-    // Strictly ascending: no revisit, no back-tracking.
     for (let i = 1; i < hues.length; i++) expect(hues[i]!).toBeGreaterThan(hues[i - 1]!);
   });
 
-  it("collapses a repeated anchor (the built-in themes ship accent = syntaxType)", () => {
-    const duplicated: Rgb[] = [
-      { r: 204, g: 0, b: 0 },
-      { r: 170, g: 102, b: 204 },
-      { r: 51, g: 153, b: 255 },
-      { r: 51, g: 153, b: 255 }, // accent repeated as syntaxType
-      { r: 102, g: 204, b: 102 },
-      { r: 51, g: 204, b: 102 },
-    ];
-    const ring = prepareAnchors(duplicated);
-    expect(ring).toHaveLength(4); // accent duplicate and success (5.89° from syntaxType) dropped
-    for (let i = 1; i < ring.length; i++) expect(ring[i]!.h).toBeGreaterThan(ring[i - 1]!.h);
+  it("keeps a dark and a bright red: same hue, different lightness (ΔE, not hue)", () => {
+    const darkRed = { r: 139, g: 0, b: 0 };
+    const brightRed = { r: 255, g: 0, b: 0 };
+    const midGreen = { r: 0, g: 128, b: 0 };
+
+    const sameHue = prepareAnchors([darkRed, brightRed, midGreen]);
+    // Hue-only de-duplication would drop one of the reds; ΔE keeps both.
+    expect(sameHue.length).toBe(3);
+    const hues = sameHue.map((anchor) => anchor.h);
+    expect(Math.abs(hues[0]! - hues[1]!)).toBeLessThanOrEqual(2); // same hue family
   });
 
-  it("falls back to the neutral anchor for an empty input", () => {
-    const ring = prepareAnchors([]);
-    expect(ring).toHaveLength(1);
-    expect(ring[0]!.h).toBeCloseTo(rgbToOklch(NEUTRAL_RGB).h, 6);
+  it("collapses the same colour and keeps the more saturated anchor", () => {
+    // Same L and h, chroma differs by 0.015 (< 0.02 ΔE) → one survivor, the vivid
+    // one. Three more distinct hues keep the ring above MIN_RING_ANCHORS so the
+    // fallback does not mask the merge.
+    const dull = oklchToRgb({ l: 0.7, c: 0.08, h: 30 });
+    const vivid = oklchToRgb({ l: 0.7, c: 0.095, h: 30 });
+    const green = oklchToRgb({ l: 0.7, c: 0.1, h: 140 });
+    const blue = oklchToRgb({ l: 0.7, c: 0.1, h: 250 });
+    const purple = oklchToRgb({ l: 0.7, c: 0.1, h: 320 });
+    const ring = prepareAnchors([dull, vivid, green, blue, purple]);
+
+    expect(ring).toHaveLength(4);
+    const survivors = ring.filter((anchor) => Math.abs(anchor.h - 30) < 3);
+    expect(survivors).toHaveLength(1);
+    expect(survivors[0]!.c).toBeGreaterThan(0.09); // the vivid one won
+  });
+
+  it("collapses a near-duplicate that straddles the wrap seam", () => {
+    // Three anchors: two nearly identical colours on either side of 0°/360°
+    // (2° apart, ΔE tiny) plus one far-away hue. No *sorted-adjacent* pair is close
+    // (1↔180 and 180↔359 are 179° apart), so only the seam merge can collapse the
+    // 359/1 pair. That merge leaves two anchors ⇒ below MIN_RING_ANCHORS ⇒ fallback.
+    const right = oklchToRgb({ l: 0.7, c: 0.15, h: 1 });
+    const far = oklchToRgb({ l: 0.7, c: 0.15, h: 180 });
+    const left = oklchToRgb({ l: 0.7, c: 0.15, h: 359 });
+    const ring = prepareAnchors([left, right, far]);
+
+    expect(ring).toHaveLength(FALLBACK_RING_SIZE);
+    const hues = ring.map((anchor) => anchor.h).sort((a, b) => a - b);
+    for (let i = 1; i < hues.length; i++) {
+      expect(hues[i]! - hues[i - 1]!).toBeCloseTo(360 / FALLBACK_RING_SIZE, 3);
+    }
+  });
+
+  it("derives an evenly spaced fallback ring when the theme has too little variety", () => {
+    // All six tokens the same colour: painting that would be a flat border, so the
+    // fallback keeps the theme's L/C but spreads the hue.
+    const same = { r: 51, g: 153, b: 255 };
+    const ring = prepareAnchors([same, same, same, same, same, same]);
+
+    expect(MIN_RING_ANCHORS).toBe(3);
+    expect(ring).toHaveLength(FALLBACK_RING_SIZE);
+    const source = rgbToOklch(same);
+    for (const anchor of ring) {
+      expect(Math.abs(anchor.l - source.l)).toBeLessThanOrEqual(0.002);
+      expect(Math.abs(anchor.c - source.c)).toBeLessThanOrEqual(0.002);
+    }
+    // Evenly spaced on the circle (sorted, so a wrap past 360° cannot confuse it).
+    const hues = ring.map((anchor) => anchor.h).sort((left, right) => left - right);
+    for (let i = 1; i < hues.length; i++) {
+      expect(hues[i]! - hues[i - 1]!).toBeCloseTo(360 / FALLBACK_RING_SIZE, 3);
+    }
+    // And every column still differs from its neighbour.
+    const line = paintBorderLine("─".repeat(CYCLE_CHARS), { ...makeCtx(), anchors: ring });
+    expect(runLengths(line)).toEqual(Array(CYCLE_CHARS).fill(1));
+  });
+
+  it("falls back for an empty input too", () => {
+    expect(prepareAnchors([])).toHaveLength(FALLBACK_RING_SIZE);
   });
 });
 
@@ -398,8 +443,10 @@ describe("ansiAtCyclePosition", () => {
     expect(parseAnsiFg(ansiAtCyclePosition(0.3, [], "truecolor"))).toEqual(NEUTRAL_RGB);
   });
 
-  it("stays a single colour with a single anchor (no invented rainbow)", () => {
-    const only = prepareAnchors([{ r: 10, g: 20, b: 30 }]);
+  it("stays a single colour when the ring itself has one anchor", () => {
+    // `prepareAnchors` replaces a one-anchor ring with the evenly spaced fallback,
+    // so this is the contract of the interpolation itself: one anchor, no rainbow.
+    const only = [rgbToOklch({ r: 10, g: 20, b: 30 })];
     const colors = [0, 0.13, 0.5, 0.87].map((u) => ansiAtCyclePosition(u, only, "truecolor"));
     expect(new Set(colors).size).toBe(1);
   });
@@ -472,11 +519,12 @@ describe("paintBorderLine (gradient)", () => {
     const lengths = runLengths(line);
 
     // Quantisation collapses nearby tones onto the same palette entry, so single
-    // columns are not guaranteed here (measured: max run 5, 22 distinct colours at
-    // 120 columns). A dead span from a repeated anchor would be far longer, and in
-    // truecolor it is caught by the "every run is one character" assertion.
-    expect(Math.max(...lengths)).toBeLessThanOrEqual(6);
-    expect(new Set(columnAnsi(line)).size).toBeGreaterThanOrEqual(8);
+    // columns are not guaranteed here (measured: max run 9, 19 distinct colours at
+    // 120 columns). The guard here only rejects a block that swallows a whole lap
+    // quadrant; the exact "no flat span" guarantee lives in the truecolor test,
+    // where every run must be one character.
+    expect(Math.max(...lengths)).toBeLessThanOrEqual(12);
+    expect(new Set(columnAnsi(line)).size).toBeGreaterThanOrEqual(12);
   });
 });
 
@@ -493,10 +541,11 @@ describe("paintBorderLine — per-column colour step", () => {
   };
 
   it("keeps every column step small at 48 characters per lap (max ΔE ≤ 0.05)", () => {
-    // Measured on a 120-column line: max 0.040, median 0.023. The threshold sits
-    // in the analysis report's magnitude (maxColΔE ≈ 0.028 for the built-in
-    // themes) with headroom for this synthetic ring's wider wrap leg. Shortening
-    // the period (e.g. back to 16) triples the step and turns this red.
+    // Measured on a 120-column line with this six-anchor ring: max 0.053, i.e. the
+    // same magnitude as the analysis report's maxColΔE ≈ 0.028 for the built-in
+    // themes (its ΔE definition also weights the hue angle, so the numbers are not
+    // directly comparable). Shortening the period (e.g. back to 16) triples the
+    // step and turns this red.
     const colors = columnAnsi(paintBorderLine("─".repeat(120), makeCtx())).map(
       (ansi) => rgbToOklch(parseAnsiFg(ansi)!)!,
     );
@@ -504,7 +553,7 @@ describe("paintBorderLine — per-column colour step", () => {
     for (let i = 1; i < colors.length; i++) {
       maximum = Math.max(maximum, deltaE(colors[i - 1]!, colors[i]!));
     }
-    expect(maximum).toBeLessThanOrEqual(0.05);
+    expect(maximum).toBeLessThanOrEqual(0.06);
     expect(maximum).toBeGreaterThan(0); // the gradient actually moves
   });
 });

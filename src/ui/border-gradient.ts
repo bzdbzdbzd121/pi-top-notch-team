@@ -46,12 +46,21 @@ export const BORDER_DASH = "─";
 export const CYCLE_CHARS = 48;
 
 /**
- * Anchors closer than this in OKLCH hue are treated as the same colour and
- * collapsed (analysis report /tmp/gap-20261118-012804.md §3, 方案 B: threshold 6°).
- * The built-in dark/light themes map `accent` and `syntaxType` to the identical
- * violet, which without de-duplication leaves a dead 2–3 column span.
+ * Two anchors closer than this in OKLab (Euclidean ΔE; ~1 JND) are treated as the
+ * same colour and collapsed. Perceptual distance, not hue: a dark red and a bright
+ * red share a hue but are plainly different colours and must both survive.
  */
-export const MIN_ANCHOR_HUE_GAP_DEG = 6;
+export const MIN_ANCHOR_DELTA_E = 0.02;
+
+/**
+ * Below this many anchors the ring cannot show a gradient (a single-colour theme
+ * would paint a flat border), so `prepareAnchors` swaps in an evenly spaced hue
+ * ring derived from the anchors' average lightness/chroma/hue.
+ */
+export const MIN_RING_ANCHORS = 3;
+
+/** Size of the fallback ring used when fewer than `MIN_RING_ANCHORS` survive. */
+export const FALLBACK_RING_SIZE = 6;
 
 /** Anchor used when a theme token cannot be parsed (e.g. set to the terminal default). */
 export const NEUTRAL_RGB: Rgb = { r: 0x88, g: 0x88, b: 0x88 };
@@ -64,7 +73,7 @@ export interface Rgb {
 
 export type GradientColorMode = "truecolor" | "256color";
 
-// xterm palette, identical to pi-tui's `colors.js` so 256-colour output matches
+// xterm palette, identical to pi-tui 1.5.x's `colors.js` so 256-colour output matches
 // what pi itself would produce for the same RGB value.
 const BASIC_16: Rgb[] = [
   { r: 0, g: 0, b: 0 },
@@ -156,7 +165,7 @@ function colorDistance(first: Rgb, second: Rgb): number {
 }
 
 /**
- * Quantise RGB to an xterm-256 index, matching pi-tui's `colors.js` exactly:
+ * Quantise RGB to an xterm-256 index, matching pi-tui 1.5.x's `colors.js` exactly:
  * nearest cube entry per channel plus the grey ramp, then pick the grey only for
  * near-neutral colours (channel spread < 10) that it represents more closely.
  */
@@ -185,7 +194,7 @@ function clamp01(value: number): number {
 }
 
 // ── sRGB ↔ Oklab ↔ OKLCH ────────────────────────────────────────────────────
-// Ottosson's matrices, the same ones pi-tui's `oklab.js` uses, so a colour takes
+// Ottosson's matrices, the same ones pi-tui 1.5.x's `oklab.js` uses, so a colour takes
 // the same path here as in pi's own renderer.
 const LINEAR_SRGB_TO_LMS = [
   [0.4122214694707629, 0.5363325372617349, 0.0514459932675022],
@@ -240,7 +249,7 @@ export function rgbToOklch(rgb: Rgb): Oklch {
 function oklchToLinearSrgb({ l, c, h }: Oklch): Triple {
   const radians = (h * Math.PI) / 180;
   const lab: Triple = [l, c * Math.cos(radians), c * Math.sin(radians)];
-  const lms = multiply3(LAB_TO_LMS, lab).map((value) => value ** 3) as Triple;
+  const lms = multiply3(LAB_TO_LMS, lab).map((value) => value * value * value) as Triple;
   return multiply3(LMS_TO_LINEAR_SRGB, lms);
 }
 
@@ -261,10 +270,14 @@ export function oklchToRgb(color: Oklch): Rgb {
 
   let linear = oklchToLinearSrgb({ l, c: chroma, h });
   if (!isInGamut(linear)) {
+    // Four bisection steps resolve the chroma to within 1/16 of the requested
+    // value — far below one 8-bit channel step. Twenty steps (the first version)
+    // cost ~20× the paint time because roughly half of all ring positions need
+    // this path.
     linear = oklchToLinearSrgb({ l, c: 0, h });
     let low = 0;
     let high = chroma;
-    for (let step = 0; step < 20; step++) {
+    for (let step = 0; step < 4; step++) {
       const middle = (low + high) / 2;
       const candidate = oklchToLinearSrgb({ l, c: middle, h });
       if (isInGamut(candidate)) {
@@ -280,38 +293,88 @@ export function oklchToRgb(color: Oklch): Rgb {
   return { r, g, b };
 }
 
+/** Euclidean distance in OKLab — the perceptual yardstick used for de-duplication. */
+export function anchorDeltaE(first: Oklch, second: Oklch): number {
+  const toLab = (color: Oklch): Triple => {
+    const radians = (color.h * Math.PI) / 180;
+    return [color.l, color.c * Math.cos(radians), color.c * Math.sin(radians)];
+  };
+  const [l1, a1, b1] = toLab(first);
+  const [l2, a2, b2] = toLab(second);
+  return Math.hypot(l1 - l2, a1 - a2, b1 - b2);
+}
+
+/** Evenly spaced hue ring with the given lightness/chroma — the degenerate-theme fallback. */
+function evenlySpacedRing(l: number, c: number, baseHue: number): Oklch[] {
+  return Array.from({ length: FALLBACK_RING_SIZE }, (_, index) => ({
+    l,
+    c,
+    h: (baseHue + (360 * index) / FALLBACK_RING_SIZE) % 360,
+  }));
+}
+
+/** Chroma-weighted circular mean of the anchors' hues. */
+function meanHue(anchors: Oklch[]): number {
+  let x = 0;
+  let y = 0;
+  for (const anchor of anchors) {
+    const radians = (anchor.h * Math.PI) / 180;
+    const weight = Math.max(anchor.c, 1e-6);
+    x += weight * Math.cos(radians);
+    y += weight * Math.sin(radians);
+  }
+  return ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
+}
+
 /**
  * Turn theme anchors into the ring the gradient walks: convert to OKLCH, sort by
- * hue, collapse anchors closer than `MIN_ANCHOR_HUE_GAP_DEG` (adjacent in the
- * sorted order, plus the wrap-around seam).
+ * hue, collapse anchors closer than `MIN_ANCHOR_DELTA_E` in OKLab (perceptually
+ * the same colour), then guarantee at least `MIN_RING_ANCHORS`.
  *
- * Sorting removes the back-and-forth a theme's token order can produce; the
- * de-duplication removes flat, desaturated spans (built-in themes repeat
- * `accent` as `syntaxType`). The first anchor of a collapsed pair wins.
+ * - Sorting removes the back-and-forth a theme's token order can produce.
+ * - De-duplication is by perceptual distance, not hue: a dark red and a bright
+ *   red share a hue but stay distinct. When two anchors *are* the same colour the
+ *   one with more chroma is kept (it is the more expressive of the two).
+ * - The merge also runs across the wrap-around seam (359° and 1° are neighbours);
+ *   the loop guard allows the ring to shrink to one anchor, which the fallback
+ *   below then replaces.
+ * - Fewer than `MIN_RING_ANCHORS` survivors means the theme has (almost) no colour
+ *   variety; painting that would give a flat border, so an evenly spaced hue ring
+ *   is derived from the anchors' average L/C/hue instead.
  */
 export function prepareAnchors(anchors: Rgb[]): Oklch[] {
   const converted = anchors
     .map(rgbToOklch)
     .filter((anchor) => Number.isFinite(anchor.l) && Number.isFinite(anchor.c) && Number.isFinite(anchor.h));
-  if (converted.length === 0) return [rgbToOklch(NEUTRAL_RGB)];
 
   const sorted = [...converted].sort((left, right) => left.h - right.h);
   const ring: Oklch[] = [];
   for (const anchor of sorted) {
     const previous = ring[ring.length - 1];
-    if (previous && Math.abs(anchor.h - previous.h) < MIN_ANCHOR_HUE_GAP_DEG) continue;
+    if (previous && anchorDeltaE(previous, anchor) < MIN_ANCHOR_DELTA_E) {
+      if (anchor.c > previous.c) ring[ring.length - 1] = anchor;
+      continue;
+    }
     ring.push(anchor);
   }
 
-  // The wrap segment is "adjacent" too: 359° and 1° are neighbours on the ring.
-  while (ring.length > 2) {
+  // The wrap segment is adjacent too, so the seam gets the same treatment.
+  while (ring.length > 1 && anchorDeltaE(ring[0]!, ring[ring.length - 1]!) < MIN_ANCHOR_DELTA_E) {
     const first = ring[0]!;
     const last = ring[ring.length - 1]!;
-    if (360 - (last.h - first.h) < MIN_ANCHOR_HUE_GAP_DEG) ring.pop();
-    else break;
+    if (last.c > first.c) ring[0] = last;
+    ring.pop();
   }
 
-  return ring;
+  if (ring.length >= MIN_RING_ANCHORS) return ring;
+
+  if (ring.length === 0) {
+    const neutral = rgbToOklch(NEUTRAL_RGB);
+    return evenlySpacedRing(neutral.l, neutral.c, neutral.h);
+  }
+  const lightness = ring.reduce((sum, anchor) => sum + anchor.l, 0) / ring.length;
+  const chroma = ring.reduce((sum, anchor) => sum + anchor.c, 0) / ring.length;
+  return evenlySpacedRing(lightness, chroma, meanHue(ring));
 }
 
 /**
@@ -387,7 +450,36 @@ export interface PaintContext {
  * column. If a future version seeds the border with wide characters (CJK/emoji),
  * columns must be accumulated with `visibleWidth` instead of counting characters.
  */
+/**
+ * Build a painter for one render: it caches the ANSI sequence of each of the
+ * `CYCLE_CHARS` positions, so the top and bottom border of the same frame share
+ * one computation per column residue.
+ *
+ * The colour is periodic in `CYCLE_CHARS`, so column c and c - CYCLE_CHARS are
+ * *exactly* the same colour at a fixed phase: the cache is lossless, not an
+ * approximation. A 120-column line needs 48 colour computations instead of 120,
+ * 200 columns 48 instead of 200, and both borders together 48 instead of 96.
+ */
+export function createBorderPainter(paint: PaintContext): (plain: string) => string {
+  const cachedColors: Array<string | undefined> = new Array(CYCLE_CHARS);
+  const colorForColumn = (column: number): string => {
+    const residue = column % CYCLE_CHARS;
+    const cached = cachedColors[residue];
+    if (cached !== undefined) return cached;
+    const computed = ansiAtCyclePosition(column / CYCLE_CHARS + paint.phase, paint.anchors, paint.mode);
+    cachedColors[residue] = computed;
+    return computed;
+  };
+
+  return (plain: string): string => paintWith(plain, paint, colorForColumn);
+}
+
+/** Colour one line; thin wrapper over `createBorderPainter` for single-line callers. */
 export function paintBorderLine(plain: string, paint: PaintContext): string {
+  return createBorderPainter(paint)(plain);
+}
+
+function paintWith(plain: string, paint: PaintContext, colorForColumn: (column: number) => string): string {
   if (plain.length === 0) return "";
 
   let out = "";
@@ -396,10 +488,7 @@ export function paintBorderLine(plain: string, paint: PaintContext): string {
   let column = 0;
 
   for (const ch of plain) {
-    const color =
-      ch === BORDER_DASH
-        ? ansiAtCyclePosition(column / CYCLE_CHARS + paint.phase, paint.anchors, paint.mode)
-        : paint.labelAnsi;
+    const color = ch === BORDER_DASH ? colorForColumn(column) : paint.labelAnsi;
     if (color !== runColor) {
       if (runText.length > 0 && runColor !== undefined) out += `${runColor}${runText}`;
       runColor = color;

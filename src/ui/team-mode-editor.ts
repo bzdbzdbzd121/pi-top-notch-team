@@ -8,7 +8,7 @@ import {
 import {
   BORDER_DASH,
   NEUTRAL_RGB,
-  paintBorderLine,
+  createBorderPainter,
   parseAnsiFg,
   prepareAnchors,
   type PaintContext,
@@ -161,16 +161,19 @@ export class TeamModeEditor extends CustomEditor {
       labelAnsi: theme.getFgAnsi("accent"),
     };
 
+    // One painter per render: both borders share the per-column colour cache.
+    const paint = createBorderPainter(context);
+
     // The first rendered line is always the top border, with or without a
     // scroll hint (`─── ↑ N more ───…`), so paint it directly.
-    const painted: Array<[number, string]> = [[0, paintBorderLine(stripAnsi(lines[0]!), context)]];
+    const painted: Array<[number, string]> = [[0, paint(stripAnsi(lines[0]!))]];
 
     // Bottom border: when autocomplete is visible the base editor appends the
     // candidate rows AFTER the bottom border, so scan upward for the first line
     // that is made of border glyphs only. (Rewriting the last line blindly
     // destroyed the last candidate on every keystroke.)
     const bottom = findBottomBorderLine(lines);
-    if (bottom >= 0) painted.push([bottom, paintBorderLine(stripAnsi(lines[bottom]!), context)]);
+    if (bottom >= 0) painted.push([bottom, paint(stripAnsi(lines[bottom]!))]);
 
     return painted;
   }
