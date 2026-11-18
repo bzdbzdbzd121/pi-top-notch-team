@@ -304,13 +304,19 @@ export function anchorDeltaE(first: Oklch, second: Oklch): number {
   return Math.hypot(l1 - l2, a1 - a2, b1 - b2);
 }
 
-/** Evenly spaced hue ring with the given lightness/chroma — the degenerate-theme fallback. */
+/**
+ * Evenly spaced hue ring with the given lightness/chroma — the degenerate-theme fallback.
+ *
+ * Sorted ascending because the ring is interpolated as-is: `(baseHue + k·60°) % 360`
+ * wraps whenever the base hue is not a multiple of 60°, which would leave a low-hue
+ * anchor at the end and make the ramp step backwards once per lap.
+ */
 function evenlySpacedRing(l: number, c: number, baseHue: number): Oklch[] {
   return Array.from({ length: FALLBACK_RING_SIZE }, (_, index) => ({
     l,
     c,
     h: (baseHue + (360 * index) / FALLBACK_RING_SIZE) % 360,
-  }));
+  })).sort((left, right) => left.h - right.h);
 }
 
 /** Chroma-weighted circular mean of the anchors' hues. */

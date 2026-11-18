@@ -110,6 +110,16 @@ const RING = prepareAnchors(ANCHORS);
 const EXPECTED_RING_HUES = [29.23, 72.07, 143.68, 149.57, 252.26, 313.37];
 
 
+/**
+ * Ascending-hue invariant, asserted on the array the function returned (not on a
+ * sorted copy — sorting a copy before asserting can never fail, and the
+ * interpolation relies on the ring itself being ascending).
+ */
+function expectAscendingHues(ring: Oklch[]): void {
+  const hues = ring.map((anchor) => anchor.h);
+  for (let i = 1; i < hues.length; i++) expect(hues[i]!).toBeGreaterThan(hues[i - 1]!);
+}
+
 const makeCtx = (over: Partial<PaintContext> = {}): PaintContext => ({
   phase: 0,
   anchors: RING,
@@ -334,6 +344,7 @@ describe("prepareAnchors — hue sort + perceptual de-duplication", () => {
     const ring = prepareAnchors([vivid, faint]);
 
     expect(ring).toHaveLength(FALLBACK_RING_SIZE);
+    expectAscendingHues(ring);
     const sorted = ring.map((anchor) => anchor.h).sort((left, right) => left - right);
     const base = 330.02;
     const expected = Array.from({ length: FALLBACK_RING_SIZE }, (_, index) => (base + (360 * index) / FALLBACK_RING_SIZE) % 360)
@@ -359,8 +370,9 @@ describe("prepareAnchors — hue sort + perceptual de-duplication", () => {
       expect(Math.abs(anchor.l - source.l)).toBeLessThanOrEqual(0.002);
       expect(Math.abs(anchor.c - source.c)).toBeLessThanOrEqual(0.002);
     }
-    // Evenly spaced on the circle (sorted, so a wrap past 360° cannot confuse it).
-    const hues = ring.map((anchor) => anchor.h).sort((left, right) => left - right);
+    // Returned ascending, and evenly spaced on the circle.
+    expectAscendingHues(ring);
+    const hues = ring.map((anchor) => anchor.h);
     for (let i = 1; i < hues.length; i++) {
       expect(hues[i]! - hues[i - 1]!).toBeCloseTo(360 / FALLBACK_RING_SIZE, 3);
     }
