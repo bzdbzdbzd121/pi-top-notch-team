@@ -33,7 +33,7 @@ pi 自身的会话支持 `--continue/--resume`，但团队会话无法恢复：T
 
 ### 5. `/team resume`（P1）
 
-扫描 manifest → 选择（参数匹配团队名/sessionId 前缀，或多个时 select）→ 孤儿清理（/proc/<pid>/environ 校验 TEAM_NAME + 会话路径后 SIGTERM，防 PID 复用误杀）→ 以原 sessionId 重建 TeamSessionState（名册以 manifest 快照为准，描述/workflow 优先取当前 YAML）→ 恢复 Goal/sharedContextWritten/origin/dynamicPhase → 注册会话工具 + widget → 以 `resume: true` 重启 startedMembers（上下文完整恢复）→ 一次性 TL 横幅（before_agent_start 注入后清除）：成员上下文已保留，但**中断时正在执行的任务不重放**、pending corrId 失效，TL 需确认成员状态后决定重派或继续。
+扫描 manifest → 选择（参数匹配团队名/sessionId 前缀，或多个时 select）→ 孤儿清理（/proc/<pid>/environ 校验 TEAM_NAME + 会话路径后 SIGTERM，防 PID 复用误杀）→ 以原 sessionId 重建 TeamSessionState（名册以 manifest 快照为准，描述/workflow 优先取当前 YAML）→ 恢复 Goal/sharedContextWritten/origin/dynamicPhase → 注册会话工具 + widget → 以 `resume: true` 重启 startedMembers（上下文完整恢复）→ 一次性 TL 恢复通知（`before_agent_start` 追加在下一轮用户消息之后，不改系统提示词）：成员可能接续旧上下文，但**中断时正在执行的任务不重放**、pending corrId 失效，TL 需确认成员状态后决定重派或继续。
 
 ## 权衡与边界
 

@@ -1436,8 +1436,12 @@ describe("session entry notice", () => {
       },
     };
     const result = await runTurn(tracedCtx);
-    expect(result.message).toBeUndefined();
-    expect(result.systemPrompt).toContain("团队会话已结束");
+    expect(result.message).toMatchObject({
+      customType: "team-session-exit-notice",
+      display: false,
+      content: expect.stringContaining("团队会话已结束"),
+    });
+    expect(result.systemPrompt).toBeUndefined();
   });
 
   it("acceptance 5: session_start(reason:new) drops the armed notice", async () => {
@@ -1467,11 +1471,16 @@ describe("session entry notice", () => {
     await getTeamCommand()("resume entry-team", createMockContext({ cwd: process.cwd() }));
 
     const result = await runTurn();
-    expect(result.message).toBeUndefined();
-    expect(result.systemPrompt).toContain("团队会话已从中断中恢复");
-    // 阶段 4（§3.4.3）：横幅改条件式——不再断言「完整上下文已保留」
-    expect(result.systemPrompt).not.toContain("完整对话上下文已保留");
-    expect(result.systemPrompt).toContain("取决于该成员是否有可用的会话记录");
+    expect(result.message).toMatchObject({
+      customType: "team-session-resume-notice",
+      display: false,
+      content: expect.stringContaining("团队会话已从中断中恢复"),
+    });
+    expect(result.systemPrompt).toContain("当前任务：Team Lead");
+    expect(result.systemPrompt).not.toContain("团队会话已从中断中恢复");
+    // Do not promise that every member retained its previous conversation.
+    expect(result.message.content).not.toContain("完整对话上下文已保留");
+    expect(result.message.content).toContain("取决于该成员是否有可用的会话记录");
   });
 
   it("阶段 4：预定义提示词逐字节注入 MEMBER_RESTART_GUIDANCE，工具清单行含 fresh? 与「尝试续接」", async () => {
@@ -1646,16 +1655,15 @@ describe("session-ended banner in before_agent_start", () => {
     // Next turn: the one-shot banner tells the TL the session is over and the
     // team tools are deactivated — the TL stops acting as Team Lead
     result = await runBeforeAgentStart();
-    expect(result.systemPrompt).toContain("团队会话已结束");
-    expect(result.systemPrompt).toContain("team_send_and_wait");
-    expect(result.systemPrompt).toContain("普通模式");
-    // The banner asserts authority over the stale Team Lead traces in history
-    // (the real-world root cause: the model trusted its historical successful
-    // team tool calls over a plain "session ended" line).
-    expect(result.systemPrompt).toContain("以本提示为准");
-    expect(result.systemPrompt).toContain("痕迹均已失效");
-    // The Team Lead prompt section is gone (only the banner's mention remains)
-    expect(result.systemPrompt).not.toContain("当前任务：Team Lead");
+    expect(result.systemPrompt).toBeUndefined();
+    expect(result.message.customType).toBe("team-session-exit-notice");
+    expect(result.message.content).toContain("团队会话已结束");
+    expect(result.message.content).toContain("team_send_and_wait");
+    expect(result.message.content).toContain("普通模式");
+    // Explain why old successful calls are not proof that team mode is active.
+    expect(result.message.content).toContain("以本提示为准");
+    expect(result.message.content).toContain("不代表团队现在仍活跃");
+    expect(result.message.content).toContain("以更新的状态为准");
 
     // Second turn: banner consumed — not repeated (no prompt modification at all)
     result = await runBeforeAgentStart();
@@ -1740,14 +1748,14 @@ describe("session-ended banner in before_agent_start", () => {
       },
     };
     const result = await runBeforeAgentStart(undefined, tracedCtx);
-    expect(result.systemPrompt).toContain("团队会话已结束");
+    expect(result.message.content).toContain("团队会话已结束");
 
     // Consumed exactly once.
     const again = await runBeforeAgentStart(undefined, tracedCtx);
     expect(again).toBeUndefined();
   });
 
-  it("banner fires when the ONLY trace is the entry notice (no team tool call at all)", async () => {
+  it.each(["team-session-notice", "team-session-resume-notice"])("banner fires when the only trace is %s", async (customType) => {
     // The most common shape of this feature: the user enters a team session,
     // discusses a few turns without ever calling a team tool, then /team stop.
     // Before the entry notice counted as a trace, this history looked
@@ -1765,7 +1773,7 @@ describe("session-ended banner in before_agent_start", () => {
           { type: "message", message: { role: "user", content: "我们聊聊方案" } },
           {
             type: "custom_message",
-            customType: "team-session-notice",
+            customType,
             // Real entries carry display:false (the notice is user-invisible).
             // Trace detection looks at type + customType only, never at display —
             // that is exactly why the exit banner still fires here.
@@ -1776,7 +1784,7 @@ describe("session-ended banner in before_agent_start", () => {
       },
     };
     const result = await runBeforeAgentStart(undefined, noticeOnlyCtx);
-    expect(result.systemPrompt).toContain("团队会话已结束");
+    expect(result.message.content).toContain("团队会话已结束");
   });
 
   it("acceptance 3: the exit banner names the entry notice as equally invalid", async () => {
@@ -1795,16 +1803,16 @@ describe("session-ended banner in before_agent_start", () => {
         ],
       },
     });
-    expect(result.systemPrompt).toContain("团队会话已结束");
+    expect(result.message.content).toContain("团队会话已结束");
     // The cross-reference must quote text that actually exists in the
     // transcript — the notice's first-line prefix — not a paraphrase, or the
     // model cannot find it in history.
-    expect(result.systemPrompt).toContain(SESSION_ENTRY_NOTICE_ANCHOR);
+    expect(result.message.content).toContain(SESSION_ENTRY_NOTICE_ANCHOR);
     // Conditional: sessions resumed without ever arming the notice exist, so
     // the banner must not assert that a notice was present.
-    expect(result.systemPrompt).toContain("若历史里出现过");
+    expect(result.message.content).toContain("若历史里出现过");
     // The internal customType identifier never leaks into model-facing text.
-    expect(result.systemPrompt).not.toContain("team-session-notice");
+    expect(result.message.content).not.toContain("team-session-notice");
   });
 
   it("acceptance 4: entry notice and exit banner never co-occur in one turn", async () => {
@@ -1834,10 +1842,9 @@ describe("session-ended banner in before_agent_start", () => {
         ],
       },
     });
-    expect(after.message).toBeUndefined();
-    expect(after.systemPrompt).toContain("团队会话已结束");
-    // …and the notice text itself is not resurrected inside the prompt.
-    expect(after.systemPrompt).not.toContain("本条不是用户输入");
+    expect(after.message.customType).toBe("team-session-exit-notice");
+    expect(after.message.content).toContain("团队会话已结束");
+    expect(after.systemPrompt).toBeUndefined();
 
     // Structural half: an inactive session never injects, even with a full
     // counter and an otherwise injectable state.
@@ -1866,7 +1873,7 @@ describe("session-ended banner in before_agent_start", () => {
       },
     };
     const result = await runBeforeAgentStart(undefined, tracedCtx);
-    expect(result.systemPrompt).toContain("团队会话已结束");
+    expect(result.message.content).toContain("团队会话已结束");
   });
 });
 
@@ -2102,15 +2109,16 @@ describe("per-session settings wiring (阶段 2)", () => {
     expect(loadSettingsCallSites.length).toBe(0);
     // 唯一入口形态：委托合并层
     expect(source).toContain("loadEffectiveSettings(getRootDir())");
-    // 11 个消费点全部经 getEffectiveSettings：getAutoCompact×2 / getCoalescing /
+    // 12 个消费点全部经 getEffectiveSettings：getAutoCompact×2 / getCoalescing /
     // getPeerMessagingAllowed（P2）/ getSettings（tlToolsDeps）+ buildMemberConfig 两
     // 调用点（start_member、startResumedMember）/ start_team_session getSettings
     // （阶段② L2 execute 门控）/ startTeamSessionVisible（阶段③ L1 可见性门控）/
     // 阶段 2：回合边界 TL 亲自分析限制（resolveTlSelfWorkGuard，团队会话才读）/
-    // 阶段 3：提示词构建处的同一限制解析（getSelfWorkGuardForPrompt）。
+    // 阶段 3：提示词构建处的同一限制解析（getSelfWorkGuardForPrompt）/
+    // 实验入口的自主开团权限检查（isGatewayActionAllowed）。
     // 计数是刻意锁死的：新增消费点必须经合并层，且这里要同步 +1（而不是静默漂移）。
     const effectiveCalls = source.match(/getEffectiveSettings\(\)/g) ?? [];
-    expect(effectiveCalls.length).toBe(11);
+    expect(effectiveCalls.length).toBe(12);
   });
 });
 

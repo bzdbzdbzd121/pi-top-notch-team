@@ -57,6 +57,10 @@ import { MEMBER_RESTART_GUIDANCE } from "./src/prompts/member-restart-guidance";
 import { buildWorkflowPrompt, WORKFLOW_ACTIVATION_BANNER } from "./src/prompts/workflow-prompt";
 import { createTlReadGuard, createDesignReadGuard } from "./src/session/tl-read-guard";
 import { enforceSessionToolVisibility, SESSION_TOOL_NAMES } from "./src/session/session-tool-visibility";
+import {
+  buildTeamModeSnapshot, createExperimentalTeamGateway, latestTeamModeHash,
+  TEAM_GATEWAY, TEAM_MODE_SNAPSHOT, teamModeMessage,
+} from "./src/tools/experimental-team-gateway";
 import { getSharedContextPath } from "./src/session/shared-context";
 import { openMemberInspector, type MemberInspectorHandle } from "./src/ui/member-inspector";
 import { createMemberOverviewStore, type MemberOverviewStore } from "./src/ui/member-overview-store";
@@ -89,14 +93,14 @@ const TEAM_TRACE_TOOL_NAMES: ReadonlySet<string> = new Set([
   STOP_TEAM_SESSION_TOOL_NAME,
 ]);
 
-/**
- * custom_message types that count as team traces (see historyHasTeamTraces).
- * The entry-notice type is imported from the prompt module so the two can never
- * drift apart (a hardcoded string would silently disable the trace check).
- */
+const SESSION_EXIT_NOTICE_CUSTOM_TYPE = "team-session-exit-notice";
+const SESSION_RESUME_NOTICE_CUSTOM_TYPE = "team-session-resume-notice";
+
+/** custom_message types that indicate prior team activity in the current conversation. */
 const TEAM_TRACE_CUSTOM_TYPES: ReadonlySet<string> = new Set([
   "team-message",
   SESSION_ENTRY_NOTICE_CUSTOM_TYPE,
+  SESSION_RESUME_NOTICE_CUSTOM_TYPE,
 ]);
 
 /**
@@ -107,12 +111,8 @@ const TEAM_TRACE_CUSTOM_TYPES: ReadonlySet<string> = new Set([
  *    (start_member, team_send_and_wait, …) — the TL actively orchestrated.
  * 2. A custom_message entry with customType "team-message" — member replies
  *    routed to the TL via the message channel.
- * 3. A custom_message entry with customType "team-session-notice" — the entry
- *    notice injected right after entering. This is the ONLY trace in the most
- *    common shape of this feature: the user enters, discusses for a while
- *    without ever calling a team tool, then exits. Without it the exit banner
- *    would be suppressed exactly when the conversation still looks like a team
- *    session to the model.
+ * 3. An entry or resume notice — this may be the only trace if no team tools
+ *    were called. An old exit notice alone is not evidence of team activity.
  *
  * Fail-open: when the session manager is unavailable (RPC mode, tests) the
  * check cannot be performed — treat as traced so the primary /team stop
@@ -128,11 +128,13 @@ function historyHasTeamTraces(ctx: {
   return entries.some((e: any) => {
     if (!e) return false;
     if (e.type === "custom_message") {
-      return TEAM_TRACE_CUSTOM_TYPES.has(e.customType);
+      return TEAM_TRACE_CUSTOM_TYPES.has(e.customType) ||
+        (e.customType === TEAM_MODE_SNAPSHOT && e.details?.sessionActive === true);
     }
     if (e.type !== "message" || e.message?.role !== "assistant") return false;
     return Array.isArray(e.message.content) && e.message.content.some(
-      (c: any) => c?.type === "toolCall" && typeof c?.name === "string" && TEAM_TRACE_TOOL_NAMES.has(c.name)
+      (c: any) => c?.type === "toolCall" && (TEAM_TRACE_TOOL_NAMES.has(c.name) ||
+        (c.name === TEAM_GATEWAY && c.arguments?.action === START_TEAM_SESSION_TOOL_NAME))
     );
   });
 }
@@ -309,6 +311,40 @@ export default function (pi: ExtensionAPI) {
   // 合并逻辑收敛于 session-settings.loadEffectiveSettings（阶段 5）——静态扫描
   // 守卫（src/static-scan.test.ts）强制全仓除白名单外无裸 loadSettings 调用。
   const getEffectiveSettings = () => loadEffectiveSettings(getRootDir());
+  const gatewayActions = new Set<string>([
+    ...SESSION_TOOL_NAMES, START_TEAM_SESSION_TOOL_NAME, STOP_TEAM_SESSION_TOOL_NAME,
+    "add_dynamic_member", SET_TEAM_NAME_TOOL_NAME, "create_team_definition", "update_team_definition",
+  ]);
+  const gateway: ReturnType<typeof createExperimentalTeamGateway> | undefined = process.env.TOP_NOTCH_TEAM_EXPERIMENTAL_PREFIX_CACHE === "1"
+    ? createExperimentalTeamGateway(pi, gatewayActions, isGatewayActionAllowed, buildGatewaySnapshot)
+    : undefined;
+  if (gateway) pi = gateway.api;
+
+  function isGatewayActionAllowed(name: string): boolean {
+    const session = getSessionState();
+    if (name === START_TEAM_SESSION_TOOL_NAME) {
+      return !session.active && resolveAgentSessionAllowed(getEffectiveSettings());
+    }
+    if (name === STOP_TEAM_SESSION_TOOL_NAME) return session.active && session.origin === "agent";
+    if (name === "create_team_definition") return !session.active && teamCtx.isCreatingTeam;
+    if (name === "update_team_definition") return !session.active && Boolean(teamCtx.editingTeamName);
+    if (name === "add_dynamic_member" || name === SET_TEAM_NAME_TOOL_NAME) return session.active && teamCtx.isDynamicSession;
+    return session.active && (SESSION_TOOL_NAMES as readonly string[]).includes(name);
+  }
+
+  function buildGatewaySnapshot(modePrompt = buildModePrompt()) {
+    const session = getSessionState();
+    const actions = gateway?.describeActions();
+    return buildTeamModeSnapshot(
+      session.active ? session.sessionId : null,
+      [
+        "【团队状态｜以最新通知为准】由团队扩展提供，不是用户消息。不要单独回复此通知。",
+        modePrompt || "当前是普通模式，不是 Team Lead。使用普通工具；历史团队操作不代表现在仍获授权。",
+        "下文出现的团队工具名是操作名，必须通过 team({action, args}) 调用。普通工具不变。",
+        actions ? "### 当前可用的 team 操作\n" + actions : "当前没有可执行的 team 操作。",
+      ].join("\n\n"),
+    );
+  }
 
   // 阶段 3：提示词构建处解析生效的「TL 亲自分析限制」。仅在团队会话的提示词分支
   // 调用（每回合至多一次小文件读取）。异常 → 默认（开启 + 3）：before_agent_start
@@ -560,11 +596,14 @@ export default function (pi: ExtensionAPI) {
     for (const toolName of GOAL_TOOL_NAMES) {
       ensureToolRegistered(pi, toolName, () => registerGoalTools(pi));
     }
-    // stop_team_session is registered at every session start (harmless) but
-    // ACTIVATED only in agent-initiated sessions (session-tool-visibility).
-    ensureToolRegistered(pi, STOP_TEAM_SESSION_TOOL_NAME, () =>
-      registerStopTeamSessionTool({ pi, teamCtx })
-    );
+    // Pi can activate freshly registered tools immediately. Don't register this
+    // agent-only tool in a user session: otherwise its snippet can already be
+    // in the first turn's base prompt when the visibility guard removes it.
+    if (getSessionState().origin === "agent") {
+      ensureToolRegistered(pi, STOP_TEAM_SESSION_TOOL_NAME, () =>
+        registerStopTeamSessionTool({ pi, teamCtx })
+      );
+    }
   };
 
   // ── Helper: safely extract path from tool input ─────────
@@ -696,7 +735,16 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ── Call-level guard: whitelist-based blocking during team session ───
-  pi.on("tool_call", (event, ctx) => {
+  pi.on("tool_call", (rawEvent, ctx) => {
+    let event = rawEvent;
+    if (gateway && rawEvent.toolName === TEAM_GATEWAY) {
+      try {
+        const { def, args } = gateway.resolve(rawEvent.input);
+        event = { ...rawEvent, toolName: def.name, input: args } as typeof rawEvent;
+      } catch (error) {
+        return { block: true, reason: error instanceof Error ? error.message : String(error) };
+      }
+    }
     const sessionForGuard = getSessionState();
     if (!sessionForGuard.active) return; // only block during active team session
 
@@ -1166,147 +1214,9 @@ export default function (pi: ExtensionAPI) {
   };
 
   // ── TL system prompt injection ───────────────────────────
-  pi.on("before_agent_start", async (event, _ctx) => {
+  function buildModePrompt(): string {
     const session = getSessionState();
-
-    // ── Session tool visibility enforcement ──
-    // Invariant: all team-session tools (start_member … wait_and_get_member_status,
-    // write_shared_context, set_goal/finish_goal) are visible ONLY during an
-    // active team session (/team start or /team dynamic). They are registered
-    // on-demand at session start and pi's active-tool set is the only visibility
-    // gate; enforce it at every turn boundary so a stale active list (extension
-    // reload, other extensions' setActiveTools, plan-mode toggles) can never
-    // leak them outside a session. No-op when the set is already correct.
-    enforceSessionToolVisibility({
-      sessionActive: session.active,
-      agentInitiated: session.active && session.origin === "agent",
-      // 阶段③ L1 可见性门控（D3 统一不变式 + D8 字面 boolean）：start_team_session
-      // 的可见性 ⇔ 设置开关，与会话状态无关。before_agent_start 每回合实时求值
-      // （late-evaluation，切换下一回合边界即生效）；经 getEffectiveSettings 合并层
-      // （R4 合规）。disabled ⇒ 工具列表与 promptSnippet/promptGuidelines 同步消失；
-      // enabled ⇒ 补回。补回/移除只经 setActiveTools，registerTools 永不为它触发。
-      // resolver fail-open（异常/缺省 → true）。
-      startTeamSessionVisible: resolveAgentSessionAllowed(getEffectiveSettings()),
-      activeTools: pi.getActiveTools(),
-      isRegistered: (name) =>
-        (((pi as any).getAllTools?.() ?? []) as Array<{ name: string }>).some(
-          (t) => t.name === name
-        ),
-      registerTools: ensureSessionToolsRegistered,
-      setActiveTools: (names) => pi.setActiveTools(names),
-    });
-
-    // Trace lifecycle must not depend on whether a UI widget is installed.
-    if (session.active) syncOverviewSession();
-    else clearOverview();
-
-    // Safety net: if widget wasn't installed by /team start (e.g., session resume),
-    // install it here. Also clean up if session ended without /team stop.
-    if (session.active && session.teamDefinition && !teamStatusWidget) {
-      teamStatusWidget = createTeamStatusWidget({
-        getTeamName: () => getSessionState().teamDefinition?.name ?? "",
-        getMembers: () => getSessionState().teamDefinition?.members ?? [],
-        teamCtx,
-        memberOpsStates,
-        activityTracker: activityTracker ?? (activityTracker = createActivityTracker()),
-        origin: session.origin,
-      });
-      teamStatusWidget.install(_ctx.ui, _ctx.ui.theme);
-      _ctx.ui.setStatus("team-inspector-hint", "alt+t 打开成员检视浮窗");
-    }
-    if (!session.active && teamStatusWidget) {
-      teamStatusWidget.uninstall();
-      teamStatusWidget = null;
-      if (activityTracker) {
-        activityTracker.clear();
-        activityTracker = null;
-      }
-      _ctx.ui.setStatus("team-inspector-hint", undefined);
-    }
-
-    // Edit mode widget safety net
-    if (teamCtx.editingTeamName && !editModeWidget && _ctx.ui) {
-      editModeWidget = createEditModeWidget(teamCtx.editingTeamName);
-      editModeWidget.install(_ctx.ui, _ctx.ui.theme);
-    }
-    if (!teamCtx.editingTeamName && editModeWidget) {
-      editModeWidget.uninstall();
-      editModeWidget = null;
-    }
-
-    // Create mode widget safety net
-    if (teamCtx.isCreatingTeam && !createModeWidget && _ctx.ui) {
-      createModeWidget = createCreateModeWidget();
-      createModeWidget.install(_ctx.ui, _ctx.ui.theme);
-    }
-    if (!teamCtx.isCreatingTeam && createModeWidget) {
-      createModeWidget.uninstall();
-      createModeWidget = null;
-    }
-
     let extraPrompt = "";
-
-    // ── One-shot "session ended" banner ──
-    // Set by teardownTeamSession (/team stop and stop_team_session — the only
-    // session exits that keep the conversation alive). Consumed exactly once on
-    // the next turn: the TL's history still contains the Team Lead system
-    // prompt and team-tool usage patterns, so without this it keeps acting as
-    // Team Lead and tries to call deactivated team tools (which fail with the
-    // cryptic "Tool xxx not found" error). The banner rides the next
-    // user-initiated turn — it never triggers a conversation of its own.
-    //
-    // Precision gate: the banner only fires if the CURRENT conversation
-    // history actually contains team traces. This kills the stale-notice edge
-    // cases — after /new the history is fresh (no banner), after /fork or
-    // /resume of a team conversation the traces were copied/restored (banner
-    // fires and is exactly what the TL needs), and after /resume of a
-    // different non-team conversation there are no traces (no banner).
-    let sessionEndedBanner = "";
-    if (!session.active && teamCtx.sessionEndedNotice) {
-      teamCtx.sessionEndedNotice = false;
-      if (historyHasTeamTraces(_ctx)) {
-        sessionEndedBanner = `## ⚠️ 团队会话已结束 —— 以本提示为准
-
-上一个团队会话（/team stop）已结束，你已回到**普通模式**。这是**当前唯一真实的状态**，**对话历史中任何团队会话的痕迹均已失效，一律以本提示为准**：
-- 你在历史记录里看到的 \`write_shared_context\`、\`start_member\`、\`team_send_and_wait\`、\`list_members\` 等成功调用都发生在会话结束**之前**，不代表团队会话仍然活跃
-- 你**不再是 Team Lead**，成员进程已全部停止，团队工具（team_send_and_wait、start_member、stop_member、list_members、get_member_log、wait_and_get_member_status、write_shared_context、set_goal、finish_goal 等）已全部停用
-- 请直接以普通模式用 read/bash/edit/write 等常规工具回答用户或完成任务，不要尝试调用团队工具（误调只会得到 "Tool xxx not found" 错误）
-- 若历史里出现过以「${SESSION_ENTRY_NOTICE_ANCHOR}」开头的系统通知（进入团队会话时注入），它同样已失效；以本提示为准
-- 如果用户需要再次进入团队模式，请告知用户使用 /team start 或 /team dynamic
-`;
-      }
-    } else if (session.active) {
-      // A new team session started before the notice was consumed — drop it.
-      teamCtx.sessionEndedNotice = false;
-    }
-
-    // ── One-shot /team resume banner ──
-    // Set by the resume handler right after rehydration; consumed exactly once
-    // so the TL knows the session was restored from disk and in-flight work
-    // was not replayed.
-    let resumeBanner = "";
-    if (teamCtx.resumedFrom) {
-      const r = teamCtx.resumedFrom;
-      teamCtx.resumedFrom = null;
-      const restarted = r.restartedMembers.length > 0 ? r.restartedMembers.join("、") : "无";
-      const failed = r.failedMembers.length > 0 ? r.failedMembers.join("、") : "无";
-      resumeBanner = `
-## ⚡ 团队会话已从中断中恢复（/team resume）
-
-此会话（${r.teamName} / ${r.sessionId}）刚从磁盘清单恢复。成员进程已用 \`--continue\` 重启：
-- 已重启的成员：${restarted}
-- 重启失败的成员：${failed}${r.failedMembers.length > 0 ? "（可用 start_member 重试）" : ""}
-
-说明：是否真正续接此前的对话，取决于该成员是否有可用的会话记录（存在会话文件且工作目录一致）。
-有可用记录的成员会接着此前的对话；没有可用记录的成员会以全新上下文启动——如果某个成员不记得之前的事，请重新交代必要背景（见 start_member 的结果说明）。
-
-**恢复后的首要动作：**
-1. 用 \`list_members\` / \`wait_and_get_member_status\` 确认成员状态
-2. 中断前**正在执行中的任务不会自动继续**（成员进程当时已死亡），pending 的 team_send_and_wait 也已失效——必要时重新派发
-3. 向用户简要汇报恢复状态，然后继续完成原目标（如已设定 Goal 会随会话一并恢复）
-
-`;
-    }
 
     if (teamCtx.isCreatingTeam) {
       extraPrompt = `
@@ -1507,6 +1417,188 @@ ${TASK_DISPATCH_PROTOCOL_PROMPT}
 `;
     }
 
+    return extraPrompt;
+  }
+
+  if (gateway) {
+    // Automatic compaction can run inside the agent's outer run, including
+    // overflow recovery. Sending there could steer Pi 0.83 or start a queued
+    // continuation. Wait for settlement to persist without triggering a run.
+    let pendingCompactionSession: string | undefined;
+    pi.on("session_compact", (event, { sessionManager }) => {
+      if (event.reason !== "manual") {
+        pendingCompactionSession = sessionManager.getSessionId();
+        return;
+      }
+      const snapshot = buildGatewaySnapshot();
+      if (latestTeamModeHash(sessionManager.buildContextEntries()) !== snapshot.hash) {
+        pi.sendMessage(teamModeMessage(snapshot), { triggerTurn: false });
+      }
+    });
+    pi.on("agent_settled", (_event, { sessionManager }) => {
+      const pendingSession = pendingCompactionSession;
+      pendingCompactionSession = undefined;
+      if (pendingSession === undefined || pendingSession !== sessionManager.getSessionId()) return;
+
+      const snapshot = buildGatewaySnapshot();
+      if (latestTeamModeHash(sessionManager.buildContextEntries()) !== snapshot.hash) {
+        pi.sendMessage(teamModeMessage(snapshot), { triggerTurn: false });
+      }
+    });
+    pi.on("context", (event) => {
+      const snapshot = buildGatewaySnapshot();
+      if (latestTeamModeHash(event.messages) === snapshot.hash) return;
+      // Recovery can issue another request before settlement; it still needs
+      // current state. Only this request's view is modified, not stored history.
+      return { messages: [...event.messages, { role: "custom", timestamp: Date.now(), ...teamModeMessage(snapshot) }] };
+    });
+  }
+
+  pi.on("before_agent_start", async (event, _ctx) => {
+    const session = getSessionState();
+
+    // ── Session tool visibility enforcement ──
+    // Invariant: all team-session tools (start_member … wait_and_get_member_status,
+    // write_shared_context, set_goal/finish_goal) are visible ONLY during an
+    // active team session (/team start or /team dynamic). They are registered
+    // on-demand at session start and pi's active-tool set is the only visibility
+    // gate; enforce it at every turn boundary so a stale active list (extension
+    // reload, other extensions' setActiveTools, plan-mode toggles) can never
+    // leak them outside a session. No-op when the set is already correct.
+    enforceSessionToolVisibility({
+      sessionActive: session.active,
+      agentInitiated: session.active && session.origin === "agent",
+      // 阶段③ L1 可见性门控（D3 统一不变式 + D8 字面 boolean）：start_team_session
+      // 的可见性 ⇔ 设置开关，与会话状态无关。before_agent_start 每回合实时求值
+      // （late-evaluation，切换下一回合边界即生效）；经 getEffectiveSettings 合并层
+      // （R4 合规）。disabled ⇒ 工具列表与 promptSnippet/promptGuidelines 同步消失；
+      // enabled ⇒ 补回。补回/移除只经 setActiveTools，registerTools 永不为它触发。
+      // resolver fail-open（异常/缺省 → true）。
+      startTeamSessionVisible: resolveAgentSessionAllowed(getEffectiveSettings()),
+      activeTools: pi.getActiveTools(),
+      isRegistered: (name) =>
+        (((pi as any).getAllTools?.() ?? []) as Array<{ name: string }>).some(
+          (t) => t.name === name
+        ),
+      registerTools: ensureSessionToolsRegistered,
+      setActiveTools: (names) => pi.setActiveTools(names),
+    });
+
+    // Trace lifecycle must not depend on whether a UI widget is installed.
+    if (session.active) syncOverviewSession();
+    else clearOverview();
+
+    // Safety net: if widget wasn't installed by /team start (e.g., session resume),
+    // install it here. Also clean up if session ended without /team stop.
+    if (session.active && session.teamDefinition && !teamStatusWidget) {
+      teamStatusWidget = createTeamStatusWidget({
+        getTeamName: () => getSessionState().teamDefinition?.name ?? "",
+        getMembers: () => getSessionState().teamDefinition?.members ?? [],
+        teamCtx,
+        memberOpsStates,
+        activityTracker: activityTracker ?? (activityTracker = createActivityTracker()),
+        origin: session.origin,
+      });
+      teamStatusWidget.install(_ctx.ui, _ctx.ui.theme);
+      _ctx.ui.setStatus("team-inspector-hint", "alt+t 打开成员检视浮窗");
+    }
+    if (!session.active && teamStatusWidget) {
+      teamStatusWidget.uninstall();
+      teamStatusWidget = null;
+      if (activityTracker) {
+        activityTracker.clear();
+        activityTracker = null;
+      }
+      _ctx.ui.setStatus("team-inspector-hint", undefined);
+    }
+
+    // Edit mode widget safety net
+    if (teamCtx.editingTeamName && !editModeWidget && _ctx.ui) {
+      editModeWidget = createEditModeWidget(teamCtx.editingTeamName);
+      editModeWidget.install(_ctx.ui, _ctx.ui.theme);
+    }
+    if (!teamCtx.editingTeamName && editModeWidget) {
+      editModeWidget.uninstall();
+      editModeWidget = null;
+    }
+
+    // Create mode widget safety net
+    if (teamCtx.isCreatingTeam && !createModeWidget && _ctx.ui) {
+      createModeWidget = createCreateModeWidget();
+      createModeWidget.install(_ctx.ui, _ctx.ui.theme);
+    }
+    if (!teamCtx.isCreatingTeam && createModeWidget) {
+      createModeWidget.uninstall();
+      createModeWidget = null;
+    }
+
+    // ── One-shot "session ended" banner ──
+    // Set by teardownTeamSession (/team stop and stop_team_session — the only
+    // session exits that keep the conversation alive). Consumed exactly once on
+    // the next turn: the TL's history can still contain Team Lead messages
+    // and team-tool usage patterns, so without this it may keep acting as
+    // Team Lead and tries to call deactivated team tools (which fail with the
+    // cryptic "Tool xxx not found" error). The banner rides the next
+    // user-initiated turn — it never triggers a conversation of its own.
+    //
+    // Precision gate: the banner only fires if the CURRENT conversation
+    // history actually contains team traces. This kills the stale-notice edge
+    // cases — after /new the history is fresh (no banner), after /fork or
+    // /resume of a team conversation the traces were copied/restored (banner
+    // fires and is exactly what the TL needs), and after /resume of a
+    // different non-team conversation there are no traces (no banner).
+    let sessionEndedBanner = "";
+    if (!session.active && teamCtx.sessionEndedNotice) {
+      teamCtx.sessionEndedNotice = false;
+      if (historyHasTeamTraces(_ctx)) {
+        sessionEndedBanner = `## ⚠️ 团队会话已结束 —— 以本提示为准
+
+这是团队扩展的状态通知，不是用户输入。不要单独回复本条，请继续处理用户的消息。
+上一个团队会话已结束，你已回到**普通模式**。历史中的团队会话痕迹不代表团队现在仍活跃：
+- 你在历史记录里看到的 \`write_shared_context\`、\`start_member\`、\`team_send_and_wait\`、\`list_members\` 等成功调用都发生在会话结束**之前**，不代表团队会话仍然活跃
+- 你**不再是 Team Lead**，成员进程已全部停止，团队工具（team_send_and_wait、start_member、stop_member、list_members、get_member_log、wait_and_get_member_status、write_shared_context、set_goal、finish_goal 等）已全部停用
+- 请直接以普通模式用 read/bash/edit/write 等常规工具回答用户或完成任务，不要尝试调用团队工具（误调只会得到 "Tool xxx not found" 错误）
+- 若历史里出现过以「${SESSION_ENTRY_NOTICE_ANCHOR}」开头的系统通知（进入团队会话时注入），它同样已失效；以本提示为准
+- 如果用户需要再次进入团队模式，请告知用户使用 /team start 或 /team dynamic
+- 本条记录的是这次退出。以后若有更新的团队状态声明或切换通知，以更新的状态为准。
+`;
+      }
+    } else if (session.active) {
+      // A new team session started before the notice was consumed — drop it.
+      teamCtx.sessionEndedNotice = false;
+    }
+
+    // ── One-shot /team resume banner ──
+    // Set by the resume handler right after rehydration; consumed exactly once
+    // so the TL knows the session was restored from disk and in-flight work
+    // was not replayed.
+    let resumeBanner = "";
+    if (session.active && teamCtx.resumedFrom) {
+      const r = teamCtx.resumedFrom;
+      teamCtx.resumedFrom = null;
+      const restarted = r.restartedMembers.length > 0 ? r.restartedMembers.join("、") : "无";
+      const failed = r.failedMembers.length > 0 ? r.failedMembers.join("、") : "无";
+      resumeBanner = `
+## ⚡ 团队会话已从中断中恢复（/team resume）
+
+这是团队扩展的状态通知，不是用户输入。不要单独回复本条，请继续处理用户的消息。
+此会话（${r.teamName} / ${r.sessionId}）刚从磁盘清单恢复。成员进程已用 \`--continue\` 重启：
+- 已重启的成员：${restarted}
+- 重启失败的成员：${failed}${r.failedMembers.length > 0 ? "（可用 start_member 重试）" : ""}
+
+说明：是否真正续接此前的对话，取决于该成员是否有可用的会话记录（存在会话文件且工作目录一致）。
+有可用记录的成员会接着此前的对话；没有可用记录的成员会以全新上下文启动——如果某个成员不记得之前的事，请重新交代必要背景（见 start_member 的结果说明）。
+
+**恢复后的首要动作：**
+1. 用 \`list_members\` / \`wait_and_get_member_status\` 确认成员状态
+2. 中断前**正在执行中的任务不会自动继续**（成员进程当时已死亡），pending 的 team_send_and_wait 也已失效——必要时重新派发
+3. 向用户简要汇报恢复状态，然后继续完成原目标（如已设定 Goal 会随会话一并恢复）
+
+`;
+    }
+
+    const extraPrompt = buildModePrompt();
+
     // ── Bounded "session entry" notice ──
     // The persistent declaration (top of the team block) says what the TL is
     // *now*; it cannot say that the switch just *happened* — a long conversation
@@ -1552,10 +1644,26 @@ ${TASK_DISPATCH_PROTOCOL_PROMPT}
       }
     }
 
-    if (entryNotice || extraPrompt || resumeBanner || sessionEndedBanner) {
+    // One-shot transitions belong after the user message, never in the cached
+    // system prefix. Preserve the per-mode prompt and the previous messages.
+    const transitionNotice = sessionEndedBanner
+      ? { customType: SESSION_EXIT_NOTICE_CUSTOM_TYPE, content: sessionEndedBanner, display: false }
+      : resumeBanner
+        ? { customType: SESSION_RESUME_NOTICE_CUSTOM_TYPE, content: resumeBanner, display: false }
+        : entryNotice;
+    if (gateway) {
+      const snapshot = buildGatewaySnapshot(extraPrompt);
+      // The full branch retains compacted-away messages. Deduplicate against
+      // Pi's retained context entries, which also work for restored sessions.
+      if (latestTeamModeHash(_ctx.sessionManager?.buildContextEntries?.() ?? []) !== snapshot.hash) {
+        return { message: teamModeMessage(snapshot, transitionNotice) };
+      }
+      return transitionNotice ? { message: transitionNotice } : undefined;
+    }
+    if (transitionNotice || extraPrompt) {
       return {
-        ...(entryNotice ? { message: entryNotice } : {}),
-        systemPrompt: event.systemPrompt + sessionEndedBanner + resumeBanner + extraPrompt,
+        ...(transitionNotice ? { message: transitionNotice } : {}),
+        ...(extraPrompt ? { systemPrompt: event.systemPrompt + extraPrompt } : {}),
       };
     }
   });

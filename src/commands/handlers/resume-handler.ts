@@ -275,7 +275,7 @@ export async function handleResume(
   // Re-stamp the manifest as active with the new pid set.
   syncActiveManifest({ status: "active" });
 
-  // One-shot TL prompt banner (consumed by the next before_agent_start)
+  // The next before_agent_start appends a one-shot resume notice after the user message.
   teamCtx.resumedFrom = {
     teamName,
     sessionId: manifest.sessionId,
