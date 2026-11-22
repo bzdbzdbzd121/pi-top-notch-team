@@ -103,8 +103,9 @@ function shifted(char: string, shift: boolean): string {
  * 只多两件事：
  *   1. 接受 kitty 的 `:<event>` 后缀（pi 请求 flags=7，按键是 `CSI 47;2:1u`），
  *      且**只认 press（事件 1）**：release（3）不是按键输入，repeat（2）会让按住
- *      `?` 反复开关图例——`e`/`t` 走 `matchesKey` 天然不匹配 `:2`，命令键必须同样
- *      只触发一次，两边行为才一致；
+ *      `?` 反复开关图例。注意这是本键自己的取舍，不要当成与 `e`/`t` 的一致性论据
+ *      ——`matchesKey` 对 repeat 序列（如 `CSI 101;1:2u`）同样返回 true，`?` 比它们
+ *      更严格；
  *   2. 把「Shift + 基础符号」归一成用户实际打出的字符（`/` → `?`），kitty 与
  *      modifyOtherKeys 同一处理，不对美式布局做自相矛盾的假设。
  * legacy 原字符仍返回 undefined，由调用方用 `matchesKey` 兜底。

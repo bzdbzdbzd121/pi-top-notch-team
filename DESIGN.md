@@ -1362,7 +1362,7 @@ A full-keyboard overlay that lets the **user** inspect each Member's live conver
 7. **冻结提示的分钟数不会自己走**：冻结窗口的显示签名不变 → 不重绘 → `停在 N 分钟前` 只在下次因其它原因重绘时更新（按键、stats 轮询等）。这是「无变化不重绘」的代价，避免为一行文字常驻定时器。
 8. 同格合并：一格内多次动作只留最高优先级的一个，精确历史进成员页。
 9. 窄屏 D 级按「最近记录数」而不是时间，未来戳的记录在 D 级仍会出现（那一级没有时间轴，不会误读为「刚刚爆发」）。
-10. **命令键忽略 kitty 的 alternate（shifted）码位**：`decodeCommandChar` 只取基础码位（`CSI 49:33;2u` = Shift+`1` 解成 `1`，不取 `!`）。今天没有可见差异（`?` 靠 Shift + `/` 的基础码位与 Shift 修饰就能识别，`CS 63;2u` 也直接给结果码位）；**下一次给命令键加「Shift + 数字/符号」类快捷键时必须处理 alternate 字段**，否则会漏键。
+10. **命令键忽略 kitty 的 alternate（shifted）码位**：`decodeCommandChar` 只取基础码位（`CSI 49:33;2u` = Shift+`1` 解成 `1`，不取 `!`）。今天没有可见差异（`?` 靠 Shift + `/` 的基础码位与 Shift 修饰就能识别，`CSI 63;2u` 也直接给结果码位）；**下一次给命令键加「Shift + 数字/符号」类快捷键时必须处理 alternate 字段**，否则会漏键。
 
 **台账（已删除的东西，不要当 bug 改回来）**：旧图标轨迹 `buildOverviewTrail` / `buildOverviewLines` / `ICONS` / `MAX_TRAIL_ICONS` / `actionTotal` / `currentAction` 连同**服务它们的 62 条用例**已在 P3 收口时删除（`member-overview-state.ts` 239 → 130 行）；被取代的旧裁决是：**新在左的图标序列、最多 20 个图标、`(N)` 隐藏计数、无刻度行、无颜色说明（现在第一正文行是刻度行，颜色说明按 `?` 打开）**。**仍然有效**：不显示表头、不显示状态文字列、成员名与占用条、名册顺序不重排——这几条不要顺手改掉。
 
@@ -1388,7 +1388,7 @@ Overlay: `ctx.ui.custom(component, { overlay: true, overlayOptions: { width: "90
 | `ctrl+a` | 成员页 `abort` 当前成员；总览只提示先进入成员会话 |
 | `ctrl+b` / `ctrl+shift+a` | `abort` ALL executing members (working/compacting) in one shot; idle/stopped/crashed are skipped. `ctrl+shift+a` requires Kitty keyboard protocol — legacy terminals send the same byte as `ctrl+a` (single abort), so `ctrl+b` remains the all-terminal key |
 | `ctrl+o` | 成员页 `compact` 当前成员；总览只提示先进入成员会话。NOT ctrl+m — indistinguishable from Enter in terminals |
-| `?` | 总览：就地切换底栏颜色说明（不新增行；9 个 2 字词按类着色，放不下从右删整项）；再按一次恢复。**必须经 `decodeCommandChar`**：legacy `?`、kitty `CSI 63;2u`/`CSI 47;2u`/`CSI 47;2:1u`/`CSI 63u`、modifyOtherKeys `CSI 27;2;63~`/`CSI 27;2;47~` 都生效；kitty release（`:<3>`）不触发。成员页无绑定 |
+| `?` | 总览：就地切换底栏颜色说明（不新增行；9 个 2 字词按类着色，放不下从右删整项）；再按一次恢复。**必须经 `decodeCommandChar`**：legacy `?`、kitty `CSI 63;2u`/`CSI 47;2u`/`CSI 47;2:1u`/`CSI 63u`、modifyOtherKeys `CSI 27;2;63~`/`CSI 27;2;47~` 都生效；kitty **只认 press**——release（`:<3>`）与 repeat（`:<2>`，按住不放）都不触发，避免图例反复开关。成员页无绑定 |
 | `Esc` | Layered exit: input box → overlay |
 
 ### Rendering Granularity
