@@ -11,7 +11,7 @@ function setup(names = members, isCompacting?: (name: string) => boolean) {
     sendCommandAndWait: vi.fn(async (cmd: any) => ({ success: true, data: cmd.type === "get_session_stats" ? { contextUsage: { percent: 42, tokens: 420, contextWindow: 1000 } } : { entries: [], leafId: null } })),
   }]));
   const state = new MemberInspectorState(names);
-  const deps = { getMembers: () => names, getHandle: (name: string) => handles.get(name) as any, memberOpsStates: new Map(names.map(m => [m.name, "working" as const])), getRecentActions: () => [{ id: 1, kind: "read" as const, status: "done" as const }], getActionCount: undefined as ((name: string) => number) | undefined, isCompacting };
+  const deps = { getMembers: () => names, getHandle: (name: string) => handles.get(name) as any, memberOpsStates: new Map(names.map(m => [m.name, "working" as const])), getRecentActions: () => [{ id: 1, kind: "read" as const, status: "done" as const, at: 0 }], getActionCount: undefined as ((name: string) => number) | undefined, isCompacting };
   const tui = { requestRender: vi.fn() };
   const comp = new MemberInspectorComponent(tui, { fg: (_: string, s: string) => s, bold: (s: string) => s }, vi.fn(), deps, state);
   return { comp, state, handles, deps, tui };
@@ -59,7 +59,7 @@ describe("Member Inspector overview integration", () => {
 
   it("keeps the hidden counter growing beyond 45 with a bounded 64-entry history", async () => {
     const { comp, deps, tui } = setup();
-    deps.getRecentActions = () => Array.from({ length: 64 }, (_, id) => ({ id, kind: "read" as const, status: "done" as const }));
+    deps.getRecentActions = () => Array.from({ length: 64 }, (_, id) => ({ id, kind: "read" as const, status: "done" as const, at: 0 }));
     let total = 64;
     deps.getActionCount = () => total;
     expect(comp.render(200)[3]).toContain("(45)");

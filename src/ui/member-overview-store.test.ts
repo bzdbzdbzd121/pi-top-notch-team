@@ -6,6 +6,14 @@ const delta = (type: string, contentIndex = 0, extra: object = {}) => ({
 });
 const tool = (type: string, toolCallId?: string, toolName = "read", extra: object = {}) =>
   ({ type: `tool_execution_${type}`, toolCallId, toolName, ...extra });
+/** Injected clock: every timestamp assertion below is deterministic. */
+const fakeClock = (start = 1_000) => {
+  let now = start;
+  return {
+    now: () => now,
+    set: (value: number) => { now = value; },
+  };
+};
 
 describe("member overview store", () => {
   it("agent_start does not fabricate thinking; ignores bad/unknown events", () => {
@@ -51,17 +59,20 @@ describe("member overview store", () => {
   });
 
   it("updates generation → execution → failure in the same action ID, without storing parameters", () => {
-    const s = createMemberOverviewStore();
+    const clock = fakeClock(1_000);
+    const s = createMemberOverviewStore({ clock: clock.now });
     expect(s.onEvent("a", delta("toolcall_start"))).toBe(false);
     expect(s.onEvent("a", delta("toolcall_end", 0, { toolCall: { id: "t1", name: "read", arguments: { secret: "private" } } }))).toBe(true);
     const id = s.getRecentActions("a")[0].id;
     expect(s.getRecentActions("a")[0].kind).toBe("tool");
+    clock.set(1_100);
     expect(s.onEvent("a", tool("start", "t1"))).toBe(true);
-    expect(s.getRecentActions("a")[0]).toEqual({ id, kind: "read", status: "active", toolName: "read" });
+    expect(s.getRecentActions("a")[0]).toEqual({ id, kind: "read", status: "active", toolName: "read", at: 1_000 });
     expect(s.onEvent("a", tool("update", "t1", "read", { partialResult: "private" }))).toBe(false);
+    clock.set(1_200);
     expect(s.onEvent("a", tool("end", "t1", "read", { isError: true, result: "private" }))).toBe(true);
     expect(s.onEvent("a", { type: "message_end", message: { role: "toolResult", toolCallId: "t1", isError: true } })).toBe(false);
-    expect(s.getRecentActions("a")).toEqual([{ id, kind: "read", status: "error", toolName: "read" }]);
+    expect(s.getRecentActions("a")).toEqual([{ id, kind: "read", status: "error", toolName: "read", at: 1_000, endedAt: 1_200 }]);
   });
 
   it("supports ID exposed on start/partial without retaining the original event", () => {
@@ -320,5 +331,178 @@ describe("member overview store", () => {
     expect(s.getRecentActions("c")).toEqual([]);
     s.clear();
     expect(s.getRecentActions("a")).toEqual([]);
+  });
+});
+
+describe("member overview store timeline data (P1)", () => {
+  it("stamps every record on arrival and gives point events a zero-length interval", () => {
+    const clock = fakeClock(1_000);
+    const s = createMemberOverviewStore({ clock: clock.now });
+
+    // Records appended already terminal own exactly the cell at their start.
+    expect(s.onEvent("a", { type: "agent_end" })).toBe(true);
+    expect(s.getRecentActions("a")[0]).toEqual({ id: 1, kind: "complete", status: "done", at: 1_000, endedAt: 1_000 });
+    clock.set(1_500);
+    expect(s.onEvent("a", { type: "process_exit", exitCode: 0 })).toBe(true);
+    expect(s.getRecentActions("a")[1]).toEqual({ id: 2, kind: "stopped", status: "done", at: 1_500, endedAt: 1_500 });
+    clock.set(2_000);
+    expect(s.onEvent("b", { type: "process_error" })).toBe(true);
+    expect(s.getRecentActions("b")[0]).toEqual({ id: 3, kind: "crashed", status: "error", at: 2_000, endedAt: 2_000 });
+    clock.set(2_500);
+    expect(s.onEvent("c", { type: "compaction_end", result: { summary: "committed" } })).toBe(true);
+    expect(s.getRecentActions("c")[0]).toEqual({ id: 4, kind: "compacting", status: "done", at: 2_500, endedAt: 2_500 });
+  });
+
+  it("writes an end time exactly once, even when the record transitions again", () => {
+    const clock = fakeClock(1_000);
+    const s = createMemberOverviewStore({ clock: clock.now });
+    expect(s.onEvent("a", tool("start", "t1"))).toBe(true);
+    clock.set(1_100);
+    expect(s.onEvent("a", tool("end", "t1"))).toBe(true);
+    clock.set(1_200);
+    // A late toolResult upgrades the status but must never move the recorded end.
+    expect(s.onEvent("a", { type: "message_end", message: { role: "toolResult", toolCallId: "t1", isError: true } })).toBe(true);
+    expect(s.getRecentActions("a")[0]).toEqual({ id: 1, kind: "read", status: "error", toolName: "read", at: 1_000, endedAt: 1_100 });
+    clock.set(1_300);
+    expect(s.onEvent("a", tool("end", "t1"))).toBe(false);
+    expect(s.getRecentActions("a")[0].endedAt).toBe(1_100);
+  });
+
+  it("clamps a backward clock jump without negative intervals, reordering, or lost events", () => {
+    const clock = fakeClock(10_000_000);
+    const s = createMemberOverviewStore({ clock: clock.now });
+    s.onEvent("a", { type: "agent_start" });
+    s.onEvent("a", delta("thinking_start"));
+    clock.set(10_000_000 - 3_600_000); // an hour backwards, e.g. an NTP correction
+    expect(s.onEvent("a", delta("text_start", 1))).toBe(true);
+    expect(s.onEvent("b", tool("start", "t"))).toBe(true);
+    s.onEvent("a", delta("thinking_end"));
+    s.onEvent("a", { type: "agent_end" });
+    const [thinking, output] = s.getRecentActions("a");
+    expect(thinking.at).toBe(10_000_000);
+    expect(thinking.endedAt).toBe(10_000_000);
+    expect(output.at - thinking.at).toBe(0);
+    // One global clamp keeps cross-member order, not one clamp per member.
+    expect(s.getRecentActions("b")[0].at).toBe(10_000_000);
+    expect(s.getActionCount("a")).toBe(3);
+    expect(s.getActionCount("b")).toBe(1);
+    expect(s.getTimelineInfo("a").turns).toEqual([[10_000_000, 10_000_000]]);
+    expect(s.getLastActivityAt()).toBe(10_000_000);
+  });
+
+  it("reports the observation horizon, truncation, and open turn", () => {
+    const clock = fakeClock(1_000);
+    const s = createMemberOverviewStore({ clock: clock.now });
+    expect(s.getTimelineInfo("never-started")).toEqual({ truncated: false, turns: [] });
+
+    s.onEvent("a", { type: "process_started" });
+    expect(s.getTimelineInfo("a")).toEqual({ knownFrom: 1_000, truncated: false, turns: [] });
+    clock.set(1_200);
+    s.onEvent("a", tool("start", "r1"));
+    expect(s.getTimelineInfo("a").knownFrom).toBe(1_000);
+    expect(s.getTimelineInfo("a").truncated).toBe(false);
+
+    // Overflow the bounded ring: the trusted horizon moves to the oldest survivor.
+    for (let i = 0; i < 70; i++) s.onEvent("a", tool("start", `burst-${i}`));
+    const info = s.getTimelineInfo("a");
+    expect(s.getRecentActions("a")).toHaveLength(64);
+    expect(s.getActionCount("a")).toBe(71);
+    expect(info.truncated).toBe(true);
+    expect(info.knownFrom).toBe(s.getRecentActions("a")[0].at);
+    expect(info.knownFrom).toBe(1_200);
+
+    // Keeping the member must not reset its evidence.
+    s.syncMembers(["a"]);
+    expect(s.getTimelineInfo("a")).toMatchObject({ knownFrom: 1_200, truncated: true });
+  });
+
+  it("keeps closed turn intervals ascending and bounded to the recent window", () => {
+    const clock = fakeClock(1_000);
+    const s = createMemberOverviewStore({ clock: clock.now });
+    for (let i = 0; i < 20; i++) {
+      clock.set(1_000 + i * 100);
+      s.onEvent("a", { type: "agent_start" });
+      clock.set(1_050 + i * 100);
+      s.onEvent("a", { type: "agent_end" });
+    }
+    const info = s.getTimelineInfo("a");
+    expect(info.turns).toHaveLength(16);
+    expect(info.openTurnStart).toBeUndefined();
+    expect(info.turns[15]).toEqual([2_900, 2_950]);
+    for (let i = 1; i < info.turns.length; i++)
+      expect(info.turns[i][0]).toBeGreaterThanOrEqual(info.turns[i - 1][1]);
+  });
+
+  it("closes the open turn and active records on process death, and does not resurrect them", () => {
+    const clock = fakeClock(1_000);
+    const s = createMemberOverviewStore({ clock: clock.now });
+    s.onEvent("a", { type: "agent_start" });
+    clock.set(1_100);
+    s.onEvent("a", delta("thinking_start"));
+    clock.set(1_400);
+    s.onEvent("a", { type: "process_exit", exitCode: 1 });
+    expect(s.getRecentActions("a")).toEqual([
+      { id: 1, kind: "thinking", status: "error", at: 1_100, endedAt: 1_400 },
+      { id: 2, kind: "crashed", status: "error", at: 1_400, endedAt: 1_400 },
+    ]);
+    const afterDeath = s.getTimelineInfo("a");
+    expect(afterDeath).toEqual({ knownFrom: 1_000, truncated: false, turns: [[1_000, 1_400]] });
+    clock.set(1_800);
+    s.onEvent("a", { type: "process_started" });
+    expect(s.getTimelineInfo("a")).toEqual({ knownFrom: 1_000, truncated: false, turns: [[1_000, 1_400]] });
+  });
+
+  it("re-opens cleanly after a turn whose end was never observed", () => {
+    const clock = fakeClock(1_000);
+    const s = createMemberOverviewStore({ clock: clock.now });
+    s.onEvent("a", { type: "agent_start" });
+    clock.set(1_500);
+    s.onEvent("a", { type: "agent_start" });
+    expect(s.getTimelineInfo("a").turns).toEqual([[1_000, 1_500]]);
+    expect(s.getTimelineInfo("a").openTurnStart).toBe(1_500);
+  });
+
+  it("tracks the team-wide last activity for the frozen-window anchor", () => {
+    const clock = fakeClock(1_000);
+    const s = createMemberOverviewStore({ clock: clock.now });
+    expect(s.getLastActivityAt()).toBeUndefined();
+    s.onEvent("a", { type: "agent_start" }); // observation only, no record
+    expect(s.getLastActivityAt()).toBeUndefined();
+    clock.set(1_200);
+    s.onEvent("a", delta("thinking_start"));
+    expect(s.getLastActivityAt()).toBe(1_200);
+    clock.set(1_400);
+    s.onEvent("b", tool("start", "t"));
+    expect(s.getLastActivityAt()).toBe(1_400);
+    clock.set(1_600);
+    s.onEvent("a", delta("thinking_end")); // the end extends the latest activity
+    expect(s.getLastActivityAt()).toBe(1_600);
+    clock.set(1_800);
+    s.onEvent("a", { type: "agent_start" });
+    expect(s.getLastActivityAt()).toBe(1_600);
+    s.syncMembers(["a"]);
+    expect(s.getLastActivityAt()).toBe(1_600);
+    s.clear();
+    expect(s.getLastActivityAt()).toBeUndefined();
+  });
+
+  it("returns immutable timeline snapshots", () => {
+    const s = createMemberOverviewStore({ clock: fakeClock(1_000).now });
+    s.onEvent("a", { type: "agent_start" });
+    s.onEvent("a", { type: "agent_end" });
+    const info = s.getTimelineInfo("a");
+    expect(Object.isFrozen(info)).toBe(true);
+    expect(Object.isFrozen(info.turns)).toBe(true);
+    expect(Object.isFrozen(info.turns[0])).toBe(true);
+    expect(Object.isFrozen(s.getTimelineInfo("absent"))).toBe(true);
+  });
+
+  it("falls back to the wall clock when no clock is injected", () => {
+    const s = createMemberOverviewStore();
+    const before = Date.now();
+    s.onEvent("a", tool("start", "t"));
+    const at = s.getRecentActions("a")[0].at;
+    expect(at).toBeGreaterThanOrEqual(before);
+    expect(at).toBeLessThanOrEqual(Date.now());
   });
 });

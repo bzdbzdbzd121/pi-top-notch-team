@@ -11,7 +11,7 @@ const row = (name: string, patch: Partial<OverviewRow> = {}): OverviewRow => ({
   name, label: name, state: "working", percent: 42, actions: [], ...patch,
 });
 const actions = (...kinds: OverviewAction["kind"][]): OverviewAction[] =>
-  kinds.map((kind, id) => ({ id, kind, status: "done" }));
+  kinds.map((kind, id) => ({ id, kind, status: "done", at: 0 }));
 const plain = (rows: OverviewRow[], width = 100) =>
   buildOverviewLines(rows, undefined, 0, rows.length, width).map(stripAnsi);
 const members = Array.from({ length: 24 }, (_, i) => ({ name: `m${i}`, label: `成员${i}` }));
@@ -58,7 +58,7 @@ describe("overview rows", () => {
   it("uses the current active read as the leftmost status without duplicating that operation", () => {
     const line = plain([row("开发", {
       phase: "executing",
-      actions: [{ id: 1, kind: "thinking", status: "done" }, { id: 2, kind: "read", status: "active" }],
+      actions: [{ id: 1, kind: "thinking", status: "done", at: 0 }, { id: 2, kind: "read", status: "active", at: 0 }],
     })])[0];
     expect(icons(line)).toEqual(["📖", "💭"]);
   });
@@ -254,7 +254,7 @@ describe("newest-first action icons", () => {
     const trail = stripAnsi(buildOverviewTrail(history, 200, undefined, undefined, 120));
     expect(icons(trail)).toHaveLength(20);
     expect(trail).toContain("(100)");
-    const active = [...history.slice(0, -1), { id: 100, kind: "read" as const, status: "active" as const }];
+    const active = [...history.slice(0, -1), { id: 100, kind: "read" as const, status: "active" as const, at: 0 }];
     const line = plain([row("开发员", { phase: "executing", actions: active, actionCount: 120 })], 200)[0];
     expect(icons(line)).toHaveLength(20);
     expect(icons(line)[0]).toBe("📖");
@@ -275,9 +275,9 @@ describe("newest-first action icons", () => {
   it("underlines active/failed actions, without exposing tool names", () => {
     const theme = { fg: (c: string, s: string) => `\x1b[${c === "error" ? "31" : "36"}m${s}\x1b[0m` };
     const trail = buildOverviewTrail([
-      { id: 1, kind: "read", status: "active", toolName: "secret-path" },
-      { id: 2, kind: "modify", status: "error" },
-      { id: 3, kind: "complete", status: "done" },
+      { id: 1, kind: "read", status: "active", toolName: "secret-path", at: 0 },
+      { id: 2, kind: "modify", status: "error", at: 0 },
+      { id: 3, kind: "complete", status: "done", at: 0 },
     ], 20, theme);
     expect(stripAnsi(trail)).toBe("✅ 📝 📖");
     expect(trail.match(/\x1b\[4m/g)).toHaveLength(2);

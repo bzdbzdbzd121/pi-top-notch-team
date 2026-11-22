@@ -7,6 +7,31 @@ export interface OverviewAction {
   readonly kind: OverviewActionKind;
   readonly status: "active" | "done" | "error";
   readonly toolName?: string;
+  /** Arrival instant of the recording event, clamped to never move backwards. */
+  readonly at: number;
+  /**
+   * Instant the record stopped being active. Written exactly once. Records that
+   * are appended already terminal (complete / crashed / stopped and a repaired
+   * compaction) carry `endedAt === at`: they occupy the cell at their start.
+   */
+  readonly endedAt?: number;
+}
+
+/** Timeline evidence for one member. P1 exposes data only; nothing here renders. */
+export interface TimelineInfo {
+  /** Earliest instant with trusted observation; earlier cells are unobserved. */
+  readonly knownFrom?: number;
+  /** True once the bounded ring dropped records (session total > retained). */
+  readonly truncated: boolean;
+  /** Closed turns in ascending order, at most TURN_CAPACITY entries. */
+  readonly turns: readonly (readonly [number, number])[];
+  /** Start of the turn that has no end yet (drives the "waiting" state). */
+  readonly openTurnStart?: number;
+}
+
+export interface MemberOverviewStoreOptions {
+  /** Injectable clock; deterministic tests pass a fake, production uses Date.now. */
+  clock?: () => number;
 }
 
 export interface MemberOverviewStore {
@@ -16,6 +41,10 @@ export interface MemberOverviewStore {
   getActionCount(name: string): number;
   /** Confirmed member-side compaction, independent of dispatch reservations. */
   isCompacting(name: string): boolean;
+  /** Observation horizon, truncation flag, and turn intervals for the timeline. */
+  getTimelineInfo(name: string): TimelineInfo;
+  /** Latest instant any member recorded activity; undefined before the first record. */
+  getLastActivityAt(): number | undefined;
   syncMembers(names: readonly string[]): void;
   clear(): void;
   /** Only confirmed physical compaction; never the dispatch reservation. */
@@ -25,7 +54,13 @@ export interface MemberOverviewStore {
 const CAPACITY = 64;
 const MAX_TOOL_ID = 256;
 const MAX_TOOL_NAME = 80;
+/** Recent turn intervals kept per member; older turns fall out of the window anyway. */
+const TURN_CAPACITY = 16;
 const EMPTY: readonly OverviewAction[] = Object.freeze([]);
+const EMPTY_TIMELINE: TimelineInfo = Object.freeze({
+  truncated: false,
+  turns: Object.freeze([]) as readonly (readonly [number, number])[],
+});
 type BlockKind = "thinking" | "output" | "tool";
 interface Entry {
   action: OverviewAction;
@@ -51,6 +86,12 @@ interface Member {
   compactionEnded: boolean;
   compactionTurn: boolean;
   compaction?: Entry;
+  /** First instant this member was observed at all; survives restarts and eviction. */
+  firstObservedAt: number;
+  /** Closed turn intervals, oldest first, bounded by TURN_CAPACITY. */
+  turns: { start: number; end: number }[];
+  /** Start of the open turn, or undefined when no turn is running. */
+  turnStart?: number;
 }
 
 function toolId(value: unknown): string | undefined {
@@ -68,9 +109,35 @@ function failed(event: any): boolean {
 }
 
 /** Team-session display storage. No RPC, timers, control-plane writes, or raw payload retention. */
-export function createMemberOverviewStore(): MemberOverviewStore {
+export function createMemberOverviewStore(options: MemberOverviewStoreOptions = {}): MemberOverviewStore {
+  const clock = options.clock ?? Date.now;
   const members = new Map<string, Member>();
   let nextId = 1;
+  // One global monotonic clamp. Per-member clamps would let member A's corrected
+  // timestamp overtake member B's, which inverts the shared timeline.
+  let lastStamp = 0;
+  let lastActivityAt: number | undefined;
+
+  /** Monotonic "now": a backward clock jump compresses events onto the current instant. */
+  function stamp(): number {
+    const now = clock();
+    if (Number.isFinite(now) && now > lastStamp) lastStamp = now;
+    return lastStamp;
+  }
+  function noteActivity(at: number): void {
+    if (lastActivityAt === undefined || at > lastActivityAt) lastActivityAt = at;
+  }
+  function closeTurn(m: Member): void {
+    if (m.turnStart === undefined) return;
+    m.turns.push({ start: m.turnStart, end: stamp() });
+    if (m.turns.length > TURN_CAPACITY) m.turns.shift();
+    m.turnStart = undefined;
+  }
+  function openTurn(m: Member): void {
+    // A run that started before the previous end was observed closes it here.
+    closeTurn(m);
+    m.turnStart = stamp();
+  }
 
   function member(name: string): Member {
     let m = members.get(name);
@@ -80,6 +147,7 @@ export function createMemberOverviewStore(): MemberOverviewStore {
         blocks: new Map(), tools: new Map(), evicted: { thinking: -1, output: -1, tool: -1 },
         ended: false, messageClosed: false, dead: false,
         compacting: false, compactionEnded: false, compactionTurn: false,
+        firstObservedAt: stamp(), turns: [],
       };
       members.set(name, m);
     }
@@ -92,10 +160,17 @@ export function createMemberOverviewStore(): MemberOverviewStore {
   }
   function append(m: Member, kind: OverviewActionKind, status: OverviewAction["status"], name?: string): Entry {
     m.totalCount++;
+    const at = stamp();
     const entry: Entry = {
-      action: Object.freeze({ id: nextId++, kind, status, ...(name ? { toolName: name } : {}) }),
+      action: Object.freeze({
+        id: nextId++, kind, status,
+        ...(name ? { toolName: name } : {}),
+        at,
+        ...(status === "active" ? {} : { endedAt: at }),
+      }),
       live: true,
     };
+    noteActivity(at);
     if (m.count === CAPACITY) {
       const old = m.ring[m.head]!;
       old.live = false;
@@ -112,11 +187,28 @@ export function createMemberOverviewStore(): MemberOverviewStore {
     }
     return entry;
   }
-  function update(entry: Entry | undefined, patch: Partial<Omit<OverviewAction, "id">>): boolean {
+  function update(
+    entry: Entry | undefined,
+    patch: Partial<Pick<OverviewAction, "kind" | "status" | "toolName">>,
+  ): boolean {
     if (!entry?.live) return false;
-    const next = { ...entry.action, ...patch };
-    if (next.kind === entry.action.kind && next.status === entry.action.status && next.toolName === entry.action.toolName) return false;
-    entry.action = Object.freeze(next);
+    const current = entry.action;
+    const kind = patch.kind ?? current.kind;
+    const status = patch.status ?? current.status;
+    // Time fields are owned here: `at` never moves, and the end is written once
+    // even if a later terminal update changes the status again.
+    const endedAt = current.endedAt ??
+      (current.status === "active" && status !== "active" ? stamp() : undefined);
+    const toolName = patch.toolName ?? current.toolName;
+    if (kind === current.kind && status === current.status &&
+      toolName === current.toolName && endedAt === current.endedAt) return false;
+    entry.action = Object.freeze({
+      id: current.id, kind, status,
+      ...(toolName ? { toolName } : {}),
+      at: current.at,
+      ...(endedAt !== undefined ? { endedAt } : {}),
+    });
+    if (current.endedAt === undefined && endedAt !== undefined) noteActivity(endedAt);
     return true;
   }
   function close(m: Member, status: "done" | "error", includeCompaction = false): boolean {
@@ -202,6 +294,7 @@ export function createMemberOverviewStore(): MemberOverviewStore {
         if (m.dead) return false;
         const normal = type === "process_exit" && [0, 143, null].includes(event.exitCode);
         close(m, normal ? "done" : "error", true);
+        closeTurn(m);
         m.blocks.clear();
         m.tools.clear();
         m.compacting = false;
@@ -214,6 +307,7 @@ export function createMemberOverviewStore(): MemberOverviewStore {
       }
       if (type === "process_start" || type === "process_started") {
         const changed = close(m, "done", true);
+        closeTurn(m);
         resetProcess(m);
         m.compacting = m.compactionEnded = m.compactionTurn = false;
         m.compaction = undefined;
@@ -223,12 +317,14 @@ export function createMemberOverviewStore(): MemberOverviewStore {
         const changed = close(m, "done");
         resetProcess(m);
         m.compactionTurn = m.compacting;
+        openTurn(m);
         return changed;
       }
       if (m.dead || m.ended) return false;
       if (type === "agent_end") {
         m.ended = m.messageClosed = true;
         const changed = close(m, "done");
+        closeTurn(m);
         if (m.compacting || m.compactionTurn) return changed;
         append(m, "complete", "done");
         return true;
@@ -286,11 +382,29 @@ export function createMemberOverviewStore(): MemberOverviewStore {
     },
     getActionCount(name) { return members.get(name)?.totalCount ?? 0; },
     isCompacting(name) { return members.get(name)?.compacting ?? false; },
+    getTimelineInfo(name) {
+      const m = members.get(name);
+      if (!m) return EMPTY_TIMELINE;
+      // Truncation moves the trusted horizon to the oldest surviving record;
+      // without it, observation is trusted from the first event we ever saw.
+      const truncated = m.totalCount > m.count;
+      const oldest = m.count > 0 ? m.ring[m.head]!.action.at : undefined;
+      const knownFrom = truncated && oldest !== undefined ? oldest : m.firstObservedAt;
+      return Object.freeze({
+        knownFrom,
+        truncated,
+        turns: Object.freeze(m.turns.map(turn => Object.freeze([turn.start, turn.end] as const))),
+        ...(m.turnStart !== undefined ? { openTurnStart: m.turnStart } : {}),
+      });
+    },
+    getLastActivityAt() { return lastActivityAt; },
     syncMembers(names) {
       const keep = new Set(names);
       for (const name of members.keys()) if (!keep.has(name)) members.delete(name);
     },
-    clear() { members.clear(); },
+    // Session-level reset. `lastStamp` stays monotonic on purpose: a store never
+    // lets its clock run backwards, not even across a clear.
+    clear() { members.clear(); lastActivityAt = undefined; },
     markCompacting(name, active) { return compaction(member(name), active); },
   };
 
