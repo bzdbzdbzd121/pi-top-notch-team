@@ -83,17 +83,23 @@ export const FALLBACK_16: Record<OpClass, number> = Object.freeze({
  * Three-layer colour resolution: theme token → fixed RGB (truecolor/256) →
  * basic 16-colour SGR. Any failure degrades instead of throwing — `theme.getFgAnsi`
  * throws for unknown tokens and pi's render loop has no boundary guard.
+ *
+ * `mode: "none"` means colour is explicitly off, so nothing is emitted: writing
+ * basic ANSI anyway would contradict the caller and add bytes to every frame.
+ * The 16-colour layer is only the fallback for a mode we cannot recognise.
  */
 export function resolveAnsi(cls: OpClass, source: PaletteSource): string {
   const token = OP_TOKEN[cls];
   const mode = source.mode;
-  if ((mode === "truecolor" || mode === "256color") && token) {
-    try {
-      const direct = source.ansi(token);
-      // An empty string carries no escape at all; treat it as unavailable.
-      if (typeof direct === "string" && direct.length > 0) return direct;
-    } catch {
-      /* fall through to the fixed palette */
+  if (mode === "truecolor" || mode === "256color") {
+    if (token) {
+      try {
+        const direct = source.ansi(token);
+        // An empty string carries no escape at all; treat it as unavailable.
+        if (typeof direct === "string" && direct.length > 0) return direct;
+      } catch {
+        /* fall through to the fixed palette */
+      }
     }
     const rgb = FALLBACK_RGB[cls];
     if (rgb) {
@@ -102,6 +108,7 @@ export function resolveAnsi(cls: OpClass, source: PaletteSource): string {
         : `\x1b[38;5;${rgbToAnsi256(rgb)}m`;
     }
   }
+  if (mode === "none") return "";
   const basic = FALLBACK_16[cls];
   return Number.isSafeInteger(basic) ? `\x1b[${basic}m` : "";
 }

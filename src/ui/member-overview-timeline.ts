@@ -1,11 +1,11 @@
 import { visibleWidth } from "@earendil-works/pi-tui";
 import {
-  BADGE_WIDTH, badgeText, pickTier, statusWord, type BadgeTier,
+  BADGE_WIDTH, badgeText, pickTier, statusClass, statusWord, type BadgeTier, type StatusWord,
 } from "./member-overview-badge";
 import { IDENTITY_THEME, type InspectorTheme } from "./member-inspector-state";
 import {
-  contextBar, duplicateLabels, fit, getOverviewWindowOffset, memberLabel, shorten,
-  type OverviewRow,
+  MARKER_WIDTH, contextBar, duplicateLabels, fit, getOverviewWindowOffset, markerFor,
+  memberLabel, memberNameWidth, shorten, type OverviewRow,
 } from "./member-overview-state";
 import { resolveAnsi, type OpClass, type PaletteSource } from "./member-overview-palette";
 import type { OverviewAction, TimelineInfo } from "./member-overview-store";
@@ -141,7 +141,6 @@ export function paintLane(
   const count = size(window.cells);
   if (!count) return [];
   const classes: (OpClass | undefined)[] = new Array(count);
-  const ranks: number[] = new Array(count).fill(Number.NEGATIVE_INFINITY);
   const owners: (number | undefined)[] = new Array(count);
 
   const cover = (from: number, to: number): [number, number] | undefined => {
@@ -152,14 +151,12 @@ export function paintLane(
     const hi = Math.min(count - 1, Math.max(first, last));
     return lo <= hi ? [lo, hi] : undefined;
   };
+  // Resolve the priority once per lane instead of once per (record × cell): sort the
+  // candidates strongest-first and let the first write own the cell. Stable sort
+  // keeps record order for equal ranks, so the earliest record still wins ties.
+  const candidates: { rank: number; cls: OpClass; owner: number; lo: number; hi: number }[] = [];
   const consider = (range: [number, number], rank: number, cls: OpClass, owner: number): void => {
-    for (let index = range[0]; index <= range[1]; index++) {
-      if (rank > ranks[index]!) {
-        ranks[index] = rank;
-        classes[index] = cls;
-        owners[index] = owner;
-      }
-    }
+    candidates.push({ rank, cls, owner, lo: range[0], hi: range[1] });
   };
 
   for (const action of actions) {
@@ -183,6 +180,17 @@ export function paintLane(
     if (info.openTurnStart !== undefined && Number.isFinite(info.openTurnStart) && info.openTurnStart >= 0) {
       const range = cover(info.openTurnStart, rightEdge);
       if (range) consider(range, PRIORITY.busySilent, "busySilent", -1);
+    }
+  }
+  if (candidates.length > 1) candidates.sort((a, b) => b.rank - a.rank);
+  let free = count;
+  for (const candidate of candidates) {
+    if (!free) break; // the lane is fully resolved — nothing can win any more
+    for (let index = candidate.lo; index <= candidate.hi; index++) {
+      if (classes[index] !== undefined) continue;
+      classes[index] = candidate.cls;
+      owners[index] = candidate.owner;
+      free--;
     }
   }
 
@@ -267,6 +275,43 @@ export function buildLaneText(cells: readonly LaneCell[], source?: PaletteSource
   })));
 }
 
+/** Status word in its semantic colour; plain text when colour is unavailable. */
+function badge(word: StatusWord, tier: BadgeTier, source?: PaletteSource): string {
+  const text = badgeText(word, tier);
+  if (!source) return text;
+  const prefix = resolveAnsi(statusClass(word), source);
+  return prefix ? `${prefix}${text}${FOREGROUND_RESET}` : text;
+}
+
+/** `?` legend (§3.6): one word per class, dropped from the right until it fits. */
+export const LEGEND_ITEMS: readonly { readonly word: string; readonly cls: OpClass }[] = Object.freeze([
+  { word: "思考", cls: "thinking" },
+  { word: "读取", cls: "read" },
+  { word: "写入", cls: "modify" },
+  { word: "执行", cls: "tool" },
+  { word: "输出", cls: "output" },
+  { word: "压缩", cls: "compact" },
+  { word: "崩溃", cls: "crash" },
+  { word: "停止", cls: "stop" },
+  { word: "空闲", cls: "idle" },
+]);
+export const LEGEND_GAP = "  ";
+
+export function buildColorLegend(width: number, source?: PaletteSource): string {
+  const total = size(width);
+  if (!total) return "";
+  const styled = LEGEND_ITEMS.map(item => {
+    if (!source) return item.word;
+    const prefix = resolveAnsi(item.cls, source);
+    return prefix ? `${prefix}${item.word}${FOREGROUND_RESET}` : item.word;
+  });
+  for (let count = styled.length; count > 0; count--) {
+    const text = styled.slice(0, count).join(LEGEND_GAP);
+    if (visibleWidth(text) <= total) return fit(text, total);
+  }
+  return " ".repeat(total);
+}
+
 function pad2(value: number): string {
   return String(value).padStart(2, "0");
 }
@@ -332,18 +377,24 @@ export interface TimelineView {
   palette?: PaletteSource;
 }
 
-/** Name column width (§C): the same formula as the icon trail, without the counter reserve. */
-export function timelineNameWidth(width: number): number {
-  return Math.min(18, Math.max(4, Math.floor(size(width) / 6)));
-}
-
-/** Columns before the lane: marker + name + gaps + badge + context. */
+/** Columns before the lane: marker + name + gaps + badge + context (§C). */
 export function timelinePrefixWidth(nameWidth: number, badgeWidth: number): number {
-  return 2 + nameWidth + 1 + badgeWidth + 1 + TIMELINE_CONTEXT_WIDTH + 1;
+  return MARKER_WIDTH + nameWidth + 1 + badgeWidth + 1 + TIMELINE_CONTEXT_WIDTH + 1;
 }
 
 export function timelineLaneWidth(width: number, badgeWidth: number): number {
-  return size(width) - timelinePrefixWidth(timelineNameWidth(width), badgeWidth);
+  return size(width) - timelinePrefixWidth(memberNameWidth(width), badgeWidth);
+}
+
+/** Fallback layout: name field plus the colour-block columns that remain. */
+export interface FallbackLayout { readonly nameWidth: number; readonly blocks: number }
+
+export function fallbackLayout(width: number, badgeWidth: number = BADGE_WIDTH[2]): FallbackLayout {
+  const total = size(width);
+  // marker + gap + badge + gap
+  const fixed = MARKER_WIDTH + 1 + badgeWidth + 1;
+  const nameWidth = Math.min(memberNameWidth(total), Math.max(0, total - fixed));
+  return { nameWidth, blocks: Math.max(0, total - fixed - nameWidth) };
 }
 
 export function timelineTier(width: number): BadgeTier | "fallback" {
@@ -389,11 +440,6 @@ function wordOf(row: TimelineRow) {
   });
 }
 
-function markerFor(selected: boolean, width: number): string {
-  if (width > 1) return selected ? "› " : "  ";
-  return width === 1 ? (selected ? "›" : " ") : "";
-}
-
 /** Newest record on the left, one block per record (degraded narrow mode, §3.8). */
 function buildBlockText(
   actions: readonly OverviewAction[], limit: number, source?: PaletteSource,
@@ -414,11 +460,7 @@ function buildFallbackLines(
   rows: readonly TimelineRow[], selectedName: string | undefined, offset: number,
   height: number, width: number, theme: InspectorTheme, view: TimelineView,
 ): string[] {
-  const badgeWidth = BADGE_WIDTH[2];
-  // marker + gap + badge + gap; the rest is name + blocks, split by the shared name formula.
-  const fixed = 2 + 1 + badgeWidth + 1;
-  const nameWidth = Math.min(timelineNameWidth(width), Math.max(0, width - fixed));
-  const blocks = Math.max(0, width - fixed - nameWidth);
+  const { nameWidth, blocks } = fallbackLayout(width);
   const start = getOverviewWindowOffset(rows, selectedName, offset, height);
   const duplicates = duplicateLabels(rows);
   const lines: string[] = [];
@@ -433,6 +475,56 @@ function buildFallbackLines(
   }
   while (lines.length < height) lines.push(" ".repeat(width));
   return lines;
+}
+
+/** True when the row after the axis is the first member. */
+export function timelineAxisVisible(height: number, width: number): boolean {
+  const lines = size(height);
+  if (lines < 3) return false;
+  const tier = timelineTier(width);
+  if (tier === "fallback") return false;
+  return timelineLaneWidth(width, BADGE_WIDTH[tier]) >= MIN_TIMELINE_CELLS;
+}
+
+/** Tick interval for the current width, or 0 when the page is in the fallback tier. */
+export function timelineStepFor(height: number, width: number): number {
+  if (size(height) < 1) return 0;
+  const tier = timelineTier(width);
+  if (tier === "fallback") return 0;
+  return pickStep(Math.max(0, timelineLaneWidth(width, BADGE_WIDTH[tier])));
+}
+
+/** Member rows that fit in `height` body lines (the axis takes one). */
+export function timelineCapacity(height: number, width: number): number {
+  const lines = size(height);
+  return Math.max(0, lines - (timelineAxisVisible(lines, width) ? 1 : 0));
+}
+
+/** The shared window for the current rows/width; undefined in the fallback tier. */
+export function timelineWindow(
+  rows: readonly TimelineRow[], height: number, width: number, now: number, view: TimelineView = {},
+): TimelineWindow | undefined {
+  const tier = timelineTier(width);
+  if (tier === "fallback" || size(height) < 1) return undefined;
+  const lastActivityAt = view.lastActivityAt ?? latestActivityOf(rows);
+  return resolveWindow({
+    now,
+    laneWidth: Math.max(0, timelineLaneWidth(width, BADGE_WIDTH[tier])),
+    live: view.live ?? rows.some(isLiveRow),
+    ...(lastActivityAt !== undefined ? { lastActivityAt } : {}),
+  });
+}
+
+/**
+ * Change signature for the overview page: tier + window anchor + the rendered
+ * rows. The anchor must be part of it, otherwise a sliding window would never
+ * repaint while the rows stay identical.
+ */
+export function timelineSignature(
+  rows: readonly TimelineRow[], height: number, width: number, now: number, view: TimelineView = {},
+): string {
+  const window = timelineWindow(rows, height, width, now, view);
+  return `${timelineTier(width)}|${window?.anchor ?? "none"}|${size(height)}|${JSON.stringify(rows)}`;
 }
 
 /**
@@ -456,16 +548,9 @@ export function buildTimelineLines(
   if (tier === "fallback") return buildFallbackLines(rows, selectedName, offset, lines, total, theme, view);
 
   const badgeWidth = BADGE_WIDTH[tier];
-  const nameWidth = timelineNameWidth(total);
-  const laneWidth = Math.max(0, timelineLaneWidth(total, badgeWidth));
-  const lastActivityAt = view.lastActivityAt ?? latestActivityOf(rows);
-  const window = resolveWindow({
-    now,
-    laneWidth,
-    live: view.live ?? rows.some(isLiveRow),
-    ...(lastActivityAt !== undefined ? { lastActivityAt } : {}),
-  });
-  const showAxis = lines >= 3 && laneWidth >= MIN_TIMELINE_CELLS;
+  const nameWidth = memberNameWidth(total);
+  const window = timelineWindow(rows, lines, total, now, view)!;
+  const showAxis = timelineAxisVisible(lines, total);
   const capacity = Math.max(1, lines - (showAxis ? 1 : 0));
   const start = getOverviewWindowOffset(rows, selectedName, offset, capacity);
   const duplicates = duplicateLabels(rows);
@@ -475,10 +560,11 @@ export function buildTimelineLines(
     const selected = row.name === selectedName;
     let label = shorten(memberLabel(row, duplicates), nameWidth);
     if (selected && theme.bold) label = theme.bold(label);
+    const word = wordOf(row);
     const context = fit(contextBar(row, CONTEXT_BAR_CELLS, theme), TIMELINE_CONTEXT_WIDTH);
     const lane = buildLaneText(paintLane(row.actions, row.info, window), view.palette);
     output.push(fit(
-      markerFor(selected, total) + fit(label, nameWidth) + " " + badgeText(wordOf(row), tier) +
+      markerFor(selected, total) + fit(label, nameWidth) + " " + badge(word, tier, view.palette) +
       " " + context + " " + lane,
       total,
     ));

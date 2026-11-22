@@ -26,9 +26,10 @@ describe("member overview palette", () => {
     expect(resolveAnsi("thinking", source("256color", () => undefined))).toBe("\x1b[38;5;67m");
   });
 
-  it("uses the basic 16-colour table when the mode is 'none' or unrecognised", () => {
+  it("emits nothing when colour is explicitly off, and the 16-colour table only for an unknown mode", () => {
     for (const cls of OP_CLASSES) {
-      expect(resolveAnsi(cls, source("none", () => "\x1b[38;2;9;9;9m"))).toBe(`\x1b[${FALLBACK_16[cls]}m`);
+      // "none" is the caller saying "no colour" — basic ANSI here would lie and cost bytes.
+      expect(resolveAnsi(cls, source("none", () => "\x1b[38;2;9;9;9m"))).toBe("");
       expect(resolveAnsi(cls, source("bogus" as PaletteSource["mode"], () => undefined))).toBe(`\x1b[${FALLBACK_16[cls]}m`);
     }
   });
@@ -38,6 +39,7 @@ describe("member overview palette", () => {
     expect(resolveAnsi(unknown, source("truecolor", () => undefined))).toBe("");
     expect(resolveAnsi(unknown, source("256color", () => { throw new Error("boom"); }))).toBe("");
     expect(resolveAnsi(unknown, source("none", () => undefined))).toBe("");
+    expect(resolveAnsi(unknown, source("bogus" as PaletteSource["mode"], () => undefined))).toBe("");
     expect(visibleWidth(resolveAnsi("read", source("truecolor", () => undefined)))).toBe(0);
   });
 

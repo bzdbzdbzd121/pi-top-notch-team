@@ -294,6 +294,8 @@ export default function (pi: ExtensionAPI) {
         getActivity: (name) => activityTracker?.getActivity(name),
         getRecentActions: (name) => overviewStore?.getRecentActions(name) ?? [],
         getActionCount: (name) => overviewStore?.getActionCount(name) ?? 0,
+        getTimelineInfo: (name) => overviewStore?.getTimelineInfo(name) ?? { truncated: false, turns: [] },
+        getLastActivityAt: () => overviewStore?.getLastActivityAt(),
         isCompacting: (name) => overviewStore?.isCompacting(name) ?? false,
         getStartedMembers: () => [...overviewStarted],
       });

@@ -2,7 +2,7 @@ import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { stripVTControlCharacters } from "node:util";
 import type { ActivityPhase } from "../channel/activity-tracker";
 import type { MemberOperationalState } from "../session/context";
-import type { InspectorTheme } from "./member-inspector-state";
+import { IDENTITY_THEME, type InspectorTheme } from "./member-inspector-state";
 import type { OverviewAction, OverviewActionKind } from "./member-overview-store";
 
 export interface OverviewRow {
@@ -20,8 +20,19 @@ export interface OverviewRow {
 
 type Member = { name: string; label: string };
 type View = { kind: "overview" } | { kind: "member"; name: string };
-const identity: InspectorTheme = { fg: (_color, text) => text };
 const MAX_TRAIL_ICONS = 20;
+/** Marker field width: `› ` (selected) or two spaces — shared with the timeline. */
+export const MARKER_WIDTH = 2;
+/** `› ` / `  ` / single-column degenerate form. */
+export function markerFor(selected: boolean, width: number): string {
+  if (width > 1) return selected ? "› " : "  ";
+  return width === 1 ? (selected ? "›" : " ") : "";
+}
+/** Name column width before any layout-specific reserve (§C). */
+export function memberNameWidth(width: number): number {
+  const total = Number.isFinite(width) ? Math.max(0, Math.floor(width)) : 0;
+  return Math.min(18, Math.max(4, Math.floor(total / 6)));
+}
 const ICONS: Record<OverviewActionKind, string> = {
   thinking: "💭", output: "✏️", read: "📖", modify: "📝", tool: "🔧",
   complete: "✅", compacting: "🗜️", crashed: "💥", stopped: "⏹️",
@@ -32,7 +43,7 @@ function actionTotal(actions: readonly OverviewAction[], count?: number): number
   return typeof count === "number" && Number.isSafeInteger(count) && count >= actions.length ? count : actions.length;
 }
 // Names are untrusted display text; do not allow terminal commands or newlines.
-export const clean = (value: string) => stripVTControlCharacters(value).replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
+const clean = (value: string) => stripVTControlCharacters(value).replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
 export function fit(text: string, width: number): string {
   if (width <= 0) return "";
   const clipped = truncateToWidth(text, width, "");
@@ -112,7 +123,7 @@ export function contextBar(row: OverviewRow, cells: number, theme: InspectorThem
 
 /** Newest first; at most 20 complete icons, reserving space for the hidden count. */
 export function buildOverviewTrail(
-  actions: readonly OverviewAction[], width: number, theme: InspectorTheme = identity,
+  actions: readonly OverviewAction[], width: number, theme: InspectorTheme = IDENTITY_THEME,
   current?: CurrentAction, totalActionCount?: number,
 ): string {
   width = size(width);
@@ -149,7 +160,7 @@ export function buildOverviewTrail(
 /** Exactly height physical lines, each exactly width visible terminal columns. */
 export function buildOverviewLines(
   rows: readonly OverviewRow[], selectedName: string | undefined, offset: number,
-  height: number, width: number, theme: InspectorTheme = identity,
+  height: number, width: number, theme: InspectorTheme = IDENTITY_THEME,
 ): string[] {
   height = size(height);
   width = size(width);
@@ -165,11 +176,11 @@ export function buildOverviewLines(
   while (barCells && width < 2 + 2 + 2 + valueWidth + barCells + 3 + minimumTrail)
     barCells = barCells > 2 ? barCells - 1 : 0;
   const contextWidth = valueWidth + (barCells ? barCells + 3 : 0);
-  const nameWidth = Math.max(0, Math.min(18, Math.max(4, Math.floor(width / 6)), width - 2 - contextWidth - 2 - minimumTrail));
+  const nameWidth = Math.max(0, Math.min(memberNameWidth(width), width - MARKER_WIDTH - contextWidth - 2 - minimumTrail));
   for (const row of rows.slice(start, start + height)) {
     const current = currentAction(row);
     const selected = row.name === selectedName;
-    const marker = width > 1 ? (selected ? "› " : "  ") : (selected ? "›" : " ");
+    const marker = markerFor(selected, width);
     let label = memberLabel(row, duplicates);
     let line: string;
     if (width < 14) {
@@ -193,7 +204,7 @@ export function buildOverviewLines(
 /** Pinned overview plus a contiguous member window around the current page. */
 export function buildInspectorHeader(
   members: readonly Member[], view: View, selectedName: string | undefined,
-  width: number, theme: InspectorTheme = identity,
+  width: number, theme: InspectorTheme = IDENTITY_THEME,
 ): string {
   width = size(width);
   if (!width) return "";

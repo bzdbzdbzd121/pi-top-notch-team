@@ -5,11 +5,13 @@ import { BADGE_WIDTH } from "./member-overview-badge.js";
 import { IDENTITY_THEME } from "./member-inspector-state.js";
 import type { PaletteSource } from "./member-overview-palette.js";
 import type { OverviewAction, TimelineInfo } from "./member-overview-store.js";
+import { memberNameWidth } from "./member-overview-state.js";
 import {
-  AXIS_NOW_LABEL, AXIS_TICK_EVERY, AXIS_TIME_WIDTH, CONTEXT_BAR_CELLS, GLYPH, MIN_TIMELINE_CELLS,
-  STEP_LADDER_MS, TARGET_WINDOW_MS, TIMELINE_CONTEXT_WIDTH, buildAxisLine, buildLaneText,
-  buildTimelineLines, cellIndexAt, cellStart, formatClock, paintLane, pickStep, resolveWindow,
-  timelineLaneWidth, timelineNameWidth, timelinePrefixWidth, timelineTier,
+  AXIS_NOW_LABEL, AXIS_TICK_EVERY, AXIS_TIME_WIDTH, CONTEXT_BAR_CELLS, GLYPH, LEGEND_ITEMS,
+  MIN_TIMELINE_CELLS, STEP_LADDER_MS, TARGET_WINDOW_MS, TIMELINE_CONTEXT_WIDTH, buildAxisLine,
+  buildColorLegend, buildLaneText, buildTimelineLines, cellIndexAt, cellStart, fallbackLayout,
+  formatClock, paintLane, pickStep, resolveWindow, timelineAxisVisible, timelineCapacity,
+  timelineLaneWidth, timelinePrefixWidth, timelineSignature, timelineTier, timelineWindow,
   type LaneCell, type TimelineRow, type TimelineWindow,
 } from "./member-overview-timeline.js";
 
@@ -25,13 +27,18 @@ const row = (name: string, patch: Partial<TimelineRow> = {}): TimelineRow =>
 const info = (patch: Partial<TimelineInfo> = {}): TimelineInfo => ({ truncated: false, turns: [], ...patch });
 const win = (cells: number, step: number, anchor: number): TimelineWindow => ({ cells, step, anchor });
 
-/** Every status word, reachable without a live clock and without painting a record. */
+/**
+ * Every status word, with a uniform lane so the lane extent can be measured from
+ * the rendered content. Records sit at `at: 0` (decades before the window), and
+ * the "active" ones also carry `endedAt: 0`: the badge reads the kind/status, the
+ * lane only sees a zero-length point outside the window.
+ */
 const STATUS_FIXTURES: Partial<TimelineRow>[] = [
   { state: "working", phase: "thinking", info: info() },
   { state: "working", phase: "output", info: info() },
-  { state: "working", phase: "executing", info: info(), actions: [{ id: 1, kind: "read", status: "active", at: 0 }] },
-  { state: "working", phase: "executing", info: info(), actions: [{ id: 2, kind: "modify", status: "active", at: 0 }] },
-  { state: "working", phase: "executing", info: info(), actions: [{ id: 3, kind: "tool", status: "active", at: 0 }] },
+  { state: "working", phase: "executing", info: info(), actions: [{ id: 1, kind: "read", status: "active", at: 0, endedAt: 0 }] },
+  { state: "working", phase: "executing", info: info(), actions: [{ id: 2, kind: "modify", status: "active", at: 0, endedAt: 0 }] },
+  { state: "working", phase: "executing", info: info(), actions: [{ id: 3, kind: "tool", status: "active", at: 0, endedAt: 0 }] },
   { state: "compacting", info: info() },
   { state: "working", info: info({ openTurnStart: 0 }) },
   { state: "working", info: info({ openTurnStart: 0 }), actions: [{ id: 4, kind: "read", status: "done", at: 0 }] },
@@ -56,7 +63,7 @@ describe("member overview timeline window", () => {
       [178, 18, 137, 1000, 137_000],
     ] as const;
     for (const [inner, name, lane, step, span] of table) {
-      expect(timelineNameWidth(inner)).toBe(name);
+      expect(memberNameWidth(inner)).toBe(name);
       expect(timelineTier(inner)).toBe(3);
       expect(timelineLaneWidth(inner, BADGE_WIDTH[3])).toBe(lane);
       expect(lane).toBeGreaterThanOrEqual(MIN_TIMELINE_CELLS);
@@ -77,7 +84,7 @@ describe("member overview timeline window", () => {
       [34, 5, 6, 8, "fallback", 0],
     ] as const;
     for (const [inner, name, wideLane, narrowLane, tier, step] of table) {
-      expect(timelineNameWidth(inner)).toBe(name);
+      expect(memberNameWidth(inner)).toBe(name);
       expect(timelineLaneWidth(inner, BADGE_WIDTH[3])).toBe(wideLane);
       expect(timelineLaneWidth(inner, BADGE_WIDTH[2])).toBe(narrowLane);
       expect(timelineTier(inner)).toBe(tier);
@@ -274,6 +281,121 @@ describe("member overview timeline lane", () => {
   });
 });
 
+describe("member overview timeline badge, legend, and layout helpers", () => {
+  it("colours the status word with its class", () => {
+    const palette: PaletteSource = {
+      mode: "truecolor",
+      ansi: token => token === "syntaxType" ? "\x1b[38;2;7;7;7m" : undefined,
+    };
+    const rows = [
+      row("a", { state: "working", phase: "executing", actions: [{ id: 1, kind: "read", status: "active", at: 0, endedAt: 0 }] }),
+      row("b", { state: "working", phase: "thinking" }),
+    ];
+    const lines = buildTimelineLines(rows, undefined, 0, 4, 106, NOW, IDENTITY_THEME, { palette });
+    expect(lines[1]).toContain("\x1b[38;2;7;7;7m读取中\x1b[39m");
+    // thinkingLow is unavailable in this palette → fixed RGB fallback, still coloured.
+    expect(lines[2]).toContain("\x1b[38;2;95;135;175m思考中\x1b[39m");
+    expect(visibleWidth(lines[1]!)).toBe(106);
+    // Without a palette the word is plain text (tests and colourless terminals).
+    const plain = buildTimelineLines(rows, undefined, 0, 4, 106, NOW);
+    expect(plain[1]).not.toContain("\x1b[");
+  });
+
+  it("builds the ? legend per class and only drops whole items from the right", () => {
+    const palette: PaletteSource = {
+      mode: "truecolor",
+      ansi: token => token === "syntaxType" ? "\x1b[38;2;7;7;7m" : undefined,
+    };
+    expect(LEGEND_ITEMS.map(item => item.word)).toEqual(["思考", "读取", "写入", "执行", "输出", "压缩", "崩溃", "停止", "空闲"]);
+    const wide = buildColorLegend(80, palette);
+    expect(visibleWidth(wide)).toBe(80);
+    const text = strip(wide);
+    for (const item of LEGEND_ITEMS) expect(text).toContain(item.word);
+    expect(wide).toContain("\x1b[38;2;7;7;7m读取\x1b[39m");
+    // 4 items = 4×4 + 3×2 = 22 columns; 5 items would need 28.
+    const narrow = buildColorLegend(26, palette);
+    expect(visibleWidth(narrow)).toBe(26);
+    for (const word of ["思考", "读取", "写入", "执行"]) expect(strip(narrow)).toContain(word);
+    for (const word of ["输出", "压缩", "崩溃", "停止", "空闲"]) expect(strip(narrow)).not.toContain(word);
+    expect(buildColorLegend(0)).toBe("");
+    // 10 columns fit exactly two 2-word items with one gap.
+    expect(strip(buildColorLegend(10))).toBe("思考  读取");
+  });
+
+  it("knows when the axis costs a member row", () => {
+    expect(timelineAxisVisible(2, 106)).toBe(false);
+    expect(timelineAxisVisible(3, 106)).toBe(true);
+    expect(timelineAxisVisible(5, 30)).toBe(false); // fallback tier: no axis
+    expect(timelineCapacity(13, 106)).toBe(12);
+    expect(timelineCapacity(13, 30)).toBe(13);
+    expect(timelineCapacity(0, 106)).toBe(0);
+    expect(timelineCapacity(1, 106)).toBe(1);
+  });
+
+  it("keeps the lane content at the right edge instead of letting fit eat it", () => {
+    const w = resolveWindow({ now: NOW, laneWidth: timelineLaneWidth(106, BADGE_WIDTH[3]), live: true });
+    const open = [row("a", {
+      state: "working", phase: "thinking", info: info({ knownFrom: NOW - 200_000 }),
+      actions: [record({ at: NOW - 4_000, kind: "thinking", status: "active" })],
+    })];
+    const line = strip(buildTimelineLines(open, undefined, 0, 4, 106, NOW)[1]!);
+    expect(visibleWidth(line)).toBe(106);
+    expect(line.endsWith(GLYPH.continuation)).toBe(true);
+    expect(line.match(/▓+$/u)![0].length).toBeGreaterThan(1);
+    // A point event at the rightmost instant lands in the rightmost column.
+    const edge = w.anchor + w.step - 1;
+    const point = [row("a", {
+      info: info({ knownFrom: NOW - 200_000 }),
+      actions: [record({ at: edge, kind: "crashed", status: "error", endedAt: edge })],
+    })];
+    expect(strip(buildTimelineLines(point, undefined, 0, 4, 106, NOW)[1]!).endsWith(GLYPH.crash)).toBe(true);
+  });
+
+  it("exposes the window and a signature that moves with the anchor", () => {
+    const rows = [row("a", { info: info({ knownFrom: NOW - 100_000 }) })];
+    const window = timelineWindow(rows, 4, 106, NOW)!;
+    expect(window).toMatchObject({ step: 3000, cells: 66 });
+    expect(timelineWindow(rows, 4, 30, NOW)).toBeUndefined();
+    const base = timelineSignature(rows, 4, 106, NOW);
+    expect(timelineSignature(rows, 4, 106, NOW)).toBe(base);
+    // One step later the anchor moves, so the page must repaint.
+    expect(timelineSignature(rows, 4, 106, NOW + 3000)).not.toBe(base);
+    // Row changes are part of the signature as well.
+    const changed = [row("a", { state: "working", info: info({ knownFrom: NOW - 100_000 }) })];
+    expect(timelineSignature(changed, 4, 106, NOW)).not.toBe(base);
+  });
+});
+
+describe("member overview timeline frame budget", () => {
+  it("records the worst-case frame cost (24 members × 64 records, inner 178)", () => {
+    const rows = Array.from({ length: 24 }, (_, index) => {
+      const actions = Array.from({ length: 64 }, (_, slot) => {
+        const kind = (["thinking", "read", "modify", "tool", "output"] as const)[slot % 5];
+        const at = NOW - 200_000 + slot * 3_000;
+        return record({ at, endedAt: at + 2_500, kind });
+      });
+      return row(`m${index}`, {
+        label: `成员${index}`, state: "working" as const, phase: "executing" as const, percent: 42,
+        actions,
+        info: info({ knownFrom: NOW - 200_000, turns: [[NOW - 200_000, NOW - 5_000]], truncated: index % 3 === 0 }),
+      });
+    });
+    // Warm up first: the recorded number must be steady state, not JIT warm-up.
+    buildTimelineLines(rows, "m0", 0, 25, 178, NOW, IDENTITY_THEME, { palette: TRUE_COLOR });
+    const frames = 20;
+    const started = performance.now();
+    for (let frame = 0; frame < frames; frame++)
+      buildTimelineLines(rows, "m0", 0, 25, 178, NOW + frame * 1_000, IDENTITY_THEME, { palette: TRUE_COLOR });
+    const perFrame = (performance.now() - started) / frames;
+    const bytes = buildTimelineLines(rows, "m0", 0, 25, 178, NOW, IDENTITY_THEME, { palette: TRUE_COLOR })
+      .reduce((total, line) => total + Buffer.byteLength(line, "utf8"), 0);
+    // eslint-disable-next-line no-console -- 留档：宽屏 + 满员 + 真彩的实测值
+    console.log(`[perf] 24×64 inner=178: ${perFrame.toFixed(3)} ms/frame, ${bytes} B/frame`);
+    expect(perFrame).toBeLessThan(50);
+    expect(bytes).toBeLessThan(200_000);
+  });
+});
+
 describe("member overview timeline axis", () => {
   it("labels cell boundaries and puts 'now' on the right edge", () => {
     const w = resolveWindow({ now: NOW, laneWidth: 66, live: true });
@@ -352,7 +474,21 @@ describe("member overview timeline lines", () => {
       expect(text).toContain(word);
   });
 
+  /** Visible length of the trailing run of the line's last character. */
+  const trailingRun = (line: string): number => {
+    const text = strip(line);
+    let run = 0;
+    for (let index = text.length - 1; index >= 0; index--) {
+      if (text[index] !== text[text.length - 1]) break;
+      run += visibleWidth(text[index]!);
+    }
+    return run;
+  };
+
   it("starts every lane at the same column for every width, tier, and status", () => {
+    // Both the badge and the lane are coloured now, so the lane start cannot be
+    // found by "first ANSI". The fixtures paint uniform lanes (all ░ or all ▁),
+    // so the trailing run measures the lane extent from the content itself.
     const rows = Array.from({ length: 24 }, (_, index) =>
       row(`m${index}`, { label: `成员${index}`, ...STATUS_FIXTURES[index % STATUS_FIXTURES.length]! }));
     for (let width = 0; width <= 160; width++) {
@@ -362,15 +498,13 @@ describe("member overview timeline lines", () => {
       if (tier === "fallback") continue;
       const members = lines.slice(1);
       expect(members).toHaveLength(24);
-      const prefix = timelinePrefixWidth(timelineNameWidth(width), BADGE_WIDTH[tier]);
+      const prefix = timelinePrefixWidth(memberNameWidth(width), BADGE_WIDTH[tier]);
       const lane = timelineLaneWidth(width, BADGE_WIDTH[tier]);
       expect(prefix + lane).toBe(width);
-      for (const line of members) {
-        // The lane is the first coloured run: nothing before it emits ANSI.
-        const escape = line.indexOf("\x1b[");
-        expect(escape).toBeGreaterThanOrEqual(0);
-        expect(visibleWidth(line.slice(0, escape))).toBe(prefix);
-      }
+      const runs = members.map(trailingRun);
+      expect(new Set(runs).size).toBe(1);
+      expect(runs[0]).toBe(lane);
+      expect(width - runs[0]!).toBe(prefix);
     }
   });
 
@@ -390,7 +524,7 @@ describe("member overview timeline lines", () => {
         return visibleWidth(text.slice(0, at));
       });
       expect(new Set(starts).size).toBe(1);
-      const nameWidth = Math.min(timelineNameWidth(width), Math.max(0, width - 8));
+      const { nameWidth } = fallbackLayout(width);
       expect(starts[0]).toBe(2 + nameWidth + 1 + BADGE_WIDTH[2] + 1);
     }
   });
