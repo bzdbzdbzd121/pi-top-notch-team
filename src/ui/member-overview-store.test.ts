@@ -122,48 +122,50 @@ describe("member overview store", () => {
     expect(s.getRecentActions("a")[0].toolName!.length).toBeLessThanOrEqual(80);
   });
 
-  it("continues the cumulative count after history eviction without unbounded storage", () => {
+  it("keeps at most 64 retained records and reports truncation past them", () => {
     const s = createMemberOverviewStore();
-    expect(s.getActionCount("a")).toBe(0);
+    expect(s.getTimelineInfo("a")).toEqual({ truncated: false, turns: [] });
     for (let i = 0; i < 1000; i++) {
       s.onEvent("a", tool("start", `read-${i}`));
       s.onEvent("a", tool("end", `read-${i}`));
     }
     expect(s.getRecentActions("a")).toHaveLength(64);
-    expect(s.getActionCount("a")).toBe(1000);
-    expect(s.getActionCount("b")).toBe(0);
+    expect(s.getTimelineInfo("a").truncated).toBe(true);
+    expect(s.getTimelineInfo("b").truncated).toBe(false);
   });
 
-  it("counts semantic appends, not streaming deltas or result updates", () => {
+  it("records one entry per semantic append, not per streaming delta or result update", () => {
     const s = createMemberOverviewStore();
     s.onEvent("a", { type: "agent_start" });
     s.onEvent("a", delta("thinking_start"));
     for (let i = 0; i < 1000; i++) s.onEvent("a", delta("thinking_delta"));
     s.onEvent("a", delta("thinking_end"));
-    expect(s.getActionCount("a")).toBe(1);
+    expect(s.getRecentActions("a")).toHaveLength(1);
     s.onEvent("a", tool("start", "read"));
     s.onEvent("a", tool("start", "read"));
     s.onEvent("a", tool("end", "read", "read", { isError: true }));
-    expect(s.getActionCount("a")).toBe(2);
+    expect(s.getRecentActions("a")).toHaveLength(2);
     s.onEvent("a", { type: "compaction_start" });
     s.onEvent("a", { type: "compaction_end" });
-    expect(s.getActionCount("a")).toBe(3);
+    expect(s.getRecentActions("a")).toHaveLength(3);
   });
 
-  it("preserves member totals across restart, but clears them on removal or session clear", () => {
+  it("preserves records across restart, but clears them on removal or session clear", () => {
     const s = createMemberOverviewStore();
     s.onEvent("a", tool("start", "first"));
     s.onEvent("a", { type: "process_exit", exitCode: 0 });
     s.onEvent("a", { type: "process_started" });
     s.onEvent("a", tool("start", "second"));
     s.onEvent("b", tool("start", "independent"));
-    expect(s.getActionCount("a")).toBe(3);
-    expect(s.getActionCount("b")).toBe(1);
+    expect(s.getRecentActions("a")).toHaveLength(3);
+    expect(s.getRecentActions("b")).toHaveLength(1);
     s.syncMembers(["a"]);
-    expect(s.getActionCount("a")).toBe(3);
-    expect(s.getActionCount("b")).toBe(0);
+    expect(s.getRecentActions("a")).toHaveLength(3);
+    expect(s.getRecentActions("b")).toHaveLength(0);
+    expect(s.getTimelineInfo("b")).toEqual({ truncated: false, turns: [] });
     s.clear();
-    expect(s.getActionCount("a")).toBe(0);
+    expect(s.getRecentActions("a")).toHaveLength(0);
+    expect(s.getTimelineInfo("a")).toEqual({ truncated: false, turns: [] });
   });
 
   it("stores at most 64 actions and bounds every correlation Map with eviction", () => {
@@ -390,8 +392,8 @@ describe("member overview store timeline data (P1)", () => {
     expect(output.at - thinking.at).toBe(0);
     // One global clamp keeps cross-member order, not one clamp per member.
     expect(s.getRecentActions("b")[0].at).toBe(10_000_000);
-    expect(s.getActionCount("a")).toBe(3);
-    expect(s.getActionCount("b")).toBe(1);
+    expect(s.getRecentActions("a")).toHaveLength(3);
+    expect(s.getRecentActions("b")).toHaveLength(1);
     expect(s.getTimelineInfo("a").turns).toEqual([[10_000_000, 10_000_000]]);
     expect(s.getLastActivityAt()).toBe(10_000_000);
   });
@@ -412,7 +414,6 @@ describe("member overview store timeline data (P1)", () => {
     for (let i = 0; i < 70; i++) s.onEvent("a", tool("start", `burst-${i}`));
     const info = s.getTimelineInfo("a");
     expect(s.getRecentActions("a")).toHaveLength(64);
-    expect(s.getActionCount("a")).toBe(71);
     expect(info.truncated).toBe(true);
     expect(info.knownFrom).toBe(s.getRecentActions("a")[0].at);
     expect(info.knownFrom).toBe(1_200);
@@ -503,7 +504,7 @@ describe("member overview store timeline data (P1)", () => {
     const info = s.getTimelineInfo("a");
     expect(info.openTurnStart).toBeUndefined();
     expect(info.turns).toEqual([[1_000, 1_500]]);
-    expect(s.getActionCount("a")).toBe(1);
+    expect(s.getRecentActions("a")).toHaveLength(1);
   });
 
   it("stamps a real compaction interval and closes it exactly once", () => {

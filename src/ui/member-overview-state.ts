@@ -13,9 +13,6 @@ export interface OverviewRow {
   percent: number | null | undefined;
   contextStale?: boolean;
   actions: readonly OverviewAction[];
-  /** Session total, including evicted records; omitted by legacy callers. */
-  actionCount?: number;
-  started?: boolean;
 }
 
 type Member = { name: string; label: string };

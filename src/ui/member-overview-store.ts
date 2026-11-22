@@ -37,8 +37,6 @@ export interface MemberOverviewStoreOptions {
 export interface MemberOverviewStore {
   onEvent(name: string, event: any): boolean;
   getRecentActions(name: string): readonly OverviewAction[];
-  /** Session total, including records already evicted from the bounded ring. */
-  getActionCount(name: string): number;
   /** Confirmed member-side compaction, independent of dispatch reservations. */
   isCompacting(name: string): boolean;
   /** Observation horizon, truncation flag, and turn intervals for the timeline. */
@@ -384,7 +382,6 @@ export function createMemberOverviewStore(options: MemberOverviewStoreOptions = 
       const m = members.get(name);
       return m ? Object.freeze(entries(m).map(entry => entry.action)) : EMPTY;
     },
-    getActionCount(name) { return members.get(name)?.totalCount ?? 0; },
     isCompacting(name) { return members.get(name)?.compacting ?? false; },
     getTimelineInfo(name) {
       const m = members.get(name);

@@ -63,14 +63,12 @@ export interface MemberInspectorDeps {
   memberOpsStates: Map<string, MemberOperationalState>;
   getActivity?: (name: string) => MemberActivity | undefined;
   getRecentActions?: (name: string) => readonly OverviewAction[];
-  getActionCount?: (name: string) => number;
   /** Real member-side compaction, not the stats-preflight reservation. */
   isCompacting?: (name: string) => boolean;
   /** P1 timeline evidence: observation horizon, truncation, turns. */
   getTimelineInfo?: (name: string) => TimelineInfo;
   /** Team-wide last activity for the frozen-window anchor (P1 store query). */
   getLastActivityAt?: () => number | undefined;
-  getStartedMembers?: () => readonly string[];
 }
 
 /** Handle exposed to index.ts for event-hook + lifecycle integration. */
@@ -458,7 +456,6 @@ export class MemberInspectorComponent {
   private overviewRows(capacity: number): TimelineRow[] {
     this.state.ensureOverviewVisible(Math.max(1, capacity));
     const offset = this.state.overviewOffset;
-    const started = this.deps.getStartedMembers?.();
     const now = Date.now();
     return this.state.tabs.map((tab, index) => {
       const visible = index >= offset && index < offset + Math.max(0, capacity);
@@ -478,9 +475,7 @@ export class MemberInspectorComponent {
         phase: activity ? derivePhase(activity, now) : undefined,
         percent: tab.contextInfo?.percent,
         contextStale: tab.contextStale,
-        started: started ? started.includes(tab.name) : undefined,
         actions: visible ? this.deps.getRecentActions?.(tab.name) ?? [] : [],
-        actionCount: visible ? this.deps.getActionCount?.(tab.name) : undefined,
         // Timeline evidence is only read for visible rows (the same O(visible) rule).
         ...(visible && this.deps.getTimelineInfo ? { info: this.deps.getTimelineInfo(tab.name) } : {}),
       };

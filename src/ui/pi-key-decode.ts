@@ -63,24 +63,65 @@ export function decodePrintableKey(data: string): string | undefined {
 }
 
 /**
- * Shift + 基础键在美式布局上打出的字符。kitty 的 CSI-u 可能报「基础码位 + shift」
- * （`CSI 47;2u` = Shift+`/`），而 xterm modifyOtherKeys 报结果字符（`CSI 27;2;63~`
- * = `?`）；命令键必须按用户实际打出的字符判断，两种编码都要落到同一个字符。
+ * Shift + 基础键打出的符号。kitty 与 xterm modifyOtherKeys 都可能报「基础码位 +
+ * shift」（`CSI 47;2u` / `CSI 27;2;47~` = Shift+`/`），而用户实际打出的是 `?`。
+ * 两套协议的同一假设必须一致，否则同一次按键的两种编码行为不同。
  */
 const SHIFTED_SYMBOLS: Readonly<Record<string, string>> = Object.freeze({ "/": "?" });
-const KITTY_SEQUENCE = /^\x1b\[(\d+);(\d+)u$/;
+
+/** kitty CSI-u：`CSI code[:alternates];modifiers[:event];text u` 的键码/修饰/事件部分。 */
+const KITTY_COMMAND = /^\x1b\[(\d+)(?::[\d:]*)?;(\d+)(?::(\d+))?u$/;
+/** kitty 无修饰形态：`CSI code[:alternates]u`（交给 decodePrintableKey 即可）。 */
+const MODIFY_OTHER_KEYS = /^\x1b\[27;(\d+);(\d+)~$/;
+/** kitty 事件类型 3 = release；释放不是一次按键输入。 */
+const KITTY_EVENT_RELEASE = 3;
+
+/** 修饰位只允许 Shift（+ Caps/Num Lock）；其他修饰返回 undefined。 */
+function shiftOnly(modifier: number): boolean | undefined {
+  const masked = modifier & ~LOCK_MASK;
+  if ((masked & ~MODIFIERS.shift) !== 0) return undefined;
+  return (masked & MODIFIERS.shift) !== 0;
+}
+
+function charAt(codepoint: number): string | undefined {
+  if (!Number.isFinite(codepoint) || codepoint < 32) return undefined;
+  try {
+    return String.fromCodePoint(codepoint);
+  } catch {
+    return undefined;
+  }
+}
+
+function shifted(char: string, shift: boolean): string {
+  return shift ? SHIFTED_SYMBOLS[char] ?? char : char;
+}
 
 /**
- * 命令键的有效字符：在 `decodePrintableKey` 之上补「Shift + 基础键」的符号别名。
- * 仅放宽 kitty 的「基础码位 + shift」形态（modifyOtherKeys 已直接给结果码位）。
+ * 命令键的有效字符（决策 #14 的字符路径纪律：命令键也必须走解码，不能只认
+ * legacy 字面量）。相对 `decodePrintableKey`（文本插入的单一事实来源，保持不动）
+ * 只多两件事：
+ *   1. 接受 kitty 的 `:<event>` 后缀（pi 请求 flags=7，按键是 `CSI 47;2:1u`），
+ *      并拒绝事件类型 3（release）——否则松手也会触发一次命令；
+ *   2. 把「Shift + 基础符号」归一成用户实际打出的字符（`/` → `?`），kitty 与
+ *      modifyOtherKeys 同一处理，不对美式布局做自相矛盾的假设。
  * legacy 原字符仍返回 undefined，由调用方用 `matchesKey` 兜底。
  */
 export function decodeCommandChar(data: string): string | undefined {
-  const decoded = decodePrintableKey(data);
-  if (decoded === undefined) return undefined;
-  const kitty = KITTY_SEQUENCE.exec(data);
-  if (!kitty) return decoded;
-  const modifier = Number(kitty[2]) - 1;
-  if (!(modifier & MODIFIERS.shift)) return decoded;
-  return SHIFTED_SYMBOLS[decoded] ?? decoded;
+  const kitty = KITTY_COMMAND.exec(data);
+  if (kitty) {
+    const event = kitty[3] === undefined ? 1 : Number(kitty[3]);
+    if (event === KITTY_EVENT_RELEASE) return undefined;
+    const shift = shiftOnly(Number(kitty[2]) - 1);
+    if (shift === undefined) return undefined;
+    const char = charAt(Number(kitty[1]));
+    return char === undefined ? undefined : shifted(char, shift);
+  }
+  const other = MODIFY_OTHER_KEYS.exec(data);
+  if (other) {
+    const shift = shiftOnly(Number(other[1]) - 1);
+    if (shift === undefined) return undefined;
+    const char = charAt(Number(other[2]));
+    return char === undefined ? undefined : shifted(char, shift);
+  }
+  return decodePrintableKey(data);
 }

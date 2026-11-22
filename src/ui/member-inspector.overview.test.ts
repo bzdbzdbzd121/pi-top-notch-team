@@ -25,7 +25,6 @@ function setup(names = members, isCompacting?: (name: string) => boolean, theme:
     getHandle: (name: string) => handles.get(name) as any,
     memberOpsStates: new Map(names.map(m => [m.name, "working" as const])),
     getRecentActions: (): readonly OverviewAction[] => [{ id: 1, kind: "read", status: "done", at: 0 }],
-    getActionCount: undefined as ((name: string) => number) | undefined,
     isCompacting,
     getTimelineInfo: () => ({ truncated: false, turns: [] as (readonly [number, number])[] }),
     getLastActivityAt: undefined as (() => number | undefined) | undefined,
@@ -528,8 +527,10 @@ describe("Member Inspector timeline wiring (P3)", () => {
     ["legacy literal", "?"],
     ["kitty shift+? codepoint", "\x1b[63;2u"],
     ["kitty shift+/ base key", "\x1b[47;2u"],
+    ["kitty shift+/ with press event", "\x1b[47;2:1u"],
     ["kitty plain ?", "\x1b[63u"],
     ["modifyOtherKeys shift+?", "\x1b[27;2;63~"],
+    ["modifyOtherKeys shift+/ base key", "\x1b[27;2;47~"],
   ])("toggles the legend from %s", (_label, data) => {
     const { comp } = setup();
     comp.render(100);
@@ -543,8 +544,9 @@ describe("Member Inspector timeline wiring (P3)", () => {
   it("does not treat other printable keys as the legend key", () => {
     const { comp } = setup();
     comp.render(100);
-    // Shift+H (modifyOtherKeys 27;2;72~) and a plain "/" must not toggle it.
-    for (const data of ["\x1b[27;2;72~", "/", "\x1b[47u", "\x1b[47;5u"]) comp.handleInput(data);
+    // Shift+H, a plain "/", ctrl/alt forms and the kitty release event must not toggle it.
+    for (const data of ["\x1b[27;2;72~", "/", "\x1b[47u", "\x1b[47;5u", "\x1b[47;2:3u", "\x1b[63;2:3u"])
+      comp.handleInput(data);
     expect(plain(comp.render(100))).toContain("ctrl+b 全部中断");
     comp.close();
   });

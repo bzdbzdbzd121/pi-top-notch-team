@@ -80,16 +80,27 @@ describe("decodePrintableKey — legacy 原字符", () => {
   });
 });
 
-describe("decodeCommandChar — 命令键（Shift 符号别名）", () => {
-  it("三种问号编码 + kitty 纯 '?' 都解出 '?'", () => {
+describe("decodeCommandChar — 命令键（Shift 符号别名 + kitty 事件类型）", () => {
+  it("五种问号编码都解出 '?'（两协议基础码位假设一致）", () => {
     // kitty：Shift 报结果码位 63
     expect(decodeCommandChar("\x1b[63;2u")).toBe("?");
-    // kitty：Shift + 基础键 '/'（码位 47）—— 美式布局打出的是 '?'
+    // kitty：Shift + 基础键 '/'（码位 47）
     expect(decodeCommandChar("\x1b[47;2u")).toBe("?");
-    // xterm modifyOtherKeys：直接给结果码位 63
+    // kitty：同上，但带事件类型（pi 请求 flags=7 → 按键带 :1）
+    expect(decodeCommandChar("\x1b[47;2:1u")).toBe("?");
+    // xterm modifyOtherKeys：结果码位 63；以及基础码位 47（与 kitty 同一假设）
     expect(decodeCommandChar("\x1b[27;2;63~")).toBe("?");
+    expect(decodeCommandChar("\x1b[27;2;47~")).toBe("?");
     // kitty 无修饰的 '?'
     expect(decodeCommandChar("\x1b[63u")).toBe("?");
+  });
+
+  it("kitty release（事件类型 3）不产生字符", () => {
+    expect(decodeCommandChar("\x1b[47;2:3u")).toBeUndefined();
+    expect(decodeCommandChar("\x1b[63;2:3u")).toBeUndefined();
+    // press/repeat（1/2）仍然算一次按键
+    expect(decodeCommandChar("\x1b[47;2:1u")).toBe("?");
+    expect(decodeCommandChar("\x1b[47;2:2u")).toBe("?");
   });
 
   it("其他字符不被别名改写（字母不别名、'/' 无 Shift 仍是 '/'）", () => {
@@ -97,12 +108,13 @@ describe("decodeCommandChar — 命令键（Shift 符号别名）", () => {
     expect(decodeCommandChar("\x1b[97;2u")).toBe("a");
     expect(decodeCommandChar("\x1b[65;2u")).toBe("A");
     expect(decodeCommandChar("\x1b[47u")).toBe("/");
-    expect(decodeCommandChar("\x1b[27;2;47~")).toBe("/"); // modifyOtherKeys 报结果字符，不猜布局
+    expect(decodeCommandChar("\x1b[27;1;47~")).toBe("/");
   });
 
   it("ctrl/alt 与非可打印序列返回 undefined（legacy 走 matchesKey 兜底）", () => {
     expect(decodeCommandChar("\x1b[47;5u")).toBeUndefined();
     expect(decodeCommandChar("\x1b[47;3u")).toBeUndefined();
+    expect(decodeCommandChar("\x1b[47;5:1u")).toBeUndefined();
     expect(decodeCommandChar("?")).toBeUndefined();
     expect(decodeCommandChar("\r")).toBeUndefined();
   });

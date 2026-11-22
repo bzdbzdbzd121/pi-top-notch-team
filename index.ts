@@ -7,8 +7,6 @@ import {
   setManifestRuntimeContext,
   syncActiveManifest,
   resetManifestRuntimeContext,
-  getManifestPath,
-  readManifestFile,
 } from "./src/session/manifest";
 import type { TeamContext } from "./src/session/context";
 import { getRootDir } from "./src/config";
@@ -234,12 +232,10 @@ export default function (pi: ExtensionAPI) {
   // Semantic traces live for a team session, including while the overlay is closed.
   let overviewStore: MemberOverviewStore | null = null;
   let overviewSessionId: string | null = null;
-  const overviewStarted = new Set<string>();
   const clearOverview = () => {
     overviewStore?.clear();
     overviewStore = null;
     overviewSessionId = null;
-    overviewStarted.clear();
   };
   const syncOverviewSession = () => {
     const session = getSessionState();
@@ -248,15 +244,9 @@ export default function (pi: ExtensionAPI) {
       clearOverview();
       overviewStore = createMemberOverviewStore();
       overviewSessionId = session.sessionId;
-      if (session.sessionId) {
-        const manifest = readManifestFile(getManifestPath(getRootDir(), session.teamDefinition.name, session.sessionId));
-        for (const name of manifest?.startedMembers ?? []) overviewStarted.add(name);
-      }
     }
     const names = session.teamDefinition.members.map(member => member.name);
     overviewStore.syncMembers(names);
-    const keep = new Set(names);
-    for (const name of overviewStarted) if (!keep.has(name)) overviewStarted.delete(name);
   };
   // Handle for the currently-open inspector overlay; null when closed.
   let inspectorHandle: MemberInspectorHandle | null = null;
@@ -293,11 +283,9 @@ export default function (pi: ExtensionAPI) {
         memberOpsStates,
         getActivity: (name) => activityTracker?.getActivity(name),
         getRecentActions: (name) => overviewStore?.getRecentActions(name) ?? [],
-        getActionCount: (name) => overviewStore?.getActionCount(name) ?? 0,
         getTimelineInfo: (name) => overviewStore?.getTimelineInfo(name) ?? { truncated: false, turns: [] },
         getLastActivityAt: () => overviewStore?.getLastActivityAt(),
         isCompacting: (name) => overviewStore?.isCompacting(name) ?? false,
-        getStartedMembers: () => [...overviewStarted],
       });
     },
   });
@@ -426,12 +414,7 @@ export default function (pi: ExtensionAPI) {
         }
       }
       try {
-        if (overviewStore) {
-          overviewStore.onEvent(memberName, event);
-          if (event?.type === "agent_start" || memberHandles.get(memberName)?.getState().status === "running") {
-            overviewStarted.add(memberName);
-          }
-        }
+        if (overviewStore) overviewStore.onEvent(memberName, event);
       } catch {
         /* isolate */
       }
@@ -473,7 +456,6 @@ export default function (pi: ExtensionAPI) {
         // pi does not emit process_started. Reset display gates after a real
         // successful start, including manager-driven auto-restarts of this handle.
         overviewStore?.onEvent(config.name, { type: "process_started" });
-        overviewStarted.add(config.name);
       }
     };
     return handle;
