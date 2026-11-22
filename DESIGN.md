@@ -1242,38 +1242,130 @@ A full-keyboard overlay that lets the **user** inspect each Member's live conver
 
 ### Layout
 
-每次打开默认显示总览。以下为结构示意，实际布局按终端可见列宽计算：
+每次打开默认显示总览。总览是**色块时间轴**（决策 #52）：纵轴是成员，横轴是时间——**同一列在所有行代表同一个时间段**，所以「谁在并行、谁长期在忙、谁空着」一眼可读；行首用 ≤3 字写「现在在做什么」，颜色与色带同源。以下为结构示意（字符是颜色替身，真实终端里同色字符是同一前景色的实心块）：
 
 ```text
-╭─ Member Inspector ──────────────────────────────────────╮
-│ ❰总览❱  分析员  编码员  测试员                           │
-├────────────────────────────────────────────────────────┤
-│ › 分析员   [█░░░░░░░░░] 12%   💭 📖 💭 📖             │
-│   编码员   [█████░░░░░] 45%   📖 📝 🔧 💭 (12)          │
-│   测试员   [██░░░░░░░░] 18%   ✅ ✏️ 🔧                 │
-├────────────────────────────────────────────────────────┤
-│ ←→ 切页  ↑↓ 选择成员  Enter 查看会话  Esc 关闭           │
-│ ctrl+b 全部中断                                        │
-╰────────────────────────────────────────────────────────╯
+╭─ Member Inspector ──────────────────────────────────────────────────────────────╮
+│ ❰总览❱  分析员  编码员  测试员                                                   │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                         10:41:15   10:42:35   10:43:55     现在                   │
+│ › 分析员  思考中 [██░░] 42%  ···██▓▓▓··██··▓▓▓▓··!··▁▁▁▁▁                          │
+│   编码员  执行中 [███░] 31%  ··██▓▓▓▓▓▓▓▓▓▓▓▓▓▓····                              │
+│   测试员  等待中 [█░░░] 18%  ░░░░▁▁▁▁▁▁▁▁▁▁▁▁██▓▓··▁▁▁▁▒▒                          │
+│   文档员  已停止        —    ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░                      │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│ ←→ 切页  ↑↓ 选择成员  Enter 查看会话  ? 颜色  Esc 关闭                             │
+│ ctrl+b 全部中断                                                                   │
+╰─────────────────────────────────────────────────────────────────────────────────╯
 ```
 
-成员会话正文和输入框继续使用原有实现。浮窗内部不再显示全员状态汇总行，底栏只保留两行提示/输入。notice 临时替换导航提示，向上翻会话时的「↓ 有更新」也保留在提示行。浮窗外的 team-status-widget 不变。
+`█`/`▓` = 段首/续块，`!` = 崩溃，`-` = 停止，`·` = 回合结束，`▁` = 忙碌但无动作，`░` = 未观测/被截断，`▒` = 压缩续块，空格 = 观测到的空闲。
+
+成员会话正文和输入框继续使用原有实现。浮窗内部不再显示全员状态汇总行，底栏只保留两行提示/输入。notice 临时替换导航提示，向上翻会话时的「↓ 有更新」也保留在提示行。浮窗外的 team-status-widget 不变：**总览页是色块 + 文字状态，状态条仍是 emoji**（单行极窄常驻条上 emoji 最省列，两者共享同一套语义映射、只是表现形式不同）。
 
 ### Overview data and lifecycle
 
-- `MemberInspectorState.view` 为显式 `overview | member(name)` 页面，成员身份用 name 保存。总览不产生伪成员 tab，也不发送成员 RPC 控制命令。
-- 每成员一行，按名册稳定排序。无表头、无状态文字列、无底部图例。所有正文行均用于成员，选择行跟随窗口滚动。标签栏固定总览并展示当前成员附近的水平窗口。
-- 轨迹最左图标表示当前状态。最新活动记录匹配当前状态时复用该记录，否则补充一个显示位置，不写入历史。新操作从左插入，历史向右移动。含当前状态最多20个图标，宽度不足时显示更少，尾部完整显示 `(N)`，N为该成员会话累计动作数减去当前显示的真实记录数，包含已被64条环形缓冲淘汰的历史；累计数不受保留容量限制，不能停在45。
-- 当前状态先采用控制面的 crashed/stopped，再采用成员侧确认的压缩，最后读取 working 的 activity-tracker 阶段。控制面 compacting 也用于派发前 stats 查询占位，不代表实际压缩；注入的 isCompacting=false 时，该占位在总览显示为空闲，不出现 🗜️。手动压缩即使控制面仍 idle，也能由成员侧事件显示 🗜️。活动和错误图标通过下划线和语义色强调。占用使用水平条加百分比，如 `[████░░░░░░] 42%`；null/未知为中性点条加 `?`，失败旧值为 `~42%`，停止/崩溃为 `—`。窄屏缩短占用条和成员名，优先保留当前图标、百分比与隐藏计数。
-- `member-overview-store.ts` 每成员保存最近64个语义动作，另用 O(1) 计数器累计全部追加操作，getActionCount 返回该总数。更新结果或接收同块 delta 不增加计数；同会话重启保留，删除成员或结束团队会话清空，resume/重载不恢复旧总数。思考/输出按内容块去重，工具按 toolCallId 关联，从参数生成到执行结果原位更新。两次 read 保留两个 📖，不按 delta 追加记录。活动和失败图标加下划线，颜色只作辅助。✅ 仅表示回合结束，不断言任务验收成功。
-- 压缩历史只认成员侧开始事件、成功 get_state.isCompacting=true，或结束事件带成功的 `result.summary`，不再采样控制面的 compacting 边沿。缺少开始依据且无成功结果的孤立 compaction_end 不创建 🗜️，以免把无实际压缩证据的结束通知误记为成员首个操作。真实已开始的压缩与失败结果仍保留；不改变控制面的压缩心跳处理。
-- 存储由 index.ts 按团队 sessionId 管理，关闭浮窗期间仍采集。同一 sessionId 的重复 UI 安装不清空，stop/shutdown 清空，resume/重载不从磁盘重建轨迹。不保存正文、参数、工具结果或完整 RPC 事件。环形缓冲与关联索引均有界。
-- 活动分发顺序：tracker 更新 → 进程死亡时清 tracker → 总览存储 → inspector → widget。每个消费者独立捕获异常。创建成员时捕获 sessionId 和 handle 身份，过期来源不更新显示观察者。成功 start（包括同一 handle 的自动重启）重置显示专用 process_started 门，不依赖首次 agent_start。
-- 总览只渲染可见成员，不拉完整会话。复用100ms–1s合并刷新与显示签名去重，进入成员页时补齐既有增量会话与流式内容。
-- stats 打开时立即查询，此后每轮结束5秒再排下一轮，最多四路并发、单次3秒超时。关闭、成员删除或句柄更换后不写回在飞结果。
-- 常规 chrome 为7行（原8行）。无表头总览正文只需1个成员行，正文窗口与 PgUp/PgDn 使用完整 bodyHeight。更矮时使用紧凑布局，显示选中成员的状态/占用和退出提示。
+**行模板**：`标记(2) + 名称(N) + 空格 + 状态词(B) + 空格 + 占用(12) + 空格 + 时间轴(lane)`。`N = min(18, max(4, floor(inner/6)))`（`memberNameWidth`，与表头共用），`B` = 6（3 字档）或 4（2 字档），占用固定 12 列 = 4 格条 + 百分比（`TIMELINE_CONTEXT_WIDTH`，`CONTEXT_BAR_CELLS = 4`）。因此 `prefix = 17 + N + B`、`lane = inner − prefix`（`timelinePrefixWidth` / `timelineLaneWidth` 单点实现），**每行 lane 起点只由宽度决定**；测试用「车道尾部可见 run」逐行实测前缀宽度并断言 `prefix + lane === width`。
 
-`MemberInspectorDeps` 在既有 getMembers/getHandle/memberOpsStates 外增加五个可选只读依赖：`getActivity(name): MemberActivity | undefined`、`getRecentActions(name): readonly OverviewAction[]`、`getActionCount(name): number`、`isCompacting(name): boolean`、`getStartedMembers(): readonly string[]`。getActionCount 经 OverviewRow.actionCount 传给布局与显示签名，缺失或非法时兼容回退到保留记录数。计数位数增长时布局先缩短占用条和名称，以保留完整 `(N)`。isCompacting 由总览存储的成员侧确认状态提供，独立于轨迹容量和控制面的预检占位；进程重启/退出清除，轨迹条目被淘汰也不丢失正在压缩的事实。可选性用于无追踪器的旧调用方安全降级。布局纯函数位于 `member-overview-state.ts`。完整设计与验证记录见 [成员浮窗总览设计](docs/design-member-inspector-overview.md)。
+**档位与窗口预算**（档位阈值 `TIER_MIN_LANE = {3: 20, 2: 14}` 锁成测试常量）：
+
+| inner | N | 档位 | lane | 每格 | 窗口 |
+|---|---|---|---|---|---|
+| 70 | 11 | 3 字 | 36 | 5 s | 180 s |
+| 88 | 14 | 3 字 | 51 | 3 s | 153 s |
+| 106 | 17 | 3 字 | 66 | 3 s | 198 s |
+| 124 | 18 | 3 字 | 83 | 2 s | 166 s |
+| 142 | 18 | 3 字 | 101 | 2 s | 202 s |
+| 178 | 18 | 3 字 | 137 | 1 s | 137 s |
+
+降级档：inner 62/52 → 3 字档（29/21 格）；43/41 → 2 字档（15/14 格）；≤ 40 → **D 级兜底**（名称 + 2 字状态 + 最近记录色块，最新在左，无时间轴）。步长 `pickStep` 从 `{1,2,3,5}` 秒（`STEP_LADDER_MS = [1000, 2000, 3000, 5000]`）里选使 `格数 × 步长` 最接近 `TARGET_WINDOW_MS = 180000`（180 s）的一档，**并列取更小步长**；`MIN_TIMELINE_CELLS = 12` 是「值得画时间轴」的防御下限（档位阈值保证 A/B 级恒 ≥ 14 格，D 级不画轴也不画刻度）。
+
+**网格与锚点**：一格一列（一格 = 一列 = 一段 `step` 长的时间）。`cell(k) = [anchor − (格数−1−k)·step, anchor − (格数−k−1)·step)`，即**最右格起点 = anchor**、它的右边界是「现在」——右端＝现在，最右一格是正在进行中的那一段。`anchor = floor(now/step)·step`。全队空闲且最后活动已滑出窗口时**冻结**：`anchor = floor(lastActivityAt/step)·step`（最后活动落在最右格），右端刻度改成该时刻，底栏写 `停在 N 分钟前`。任何成员在跑（控制面 working/compacting，或可见记录里有 active）都不冻结；有新记录就自然回到「现在」。
+
+**时钟保护**：存储侧全局单调钳制（回拨时事件压到当前瞬间、跨成员顺序不颠倒，见下）；**时间轴上起点在窗口右缘之后的记录不画**（回拨后残留在未来的戳不会堆成「刚刚爆发」），起点在窗内的区间画到右缘；`at` 为 NaN/±Infinity/负数直接丢弃，不产生 NaN 列号。前跳一小时：旧活动按冻结锚点照常可见（不画假空白）。
+
+**格内优先级**（`PRIORITY`，一格只画一个符号，强者胜；同级按记录先后、先到先占）：
+
+```text
+崩溃 100 > 停止 95 > 压缩 80 > 工具失败 70 > 写入 60 > 读取 55 > 其他工具 50
+  > 输出 40 > 思考 30 > 回合结束 20 > 忙碌静默 10 > 空闲（无候选时空白） > 未观测（斜纹）
+```
+
+「回合结束」是点事件，只在该格没有真实动作时出现——它每次回合末尾都产生，否则会吃掉每轮最后一个工具记录。候选按优先级排序后「先到先占、全格占满即停」，把「记录 × 格」的重复写入降为 O(候选 + 格)。
+
+**字形表**（全部 1 列宽，宽度由 `visibleWidth` 统一计算）：段首 `█` / 续块 `▓`（每一段可见 run 从其首个可见格重新从 `█` 开始，所以相邻两件事不会粘成一条）；压缩段首 `█` / 续块 `▒`；崩溃 `!`（error）；停止 `-`（muted）；回合结束 `·`（dim）；忙碌但无动作 `▁`（muted，来自 P1 回合区间）；空闲 = 空格；未观测/被截断 `░`（dim）。**D 级兜底的记录块一律是 `█`**（含 complete/crash/stop——那一级没有时间轴，点事件的定位意义消失，状态词负责说「已崩溃」）。
+
+**颜色**（`resolveAnsi` 三层回退，逐语义 fail-open，绝不抛错）：
+
+| 语义（`OpClass`） | 主题 token | 固定 RGB | 16 色 |
+|---|---|---|---|
+| 思考 `thinking` | `thinkingLow` | `#5f87af` | 94 |
+| 输出 `output` | `text` | `#c8c8c8` | 39 |
+| 读取 `read` | `syntaxType` | `#4ec9b0` | 96 |
+| 写入 `modify` | `customMessageLabel` | `#9575cd` | 95 |
+| 其他工具 `tool` | `warning` | `#d7af5f` | 93 |
+| 工具失败 `failed` | `error` | `#cc6666` | 91 |
+| 压缩 `compact` | `warning` | `#d7af5f` | 93 |
+| 崩溃 `crash` | `error` | `#cc6666` | 91 |
+| 停止 `stop` | `muted` | `#808080` | 90 |
+| 回合结束 `complete` | `dim` | `#666666` | 90 |
+| 忙碌静默 `busySilent` | `muted` | `#808080` | 90 |
+| 未观测 `unknown` | `dim` | `#666666` | 90 |
+| 空闲 `idle` | `muted` | `#808080` | 90 |
+
+第 1 层：`mode: "truecolor" | "256color"` 直接用主题 token 的 ANSI（256 用 `rgbToAnsi256` 量化固定 RGB）。第 2 层：token 缺失/抛错/空串 → 固定 RGB。第 3 层：**16 色表只在模式无法识别时启用**；`mode: "none"` = **不发色**（空串，调用方据此跳过上色），因为 pi 的 `getColorMode()` 只报真彩/256 两种，16 色在正常路径上不可达。`OpClass` 共 **13 类**：方案正文的 11 类 + `failed`（§3.4「失败优先显示失败色」需要一个可断言的类）+ `idle`（空白字形，让 `paintLane()` 返回全函数而非 `undefined`）。压缩不占独立色相（`warning` + `▒`）：8 个色相在 256 色 + 色觉缺陷模拟下会与青色撞车。
+
+**状态词**（11 状态 × 2 档；`BADGE_WORDS` 是单一事实来源，`BADGE_WIDTH = {3: 6, 2: 4}`，左对齐补空格）：
+
+| 状态 | 3 字档 | 2 字档 | 判定依据 |
+|---|---|---|---|
+| 思考 | `思考中` | `思考` | phase = thinking |
+| 输出 | `输出中` | `输出` | phase = output |
+| 读取 | `读取中` | `读取` | phase = executing 且最新记录是 active read |
+| 写入 | `写入中` | `写入` | phase = executing 且最新记录是 active modify |
+| 执行 | `执行中` | `执行` | phase = executing / tool-calling 的其他情况 |
+| 压缩 | `压缩中` | `压缩` | 控制面或成员侧确认的压缩（预检占位不算） |
+| 等待 | `等待中` | `等待` | working 且（无开放回合 或 本轮无记录） |
+| 工作 | `工作中` | `工作` | working、本轮有记录、tracker 无具体阶段 |
+| 空闲 | `空闲`（补 2 空格） | `空闲` | 控制面 idle |
+| 崩溃 | `已崩溃` | `崩溃` | 进程崩溃 |
+| 停止 | `已停止` | `停止` | 已停止 / 从未启动 |
+
+状态词的颜色 = 它在时间轴里的语义色（`statusClass`）：思考蓝、读取青、写入紫、执行/压缩琥珀、输出常规前景、崩溃红；**等待/工作/空闲/停止是灰色**——它们在时间轴上没有专属色相，颜色不撒谎，具体是哪种由文字说明。**运行期不做裁剪**：字段宽度只靠「表内词 + 补空格」保证，词表本身不允许超宽（测试穷举 22 个字符串）；不要加省略号截断。
+
+**推进**：一个按格边界对齐的定时器（`timelineStepFor` 只读宽度，**不收集行**），只在浮窗打开且停在总览页时存在；离开总览、`close()` 立即清除；`unref()` 不持事件循环。每次 tick 走显示签名去重（`timelineSignature` = 档位 + 窗口 anchor + 行数据，首帧播种），行与锚点都不变 → 0 次重绘；冻结窗口 anchor 不变 → tick 空转、0 重绘。定时器不产生任何 RPC。
+
+**`?` 颜色说明**：总览页按 `?` 就地替换底栏第二行（不新增行、不改正文高度），9 个 2 字词按类着色、放不下时从右删整项；再按一次恢复 `ctrl+b 全部中断`（冻结时该行是 `停在 N 分钟前 · ctrl+b 全部中断`，图例优先占用）。图例只列 9 类、**不含「失败」**：失败与崩溃同为 error 色相，靠 `!` 字形与状态词区分。导航提示常驻 `? 颜色` 入口。命令键走 `decodeCommandChar`（决策 #14 的字符路径纪律）：legacy 字面量 `?`、kitty `CSI 63;2u` / `CSI 47;2u` / `CSI 47;2:1u`（带事件类型）/ `CSI 63u`、xterm modifyOtherKeys `CSI 27;2;63~` / `CSI 27;2;47~` 都生效；kitty release（`:<3>`）不触发；「Shift + 基础符号」（`/` → `?`）对两套协议同一处理。
+
+**数据与生命周期**（P1 存储契约）：
+- `OverviewAction` 带 `at` / `endedAt`。`endedAt` 只在离开 active 时写一次；直接以终态追加的记录（complete / crashed / stopped / 补记的压缩）`endedAt === at`，保证三类点事件各自占住一格而不是永不出现。时间戳走**全局单调钳制**（`lastStamp = max(lastStamp, clock())`）：回拨 1 小时时事件被压到当前瞬间，区间不为负、跨成员顺序不颠倒、事件不丢。
+- `getTimelineInfo(name)`：`knownFrom`（未截断 = 首次观测时刻；64 条环形缓冲截断后 = 最老保留记录的时刻）、`truncated`（会话总数 > 保留数）、`turns`（闭合回合区间，升序，上限 16）、`openTurnStart`（未闭合回合，驱动「等待中」）。`knownFrom` 之前的格画 `░`，之内且无任何记录的格是空白——「我们没看见」与「它闲着」不能互相冒充。进程死亡/重启关闭回合且不复活已闭合的回合；进程死亡后迟到的 `agent_start` **不复活**成员（只认 `process_start`/`process_started`）。
+- `getLastActivityAt()`：全队最后活动（append 与 endedAt 写入都推进），供冻结锚点使用；成员移除不降水位，`clear()` 归零。
+- 每成员保留最近 64 条语义记录（容量不变）；淘汰不重置回合区间与观测水位。**`/team resume` / `/reload` 之后是从零观测**（新 store 无证据）：整行斜纹，不复活旧历史、不把未观测段画成空闲。
+- 压缩历史只认成员侧开始事件、成功 `get_state.isCompacting=true`、或带成功 `result.summary` 的结束事件（孤立结束不补造记录）；控制面 compacting 是派发前预检占位，不写压缩历史。
+- 存储由 index.ts 按团队 sessionId 管理，关闭浮窗期间仍采集；stop/shutdown 清空，不从磁盘重建。不保存正文、参数、工具结果或完整 RPC 事件；环形缓冲与关联索引均有界。
+- 活动分发顺序：tracker → 进程死亡清 tracker → 总览存储 → inspector → widget，每个消费者独立捕获异常；创建成员时捕获 sessionId 与 handle 身份，过期来源不更新。
+
+`MemberInspectorDeps` 的可选只读依赖：`getActivity(name)`、`getRecentActions(name)`、`isCompacting(name)`、`getTimelineInfo(name)`、`getLastActivityAt()`。总览只读**可见成员**的动作与时间轴证据（O(可见)），缺失 `getTimelineInfo`/`getLastActivityAt` 时退化为「无观测」（整行斜纹）而不报错。旧图标轨迹的 `getActionCount` / `getStartedMembers` 与 `OverviewRow.actionCount` / `started` 已随旧轨迹删除（见台账）。布局纯函数分布在三个模块：`member-overview-timeline.ts`（网格/绘制/刻度/图例/签名/容量）、`member-overview-badge.ts`（词表/档位/状态词判定）、`member-overview-palette.ts`（颜色三层回退）；`member-overview-state.ts` 只剩表头窗口与可复用辅助（`markerFor`/`memberNameWidth`/`contextBar`/名称清洗）。
+
+**容量同步**：`timelineCapacity(height, inner)` 是唯一来源——渲染、可见行收集、PgUp/PgDn、选择跟随四处共用。24 行终端 = 轴 + 12 成员（13 正文行减轴行）。刻度行占正文第一行；高度 < 3 行不画轴；零成员显示「暂无成员」且不画轴。
+
+**成本与性能留档**：24 成员 × 64 记录、inner 178、真彩，单帧 **12 206 B**；20 帧中位数 **1.63 ms/帧（无色）/ 2.20 ms/帧（真彩）**（空闲机），并行跑全量测试时同用例实测 3.9–11.4 ms/帧——结论是它比被替换掉的图标轨迹更快：同数据下旧轨迹 **3.38 ms/帧**。每帧行收集 1 次（定时器不收集），`paintLane` 为 O(候选 + 格)。
+
+**已知限制**（与方案 §6.2 一致，并补两条实现事实）：
+1. 没有派发时刻的数据源，`等待中` 只能由「working 且本轮无记录」推断，给不出「已等待 N 秒」。
+2. 颜色不是无损语义：7 类色相是实测上限；压缩不占色相（琥珀斜纹），工具失败与崩溃同色相。
+3. 不做跨会话回放：`/resume`、`/reload` 之后从零观测，开头是斜纹。
+4. 纯文本自分析（模型不调工具的思考）只能落在「回合在跑」的细横条里。
+5. 16 色回退不是正常路径（pi 只报真彩/256），仅在模式无法识别时启用。
+6. 3 字状态无法细分是 bash 还是其他工具（工具名属成员页信息）。
+7. **冻结提示的分钟数不会自己走**：冻结窗口的显示签名不变 → 不重绘 → `停在 N 分钟前` 只在下次因其它原因重绘时更新（按键、stats 轮询等）。这是「无变化不重绘」的代价，避免为一行文字常驻定时器。
+8. 同格合并：一格内多次动作只留最高优先级的一个，精确历史进成员页。
+9. 窄屏 D 级按「最近记录数」而不是时间，未来戳的记录在 D 级仍会出现（那一级没有时间轴，不会误读为「刚刚爆发」）。
+
+**台账（已删除的东西，不要当 bug 改回来）**：旧图标轨迹 `buildOverviewTrail` / `buildOverviewLines` / `ICONS` / `MAX_TRAIL_ICONS` / `actionTotal` / `currentAction` 连同**服务它们的 62 条用例**已在 P3 收口时删除（`member-overview-state.ts` 239 → 130 行）；被取代的旧裁决是：**新在左的图标序列、最多 20 个图标、`(N)` 隐藏计数、无表头无图例（现在有刻度行与 `?` 说明）、emoji 图标、单字徽标**。
+
+完整设计与验证记录见 [成员浮窗总览设计](docs/design-member-inspector-overview.md)。
 
 Overlay: `ctx.ui.custom(component, { overlay: true, overlayOptions: { width: "90%", maxHeight: "85%", anchor: "center" } })`.
 
@@ -1295,6 +1387,7 @@ Overlay: `ctx.ui.custom(component, { overlay: true, overlayOptions: { width: "90
 | `ctrl+a` | 成员页 `abort` 当前成员；总览只提示先进入成员会话 |
 | `ctrl+b` / `ctrl+shift+a` | `abort` ALL executing members (working/compacting) in one shot; idle/stopped/crashed are skipped. `ctrl+shift+a` requires Kitty keyboard protocol — legacy terminals send the same byte as `ctrl+a` (single abort), so `ctrl+b` remains the all-terminal key |
 | `ctrl+o` | 成员页 `compact` 当前成员；总览只提示先进入成员会话。NOT ctrl+m — indistinguishable from Enter in terminals |
+| `?` | 总览：就地切换底栏颜色说明（不新增行；9 个 2 字词按类着色，放不下从右删整项）；再按一次恢复。**必须经 `decodeCommandChar`**：legacy `?`、kitty `CSI 63;2u`/`CSI 47;2u`/`CSI 47;2:1u`/`CSI 63u`、modifyOtherKeys `CSI 27;2;63~`/`CSI 27;2;47~` 都生效；kitty release（`:<3>`）不触发。成员页无绑定 |
 | `Esc` | Layered exit: input box → overlay |
 
 ### Rendering Granularity
@@ -1439,8 +1532,13 @@ inspector 输入框曾有两个独立的按键故障根因，修复互补、全�
 
 | File | Role |
 |------|------|
-| `src/ui/member-inspector-state.ts` | Pure display state + line building (no TUI deps, fully unit-tested) |
-| `src/ui/member-inspector.ts` | TUI glue: overlay component, key dispatch, refresh engine, send/control logic |
+| `src/ui/member-inspector-state.ts` | Pure display state + conversation line building (no TUI deps, fully unit-tested) |
+| `src/ui/member-inspector.ts` | TUI glue: overlay component, key dispatch, refresh engine, timeline tick, send/control logic |
+| `src/ui/member-overview-timeline.ts` | 总览时间轴纯函数：档位/窗口/锚点/落格/字形/刻度/图例/签名/容量 |
+| `src/ui/member-overview-badge.ts` | 11 状态 × 2 档词表、字段宽度、档位判定、状态词判定与配色映射 |
+| `src/ui/member-overview-palette.ts` | 语义 → ANSI 三层回退（token → 固定 RGB → 16 色 → 无色） |
+| `src/ui/member-overview-state.ts` | 总览表头窗口 + 可复用辅助（marker/名称列/上下文栏/名称清洗） |
+| `src/ui/member-overview-store.ts` | 会话级语义动作存储 + P1 时间轴证据（at/endedAt/水位/回合/最后活动） |
 | `src/channel/event-handler.ts` | `onMemberActivity` hook in `EventHandlerDeps` |
 | `index.ts` | `registerShortcut("alt+t")`, hook wiring, `/team stop` auto-close |
 
