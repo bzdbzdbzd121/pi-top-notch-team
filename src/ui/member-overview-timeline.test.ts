@@ -9,7 +9,7 @@ import { memberNameWidth } from "./member-overview-state.js";
 import {
   AXIS_NOW_LABEL, AXIS_TICK_EVERY, AXIS_TIME_WIDTH, CONTEXT_BAR_CELLS, GLYPH, LEGEND_ITEMS,
   MIN_TIMELINE_CELLS, STEP_LADDER_MS, TARGET_WINDOW_MS, TIMELINE_CONTEXT_WIDTH, buildAxisLine,
-  buildColorLegend, buildLaneText, buildTimelineLines, cellIndexAt, cellStart, fallbackLayout,
+  buildColorLegend, buildFrozenNotice, buildLaneText, buildTimelineLines, cellIndexAt, cellStart, fallbackLayout,
   formatClock, paintLane, pickStep, resolveWindow, timelineAxisVisible, timelineCapacity,
   timelineLaneWidth, timelinePrefixWidth, timelineSignature, timelineTier, timelineWindow,
   type LaneCell, type TimelineRow, type TimelineWindow,
@@ -191,14 +191,16 @@ describe("member overview timeline lane", () => {
     expect(paintLane([], undefined, w)[0]!.cls).toBe("unknown");
   });
 
-  it("discards unusable timestamps and clamps the future into the current cell", () => {
-    const w = win(10, 1000, 100_000);
+  it("discards unusable timestamps and never paints the future", () => {
+    const w = win(10, 1000, 100_000); // window = [91 000, 101 000)
     const base = info({ knownFrom: 91_000 });
     for (const at of [Number.NaN, Number.POSITIVE_INFINITY, -5])
       expect(paintLane([record({ at })], base, w).every(cell => cell.cls === "idle")).toBe(true);
-    const future = paintLane([record({ at: 500_000 })], base, w);
-    expect(future[9]!.cls).toBe("read");
-    expect(future.filter(cell => cell.cls !== "idle")).toHaveLength(1);
+    // Beyond the right edge (clock rollback leaves stamps ahead of now): not drawn.
+    for (const at of [101_000, 101_001, 500_000])
+      expect(paintLane([record({ at })], base, w).every(cell => cell.cls === "idle")).toBe(true);
+    // One millisecond inside the edge still owns the last cell.
+    expect(paintLane([record({ at: 100_999 })], base, w)[9]!.cls).toBe("read");
     expect(paintLane([record({ at: 1_000 })], base, w).every(cell => cell.cls === "idle")).toBe(true);
   });
 
@@ -393,6 +395,56 @@ describe("member overview timeline frame budget", () => {
     console.log(`[perf] 24×64 inner=178: ${perFrame.toFixed(3)} ms/frame, ${bytes} B/frame`);
     expect(perFrame).toBeLessThan(50);
     expect(bytes).toBeLessThan(200_000);
+  });
+});
+
+describe("member overview timeline clock guards (P4)", () => {
+  it("keeps a backward clock jump honest: the future stamp is invisible, the present one paints", () => {
+    const now = 10_000_000;
+    const ahead = now + 3_600_000; // an hour ahead, as a rollback leaves the store's stamps
+    const window = resolveWindow({ now, laneWidth: 40, live: false, lastActivityAt: ahead });
+    expect(window.frozenAt).toBeUndefined(); // a future watermark is not "idle in the past"
+    const cells = paintLane([
+      record({ at: ahead, endedAt: ahead + 2_000, kind: "thinking" }),
+      record({ at: now - 1_000, kind: "read" }),
+    ], info({ knownFrom: now - 60_000 }), window);
+    const painted = cells.map((cell, index) => cell.cls === "read" ? index : -1).filter(index => index >= 0);
+    // now-1 s falls in the cell before the in-progress one (5 s cells, anchor = now).
+    const expectedCell = window.cells - 1 - Math.ceil(1_000 / window.step);
+    expect(painted).toEqual([expectedCell]);
+    expect(cells.filter(cell => cell.cls === "thinking")).toHaveLength(0);
+    expect(buildLaneText(cells)).not.toMatch(/NaN/);
+  });
+
+  it("filters non-finite timestamps without producing a NaN column", () => {
+    const window = win(12, 1_000, 100_000);
+    const cells = paintLane([
+      record({ at: Number.NaN }),
+      record({ at: Number.POSITIVE_INFINITY }),
+      record({ at: Number.NEGATIVE_INFINITY }),
+      record({ at: -1 }),
+      { id: 99, kind: "read", status: "done", at: Number.NaN, endedAt: 500 },
+    ], info({ knownFrom: 89_000 }), window);
+    expect(cells).toHaveLength(12);
+    expect(cells.every(cell => cell.cls === "idle")).toBe(true);
+    const text = buildLaneText(cells);
+    expect(text).not.toContain("NaN");
+    expect(visibleWidth(text)).toBe(12);
+  });
+
+  it("explains a frozen window and says nothing while it slides", () => {
+    const now = 100_000_000;
+    const last = now - 12 * 60_000;
+    const frozen = resolveWindow({ now, laneWidth: 40, live: false, lastActivityAt: last });
+    expect(buildFrozenNotice(frozen, now)).toBe("停在 12 分钟前");
+    expect(buildFrozenNotice(resolveWindow({ now, laneWidth: 40, live: true }), now)).toBe("");
+    // A frozen window always reads as at least one minute.
+    const shortest = resolveWindow({ now, laneWidth: 1, live: false, lastActivityAt: now - 1_000 });
+    expect(shortest.frozenAt).toBe(now - 1_000);
+    expect(buildFrozenNotice(shortest, now)).toBe("停在 1 分钟前");
+    // Long idle stretches stay in minutes (no fake precision).
+    expect(buildFrozenNotice(resolveWindow({ now, laneWidth: 40, live: false, lastActivityAt: now - 3_600_000 }), now))
+      .toBe("停在 60 分钟前");
   });
 });
 

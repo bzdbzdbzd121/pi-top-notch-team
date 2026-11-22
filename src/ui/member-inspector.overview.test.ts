@@ -524,6 +524,31 @@ describe("Member Inspector timeline wiring (P3)", () => {
     comp.close();
   });
 
+  it.each([
+    ["legacy literal", "?"],
+    ["kitty shift+? codepoint", "\x1b[63;2u"],
+    ["kitty shift+/ base key", "\x1b[47;2u"],
+    ["kitty plain ?", "\x1b[63u"],
+    ["modifyOtherKeys shift+?", "\x1b[27;2;63~"],
+  ])("toggles the legend from %s", (_label, data) => {
+    const { comp } = setup();
+    comp.render(100);
+    comp.handleInput(data);
+    expect(plain(comp.render(100))).toContain("思考");
+    comp.handleInput(data);
+    expect(plain(comp.render(100))).not.toContain("思考");
+    comp.close();
+  });
+
+  it("does not treat other printable keys as the legend key", () => {
+    const { comp } = setup();
+    comp.render(100);
+    // Shift+H (modifyOtherKeys 27;2;72~) and a plain "/" must not toggle it.
+    for (const data of ["\x1b[27;2;72~", "/", "\x1b[47u", "\x1b[47;5u"]) comp.handleInput(data);
+    expect(plain(comp.render(100))).toContain("ctrl+b 全部中断");
+    comp.close();
+  });
+
   it("adds no RPC of its own", async () => {
     atBoundary();
     const { comp, handles } = setup();
@@ -536,6 +561,117 @@ describe("Member Inspector timeline wiring (P3)", () => {
       for (const [command] of handle.sendCommandAndWait.mock.calls) expect(command.type).toBe("get_session_stats");
       expect(handle.sendCommand).not.toHaveBeenCalled();
     }
+    comp.close();
+  });
+});
+
+describe("Member Inspector timeline honesty (P4)", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+  /** Lane part of a body row: drop the fixed-width context field. */
+  const laneOf = (row: string): string => row.replace(/\[[█░·]{4}\] [^ ]{1,5}/u, "");
+  const idleTeam = (deps: { memberOpsStates: Map<string, any> }) => {
+    for (const name of deps.memberOpsStates.keys()) deps.memberOpsStates.set(name, "idle");
+  };
+
+  it("freezes an idle team at its last activity and says how long ago", () => {
+    atBoundary();
+    const { comp, deps } = setup();
+    idleTeam(deps);
+    deps.getLastActivityAt = () => Date.now() - 12 * 60_000;
+    const frame = plain(comp.render(100));
+    expect(frame).not.toContain("现在");
+    expect(frame).toContain("停在 12 分钟前");
+    expect(frame).toContain("ctrl+b 全部中断");
+    comp.close();
+  });
+
+  it("returns to now as soon as a new record lands", () => {
+    atBoundary();
+    const { comp, deps } = setup();
+    idleTeam(deps);
+    let last = Date.now() - 12 * 60_000;
+    deps.getLastActivityAt = () => last;
+    expect(plain(comp.render(100))).toContain("停在 12 分钟前");
+    last = Date.now();
+    const frame = plain(comp.render(100));
+    expect(frame).toContain("现在");
+    expect(frame).not.toContain("停在");
+    comp.close();
+  });
+
+  it("keeps a forward clock jump as a frozen past instead of a blank screen", () => {
+    atBoundary();
+    const { comp, deps } = setup();
+    idleTeam(deps);
+    const last = Date.now() - 3_600_000; // the activity is an hour behind the clock
+    deps.getLastActivityAt = () => last;
+    deps.getTimelineInfo = () => ({ knownFrom: last, truncated: false, turns: [] });
+    deps.getRecentActions = () => [{ id: 1, kind: "read", status: "done", at: last }];
+    const lines = comp.render(100);
+    const frame = plain(lines);
+    expect(frame).toContain("停在 60 分钟前");
+    // The old activity is still visible: frozen at it, solid block in the last cell.
+    expect(laneOf(rowOf(lines, "分析员"))).toContain("█");
+    for (const line of lines) expect(visibleWidth(line)).toBe(100);
+    comp.close();
+  });
+
+  it("does not paint a burst for stamps left in the future by a rollback", () => {
+    atBoundary();
+    const { comp, deps } = setup();
+    const now = Date.now();
+    deps.getTimelineInfo = () => ({ knownFrom: now - 200_000, truncated: false, turns: [] });
+    deps.getRecentActions = () => [{ id: 1, kind: "read", status: "done", at: now + 3_600_000 }];
+    const lines = comp.render(100);
+    const lane = laneOf(rowOf(lines, "分析员"));
+    expect(lane).not.toContain("█");
+    expect(lane).not.toContain("▓");
+    expect(plain(lines)).not.toMatch(/NaN/);
+    comp.close();
+  });
+
+  it("stripes history we never observed and never invents idle time", () => {
+    const { comp, deps } = setup();
+    const now = Date.now();
+    deps.getTimelineInfo = () => ({ knownFrom: now - 30_000, truncated: false, turns: [] });
+    deps.getRecentActions = () => [];
+    const lane = laneOf(rowOf(comp.render(100), "分析员"));
+    expect(lane).toContain("░"); // left of the observation horizon
+    expect(lane).not.toContain("█"); // and no fabricated activity
+    comp.close();
+  });
+
+  it("renders a never-observed team as stripes without errors", () => {
+    const { comp, deps } = setup();
+    deps.getTimelineInfo = () => ({ truncated: false, turns: [] });
+    deps.getLastActivityAt = () => undefined;
+    deps.getRecentActions = () => [];
+    const lines = comp.render(100);
+    for (const line of lines) expect(visibleWidth(line)).toBe(100);
+    for (const name of ["分析员", "编码员"]) {
+      const lane = laneOf(rowOf(lines, name));
+      expect(lane).toContain("░");
+      expect(lane).not.toContain("█");
+    }
+    expect(plain(lines)).not.toMatch(/NaN|undefined/);
+    comp.close();
+  });
+
+  it("ignores invalid timestamps coming from the store", () => {
+    const { comp, deps } = setup();
+    const now = Date.now();
+    deps.getTimelineInfo = () => ({ knownFrom: now - 200_000, truncated: false, turns: [] });
+    deps.getRecentActions = () => [
+      { id: 1, kind: "read", status: "done", at: Number.NaN },
+      { id: 2, kind: "modify", status: "done", at: Number.POSITIVE_INFINITY },
+      { id: 3, kind: "tool", status: "done", at: -1 },
+    ];
+    const lines = comp.render(100);
+    const lane = laneOf(rowOf(lines, "分析员"));
+    expect(lane).not.toContain("█");
+    expect(plain(lines)).not.toMatch(/NaN|Infinity/);
+    for (const line of lines) expect(visibleWidth(line)).toBe(100);
     comp.close();
   });
 });

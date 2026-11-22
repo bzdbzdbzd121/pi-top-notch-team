@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { decodePrintableKey } from "./pi-key-decode";
+import { decodeCommandChar, decodePrintableKey } from "./pi-key-decode";
 
 // ── decodePrintableKey 本地实现（pi-key-decode.ts）测试 ────────────────────
 // 行为锁定：与 pi-tui dist/keys.js 的 decodePrintableKey 逐字节一致
@@ -77,5 +77,33 @@ describe("decodePrintableKey — legacy 原字符", () => {
   it("原字符不经解码（'a' → undefined，插入分支走兜底）", () => {
     expect(decodePrintableKey("a")).toBeUndefined();
     expect(decodePrintableKey("\r")).toBeUndefined();
+  });
+});
+
+describe("decodeCommandChar — 命令键（Shift 符号别名）", () => {
+  it("三种问号编码 + kitty 纯 '?' 都解出 '?'", () => {
+    // kitty：Shift 报结果码位 63
+    expect(decodeCommandChar("\x1b[63;2u")).toBe("?");
+    // kitty：Shift + 基础键 '/'（码位 47）—— 美式布局打出的是 '?'
+    expect(decodeCommandChar("\x1b[47;2u")).toBe("?");
+    // xterm modifyOtherKeys：直接给结果码位 63
+    expect(decodeCommandChar("\x1b[27;2;63~")).toBe("?");
+    // kitty 无修饰的 '?'
+    expect(decodeCommandChar("\x1b[63u")).toBe("?");
+  });
+
+  it("其他字符不被别名改写（字母不别名、'/' 无 Shift 仍是 '/'）", () => {
+    // 字母只做解码不做大小写改写（kitty 对 Shift+a 报 shifted 码位 65）
+    expect(decodeCommandChar("\x1b[97;2u")).toBe("a");
+    expect(decodeCommandChar("\x1b[65;2u")).toBe("A");
+    expect(decodeCommandChar("\x1b[47u")).toBe("/");
+    expect(decodeCommandChar("\x1b[27;2;47~")).toBe("/"); // modifyOtherKeys 报结果字符，不猜布局
+  });
+
+  it("ctrl/alt 与非可打印序列返回 undefined（legacy 走 matchesKey 兜底）", () => {
+    expect(decodeCommandChar("\x1b[47;5u")).toBeUndefined();
+    expect(decodeCommandChar("\x1b[47;3u")).toBeUndefined();
+    expect(decodeCommandChar("?")).toBeUndefined();
+    expect(decodeCommandChar("\r")).toBeUndefined();
   });
 });

@@ -5,21 +5,21 @@ import { matchesKey, Key, visibleWidth, CURSOR_MARKER } from "@earendil-works/pi
 // 前缀替换会把子路径拼到包 main 后（→ dist/index.js/dist/keys.js），导致扩展
 // 加载失败（Cannot find module）。主 index 只 re-export decodeKittyPrintable，
 // 故 modifyOtherKeys 回退在本地按上游 keys.js 原样复刻（0.83.0/0.84.2 一致）。
-import { decodePrintableKey } from "./pi-key-decode";
+import { decodeCommandChar, decodePrintableKey } from "./pi-key-decode";
 import type { MemberProcessHandle } from "../process/member-process";
 import type { MemberOperationalState } from "../session/context";
 import { derivePhase, type MemberActivity } from "../channel/activity-tracker";
 import type { OverviewAction, TimelineInfo } from "./member-overview-store";
 import { buildInspectorHeader } from "./member-overview-state";
-import { BADGE_WIDTH } from "./member-overview-badge";
 import type { PaletteSource } from "./member-overview-palette";
 import {
   buildColorLegend,
+  buildFrozenNotice,
   buildTimelineLines,
   timelineCapacity,
   timelineSignature,
   timelineStepFor,
-  timelineTier,
+  timelineWindow,
   type TimelineRow,
   type TimelineView,
 } from "./member-overview-timeline";
@@ -1273,7 +1273,10 @@ export class MemberInspectorComponent {
       } else if (matchesKey(data, "ctrl+b") || matchesKey(data, "ctrl+shift+a")) {
         this.sendAbortAll();
         return;
-      } else if (matchesKey(data, "?")) {
+      } else if (matchesKey(data, "?") || decodeCommandChar(data) === "?") {
+        // Legacy terminals send "?" literally; kitty CSI-u may send the base key
+        // with Shift (`CSI 47;2u`) and xterm modifyOtherKeys the result codepoint
+        // (`CSI 27;2;63~`) — all three must toggle the legend (decision #14).
         this.showLegend = !this.showLegend;
         this.requestRenderSafe(true);
         return;
@@ -1451,17 +1454,21 @@ export class MemberInspectorComponent {
     // (fitLinesToWidth) so the right border stays aligned; no truncateLine /
     // padVisible here — the scroll hot path does ZERO width computation.
     const body: string[] = [];
-    if (overview) {
-      const now = Date.now();
-      const view = this.timelineView();
-      const rows = this.overviewRows(this.overviewCapacity());
+    const overviewNow = Date.now();
+    const overviewView = overview ? this.timelineView() : undefined;
+    const overviewRows = overview ? this.overviewRows(this.overviewCapacity()) : [];
+    const overviewWindow = overview && overviewView
+      ? timelineWindow(overviewRows, bh, inner, overviewNow, overviewView)
+      : undefined;
+    if (overview && overviewView) {
       body.push(...buildTimelineLines(
-        rows, this.state.selectedName, this.state.overviewOffset, bh, inner, now, theme, view,
+        overviewRows, this.state.selectedName, this.state.overviewOffset, bh, inner,
+        overviewNow, theme, overviewView,
       ));
       // Seed the display signature once so the first background refresh does not
       // repaint a frame that was just drawn (subsequent refreshes compare against it).
       if (this.lastOverviewSignature === null)
-        this.lastOverviewSignature = timelineSignature(rows, bh, inner, now, view);
+        this.lastOverviewSignature = timelineSignature(overviewRows, bh, inner, overviewNow, overviewView);
     } else if (tab) {
       const visible = tab.lines.slice(tab.scrollOffset, tab.scrollOffset + bh);
       // A resize may precede the deferred rebuild. Clip just the visible
@@ -1501,10 +1508,15 @@ export class MemberInspectorComponent {
     const footer2Line = hintFrame(footer2);
 
     // ── Footer line 2: action key hints, or input-mode hints ──
-    // `?` swaps this line for the colour legend in place (no extra row, no height change).
+    // `?` swaps this line for the colour legend in place (no extra row, no height
+    // change). A frozen window prefixes why the right edge is not "now".
+    const frozenNotice = overviewWindow
+      ? buildFrozenNotice(overviewWindow, overviewNow)
+      : "";
+    const interruptHint = frozenNotice ? `${frozenNotice} · ctrl+b 全部中断` : "ctrl+b 全部中断";
     const overviewHint = this.showLegend
       ? buildColorLegend(contentWidth, this.inspectorPalette)
-      : "ctrl+b 全部中断";
+      : interruptHint;
     const footer3 = this.state.inputOpen ? (this.state.notice || newBelow ? feedback : INPUT_HINTS) : overview
       ? overviewHint
       : KEY_HINTS_ACTION;

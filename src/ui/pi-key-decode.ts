@@ -61,3 +61,26 @@ function decodeModifyOtherKeysPrintable(data: string): string | undefined {
 export function decodePrintableKey(data: string): string | undefined {
   return decodeKittyPrintable(data) ?? decodeModifyOtherKeysPrintable(data);
 }
+
+/**
+ * Shift + 基础键在美式布局上打出的字符。kitty 的 CSI-u 可能报「基础码位 + shift」
+ * （`CSI 47;2u` = Shift+`/`），而 xterm modifyOtherKeys 报结果字符（`CSI 27;2;63~`
+ * = `?`）；命令键必须按用户实际打出的字符判断，两种编码都要落到同一个字符。
+ */
+const SHIFTED_SYMBOLS: Readonly<Record<string, string>> = Object.freeze({ "/": "?" });
+const KITTY_SEQUENCE = /^\x1b\[(\d+);(\d+)u$/;
+
+/**
+ * 命令键的有效字符：在 `decodePrintableKey` 之上补「Shift + 基础键」的符号别名。
+ * 仅放宽 kitty 的「基础码位 + shift」形态（modifyOtherKeys 已直接给结果码位）。
+ * legacy 原字符仍返回 undefined，由调用方用 `matchesKey` 兜底。
+ */
+export function decodeCommandChar(data: string): string | undefined {
+  const decoded = decodePrintableKey(data);
+  if (decoded === undefined) return undefined;
+  const kitty = KITTY_SEQUENCE.exec(data);
+  if (!kitty) return decoded;
+  const modifier = Number(kitty[2]) - 1;
+  if (!(modifier & MODIFIERS.shift)) return decoded;
+  return SHIFTED_SYMBOLS[decoded] ?? decoded;
+}

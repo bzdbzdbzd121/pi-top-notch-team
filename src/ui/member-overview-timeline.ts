@@ -143,7 +143,12 @@ export function paintLane(
   const classes: (OpClass | undefined)[] = new Array(count);
   const owners: (number | undefined)[] = new Array(count);
 
+  // A record that starts at or after the window's right edge is not on screen.
+  // Clamping it into the last cell would fake a burst "right now" — exactly what a
+  // backward clock jump would otherwise paint (P4 ①).
+  const rightEdge = window.anchor + window.step;
   const cover = (from: number, to: number): [number, number] | undefined => {
+    if (from >= rightEdge) return undefined;
     const first = cellIndexAt(window, from);
     const last = to > from ? cellIndexAt(window, to - 1) : first;
     if (last < 0) return undefined; // entirely left of the window
@@ -168,7 +173,6 @@ export function paintLane(
     if (range) consider(range, PRIORITY[cls], cls, action.id);
   }
   if (info) {
-    const rightEdge = window.anchor + window.step;
     for (const turn of info.turns) {
       const [start, end] = turn;
       if (!Number.isFinite(start) || start < 0) continue;
@@ -327,6 +331,16 @@ export function formatClock(at: number): string {
  * Clock axis for the shared window: labels sit on cell boundaries, the right edge
  * carries "现在" (or the frozen instant). Exactly `width` columns.
  */
+/**
+ * Footer note while the window is frozen (P4 ③): the right edge shows the last
+ * activity instead of "now", and the reader must be told why.
+ */
+export function buildFrozenNotice(window: TimelineWindow, now: number): string {
+  if (window.frozenAt === undefined) return "";
+  const minutes = Math.max(1, Math.round((now - window.frozenAt) / 60_000));
+  return `停在 ${minutes} 分钟前`;
+}
+
 export function buildAxisLine(
   window: TimelineWindow, width: number, theme: InspectorTheme = IDENTITY_THEME,
 ): string {
@@ -547,7 +561,6 @@ export function buildTimelineLines(
   const tier = timelineTier(total);
   if (tier === "fallback") return buildFallbackLines(rows, selectedName, offset, lines, total, theme, view);
 
-  const badgeWidth = BADGE_WIDTH[tier];
   const nameWidth = memberNameWidth(total);
   const window = timelineWindow(rows, lines, total, now, view)!;
   const showAxis = timelineAxisVisible(lines, total);
