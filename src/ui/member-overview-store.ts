@@ -313,6 +313,10 @@ export function createMemberOverviewStore(options: MemberOverviewStoreOptions = 
         m.compaction = undefined;
         return changed;
       }
+      // A dead process cannot start a run: its late, in-flight events must not
+      // resurrect the member or open a turn nothing will ever close. Only a real
+      // restart (process_start/process_started, emitted by the starter) revives it.
+      if (m.dead) return false;
       if (type === "agent_start") {
         const changed = close(m, "done");
         resetProcess(m);
@@ -320,7 +324,7 @@ export function createMemberOverviewStore(options: MemberOverviewStoreOptions = 
         openTurn(m);
         return changed;
       }
-      if (m.dead || m.ended) return false;
+      if (m.ended) return false;
       if (type === "agent_end") {
         m.ended = m.messageClosed = true;
         const changed = close(m, "done");

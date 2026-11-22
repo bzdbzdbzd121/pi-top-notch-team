@@ -209,13 +209,19 @@ describe("member overview store", () => {
     expect(JSON.stringify(s.getRecentActions("a"))).not.toContain("secret-body");
   });
 
-  it("process death closes active actions, deduplicates error+exit, and restart preserves history but resets IDs", () => {
+  it("process death closes active actions and deduplicates error+exit; only a real restart revives the member", () => {
     const s = createMemberOverviewStore();
     s.onEvent("a", tool("start", "same"));
     s.onEvent("a", { type: "process_error", error: "private" });
     expect(s.onEvent("a", { type: "process_exit", exitCode: 1 })).toBe(false);
     expect(s.onEvent("a", delta("text_delta"))).toBe(false);
     expect(s.getRecentActions("a").map(a => [a.kind, a.status])).toEqual([["read", "error"], ["crashed", "error"]]);
+    // A death-late agent_start from the dying process must not resurrect it.
+    expect(s.onEvent("a", { type: "agent_start" })).toBe(false);
+    expect(s.onEvent("a", tool("start", "same"))).toBe(false);
+    expect(s.getTimelineInfo("a").openTurnStart).toBeUndefined();
+    // The starter's process_started is the one legitimate revival edge.
+    s.onEvent("a", { type: "process_started" });
     s.onEvent("a", { type: "agent_start" });
     s.onEvent("a", tool("start", "same"));
     expect(s.getRecentActions("a")).toHaveLength(3);
@@ -484,6 +490,63 @@ describe("member overview store timeline data (P1)", () => {
     expect(s.getLastActivityAt()).toBe(1_600);
     s.clear();
     expect(s.getLastActivityAt()).toBeUndefined();
+  });
+
+  it("does not open a never-closing turn for a death-late agent_start", () => {
+    const clock = fakeClock(1_000);
+    const s = createMemberOverviewStore({ clock: clock.now });
+    s.onEvent("a", { type: "agent_start" });
+    clock.set(1_500);
+    s.onEvent("a", { type: "process_exit", exitCode: 1 });
+    clock.set(2_000);
+    expect(s.onEvent("a", { type: "agent_start" })).toBe(false);
+    const info = s.getTimelineInfo("a");
+    expect(info.openTurnStart).toBeUndefined();
+    expect(info.turns).toEqual([[1_000, 1_500]]);
+    expect(s.getActionCount("a")).toBe(1);
+  });
+
+  it("stamps a real compaction interval and closes it exactly once", () => {
+    const clock = fakeClock(1_000);
+    const s = createMemberOverviewStore({ clock: clock.now });
+    expect(s.onEvent("a", { type: "compaction_start" })).toBe(true);
+    clock.set(4_000);
+    expect(s.onEvent("a", { type: "compaction_end" })).toBe(true);
+    expect(s.getRecentActions("a")).toEqual([
+      { id: 1, kind: "compacting", status: "done", at: 1_000, endedAt: 4_000 },
+    ]);
+    clock.set(5_000);
+    expect(s.onEvent("a", { type: "compaction_end" })).toBe(false);
+    expect(s.getRecentActions("a")[0]).toMatchObject({ at: 1_000, endedAt: 4_000 });
+  });
+
+  it("closes the open turn on process_error too", () => {
+    const clock = fakeClock(1_000);
+    const s = createMemberOverviewStore({ clock: clock.now });
+    s.onEvent("a", { type: "agent_start" });
+    clock.set(2_500);
+    s.onEvent("a", { type: "process_error", error: "boom" });
+    const info = s.getTimelineInfo("a");
+    expect(info.openTurnStart).toBeUndefined();
+    expect(info.turns).toEqual([[1_000, 2_500]]);
+  });
+
+  it("flips truncation exactly when the 65th record evicts the oldest", () => {
+    const clock = fakeClock(1_000);
+    const s = createMemberOverviewStore({ clock: clock.now });
+    for (let index = 0; index < 64; index++) {
+      clock.set(1_000 + index);
+      s.onEvent("a", tool("start", `t${index}`));
+    }
+    expect(s.getRecentActions("a")).toHaveLength(64);
+    expect(s.getTimelineInfo("a")).toMatchObject({ knownFrom: 1_000, truncated: false });
+    clock.set(2_000);
+    s.onEvent("a", tool("start", "t64"));
+    const info = s.getTimelineInfo("a");
+    expect(s.getRecentActions("a")).toHaveLength(64);
+    expect(info.truncated).toBe(true);
+    expect(info.knownFrom).toBe(1_001);
+    expect(info.knownFrom).toBe(s.getRecentActions("a")[0].at);
   });
 
   it("returns immutable timeline snapshots", () => {

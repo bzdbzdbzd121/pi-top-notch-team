@@ -32,16 +32,16 @@ function actionTotal(actions: readonly OverviewAction[], count?: number): number
   return typeof count === "number" && Number.isSafeInteger(count) && count >= actions.length ? count : actions.length;
 }
 // Names are untrusted display text; do not allow terminal commands or newlines.
-const clean = (value: string) => stripVTControlCharacters(value).replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
-function fit(text: string, width: number): string {
+export const clean = (value: string) => stripVTControlCharacters(value).replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
+export function fit(text: string, width: number): string {
   if (width <= 0) return "";
   const clipped = truncateToWidth(text, width, "");
   return clipped + " ".repeat(Math.max(0, width - visibleWidth(clipped)));
 }
-function shorten(text: string, width: number): string {
+export function shorten(text: string, width: number): string {
   return width > 0 ? truncateToWidth(text, width, "…") : "";
 }
-function duplicateLabels(members: readonly Member[]): Set<string> {
+export function duplicateLabels(members: readonly Member[]): Set<string> {
   const seen = new Set<string>();
   const duplicates = new Set<string>();
   for (const member of members) {
@@ -51,7 +51,7 @@ function duplicateLabels(members: readonly Member[]): Set<string> {
   }
   return duplicates;
 }
-function memberLabel(member: Member, duplicates: Set<string>): string {
+export function memberLabel(member: Member, duplicates: Set<string>): string {
   const label = clean(member.label) || clean(member.name);
   return duplicates.has(clean(member.label)) ? `${clean(member.name)}(${label})` : label;
 }
@@ -100,7 +100,7 @@ function contextValue(row: OverviewRow): string {
   if (typeof row.percent !== "number" || !Number.isFinite(row.percent)) return "?";
   return `${row.contextStale ? "~" : ""}${Math.round(row.percent)}%`;
 }
-function contextBar(row: OverviewRow, cells: number, theme: InspectorTheme): string {
+export function contextBar(row: OverviewRow, cells: number, theme: InspectorTheme): string {
   const value = contextValue(row);
   if (!cells || value === "—") return value;
   if (typeof row.percent !== "number" || !Number.isFinite(row.percent))
