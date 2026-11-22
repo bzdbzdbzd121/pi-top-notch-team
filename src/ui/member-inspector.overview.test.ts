@@ -544,8 +544,8 @@ describe("Member Inspector timeline wiring (P3)", () => {
   it("does not treat other printable keys as the legend key", () => {
     const { comp } = setup();
     comp.render(100);
-    // Shift+H, a plain "/", ctrl/alt forms and the kitty release event must not toggle it.
-    for (const data of ["\x1b[27;2;72~", "/", "\x1b[47u", "\x1b[47;5u", "\x1b[47;2:3u", "\x1b[63;2:3u"])
+    // Shift+H, a plain "/", ctrl/alt forms, kitty release and kitty repeat must not toggle it.
+    for (const data of ["\x1b[27;2;72~", "/", "\x1b[47u", "\x1b[47;5u", "\x1b[47;2:3u", "\x1b[63;2:3u", "\x1b[47;2:2u", "\x1b[63;2:2u"])
       comp.handleInput(data);
     expect(plain(comp.render(100))).toContain("ctrl+b 全部中断");
     comp.close();

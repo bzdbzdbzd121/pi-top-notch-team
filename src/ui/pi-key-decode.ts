@@ -73,7 +73,8 @@ const SHIFTED_SYMBOLS: Readonly<Record<string, string>> = Object.freeze({ "/": "
 const KITTY_COMMAND = /^\x1b\[(\d+)(?::[\d:]*)?;(\d+)(?::(\d+))?u$/;
 /** kitty 无修饰形态：`CSI code[:alternates]u`（交给 decodePrintableKey 即可）。 */
 const MODIFY_OTHER_KEYS = /^\x1b\[27;(\d+);(\d+)~$/;
-/** kitty 事件类型 3 = release；释放不是一次按键输入。 */
+/** kitty 事件类型：1 = press、2 = repeat、3 = release。命令键只认 press。 */
+const KITTY_EVENT_PRESS = 1;
 const KITTY_EVENT_RELEASE = 3;
 
 /** 修饰位只允许 Shift（+ Caps/Num Lock）；其他修饰返回 undefined。 */
@@ -101,7 +102,9 @@ function shifted(char: string, shift: boolean): string {
  * legacy 字面量）。相对 `decodePrintableKey`（文本插入的单一事实来源，保持不动）
  * 只多两件事：
  *   1. 接受 kitty 的 `:<event>` 后缀（pi 请求 flags=7，按键是 `CSI 47;2:1u`），
- *      并拒绝事件类型 3（release）——否则松手也会触发一次命令；
+ *      且**只认 press（事件 1）**：release（3）不是按键输入，repeat（2）会让按住
+ *      `?` 反复开关图例——`e`/`t` 走 `matchesKey` 天然不匹配 `:2`，命令键必须同样
+ *      只触发一次，两边行为才一致；
  *   2. 把「Shift + 基础符号」归一成用户实际打出的字符（`/` → `?`），kitty 与
  *      modifyOtherKeys 同一处理，不对美式布局做自相矛盾的假设。
  * legacy 原字符仍返回 undefined，由调用方用 `matchesKey` 兜底。
@@ -109,8 +112,8 @@ function shifted(char: string, shift: boolean): string {
 export function decodeCommandChar(data: string): string | undefined {
   const kitty = KITTY_COMMAND.exec(data);
   if (kitty) {
-    const event = kitty[3] === undefined ? 1 : Number(kitty[3]);
-    if (event === KITTY_EVENT_RELEASE) return undefined;
+    const event = kitty[3] === undefined ? KITTY_EVENT_PRESS : Number(kitty[3]);
+    if (event !== KITTY_EVENT_PRESS) return undefined;
     const shift = shiftOnly(Number(kitty[2]) - 1);
     if (shift === undefined) return undefined;
     const char = charAt(Number(kitty[1]));

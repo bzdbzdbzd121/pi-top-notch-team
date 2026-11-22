@@ -95,12 +95,20 @@ describe("decodeCommandChar — 命令键（Shift 符号别名 + kitty 事件类
     expect(decodeCommandChar("\x1b[63u")).toBe("?");
   });
 
-  it("kitty release（事件类型 3）不产生字符", () => {
+  it("只认 press：release（3）与 repeat（2）都不产生字符", () => {
     expect(decodeCommandChar("\x1b[47;2:3u")).toBeUndefined();
     expect(decodeCommandChar("\x1b[63;2:3u")).toBeUndefined();
-    // press/repeat（1/2）仍然算一次按键
+    // 按住不放的 repeat 会让命令反复触发（e/t 走 matchesKey 不匹配 `:2`），故拒绝。
+    expect(decodeCommandChar("\x1b[47;2:2u")).toBeUndefined();
+    expect(decodeCommandChar("\x1b[63;2:2u")).toBeUndefined();
+    // press 仍然有效（带/不带事件后缀等价）
     expect(decodeCommandChar("\x1b[47;2:1u")).toBe("?");
-    expect(decodeCommandChar("\x1b[47;2:2u")).toBe("?");
+    expect(decodeCommandChar("\x1b[47;2u")).toBe("?");
+  });
+
+  it("忽略 kitty alternate（shifted）码位，只取基础码位（已知限制）", () => {
+    // `CSI 49:33;2u` = Shift+1（alternate 33 = '!'）：今天只取基础码位 '1'。
+    expect(decodeCommandChar("\x1b[49:33;2u")).toBe("1");
   });
 
   it("其他字符不被别名改写（字母不别名、'/' 无 Shift 仍是 '/'）", () => {

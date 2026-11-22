@@ -135,7 +135,10 @@ describe("member overview timeline window", () => {
     expect(cellIndexAt(w, 17_999)).toBe(-1);
     expect(cellIndexAt(w, 60_000)).toBe(4);
     expect(cellIndexAt(w, Number.NaN)).toBe(-1);
-    // One cell = one step; advancing now by a step shifts every cell by one.
+    // One cell = one step (half-open: [start, start+step)); the rightmost cell
+    // starts at the anchor and ends at anchor+step.
+    for (let k = 0; k < 4; k++) expect(cellStart(w, k + 1) - cellStart(w, k)).toBe(w.step);
+    expect(cellStart(w, 4) + w.step).toBe(33_000);
     const advanced = win(5, 3000, 33_000);
     for (let k = 0; k < 4; k++) expect(cellStart(advanced, k)).toBe(cellStart(w, k + 1));
   });

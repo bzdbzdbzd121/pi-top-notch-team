@@ -150,6 +150,23 @@ describe("member overview store", () => {
     expect(s.getRecentActions("a")).toHaveLength(3);
   });
 
+  it("keeps the cumulative total across a restart (truncation never resets)", () => {
+    const s = createMemberOverviewStore();
+    for (let index = 0; index < 70; index++) s.onEvent("a", tool("start", `t${index}`));
+    expect(s.getTimelineInfo("a").truncated).toBe(true);
+    expect(s.getRecentActions("a")).toHaveLength(64);
+    s.onEvent("a", { type: "process_exit", exitCode: 0 });
+    s.onEvent("a", { type: "process_started" });
+    // totalCount survives the restart, so the ring stays "overflowed" and the
+    // horizon keeps pointing at the oldest survivor.
+    const restarted = s.getTimelineInfo("a");
+    expect(restarted.truncated).toBe(true);
+    expect(s.getRecentActions("a")).toHaveLength(64);
+    s.onEvent("a", tool("start", "after"));
+    expect(s.getTimelineInfo("a").truncated).toBe(true);
+    expect(s.getRecentActions("a")).toHaveLength(64);
+  });
+
   it("preserves records across restart, but clears them on removal or session clear", () => {
     const s = createMemberOverviewStore();
     s.onEvent("a", tool("start", "first"));

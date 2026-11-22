@@ -1280,7 +1280,7 @@ A full-keyboard overlay that lets the **user** inspect each Member's live conver
 
 降级档：inner 62/52 → 3 字档（29/21 格）；43/41 → 2 字档（15/14 格）；≤ 40 → **D 级兜底**（名称 + 2 字状态 + 最近记录色块，最新在左，无时间轴）。步长 `pickStep` 从 `{1,2,3,5}` 秒（`STEP_LADDER_MS = [1000, 2000, 3000, 5000]`）里选使 `格数 × 步长` 最接近 `TARGET_WINDOW_MS = 180000`（180 s）的一档，**并列取更小步长**；`MIN_TIMELINE_CELLS = 12` 是「值得画时间轴」的防御下限（档位阈值保证 A/B 级恒 ≥ 14 格，D 级不画轴也不画刻度）。
 
-**网格与锚点**：一格一列（一格 = 一列 = 一段 `step` 长的时间）。`cell(k) = [anchor − (格数−1−k)·step, anchor − (格数−k−1)·step)`，即**最右格起点 = anchor**、它的右边界是「现在」——右端＝现在，最右一格是正在进行中的那一段。`anchor = floor(now/step)·step`。全队空闲且最后活动已滑出窗口时**冻结**：`anchor = floor(lastActivityAt/step)·step`（最后活动落在最右格），右端刻度改成该时刻，底栏写 `停在 N 分钟前`。任何成员在跑（控制面 working/compacting，或可见记录里有 active）都不冻结；有新记录就自然回到「现在」。
+**网格与锚点**：一格一列（一格 = 一列 = 一段 `step` 长的时间）。`cell(k) = [anchor − (格数−1−k)·step, anchor − (格数−2−k)·step)`（半开区间，每格恰好 `step` 长），即**最右格起点 = anchor**；「现在」是该格内的一个实时点（`anchor ≤ now < anchor+step`），右端刻度标「现在」，最右一格是正在进行中的那一段。`anchor = floor(now/step)·step`。全队空闲且最后活动已滑出窗口时**冻结**：`anchor = floor(lastActivityAt/step)·step`（最后活动落在最右格），右端刻度改成该时刻，底栏写 `停在 N 分钟前`。任何成员在跑（控制面 working/compacting，或可见记录里有 active）都不冻结；有新记录就自然回到「现在」。
 
 **时钟保护**：存储侧全局单调钳制（回拨时事件压到当前瞬间、跨成员顺序不颠倒，见下）；**时间轴上起点在窗口右缘之后的记录不画**（回拨后残留在未来的戳不会堆成「刚刚爆发」），起点在窗内的区间画到右缘；`at` 为 NaN/±Infinity/负数直接丢弃，不产生 NaN 列号。前跳一小时：旧活动按冻结锚点照常可见（不画假空白）。
 
@@ -1362,8 +1362,9 @@ A full-keyboard overlay that lets the **user** inspect each Member's live conver
 7. **冻结提示的分钟数不会自己走**：冻结窗口的显示签名不变 → 不重绘 → `停在 N 分钟前` 只在下次因其它原因重绘时更新（按键、stats 轮询等）。这是「无变化不重绘」的代价，避免为一行文字常驻定时器。
 8. 同格合并：一格内多次动作只留最高优先级的一个，精确历史进成员页。
 9. 窄屏 D 级按「最近记录数」而不是时间，未来戳的记录在 D 级仍会出现（那一级没有时间轴，不会误读为「刚刚爆发」）。
+10. **命令键忽略 kitty 的 alternate（shifted）码位**：`decodeCommandChar` 只取基础码位（`CSI 49:33;2u` = Shift+`1` 解成 `1`，不取 `!`）。今天没有可见差异（`?` 靠 Shift + `/` 的基础码位与 Shift 修饰就能识别，`CS 63;2u` 也直接给结果码位）；**下一次给命令键加「Shift + 数字/符号」类快捷键时必须处理 alternate 字段**，否则会漏键。
 
-**台账（已删除的东西，不要当 bug 改回来）**：旧图标轨迹 `buildOverviewTrail` / `buildOverviewLines` / `ICONS` / `MAX_TRAIL_ICONS` / `actionTotal` / `currentAction` 连同**服务它们的 62 条用例**已在 P3 收口时删除（`member-overview-state.ts` 239 → 130 行）；被取代的旧裁决是：**新在左的图标序列、最多 20 个图标、`(N)` 隐藏计数、无表头无图例（现在有刻度行与 `?` 说明）、emoji 图标、单字徽标**。
+**台账（已删除的东西，不要当 bug 改回来）**：旧图标轨迹 `buildOverviewTrail` / `buildOverviewLines` / `ICONS` / `MAX_TRAIL_ICONS` / `actionTotal` / `currentAction` 连同**服务它们的 62 条用例**已在 P3 收口时删除（`member-overview-state.ts` 239 → 130 行）；被取代的旧裁决是：**新在左的图标序列、最多 20 个图标、`(N)` 隐藏计数、无刻度行、无颜色说明（现在第一正文行是刻度行，颜色说明按 `?` 打开）**。**仍然有效**：不显示表头、不显示状态文字列、成员名与占用条、名册顺序不重排——这几条不要顺手改掉。
 
 完整设计与验证记录见 [成员浮窗总览设计](docs/design-member-inspector-overview.md)。
 
