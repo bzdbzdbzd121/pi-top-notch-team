@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { decodePrintableKey } from "./pi-key-decode";
+import { decodeCommandChar, decodePrintableKey } from "./pi-key-decode";
 
 // ── decodePrintableKey 本地实现（pi-key-decode.ts）测试 ────────────────────
 // 行为锁定：与 pi-tui dist/keys.js 的 decodePrintableKey 逐字节一致
@@ -77,5 +77,53 @@ describe("decodePrintableKey — legacy 原字符", () => {
   it("原字符不经解码（'a' → undefined，插入分支走兜底）", () => {
     expect(decodePrintableKey("a")).toBeUndefined();
     expect(decodePrintableKey("\r")).toBeUndefined();
+  });
+});
+
+describe("decodeCommandChar — 命令键（Shift 符号别名 + kitty 事件类型）", () => {
+  it("五种问号编码都解出 '?'（两协议基础码位假设一致）", () => {
+    // kitty：Shift 报结果码位 63
+    expect(decodeCommandChar("\x1b[63;2u")).toBe("?");
+    // kitty：Shift + 基础键 '/'（码位 47）
+    expect(decodeCommandChar("\x1b[47;2u")).toBe("?");
+    // kitty：同上，但带事件类型（pi 请求 flags=7 → 按键带 :1）
+    expect(decodeCommandChar("\x1b[47;2:1u")).toBe("?");
+    // xterm modifyOtherKeys：结果码位 63；以及基础码位 47（与 kitty 同一假设）
+    expect(decodeCommandChar("\x1b[27;2;63~")).toBe("?");
+    expect(decodeCommandChar("\x1b[27;2;47~")).toBe("?");
+    // kitty 无修饰的 '?'
+    expect(decodeCommandChar("\x1b[63u")).toBe("?");
+  });
+
+  it("只认 press：release（3）与 repeat（2）都不产生字符", () => {
+    expect(decodeCommandChar("\x1b[47;2:3u")).toBeUndefined();
+    expect(decodeCommandChar("\x1b[63;2:3u")).toBeUndefined();
+    // 按住不放的 repeat 会让命令反复触发（e/t 走 matchesKey 不匹配 `:2`），故拒绝。
+    expect(decodeCommandChar("\x1b[47;2:2u")).toBeUndefined();
+    expect(decodeCommandChar("\x1b[63;2:2u")).toBeUndefined();
+    // press 仍然有效（带/不带事件后缀等价）
+    expect(decodeCommandChar("\x1b[47;2:1u")).toBe("?");
+    expect(decodeCommandChar("\x1b[47;2u")).toBe("?");
+  });
+
+  it("忽略 kitty alternate（shifted）码位，只取基础码位（已知限制）", () => {
+    // `CSI 49:33;2u` = Shift+1（alternate 33 = '!'）：今天只取基础码位 '1'。
+    expect(decodeCommandChar("\x1b[49:33;2u")).toBe("1");
+  });
+
+  it("其他字符不被别名改写（字母不别名、'/' 无 Shift 仍是 '/'）", () => {
+    // 字母只做解码不做大小写改写（kitty 对 Shift+a 报 shifted 码位 65）
+    expect(decodeCommandChar("\x1b[97;2u")).toBe("a");
+    expect(decodeCommandChar("\x1b[65;2u")).toBe("A");
+    expect(decodeCommandChar("\x1b[47u")).toBe("/");
+    expect(decodeCommandChar("\x1b[27;1;47~")).toBe("/");
+  });
+
+  it("ctrl/alt 与非可打印序列返回 undefined（legacy 走 matchesKey 兜底）", () => {
+    expect(decodeCommandChar("\x1b[47;5u")).toBeUndefined();
+    expect(decodeCommandChar("\x1b[47;3u")).toBeUndefined();
+    expect(decodeCommandChar("\x1b[47;5:1u")).toBeUndefined();
+    expect(decodeCommandChar("?")).toBeUndefined();
+    expect(decodeCommandChar("\r")).toBeUndefined();
   });
 });

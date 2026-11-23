@@ -77,7 +77,6 @@ describe("index overview session wiring", () => {
     await open();
     expect(deps.getRecentActions?.("coder").map(action => action.kind)).toEqual(["thinking", "read", "complete"]);
     expect(deps.getActivity?.("coder")?.phase).toBe("idle");
-    expect(deps.getStartedMembers?.()).toContain("coder");
     emit({ type: "agent_start" });
     emit({ type: "message_update", assistantMessageEvent: { type: "text_start", contentIndex: 0 } });
     await open();
@@ -85,7 +84,7 @@ describe("index overview session wiring", () => {
     expect(deps.getActivity?.("coder")?.phase).toBe("output");
   });
 
-  it("exposes cumulative per-member action totals beyond the retained history", async () => {
+  it("keeps the bounded retained history and reports truncation past 64 records", async () => {
     emit({ type: "agent_start" });
     for (let i = 0; i < 100; i++) {
       emit({ type: "tool_execution_start", toolCallId: `read-${i}`, toolName: "read" });
@@ -93,11 +92,11 @@ describe("index overview session wiring", () => {
     }
     await open();
     expect(deps.getRecentActions?.("coder")).toHaveLength(64);
-    expect(deps.getActionCount?.("coder")).toBe(100);
+    expect(deps.getTimelineInfo?.("coder")).toMatchObject({ truncated: true });
     await open();
-    expect(deps.getActionCount?.("coder")).toBe(100);
+    expect(deps.getTimelineInfo?.("coder")).toMatchObject({ truncated: true });
     await command.handler("stop", ctx);
-    expect(deps.getActionCount?.("coder")).toBe(0);
+    expect(deps.getTimelineInfo?.("coder")).toMatchObject({ truncated: false, turns: [] });
   });
 
   it.each([100, 600000])("distinguishes stats preflight from real compaction at %i tokens", async (tokens) => {
@@ -246,7 +245,6 @@ describe("index overview session wiring", () => {
     previousSessionEmit({ type: "agent_start" });
     previousSessionEmit({ type: "tool_execution_start", toolCallId: "old-session", toolName: "read" });
     expect(deps.getRecentActions?.("coder")).toEqual([]);
-    expect(deps.getStartedMembers?.()).toEqual([]);
     expect(deps.getActivity?.("coder")).toBeUndefined();
   });
 
@@ -258,7 +256,6 @@ describe("index overview session wiring", () => {
     expect(deps.getRecentActions?.("coder")).toHaveLength(1);
     await command.handler("stop", ctx);
     expect(deps.getRecentActions?.("coder")).toEqual([]);
-    expect(deps.getStartedMembers?.()).toEqual([]);
     // Late events from a stopped team must not recreate the old store.
     emit({ type: "agent_start" });
     expect(deps.getRecentActions?.("coder")).toEqual([]);

@@ -5,12 +5,24 @@ import { matchesKey, Key, visibleWidth, CURSOR_MARKER } from "@earendil-works/pi
 // 前缀替换会把子路径拼到包 main 后（→ dist/index.js/dist/keys.js），导致扩展
 // 加载失败（Cannot find module）。主 index 只 re-export decodeKittyPrintable，
 // 故 modifyOtherKeys 回退在本地按上游 keys.js 原样复刻（0.83.0/0.84.2 一致）。
-import { decodePrintableKey } from "./pi-key-decode";
+import { decodeCommandChar, decodePrintableKey } from "./pi-key-decode";
 import type { MemberProcessHandle } from "../process/member-process";
 import type { MemberOperationalState } from "../session/context";
 import { derivePhase, type MemberActivity } from "../channel/activity-tracker";
-import type { OverviewAction } from "./member-overview-store";
-import { buildInspectorHeader, buildOverviewLines, type OverviewRow } from "./member-overview-state";
+import type { OverviewAction, TimelineInfo } from "./member-overview-store";
+import { buildInspectorHeader } from "./member-overview-state";
+import type { PaletteSource } from "./member-overview-palette";
+import {
+  buildColorLegend,
+  buildFrozenNotice,
+  buildTimelineLines,
+  timelineCapacity,
+  timelineSignature,
+  timelineStepFor,
+  timelineWindow,
+  type TimelineRow,
+  type TimelineView,
+} from "./member-overview-timeline";
 import {
   MemberInspectorState,
   buildBodyLinesIncremental,
@@ -51,10 +63,12 @@ export interface MemberInspectorDeps {
   memberOpsStates: Map<string, MemberOperationalState>;
   getActivity?: (name: string) => MemberActivity | undefined;
   getRecentActions?: (name: string) => readonly OverviewAction[];
-  getActionCount?: (name: string) => number;
   /** Real member-side compaction, not the stats-preflight reservation. */
   isCompacting?: (name: string) => boolean;
-  getStartedMembers?: () => readonly string[];
+  /** P1 timeline evidence: observation horizon, truncation, turns. */
+  getTimelineInfo?: (name: string) => TimelineInfo;
+  /** Team-wide last activity for the frozen-window anchor (P1 store query). */
+  getLastActivityAt?: () => number | undefined;
 }
 
 /** Handle exposed to index.ts for event-hook + lifecycle integration. */
@@ -220,6 +234,16 @@ export class MemberInspectorComponent {
   private streamFlushDelayMs = STREAM_FLUSH_MS;
   /** P1-④/S2: compensation render pending for a suspended background render. */
   private renderTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * P3: overview timeline tick, aligned to the current step boundary. It only
+   * exists while the overlay is open on the overview page; every redraw still
+   * goes through the display-signature gate.
+   */
+  private timelineTimer: ReturnType<typeof setTimeout> | null = null;
+  /** `?`: in-place colour legend in the second footer line (§3.6). */
+  private showLegend = false;
+  /** Inner width of the last render — the timeline needs it outside render(). */
+  private lastInnerWidth = 0;
   /** P1-④: timestamp of the last key event (interaction window clock). */
   private lastInteractionAt = 0;
   /** In-flight refetch guard per member. */
@@ -307,10 +331,12 @@ export class MemberInspectorComponent {
     if (this.statsTimer) clearTimeout(this.statsTimer);
     if (this.renderTimer) clearTimeout(this.renderTimer);
     if (this.streamTimer) clearTimeout(this.streamTimer);
+    if (this.timelineTimer) clearTimeout(this.timelineTimer);
     this.refreshTimer = null;
     this.statsTimer = null;
     this.renderTimer = null;
     this.streamTimer = null;
+    this.timelineTimer = null;
     this.bodyCaches.clear();
     this.lastMessages.clear();
     this.entryCursors.clear();
@@ -407,13 +433,32 @@ export class MemberInspectorComponent {
 
   private lastOverviewSignature: string | null = null;
 
-  private overviewRows(height: number): OverviewRow[] {
-    this.state.ensureOverviewVisible(Math.max(1, height));
+  /**
+   * Member rows the overview can show: body lines minus the axis row. Every
+   * capacity consumer (render, visible-row collection, PgUp/PgDn, selection
+   * follow) reads this one helper so they cannot drift apart.
+   */
+  private overviewCapacity(): number {
+    return Math.max(0, timelineCapacity(bodyHeight(), this.lastInnerWidth));
+  }
+
+  /**
+   * Control-plane live flag. Only the operational map is scanned here (O(members),
+   * no per-member store reads); records that are still active are picked up by
+   * `buildTimelineLines` itself when `live` is not forced.
+   */
+  private controlPlaneLive(): boolean {
+    for (const state of this.deps.memberOpsStates.values())
+      if (state === "working" || state === "compacting") return true;
+    return false;
+  }
+
+  private overviewRows(capacity: number): TimelineRow[] {
+    this.state.ensureOverviewVisible(Math.max(1, capacity));
     const offset = this.state.overviewOffset;
-    const started = this.deps.getStartedMembers?.();
     const now = Date.now();
     return this.state.tabs.map((tab, index) => {
-      const visible = index >= offset && index < offset + Math.max(0, height);
+      const visible = index >= offset && index < offset + Math.max(0, capacity);
       const activity = this.deps.getActivity?.(tab.name);
       const logicalState = this.deps.memberOpsStates.get(tab.name) ?? "stopped";
       const compacting = this.deps.isCompacting?.(tab.name);
@@ -430,23 +475,66 @@ export class MemberInspectorComponent {
         phase: activity ? derivePhase(activity, now) : undefined,
         percent: tab.contextInfo?.percent,
         contextStale: tab.contextStale,
-        started: started ? started.includes(tab.name) : undefined,
         actions: visible ? this.deps.getRecentActions?.(tab.name) ?? [] : [],
-        actionCount: visible ? this.deps.getActionCount?.(tab.name) : undefined,
+        // Timeline evidence is only read for visible rows (the same O(visible) rule).
+        ...(visible && this.deps.getTimelineInfo ? { info: this.deps.getTimelineInfo(tab.name) } : {}),
       };
     });
   }
 
+  private timelineView(): TimelineView {
+    const lastActivityAt = this.deps.getLastActivityAt?.();
+    return {
+      palette: this.inspectorPalette,
+      // Forced only when the control plane says someone runs; otherwise the
+      // timeline derives liveness from the visible records (no extra store reads).
+      ...(this.controlPlaneLive() ? { live: true } : {}),
+      ...(lastActivityAt !== undefined ? { lastActivityAt } : {}),
+    };
+  }
+
   private refreshOverview(): void {
-    if (this.state.view.kind !== "overview") return;
+    if (this.state.view.kind !== "overview" || this.disposed) return;
+    // Nothing has been rendered yet: there is no frame to deduplicate against.
+    if (!this.lastInnerWidth) return;
     const started = Date.now();
-    const signature = JSON.stringify(this.overviewRows(bodyHeight()));
+    const view = this.timelineView();
+    // Signature = tier + window anchor + rows: a sliding window must repaint even
+    // when the rows themselves are unchanged.
+    const signature = timelineSignature(
+      this.overviewRows(this.overviewCapacity()), bodyHeight(), this.lastInnerWidth, Date.now(), view,
+    );
     this.streamFlushDelayMs = nextStreamFlushDelay(
       this.streamFlushDelayMs, Date.now() - started, STREAM_FLUSH_MS, STREAM_FLUSH_MAX_MS
     );
     if (signature === this.lastOverviewSignature) return;
     this.lastOverviewSignature = signature;
     this.requestRenderSafe();
+  }
+
+  /**
+   * Keep exactly one boundary-aligned overview tick alive while the overlay shows
+   * the overview. Idempotent: render() calls it every frame.
+   */
+  private syncTimelineTimer(): void {
+    if (this.disposed || this.state.view.kind !== "overview") {
+      if (this.timelineTimer) clearTimeout(this.timelineTimer);
+      this.timelineTimer = null;
+      return;
+    }
+    if (this.timelineTimer) return;
+    // The step depends on the width only — never collect the rows a second time here.
+    const step = timelineStepFor(bodyHeight(), this.lastInnerWidth);
+    if (!step) return;
+    const delay = Math.max(1, step - (Date.now() % step));
+    this.timelineTimer = setTimeout(() => {
+      this.timelineTimer = null;
+      if (this.disposed || this.state.view.kind !== "overview") return;
+      this.refreshOverview();
+      this.syncTimelineTimer();
+    }, delay);
+    // Never hold the process open for a repaint.
+    (this.timelineTimer as { unref?: () => void } | null)?.unref?.();
   }
 
   private scheduleFlush(delay: number = REFRESH_THROTTLE_MS): void {
@@ -1164,7 +1252,7 @@ export class MemberInspectorComponent {
       return;
     }
     if (this.state.view.kind === "overview" && !matchesKey(data, Key.left) && !matchesKey(data, Key.right)) {
-      const capacity = Math.max(1, bh);
+      const capacity = Math.max(1, this.overviewCapacity());
       if (matchesKey(data, Key.up)) this.state.moveOverviewSelection(-1, capacity);
       else if (matchesKey(data, Key.down)) this.state.moveOverviewSelection(1, capacity);
       else if (matchesKey(data, Key.pageUp)) this.state.moveOverviewSelection(-capacity, capacity);
@@ -1176,8 +1264,16 @@ export class MemberInspectorComponent {
         this.lastInteractionAt = 0;
         this.flushStreaming();
         this.scheduleFlush(0);
+        this.syncTimelineTimer(); // leaving the overview stops the tick
       } else if (matchesKey(data, "ctrl+b") || matchesKey(data, "ctrl+shift+a")) {
         this.sendAbortAll();
+        return;
+      } else if (matchesKey(data, "?") || decodeCommandChar(data) === "?") {
+        // Legacy terminals send "?" literally; kitty CSI-u may send the base key
+        // with Shift (`CSI 47;2u`) and xterm modifyOtherKeys the result codepoint
+        // (`CSI 27;2;63~`) — all three must toggle the legend (decision #14).
+        this.showLegend = !this.showLegend;
+        this.requestRenderSafe(true);
         return;
       } else if (matchesKey(data, "i") || matchesKey(data, "ctrl+a") || matchesKey(data, "ctrl+o")) {
         this.state.notice = "进入成员会话后操作或发送消息";
@@ -1191,6 +1287,7 @@ export class MemberInspectorComponent {
     if (matchesKey(data, Key.left)) {
       this.lastInteractionAt = 0;
       this.state.switchTab(-1);
+      this.syncTimelineTimer();
       // P2: inactive tabs skip streaming rebuilds — catch up the newly
       // active tab's live tail immediately (O(Δ) via the wrap cache).
       this.flushStreaming();
@@ -1200,6 +1297,7 @@ export class MemberInspectorComponent {
     } else if (matchesKey(data, Key.right)) {
       this.lastInteractionAt = 0;
       this.state.switchTab(1);
+      this.syncTimelineTimer();
       this.flushStreaming();
       this.scheduleFlush();
     } else if (matchesKey(data, Key.up)) {
@@ -1272,6 +1370,34 @@ export class MemberInspectorComponent {
     };
   }
 
+  /**
+   * Palette wrapper for the timeline. Both members fail open: a custom theme may
+   * lack a token (`getFgAnsi` throws) and pi's render loop has no boundary guard,
+   * so a throw here would kill the process instead of degrading to no colour.
+   * `"none"` when the theme does not report a colour mode (tests, dumb terminals).
+   */
+  private get inspectorPalette(): PaletteSource {
+    const t = this.theme;
+    let mode: PaletteSource["mode"] = "none";
+    try {
+      const reported = t?.getColorMode?.();
+      if (reported === "truecolor" || reported === "256color") mode = reported;
+    } catch {
+      /* unknown mode → no colour */
+    }
+    return {
+      mode,
+      ansi: (token: string) => {
+        try {
+          const value = t?.getFgAnsi?.(token);
+          return typeof value === "string" && value.length > 0 ? value : undefined;
+        } catch {
+          return undefined;
+        }
+      },
+    };
+  }
+
   render(width: number): string[] {
     // P1-①: detect terminal width changes. The build-time fixed-width contract
     // ties line widths to the last render width — after a resize the cached
@@ -1286,6 +1412,7 @@ export class MemberInspectorComponent {
     this.syncMembers();
     const theme = this.inspectorTheme;
     const inner = Math.max(0, width - 2);
+    this.lastInnerWidth = inner;
     const bh = bodyHeight();
     const tab = this.state.activeTab;
     const overview = this.state.view.kind === "overview";
@@ -1322,8 +1449,21 @@ export class MemberInspectorComponent {
     // (fitLinesToWidth) so the right border stays aligned; no truncateLine /
     // padVisible here — the scroll hot path does ZERO width computation.
     const body: string[] = [];
-    if (overview) {
-      body.push(...buildOverviewLines(this.overviewRows(bh), this.state.selectedName, this.state.overviewOffset, bh, inner, theme));
+    const overviewNow = Date.now();
+    const overviewView = overview ? this.timelineView() : undefined;
+    const overviewRows = overview ? this.overviewRows(this.overviewCapacity()) : [];
+    const overviewWindow = overview && overviewView
+      ? timelineWindow(overviewRows, bh, inner, overviewNow, overviewView)
+      : undefined;
+    if (overview && overviewView) {
+      body.push(...buildTimelineLines(
+        overviewRows, this.state.selectedName, this.state.overviewOffset, bh, inner,
+        overviewNow, theme, overviewView,
+      ));
+      // Seed the display signature once so the first background refresh does not
+      // repaint a frame that was just drawn (subsequent refreshes compare against it).
+      if (this.lastOverviewSignature === null)
+        this.lastOverviewSignature = timelineSignature(overviewRows, bh, inner, overviewNow, overviewView);
     } else if (tab) {
       const visible = tab.lines.slice(tab.scrollOffset, tab.scrollOffset + bh);
       // A resize may precede the deferred rebuild. Clip just the visible
@@ -1339,7 +1479,7 @@ export class MemberInspectorComponent {
     // Two footer lines only: notices replace navigation hints, never disappear
     // with the removed status summary. Reserve the new-below hint FIRST.
     const navHints = overview
-      ? "←→ 切页  ↑↓ 选择成员  Enter 查看会话  Esc 关闭"
+      ? "←→ 切页  ↑↓ 选择成员  Enter 查看会话  ? 颜色  Esc 关闭"
       : buildNavHints(this.state.expanded, this.state.showThinking);
     const newBelow = tab?.newBelow ? "  ↓ 有更新" : "";
     const navigation = this.state.notice ?? navHints;
@@ -1363,8 +1503,17 @@ export class MemberInspectorComponent {
     const footer2Line = hintFrame(footer2);
 
     // ── Footer line 2: action key hints, or input-mode hints ──
+    // `?` swaps this line for the colour legend in place (no extra row, no height
+    // change). A frozen window prefixes why the right edge is not "now".
+    const frozenNotice = overviewWindow
+      ? buildFrozenNotice(overviewWindow, overviewNow)
+      : "";
+    const interruptHint = frozenNotice ? `${frozenNotice} · ctrl+b 全部中断` : "ctrl+b 全部中断";
+    const overviewHint = this.showLegend
+      ? buildColorLegend(contentWidth, this.inspectorPalette)
+      : interruptHint;
     const footer3 = this.state.inputOpen ? (this.state.notice || newBelow ? feedback : INPUT_HINTS) : overview
-      ? "ctrl+b 全部中断"
+      ? overviewHint
       : KEY_HINTS_ACTION;
     const footer3Line = hintFrame(footer3);
 
@@ -1382,12 +1531,16 @@ export class MemberInspectorComponent {
       const compact = [top];
       const slots = height - 2;
       if (slots > 1) compact.push(overview
-        ? frame(buildOverviewLines(this.overviewRows(1), this.state.selectedName, this.state.overviewOffset, 1, inner, theme)[0] ?? "总览")
+        ? frame(buildTimelineLines(
+            this.overviewRows(1), this.state.selectedName, this.state.overviewOffset, 1, inner,
+            Date.now(), theme, this.timelineView(),
+          )[0] ?? "总览")
         : frame(tab?.lines[tab.scrollOffset] ?? ""));
       while (compact.length < height - 2) compact.push(frame(""));
       if (slots > 0) compact.push(hintFrame("Esc 关闭" + (this.state.notice ? "  " + this.state.notice : "")));
       return [...compact, bottom];
     }
+    this.syncTimelineTimer();
     return [top, header, sep, ...bodyLines, sep, footer2Line, footer3Line, bottom];
   }
 }
